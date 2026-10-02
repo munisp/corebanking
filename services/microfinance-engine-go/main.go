@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -76,22 +79,76 @@ type SavingsCycle struct {
 	Status     string  `json:"status"`
 }
 
-var (
-	mu     sync.RWMutex
-	groups []MFGroup
-	loans  []MFLoan
-	cycles []SavingsCycle
-)
+// ── Persistence (wave-12 C3-P0-B7) ─────────────────────────────────────────
+// Groups, loans and savings cycles are Postgres-authoritative (typed tables
+// mf_groups, mf_loans, savings_cycles). The package-level slices were removed:
+// creates are transactional INSERTs with sequence-allocated ids, lists/stats
+// are served from PG. Fail-closed 503 when DATABASE_URL is unset/down.
+var db *sql.DB
 
-func init() {
-	groups = []MFGroup{
+const microfinanceDDL = `
+CREATE SEQUENCE IF NOT EXISTS mf_group_id_seq START 100;
+CREATE SEQUENCE IF NOT EXISTS mf_loan_id_seq START 100;
+CREATE TABLE IF NOT EXISTS mf_groups (
+    id              text PRIMARY KEY,
+    tenant_id       text NOT NULL DEFAULT '',
+    name            text NOT NULL,
+    group_type      text NOT NULL DEFAULT '',
+    members         integer NOT NULL DEFAULT 0,
+    loan_officer    text NOT NULL DEFAULT '',
+    meeting_day     text NOT NULL DEFAULT '',
+    savings_balance double precision NOT NULL DEFAULT 0,
+    loan_balance    double precision NOT NULL DEFAULT 0,
+    attendance_rate double precision NOT NULL DEFAULT 0,
+    status          text NOT NULL DEFAULT 'forming',
+    region          text NOT NULL DEFAULT '',
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS mf_loans (
+    id           text PRIMARY KEY,
+    tenant_id    text NOT NULL DEFAULT '',
+    group_id     text NOT NULL,
+    member_name  text NOT NULL DEFAULT '',
+    amount       double precision NOT NULL DEFAULT 0,
+    purpose      text NOT NULL DEFAULT '',
+    term         integer NOT NULL DEFAULT 0,
+    rate         double precision NOT NULL DEFAULT 0,
+    repaid       double precision NOT NULL DEFAULT 0,
+    status       text NOT NULL DEFAULT 'pending_approval',
+    guarantors   jsonb NOT NULL DEFAULT '[]'::jsonb,
+    disbursed_at text NOT NULL DEFAULT '',
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_mf_loans_group ON mf_loans (group_id);
+CREATE TABLE IF NOT EXISTS savings_cycles (
+    id          text PRIMARY KEY,
+    tenant_id   text NOT NULL DEFAULT '',
+    group_id    text NOT NULL,
+    cycle_no    integer NOT NULL DEFAULT 0,
+    start_date  text NOT NULL DEFAULT '',
+    end_date    text NOT NULL DEFAULT '',
+    total_saved double precision NOT NULL DEFAULT 0,
+    share_value double precision NOT NULL DEFAULT 0,
+    status      text NOT NULL DEFAULT 'active',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_savings_cycles_group ON savings_cycles (group_id);
+`
+
+// seedGroups/seedLoans/seedCycles are the demo fixtures previously held in
+// process memory; inserted once at boot ON CONFLICT DO NOTHING (idempotent).
+var (
+	seedGroups = []MFGroup{
 		{ID: "MFG-001", Name: "Iya Oloja Women's Group", GroupType: "solidarity", Members: 15, LoanOfficer: "LO-001 Adebisi Kemi", MeetingDay: "Monday", SavingsBalance: 4500000.0, LoanBalance: 12000000.0, AttendanceRate: 96.5, Status: "active", Region: "Lagos-Mushin"},
 		{ID: "MFG-002", Name: "Agric Cooperative Kano", GroupType: "cooperative", Members: 25, LoanOfficer: "LO-002 Musa Ibrahim", MeetingDay: "Wednesday", SavingsBalance: 8200000.0, LoanBalance: 25000000.0, AttendanceRate: 92.0, Status: "active", Region: "Kano-Sabon-Gari"},
 		{ID: "MFG-003", Name: "Traders Union Onitsha", GroupType: "village_banking", Members: 30, LoanOfficer: "LO-003 Chidera Obi", MeetingDay: "Thursday", SavingsBalance: 6800000.0, LoanBalance: 18000000.0, AttendanceRate: 88.5, Status: "active", Region: "Anambra-Onitsha"},
 		{ID: "MFG-004", Name: "Youth Empowerment Ibadan", GroupType: "solidarity", Members: 12, LoanOfficer: "LO-004 Taiwo Ade", MeetingDay: "Friday", SavingsBalance: 2100000.0, LoanBalance: 5000000.0, AttendanceRate: 94.0, Status: "active", Region: "Oyo-Ibadan"},
 		{ID: "MFG-005", Name: "Market Women PH", GroupType: "village_banking", Members: 20, LoanOfficer: "LO-005 Grace Amadi", MeetingDay: "Tuesday", SavingsBalance: 5500000.0, LoanBalance: 15000000.0, AttendanceRate: 91.0, Status: "active", Region: "Rivers-PH"},
 	}
-	loans = []MFLoan{
+	seedLoans = []MFLoan{
 		{ID: "MFL-001", GroupID: "MFG-001", MemberName: "Adeola Balogun", Amount: 500000.0, Purpose: "textile_trading", Term: 12, Rate: 2.5, Repaid: 350000.0, Status: "performing", Guarantors: []string{"Funke Adeyemi", "Shade Okonkwo"}, DisbursedAt: "2026-01-15T10:00:00Z"},
 		{ID: "MFL-002", GroupID: "MFG-001", MemberName: "Funke Adeyemi", Amount: 750000.0, Purpose: "food_processing", Term: 18, Rate: 2.5, Repaid: 450000.0, Status: "performing", Guarantors: []string{"Adeola Balogun", "Bisi Oladipo"}, DisbursedAt: "2025-11-01T10:00:00Z"},
 		{ID: "MFL-003", GroupID: "MFG-002", MemberName: "Aliyu Danjuma", Amount: 2000000.0, Purpose: "irrigation_equipment", Term: 24, Rate: 3.0, Repaid: 800000.0, Status: "performing", Guarantors: []string{"Sani Mohammed", "Bello Garba"}, DisbursedAt: "2025-09-01T10:00:00Z"},
@@ -99,11 +156,147 @@ func init() {
 		{ID: "MFL-005", GroupID: "MFG-004", MemberName: "Tunde Ajayi", Amount: 300000.0, Purpose: "phone_repair_shop", Term: 6, Rate: 2.0, Repaid: 50000.0, Status: "performing", Guarantors: []string{"Segun Ojo"}, DisbursedAt: "2026-04-01T10:00:00Z"},
 		{ID: "MFL-006", GroupID: "MFG-005", MemberName: "Blessing Okoro", Amount: 800000.0, Purpose: "provision_store", Term: 12, Rate: 2.5, Repaid: 100000.0, Status: "watch_list", Guarantors: []string{"Joy Amaechi", "Patience Nwogu"}, DisbursedAt: "2026-03-01T10:00:00Z"},
 	}
-	cycles = []SavingsCycle{
+	seedCycles = []SavingsCycle{
 		{ID: "SC-001", GroupID: "MFG-001", CycleNo: 3, StartDate: "2026-01-01", EndDate: "2026-12-31", TotalSaved: 4500000.0, ShareValue: 10000.0, Status: "active"},
 		{ID: "SC-002", GroupID: "MFG-002", CycleNo: 2, StartDate: "2026-01-01", EndDate: "2026-12-31", TotalSaved: 8200000.0, ShareValue: 25000.0, Status: "active"},
 		{ID: "SC-003", GroupID: "MFG-003", CycleNo: 4, StartDate: "2026-01-01", EndDate: "2026-12-31", TotalSaved: 6800000.0, ShareValue: 15000.0, Status: "active"},
 	}
+)
+
+func initDB() {
+	dsn := envOr("DATABASE_URL", "")
+	if dsn == "" {
+		log.Printf("[microfinance-engine-go] DATABASE_URL not set — endpoints fail-closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[microfinance-engine-go] pg open failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[microfinance-engine-go] pg ping failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(microfinanceDDL); err != nil {
+		log.Fatalf("[microfinance-engine-go] DDL failed: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatalf("[microfinance-engine-go] seed tx begin: %v", err)
+	}
+	for _, g := range seedGroups {
+		if _, err = tx.Exec(
+			`INSERT INTO mf_groups (id, name, group_type, members, loan_officer, meeting_day, savings_balance, loan_balance, attendance_rate, status, region)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+			g.ID, g.Name, g.GroupType, g.Members, g.LoanOfficer, g.MeetingDay, g.SavingsBalance, g.LoanBalance, g.AttendanceRate, g.Status, g.Region); err != nil {
+			tx.Rollback()
+			log.Fatalf("[microfinance-engine-go] seed group %s: %v", g.ID, err)
+		}
+	}
+	for _, l := range seedLoans {
+		guarantors, _ := json.Marshal(l.Guarantors)
+		if _, err = tx.Exec(
+			`INSERT INTO mf_loans (id, group_id, member_name, amount, purpose, term, rate, repaid, status, guarantors, disbursed_at)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+			l.ID, l.GroupID, l.MemberName, l.Amount, l.Purpose, l.Term, l.Rate, l.Repaid, l.Status, guarantors, l.DisbursedAt); err != nil {
+			tx.Rollback()
+			log.Fatalf("[microfinance-engine-go] seed loan %s: %v", l.ID, err)
+		}
+	}
+	for _, c := range seedCycles {
+		if _, err = tx.Exec(
+			`INSERT INTO savings_cycles (id, group_id, cycle_no, start_date, end_date, total_saved, share_value, status)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+			c.ID, c.GroupID, c.CycleNo, c.StartDate, c.EndDate, c.TotalSaved, c.ShareValue, c.Status); err != nil {
+			tx.Rollback()
+			log.Fatalf("[microfinance-engine-go] seed cycle %s: %v", c.ID, err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		log.Fatalf("[microfinance-engine-go] seed tx commit: %v", err)
+	}
+	log.Printf("[microfinance-engine-go] postgres authoritative store ready (mf_groups, mf_loans, savings_cycles)")
+}
+
+func dbListGroups() ([]MFGroup, error) {
+	rows, err := db.Query(`SELECT id, name, group_type, members, loan_officer, meeting_day, savings_balance, loan_balance, attendance_rate, status, region FROM mf_groups ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []MFGroup{}
+	for rows.Next() {
+		var g MFGroup
+		if err := rows.Scan(&g.ID, &g.Name, &g.GroupType, &g.Members, &g.LoanOfficer, &g.MeetingDay, &g.SavingsBalance, &g.LoanBalance, &g.AttendanceRate, &g.Status, &g.Region); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func dbInsertGroup(g *MFGroup) error {
+	return db.QueryRow(
+		`INSERT INTO mf_groups (id, name, group_type, members, loan_officer, meeting_day, savings_balance, loan_balance, attendance_rate, status, region)
+		 VALUES ('MFG-' || lpad(nextval('mf_group_id_seq')::text, 3, '0'), $1,$2,$3,$4,$5,$6,$7,$8,'forming',$9)
+		 RETURNING id`,
+		g.Name, g.GroupType, g.Members, g.LoanOfficer, g.MeetingDay, g.SavingsBalance, g.LoanBalance, g.AttendanceRate, g.Region).
+		Scan(&g.ID)
+}
+
+func dbListLoans() ([]MFLoan, error) {
+	rows, err := db.Query(`SELECT id, group_id, member_name, amount, purpose, term, rate, repaid, status, guarantors, disbursed_at FROM mf_loans ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []MFLoan{}
+	for rows.Next() {
+		var l MFLoan
+		var guarantors []byte
+		if err := rows.Scan(&l.ID, &l.GroupID, &l.MemberName, &l.Amount, &l.Purpose, &l.Term, &l.Rate, &l.Repaid, &l.Status, &guarantors, &l.DisbursedAt); err != nil {
+			return nil, err
+		}
+		json.Unmarshal(guarantors, &l.Guarantors)
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func dbInsertLoan(l *MFLoan) error {
+	guarantors, _ := json.Marshal(l.Guarantors)
+	l.Status = "pending_approval"
+	l.DisbursedAt = now()
+	return db.QueryRow(
+		`INSERT INTO mf_loans (id, group_id, member_name, amount, purpose, term, rate, repaid, status, guarantors, disbursed_at)
+		 VALUES ('MFL-' || lpad(nextval('mf_loan_id_seq')::text, 3, '0'), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		 RETURNING id`,
+		l.GroupID, l.MemberName, l.Amount, l.Purpose, l.Term, l.Rate, l.Repaid, l.Status, guarantors, l.DisbursedAt).
+		Scan(&l.ID)
+}
+
+func dbListCycles() ([]SavingsCycle, error) {
+	rows, err := db.Query(`SELECT id, group_id, cycle_no, start_date, end_date, total_saved, share_value, status FROM savings_cycles ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SavingsCycle{}
+	for rows.Next() {
+		var c SavingsCycle
+		if err := rows.Scan(&c.ID, &c.GroupID, &c.CycleNo, &c.StartDate, &c.EndDate, &c.TotalSaved, &c.ShareValue, &c.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func respond(w http.ResponseWriter, code int, data interface{}) {
@@ -135,71 +328,94 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func handleGroups(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	if db == nil {
+		respond(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
+	}
 	if r.Method == http.MethodPost {
 		var g MFGroup
 		json.NewDecoder(r.Body).Decode(&g)
-		g.ID = fmt.Sprintf("MFG-%03d", len(groups)+1)
+		if err := dbInsertGroup(&g); err != nil {
+			respond(w, 500, map[string]string{"error": "persist failed: " + err.Error()})
+			return
+		}
 		g.Status = "forming"
-		groups = append(groups, g)
 		respond(w, 201, g)
 		return
 	}
-	respond(w, 200, map[string]interface{}{"items": groups, "total": len(groups)})
+	items, err := dbListGroups()
+	if err != nil {
+		respond(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+		return
+	}
+	respond(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
 }
 
 func handleLoans(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	if db == nil {
+		respond(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
+	}
 	if r.Method == http.MethodPost {
 		var l MFLoan
 		json.NewDecoder(r.Body).Decode(&l)
-		l.ID = fmt.Sprintf("MFL-%03d", len(loans)+1)
-		l.Status = "pending_approval"
-		l.DisbursedAt = now()
-		loans = append(loans, l)
+		if err := dbInsertLoan(&l); err != nil {
+			respond(w, 500, map[string]string{"error": "persist failed: " + err.Error()})
+			return
+		}
 		respond(w, 201, l)
 		return
 	}
-	respond(w, 200, map[string]interface{}{"items": loans, "total": len(loans)})
+	items, err := dbListLoans()
+	if err != nil {
+		respond(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+		return
+	}
+	respond(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
 }
 
 func handleCycles(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	respond(w, 200, map[string]interface{}{"items": cycles, "total": len(cycles)})
+	if db == nil {
+		respond(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
+	}
+	items, err := dbListCycles()
+	if err != nil {
+		respond(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+		return
+	}
+	respond(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
 }
 
 func handleStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	totalMembers := 0
-	var totalSavings, totalLoanBalance, totalRepaid float64
-	for _, g := range groups {
-		totalMembers += g.Members
-		totalSavings += g.SavingsBalance
-		totalLoanBalance += g.LoanBalance
+	if db == nil {
+		respond(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
 	}
-	performing := 0
-	fullyRepaid := 0
-	watchList := 0
-	for _, l := range loans {
-		totalRepaid += l.Repaid
-		switch l.Status {
-		case "performing":
-			performing++
-		case "fully_repaid":
-			fullyRepaid++
-		case "watch_list":
-			watchList++
-		}
+	var totalGroups, totalMembers, performing, fullyRepaid, watchList, cycleCount int
+	var totalSavings, totalLoanBalance, totalRepaid float64
+	if err := db.QueryRow(`SELECT count(*), COALESCE(sum(members),0), COALESCE(sum(savings_balance),0), COALESCE(sum(loan_balance),0) FROM mf_groups`).
+		Scan(&totalGroups, &totalMembers, &totalSavings, &totalLoanBalance); err != nil {
+		respond(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+		return
+	}
+	if err := db.QueryRow(`SELECT COALESCE(sum(repaid),0),
+	        count(*) FILTER (WHERE status = 'performing'),
+	        count(*) FILTER (WHERE status = 'fully_repaid'),
+	        count(*) FILTER (WHERE status = 'watch_list') FROM mf_loans`).
+		Scan(&totalRepaid, &performing, &fullyRepaid, &watchList); err != nil {
+		respond(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+		return
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM savings_cycles`).Scan(&cycleCount); err != nil {
+		respond(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+		return
 	}
 	respond(w, 200, map[string]interface{}{
-		"totalGroups": len(groups), "totalMembers": totalMembers,
+		"totalGroups": totalGroups, "totalMembers": totalMembers,
 		"totalSavings": totalSavings, "totalLoanBalance": totalLoanBalance, "totalRepaid": totalRepaid,
 		"activeLoans": performing, "fullyRepaidLoans": fullyRepaid, "watchListLoans": watchList,
-		"totalSavingsCycles": len(cycles), "repaymentRate": 95.2,
+		"totalSavingsCycles": cycleCount, "repaymentRate": 95.2, "source": "postgres",
 	})
 }
 
@@ -377,16 +593,17 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	initDB()
 	startJWKSRefresh()
 
 	port := envOr("PORT", "8252")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/microfinance/groups", handleGroups)
-	http.HandleFunc("/v1/microfinance/loans", handleLoans)
-	http.HandleFunc("/v1/microfinance/cycles", handleCycles)
-	http.HandleFunc("/v1/microfinance/stats", handleStats)
+	http.HandleFunc("/v1/microfinance/groups", permifyAuthzGuard("loan_application", "manage", handleGroups))
+	http.HandleFunc("/v1/microfinance/loans", permifyAuthzGuard("loan_application", "manage", handleLoans))
+	http.HandleFunc("/v1/microfinance/cycles", permifyAuthzGuard("loan_application", "manage", handleCycles))
+	http.HandleFunc("/v1/microfinance/stats", permifyAuthzGuard("loan_application", "view", handleStats))
 	fmt.Printf("Microfinance Engine on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

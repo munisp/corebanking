@@ -5,12 +5,154 @@ Port: 8111
 Middleware: Kafka, Redis, OpenSearch, Postgres, Temporal
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional, List
 import uvicorn, os, uuid, random
+import json
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
+
+def _w12_put(store, rid, payload):
+    try:
+        store.put(rid, payload)
+    except Exception as e:
+        raise HTTPException(503, f"persistence_unavailable: {e}")
+
+
+def _w12_all(store):
+    try:
+        return store.all()
+    except Exception as e:
+        raise HTTPException(503, f"persistence_unavailable: {e}")
+
+
+def _w12_all_by_or_503(store, field, value):
+    try:
+        return _w12_all_by(store, field, value)
+    except Exception as e:
+        raise HTTPException(503, f"persistence_unavailable: {e}")
 import os
 
 app = FastAPI(title="54link-dev Customer Engagement", version="1.0.0")
@@ -275,21 +417,27 @@ class Referral(BaseModel):
     created_at: str = ""
 
 # --- Storage ---
-messages: list[InAppMessage] = [
+_MSG_SEED: list[InAppMessage] = [
     InAppMessage(id="MSG-001", customer_id="CUST-001", title="Welcome to 54link-dev!", body="Your account is set up and ready. Explore our savings products.", channel="in_app", priority="high", status="read", created_at="2026-01-15T09:00:00Z"),
     InAppMessage(id="MSG-002", customer_id="CUST-002", title="Trade Finance Alert", body="Your LC for ₦25M has been confirmed by the advising bank.", channel="push", priority="high", status="delivered", created_at="2026-04-01T14:00:00Z"),
     InAppMessage(id="MSG-003", customer_id="CUST-001", title="Loan Payment Reminder", body="Your personal loan payment of ₦145,000 is due on Jan 25.", channel="sms", priority="medium", status="sent", created_at="2026-01-20T08:00:00Z"),
 ]
-recommendations: list[ProductRecommendation] = []
-surveys: list[SurveyResponse] = [
+REC_STORE = _W12Store("product_recommendations")
+_SURVEY_SEED: list[SurveyResponse] = [
     SurveyResponse(id="SRV-001", customer_id="CUST-001", survey_type="nps", score=9, feedback="Excellent mobile app experience", channel="mobile", interaction_type="mobile", created_at="2026-03-15T10:00:00Z"),
     SurveyResponse(id="SRV-002", customer_id="CUST-002", survey_type="csat", score=4, feedback="Fast LC processing", channel="internet_banking", interaction_type="call_center", created_at="2026-04-02T11:00:00Z"),
     SurveyResponse(id="SRV-003", customer_id="CUST-003", survey_type="nps", score=6, feedback="Branch wait times could improve", channel="in_app", interaction_type="teller", created_at="2026-04-10T15:00:00Z"),
 ]
-referrals: list[Referral] = [
+_REFERRAL_SEED: list[Referral] = [
     Referral(id="REF-001", referrer_id="CUST-001", referee_name="Halima Yusuf", referee_phone="+2348065551234", referee_email="halima@example.ng", status="converted", reward_amount=2000, product_opened="savings_account", created_at="2026-02-01T09:00:00Z"),
     Referral(id="REF-002", referrer_id="CUST-002", referee_name="Taiwo Ogunleye", referee_phone="+2348077778899", referee_email="taiwo@corp.ng", status="registered", reward_amount=0, product_opened="", created_at="2026-03-20T14:00:00Z"),
 ]
+
+# W12-C3P2B5: PG-backed stores (seeds inserted ON CONFLICT DO NOTHING).
+MSG_STORE = _W12Store("in_app_messages", seed=[m.model_dump() for m in _MSG_SEED])
+SURVEY_STORE = _W12Store("survey_responses", seed=[s.model_dump() for s in _SURVEY_SEED])
+REF_STORE = _W12Store("referrals", seed=[r.model_dump() for r in _REFERRAL_SEED])
+
 
 @app.get("/healthz")
 def healthz():
@@ -315,19 +463,19 @@ def healthz():
 
 # --- In-App Messaging ---
 
-@app.get("/v1/engagement/messages")
+@app.get("/v1/engagement/messages", dependencies=[Depends(require_permify("customer_profile", "view"))])
 def list_messages(customer_id: str = ""):
-    filtered = [m for m in messages if m.customer_id == customer_id] if customer_id else messages
+    filtered = _w12_all_by_or_503(MSG_STORE, "customer_id", customer_id) if customer_id else _w12_all(MSG_STORE)
     return {"items": filtered, "total": len(filtered)}
 
-@app.post("/v1/engagement/messages", status_code=201)
+@app.post("/v1/engagement/messages", status_code=201, dependencies=[Depends(require_permify("customer_profile", "create"))])
 def send_message(req: InAppMessage):
     req.id = f"MSG-{uuid.uuid4().hex[:8]}"
     req.sent_at = datetime.utcnow().isoformat()
-    messages.append(req)
+    _w12_put(MSG_STORE, req.id, req.model_dump())
     return req
 
-@app.post("/v1/engagement/messages/bulk", status_code=201)
+@app.post("/v1/engagement/messages/bulk", status_code=201, dependencies=[Depends(require_permify("customer_profile", "create"))])
 def bulk_message(body: dict):
     """Send message to a customer segment"""
     segment = body.get("segment", "mass_market")
@@ -342,13 +490,13 @@ def bulk_message(body: dict):
             customer_id=cid, title=title, body=msg_body,
             segment=segment, sent_at=datetime.utcnow().isoformat(),
         )
-        messages.append(msg)
+        _w12_put(MSG_STORE, msg.id, msg.model_dump())
         created.append(msg)
     return {"sent": len(created), "messages": created}
 
 # --- Product Recommendations ---
 
-@app.get("/v1/engagement/recommendations/{customer_id}")
+@app.get("/v1/engagement/recommendations/{customer_id}", dependencies=[Depends(require_permify("customer_profile", "view"))])
 def get_recommendations(customer_id: str):
     # Generate recommendations based on customer profile
     possible = [
@@ -372,13 +520,13 @@ def get_recommendations(customer_id: str):
             created_at=datetime.utcnow().isoformat(),
         )
         recs.append(rec)
-        recommendations.append(rec)
+        _w12_put(REC_STORE, rec.id, rec.model_dump())
 
     return sorted(recs, key=lambda r: r.score, reverse=True)
 
 # --- Customer 360 View ---
 
-@app.get("/v1/engagement/customer360/{customer_id}")
+@app.get("/v1/engagement/customer360/{customer_id}", dependencies=[Depends(require_permify("customer_profile", "view"))])
 def customer_360(customer_id: str):
     return Customer360(
         customer_id=customer_id,
@@ -399,11 +547,11 @@ def customer_360(customer_id: str):
 
 # --- NPS/CSAT Surveys ---
 
-@app.get("/v1/engagement/surveys")
+@app.get("/v1/engagement/surveys", dependencies=[Depends(require_permify("customer_profile", "view"))])
 def list_surveys():
     return {"items": surveys, "total": len(surveys)}
 
-@app.post("/v1/engagement/surveys", status_code=201)
+@app.post("/v1/engagement/surveys", status_code=201, dependencies=[Depends(require_permify("customer_profile", "create"))])
 def submit_survey(req: SurveyResponse):
     valid_types = {"nps": (0, 10), "csat": (1, 5), "ces": (1, 7)}
     if req.survey_type not in valid_types:
@@ -414,11 +562,12 @@ def submit_survey(req: SurveyResponse):
 
     req.id = f"SRV-{uuid.uuid4().hex[:8]}"
     req.created_at = datetime.utcnow().isoformat()
-    surveys.append(req)
+    _w12_put(SURVEY_STORE, req.id, req.model_dump())
     return req
 
-@app.get("/v1/engagement/surveys/analytics")
+@app.get("/v1/engagement/surveys/analytics", dependencies=[Depends(require_permify("customer_profile", "view"))])
 def survey_analytics():
+    surveys = [SurveyResponse(**r) for r in _w12_all(SURVEY_STORE)]
     nps_scores = [s.score for s in surveys if s.survey_type == "nps"]
     csat_scores = [s.score for s in surveys if s.survey_type == "csat"]
 
@@ -436,14 +585,15 @@ def survey_analytics():
 
 # --- Referral Program ---
 
-@app.get("/v1/engagement/referrals")
+@app.get("/v1/engagement/referrals", dependencies=[Depends(require_permify("customer_profile", "view"))])
 def list_referrals():
+    referrals = _w12_all(REF_STORE)
     return {"items": referrals, "total": len(referrals)}
 
-@app.post("/v1/engagement/referrals", status_code=201)
+@app.post("/v1/engagement/referrals", status_code=201, dependencies=[Depends(require_permify("customer_profile", "create"))])
 def create_referral(req: Referral):
-    # Check for duplicate referrals
-    for r in referrals:
+    # Check for duplicate referrals (PG-backed)
+    for r in [Referral(**x) for x in _w12_all(REF_STORE)]:
         if r.referee_phone == req.referee_phone:
             raise HTTPException(400, "This phone number has already been referred")
 
@@ -451,18 +601,22 @@ def create_referral(req: Referral):
     req.status = "pending"
     req.reward_amount = 2000  # ₦2,000 referral bonus
     req.created_at = datetime.utcnow().isoformat()
-    referrals.append(req)
+    _w12_put(REF_STORE, req.id, req.model_dump())
     return req
 
-@app.post("/v1/engagement/referrals/{referral_id}/convert")
+@app.post("/v1/engagement/referrals/{referral_id}/convert", dependencies=[Depends(require_permify("customer_profile", "manage"))])
 def convert_referral(referral_id: str, body: dict):
-    for i, r in enumerate(referrals):
-        if r.id == referral_id:
-            referrals[i].status = "converted"
-            referrals[i].product_opened = body.get("product", "current_account")
-            referrals[i].reward_amount = 2000
-            return referrals[i]
-    raise HTTPException(404, "Referral not found")
+    try:
+        row = REF_STORE.get(referral_id)
+    except Exception as e:
+        raise HTTPException(503, f"persistence_unavailable: {e}")
+    if not row:
+        raise HTTPException(404, "Referral not found")
+    row["status"] = "converted"
+    row["product_opened"] = body.get("product", "current_account")
+    row["reward_amount"] = 2000
+    _w12_put(REF_STORE, referral_id, row)
+    return row
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8111))

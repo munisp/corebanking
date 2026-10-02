@@ -312,8 +312,8 @@ func handleBillingPlanDefByID(w http.ResponseWriter, r *http.Request) {
 }
 
 var (
-	tenantPlanMu sync.RWMutex
-	tenantPlans  = map[string]*TenantPlan{} // keyed by tenantId
+	// W12 C3-P2-B5: the tenantPlans map was removed — plans live in the
+	// tenant_plans PG table (see getOrCreateTenantPlan / dbListTenantPlans).
 
 	mu      sync.RWMutex
 	records = []Record{
@@ -337,19 +337,41 @@ const (
 	maxAuditEntries    = 2000
 )
 
-// appendRecord appends to the in-memory store, evicting the oldest entries
-// once the store exceeds maxInMemoryRecords (bounded store, GPT-06).
-func appendRecord(rec Record) {
+// appendRecord persists to Postgres FIRST (PG-authoritative, W12-C3P2B1) and
+// updates the bounded in-memory mirror only after a successful INSERT. When no
+// database is configured the service runs in documented degraded-memory mode
+// and the mirror is the only copy. An error means the record was NOT persisted
+// and NOT mirrored; callers must fail the request (503).
+func appendRecord(rec Record) error {
+	if db != nil {
+		dataBytes, merr := json.Marshal(rec.Data)
+		if merr != nil {
+			return merr
+		}
+		if err := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); err != nil {
+			return err
+		}
+	}
 	records = append(records, rec)
 	if len(records) > maxInMemoryRecords {
 		copy(records, records[len(records)-maxInMemoryRecords:])
 		records = records[:maxInMemoryRecords]
 	}
+	return nil
 }
 
-// appendAudit appends to the audit log, evicting the oldest entries once the
-// log exceeds maxAuditEntries (bounded store, GPT-06).
+// appendAudit persists to the audit_log table FIRST (PG-authoritative,
+// W12-C3P2B1) and updates the bounded in-memory mirror only after a successful
+// INSERT; on insert failure the entry is deliberately NOT mirrored so the
+// memory mirror never claims durability Postgres does not have. When no
+// database is configured the mirror is the only copy (degraded-memory mode).
 func appendAudit(e AuditEntry) {
+	if db != nil {
+		if err := dbAuditInsert(e); err != nil {
+			log.Printf("[%s] audit_log insert failed - entry NOT mirrored in memory: %v", serviceName, err)
+			return
+		}
+	}
 	auditLog = append(auditLog, e)
 	if len(auditLog) > maxAuditEntries {
 		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
@@ -419,20 +441,43 @@ func min64len(s string, n int) int {
 	return n
 }
 
+// getOrCreateTenantPlan reads the tenant's plan from Postgres, auto-provisioning
+// the default plan on first sight (idempotent INSERT ... ON CONFLICT DO NOTHING
+// on the tenant_id natural key — concurrent first-reads across replicas agree).
+// When PG is unavailable the plan cannot be persisted: an EPHEMERAL default is
+// returned for read paths (documented degraded read — nothing is stored, so no
+// false durability is claimed); write paths check db != nil and fail closed 503.
 func getOrCreateTenantPlan(tenantID string) *TenantPlan {
-	tenantPlanMu.Lock()
-	defer tenantPlanMu.Unlock()
-	if p, ok := tenantPlans[tenantID]; ok {
+	fallback := func() *TenantPlan {
+		return &TenantPlan{
+			Plan:            defaultPlanName(),
+			BillingCycle:    "monthly",
+			NextBillingDate: time.Now().AddDate(0, 1, 0).Format(time.RFC3339),
+			Status:          "active",
+			UpdatedAt:       time.Now().Format(time.RFC3339),
+		}
+	}
+	if db == nil {
+		return fallback()
+	}
+	p, err := dbGetTenantPlan(tenantID)
+	if err == nil {
 		return p
 	}
-	p := &TenantPlan{
-		Plan:            defaultPlanName(),
-		BillingCycle:    "monthly",
-		NextBillingDate: time.Now().AddDate(0, 1, 0).Format(time.RFC3339),
-		Status:          "active",
-		UpdatedAt:       time.Now().Format(time.RFC3339),
+	if err != sql.ErrNoRows {
+		log.Printf("[%s] tenant plan read failed for %s: %v", serviceName, tenantID, err)
+		return fallback()
 	}
-	tenantPlans[tenantID] = p
+	p = fallback()
+	if _, err := db.Exec(`INSERT INTO tenant_plans (tenant_id, plan, billing_cycle, next_billing_date, status, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (tenant_id) DO NOTHING`,
+		tenantID, p.Plan, p.BillingCycle, p.NextBillingDate, p.Status, p.UpdatedAt); err != nil {
+		log.Printf("[%s] tenant plan provision failed for %s: %v", serviceName, tenantID, err)
+	}
+	// Re-read so a concurrent provisioner's row wins (multi-replica agreement).
+	if stored, err := dbGetTenantPlan(tenantID); err == nil {
+		return stored
+	}
 	return p
 }
 
@@ -543,10 +588,15 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("tenant-billing-go: DB query failed, falling back to in-memory: %v", err)
 	}
-	// In-memory fallback
+	// Degraded-mode fallback (W12-C3P2B1): Postgres is authoritative; the
+	// bounded in-memory mirror is served only when the database is unreachable
+	// or not configured, and the response is explicitly marked as degraded.
+	if db == nil {
+		log.Printf("[%s] no database configured - records served from degraded memory mirror", serviceName)
+	}
 	mu.RLock()
 	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "in-memory"})
+	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "degraded-memory"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -586,15 +636,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if rec.Type == "" {
 		rec.Type = "primary"
 	}
-	appendRecord(rec)
-	domainStats.TotalRecords = len(records)
-
-	// Persist to database
-	if dataBytes, err := json.Marshal(rec.Data); err == nil {
-		if dbErr := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); dbErr != nil {
-			log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-		}
+	if err := appendRecord(rec); err != nil {
+		log.Printf("[%s] record INSERT failed - record NOT created: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not created"})
+		return
 	}
+	domainStats.TotalRecords = len(records)
 
 	appendAudit(AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
@@ -619,16 +666,49 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
+			// Build the updated record on a copy FIRST (W12-C3P2B1): the
+			// in-memory mirror is mutated only after Postgres accepts the
+			// write — PG is authoritative, memory is a mirror.
+			updated := records[i]
+			newData := make(map[string]interface{}, len(records[i].Data)+len(body))
+			for k, v := range records[i].Data {
+				newData[k] = v
+			}
+			updated.Data = newData
 			if s := getString(body, "status"); s != "" {
-				records[i].Status = s
+				updated.Status = s
 			}
 			for k, v := range body {
 				if k != "id" {
-					records[i].Data[k] = v
+					updated.Data[k] = v
 				}
 			}
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
+			updated.UpdatedAt = time.Now().Format(time.RFC3339)
+			updated.Version++
+			if db != nil {
+				dataBytes, merr := json.Marshal(updated.Data)
+				if merr != nil {
+					respondJSON(w, 500, map[string]string{"error": "record encode failed"})
+					return
+				}
+				res, uerr := db.Exec("UPDATE service_records SET status = $1, data = $2 WHERE id = $3 AND service = $4", updated.Status, string(dataBytes), id, serviceName)
+				if uerr != nil {
+					log.Printf("[%s] record UPDATE failed - record NOT updated: %v", serviceName, uerr)
+					respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not updated"})
+					return
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					// Row absent in PG (created before the flip or in degraded
+					// mode): backfill via INSERT so PG is authoritative from
+					// this write onward.
+					if ierr := dbInsert(updated.ID, serviceName, updated.Type, updated.Status, dataBytes); ierr != nil {
+						log.Printf("[%s] record UPDATE backfill INSERT failed - record NOT updated: %v", serviceName, ierr)
+						respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not updated"})
+						return
+					}
+				}
+			}
+			records[i] = updated
 			appendAudit(AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
@@ -650,9 +730,30 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
+	// PG-authoritative read (W12-C3P2B1): the audit log is served from
+	// Postgres. The bounded in-memory log is only a degraded-mode fallback
+	// mirror and is explicitly marked as such.
+	if db != nil {
+		rows, err := db.Query("SELECT id, action, record_id, actor, timestamp, details FROM audit_log WHERE service = $1 ORDER BY created_at DESC LIMIT 100", serviceName)
+		if err == nil {
+			defer rows.Close()
+			items := []map[string]interface{}{}
+			for rows.Next() {
+				var id, action, recordID, actor, ts, details string
+				if rows.Scan(&id, &action, &recordID, &actor, &ts, &details) == nil {
+					items = append(items, map[string]interface{}{"id": id, "action": action, "recordId": recordID, "actor": actor, "timestamp": ts, "details": details})
+				}
+			}
+			respondJSON(w, 200, map[string]interface{}{"auditLog": items, "total": len(items), "source": "database"})
+			return
+		}
+		log.Printf("[%s] audit_log query failed - degraded-memory fallback: %v", serviceName, err)
+	} else {
+		log.Printf("[%s] no database configured - audit log served from degraded memory mirror", serviceName)
+	}
 	mu.RLock()
 	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
+	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog), "source": "degraded-memory"})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -771,6 +872,31 @@ func (rw *responseWriter) WriteHeader(code int) {
 // --- Database Layer ---
 var db *sql.DB
 
+// ensureRecordsSchemaW12 creates the PG-authoritative record/audit stores
+// (W12-C3P2B1). Idempotent; no-op when the service runs without a database
+// (documented degraded-memory mode).
+func ensureRecordsSchemaW12() {
+	if db == nil {
+		return
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`); err != nil {
+		log.Printf("[%s] service_records schema init failed: %v", serviceName, err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS audit_log (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, action TEXT NOT NULL,
+		record_id TEXT DEFAULT '', actor TEXT DEFAULT '', timestamp TEXT DEFAULT '',
+		details TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[%s] audit_log schema init failed: %v", serviceName, err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_svc_created ON audit_log(service, created_at DESC)`)
+}
+
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
@@ -792,7 +918,51 @@ func initDB() {
 		db = nil
 		return
 	}
+	// W12 C3-P2-B5: tenant_plans store (was in-memory tenantPlans map).
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS tenant_plans (
+		tenant_id TEXT PRIMARY KEY,
+		plan TEXT NOT NULL DEFAULT '',
+		billing_cycle TEXT NOT NULL DEFAULT 'monthly',
+		next_billing_date TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'active',
+		updated_at TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		log.Printf("[%s] tenant_plans DDL failed: %v — plan endpoints fail closed (503)", serviceName, err)
+		db = nil
+		return
+	}
 	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+}
+
+// dbGetTenantPlan reads one tenant plan; sql.ErrNoRows when absent.
+func dbGetTenantPlan(tenantID string) (*TenantPlan, error) {
+	p := &TenantPlan{}
+	err := db.QueryRow(`SELECT plan, billing_cycle, next_billing_date, status, updated_at
+		FROM tenant_plans WHERE tenant_id = $1`, tenantID).
+		Scan(&p.Plan, &p.BillingCycle, &p.NextBillingDate, &p.Status, &p.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// dbListTenantPlans returns all tenant plans keyed by tenantId.
+func dbListTenantPlans() (map[string]*TenantPlan, error) {
+	rows, err := db.Query(`SELECT tenant_id, plan, billing_cycle, next_billing_date, status, updated_at FROM tenant_plans`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]*TenantPlan{}
+	for rows.Next() {
+		var tid string
+		p := &TenantPlan{}
+		if err := rows.Scan(&tid, &p.Plan, &p.BillingCycle, &p.NextBillingDate, &p.Status, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out[tid] = p
+	}
+	return out, rows.Err()
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -1369,8 +1539,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1378,10 +1555,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
+		"service_configs.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1418,7 +1605,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1426,25 +1620,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
+		"service_configs.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+		"service_configs.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1722,6 +1945,7 @@ func main() {
 		port = "9446"
 	}
 	initDB()
+	ensureRecordsSchemaW12()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
@@ -1729,25 +1953,25 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "manage", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/tenant-billing/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
-	mux.Handle("/v1/tenant-billing/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
-	mux.Handle("/v1/tenant-billing/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
-	mux.Handle("/v1/tenant-billing/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
-	mux.Handle("/v1/tenant-billing/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
-	mux.Handle("/v1/tenant-billing/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/tenant-billing/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(tenant_billingScoreHandler)))
-	mux.Handle("/v1/tenant-billing/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(tenant_billingValidateRequestHandler)))
-	mux.Handle("/v1/billing/me", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingMe)))
-	mux.Handle("/v1/billing/plan", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingPlan)))
-	mux.Handle("/v1/billing/plans", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingPlanDefs)))
-	mux.Handle("/v1/billing/plans/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingPlanDefByID)))
-	mux.Handle("/v1/billing/invoices", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingInvoices)))
-	mux.Handle("/v1/billing/records", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingRecords)))
-	mux.Handle("/v1/billing/trends", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingTrends)))
-	mux.Handle("/v1/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBillingGlobalStats)))
+	mux.Handle("/v1/tenant-billing/list", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "view", http.HandlerFunc(handleList))))
+	mux.Handle("/v1/tenant-billing/create", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "create", http.HandlerFunc(handleCreate))))
+	mux.Handle("/v1/tenant-billing/update", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "update", http.HandlerFunc(handleUpdate))))
+	mux.Handle("/v1/tenant-billing/process", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "process", http.HandlerFunc(handleProcess))))
+	mux.Handle("/v1/tenant-billing/audit", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "view", http.HandlerFunc(handleAudit))))
+	mux.Handle("/v1/tenant-billing/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "view", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/tenant-billing/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "score", http.HandlerFunc(tenant_billingScoreHandler))))
+	mux.Handle("/v1/tenant-billing/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "validate", http.HandlerFunc(tenant_billingValidateRequestHandler))))
+	mux.Handle("/v1/billing/me", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "me", http.HandlerFunc(handleBillingMe))))
+	mux.Handle("/v1/billing/plan", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "plan", http.HandlerFunc(handleBillingPlan))))
+	mux.Handle("/v1/billing/plans", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "manage", http.HandlerFunc(handleBillingPlanDefs))))
+	mux.Handle("/v1/billing/plans/", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "manage", http.HandlerFunc(handleBillingPlanDefByID))))
+	mux.Handle("/v1/billing/invoices", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "manage", http.HandlerFunc(handleBillingInvoices))))
+	mux.Handle("/v1/billing/records", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "manage", http.HandlerFunc(handleBillingRecords))))
+	mux.Handle("/v1/billing/trends", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "manage", http.HandlerFunc(handleBillingTrends))))
+	mux.Handle("/v1/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("tenant_billing", "view", http.HandlerFunc(handleBillingGlobalStats))))
 	log.Printf("Tenant Billing v2.0 (Platform) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1783,8 +2007,6 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w
 func handleBillingMe(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	plan := getOrCreateTenantPlan(tenantID)
-	tenantPlanMu.RLock()
-	defer tenantPlanMu.RUnlock()
 	respondJSON(w, 200, map[string]interface{}{
 		"billing_info": map[string]interface{}{
 			"plan":            plan.Plan,
@@ -1813,11 +2035,23 @@ func handleBillingPlan(w http.ResponseWriter, r *http.Request) {
 		tenantID = tid
 	}
 	plan := getOrCreateTenantPlan(tenantID)
-	tenantPlanMu.Lock()
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "tenant plan store unavailable (postgres down)"})
+		return
+	}
 	plan.Plan = newPlan
 	plan.NextBillingDate = time.Now().AddDate(0, 1, 0).Format(time.RFC3339)
 	plan.UpdatedAt = time.Now().Format(time.RFC3339)
-	tenantPlanMu.Unlock()
+	// Durable write-through: the plan change is a billing mutation and must
+	// survive restarts/replicas (idempotent UPSERT on the tenant_id natural key).
+	if _, err := db.Exec(`INSERT INTO tenant_plans (tenant_id, plan, billing_cycle, next_billing_date, status, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6)
+		ON CONFLICT (tenant_id) DO UPDATE SET plan = EXCLUDED.plan, next_billing_date = EXCLUDED.next_billing_date, updated_at = EXCLUDED.updated_at`,
+		tenantID, plan.Plan, plan.BillingCycle, plan.NextBillingDate, plan.Status, plan.UpdatedAt); err != nil {
+		log.Printf("[%s] tenant plan update failed for %s: %v", serviceName, tenantID, err)
+		respondJSON(w, 503, map[string]string{"error": "tenant plan store unavailable (postgres down)"})
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"updated": true,
 		"billing_info": map[string]interface{}{
@@ -1858,8 +2092,16 @@ var seedTenants = []map[string]interface{}{
 func handleBillingRecords(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	recs := make([]map[string]interface{}, 0, len(seedTenants))
-	tenantPlanMu.RLock()
-	defer tenantPlanMu.RUnlock()
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "tenant plan store unavailable (postgres down)"})
+		return
+	}
+	tenantPlans, err := dbListTenantPlans()
+	if err != nil {
+		log.Printf("[%s] billing records plan read failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "tenant plan store unavailable (postgres down)"})
+		return
+	}
 	for _, t := range seedTenants {
 		tid, _ := t["id"].(string)
 		name, _ := t["name"].(string)
@@ -1884,8 +2126,16 @@ func handleBillingRecords(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleBillingGlobalStats(w http.ResponseWriter, r *http.Request) {
-	tenantPlanMu.RLock()
-	defer tenantPlanMu.RUnlock()
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "tenant plan store unavailable (postgres down)"})
+		return
+	}
+	tenantPlans, err := dbListTenantPlans()
+	if err != nil {
+		log.Printf("[%s] billing stats plan read failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "tenant plan store unavailable (postgres down)"})
+		return
+	}
 	// Compute MRR from all known tenant plans
 	mrr := 0.0
 	for _, t := range seedTenants {
@@ -1989,6 +2239,17 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+}
+
+// dbAuditInsert persists one audit entry to the shared audit_log table
+// (W12-C3P2B1).
+func dbAuditInsert(e AuditEntry) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO audit_log (id, service, action, record_id, actor, timestamp, details) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+		e.ID, serviceName, e.Action, e.RecordID, e.Actor, e.Timestamp, e.Details)
+	return err
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {

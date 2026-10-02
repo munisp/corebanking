@@ -1,1 +1,2 @@
 # no external deps
+psycopg2-binary>=2.9.9  # W12-C3P2B5: PG persistence

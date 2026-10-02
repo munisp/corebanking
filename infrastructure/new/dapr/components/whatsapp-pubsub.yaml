@@ -1,0 +1,24 @@
+# W12-B5-P1-G: omini-service/whatsapp-service referenced component
+# 'whatsapp-pubsub' (whatsapp_middleware_integration.py:143,289) with NO
+# manifest — added here. Broker by evidence: the same topics are published to
+# raw Kafka in the same code path (kafka_producer.send "whatsapp.messages"
+# whatsapp_middleware_integration.py:141, "whatsapp.transactions" :152,
+# "lakehouse.whatsapp.events" :249) — all harvested Kafka literals with
+# KafkaTopic CRDs (work/w12/kafka-topic-catalog.json) — so the component is
+# pubsub.kafka, mirroring eod-pubsub.yaml. NOTE: omini-service code is owned by
+# running peer batch C3-P1-B2R; only this platform manifest is added (no code edit).
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: whatsapp-pubsub
+  namespace: 54bank
+spec:
+  type: pubsub.kafka
+  version: v1
+  metadata:
+    - name: brokers
+      value: "localhost:9092"
+    - name: consumerGroup
+      value: "54bank-whatsapp"
+    - name: authType
+      value: "none"

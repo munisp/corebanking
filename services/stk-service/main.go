@@ -167,11 +167,11 @@ func (s *STKServer) setupRoutes() {
 	s.router.Handle("/metrics", promhttp.Handler())
 
 	api := s.router.PathPrefix("/api/v1").Subrouter()
-	api.HandleFunc("/stk/push", s.stkPushHandler).Methods("POST")
+	api.HandleFunc("/stk/push", permifyAuthzGuard("transfer", "create", s.stkPushHandler)).Methods("POST")
 	api.HandleFunc("/stk/callback", s.stkCallbackHandler).Methods("POST")
-	api.HandleFunc("/stk/status/{transactionId}", s.stkStatusHandler).Methods("GET")
+	api.HandleFunc("/stk/status/{transactionId}", permifyAuthzGuard("transfer", "view", s.stkStatusHandler)).Methods("GET")
 	// STK Banking command handler - processes SIM Toolkit menu commands
-	api.HandleFunc("/stk/command", s.stkCommandHandler).Methods("POST")
+	api.HandleFunc("/stk/command", permifyAuthzGuard("transfer", "create", s.stkCommandHandler)).Methods("POST")
 }
 
 func (s *STKServer) healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -614,6 +614,7 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down STK Push service...")
+	server.bankingService.ledger.close()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	httpServer.Shutdown(shutdownCtx)

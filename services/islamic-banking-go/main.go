@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/IBM/sarama"
+	"github.com/redis/go-redis/v9"
 	"log"
 	"net/http"
 	"os"
@@ -91,36 +92,69 @@ func (cb *CircuitBreaker) RecordFailure() {
 var circuitBreaker = newCircuitBreaker()
 
 // --- Rate Limiter ---
+// W12 C3-P1-B3: redis fixed-window limiter (key ratelimit:{svc}:{subject},
+// TTL = window). The map is gone — limits are now enforced globally across
+// replicas and survive restarts (previously each replica had its own
+// per-process counts, so effective limits multiplied by replica count).
 type RateLimiter struct {
-	mu       sync.Mutex
-	requests map[string][]time.Time
-	max      int
-	window   time.Duration
+	max    int
+	window time.Duration
 }
 
 func newRateLimiter() *RateLimiter {
-	return &RateLimiter{requests: make(map[string][]time.Time), max: 200, window: time.Minute}
+	return &RateLimiter{max: 200, window: time.Minute}
 }
 
 func (rl *RateLimiter) Allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	now := time.Now()
-	reqs := rl.requests[ip]
-	var valid []time.Time
-	for _, t := range reqs {
-		if now.Sub(t) < rl.window {
-			valid = append(valid, t)
-		}
-	}
-	if len(valid) >= rl.max {
-		return false
-	}
-	rl.requests[ip] = append(valid, now)
-	return true
+	return rateLimitAllow(fmt.Sprintf("ratelimit:%s:%s", serviceName, ip), rl.max, rl.window)
 }
 
 var rateLimiter = newRateLimiter()
+
+// W12 C3-P1-B3: pooled go-redis client (canonical pattern per
+// services/cooperative-meetings-go/main.go). Limits/state now hold across
+// restarts and replicas (previously per-process memory).
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+)
+
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		addr := os.Getenv("REDIS_URL")
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         addr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
+}
+
+// rateLimitIncr atomically increments the fixed-window counter for key and
+// sets the window TTL on first hit (INCR + PEXPIRE via Lua).
+var rateLimitIncrScript = redis.NewScript(`local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return c`)
+
+func rateLimitAllow(key string, max int, window time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	count, err := rateLimitIncrScript.Run(ctx, getRedisClient(), []string{key}, int64(window/time.Millisecond)).Int64()
+	if err != nil {
+		// FAIL OPEN: rate limiting is not a revocation control — on redis
+		// outage the request proceeds (logged) rather than taking the
+		// service down with the cache layer.
+		log.Printf("[%s] rate-limiter redis error, failing open: %v", serviceName, err)
+		return true
+	}
+	return count <= int64(max)
+}
 
 // --- EventBus ---
 type EventBus struct {

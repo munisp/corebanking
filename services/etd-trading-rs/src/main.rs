@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -55,7 +56,20 @@ fn seed() -> Vec<ETDPosition> {
     ]
 }
 
-struct AppState { items: Mutex<Vec<ETDPosition>> }
+struct AppState { items: Mutex<Vec<ETDPosition>>, db: sqlx::PgPool }
+
+// W12-RUSTFIX: CreateRequest was referenced by the wave-11 CRUD handlers but
+// never defined (baseline did not compile). Fleet-canonical shape.
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
 
 async fn healthz() -> HttpResponse {
     let c = mw();
@@ -82,6 +96,7 @@ async fn healthz() -> HttpResponse {
 
 async fn list_items(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "derivative", "view").await { return resp; } // W12-B5P1DD
     let d = data.items.lock().unwrap();
     HttpResponse::Ok().json(serde_json::json!({ "items": *d, "total": d.len() }))
 }
@@ -286,7 +301,28 @@ fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8175".into()).parse().unwrap_or(8175);
-    let data = web::Data::new(AppState { items: Mutex::new(seed()) });
+    // W12-RUSTFIX: sqlx pool for the wave-11 CRUD handlers (data.db) — never
+    // initialised by the generator (baseline did not compile). Fleet-canonical init.
+    let db: sqlx::PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("etd-trading-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[etd-trading-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[etd-trading-rs] DATABASE_URL not set — DB endpoints will fail");
+            sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+        }
+    };
+    let data = web::Data::new(AppState { items: Mutex::new(seed()), db: db.clone() });
     println!("Exchange Traded Derivatives Service running on port {}", port);
     HttpServer::new(move || {
         App::new()
@@ -300,20 +336,29 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -322,18 +367,31 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }
+
+// Wave-12 B5-P1-D-D: Permify authorization guard module.
+mod permify;

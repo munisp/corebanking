@@ -11,7 +11,7 @@ import (
 // ReportService handles risk report operations
 type ReportService struct {
 	tenantID string
-	reports  map[string]*RiskReport
+	reports  *repo[RiskReport]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type ReportService struct {
 func NewReportService(tenantID string) *ReportService {
 	svc := &ReportService{
 		tenantID: tenantID,
-		reports:  make(map[string]*RiskReport),
+		reports:  newRepo[RiskReport](serviceDB, "risk_reports"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -30,7 +30,7 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 	submittedAt := time.Now().AddDate(0, 0, -4)
 
 	// Daily risk report
-	s.reports["rpt-001"] = &RiskReport{
+	s.reports.seed(tenantID, "rpt-001", &RiskReport{
 		ReportID:    "rpt-001",
 		TenantID:    tenantID,
 		ReportType:  "daily",
@@ -57,10 +57,10 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		Metadata:  make(map[string]interface{}),
 		CreatedAt: time.Now().AddDate(0, 0, -1),
 		UpdatedAt: time.Now().AddDate(0, 0, -1),
-	}
+	})
 
 	// Monthly risk report
-	s.reports["rpt-002"] = &RiskReport{
+	s.reports.seed(tenantID, "rpt-002", &RiskReport{
 		ReportID:    "rpt-002",
 		TenantID:    tenantID,
 		ReportType:  "monthly",
@@ -82,10 +82,10 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		Metadata:  make(map[string]interface{}),
 		CreatedAt: time.Now().AddDate(0, -1, 5),
 		UpdatedAt: time.Now().AddDate(0, 0, -4),
-	}
+	})
 
 	// Quarterly regulatory report
-	s.reports["rpt-003"] = &RiskReport{
+	s.reports.seed(tenantID, "rpt-003", &RiskReport{
 		ReportID:    "rpt-003",
 		TenantID:    tenantID,
 		ReportType:  "regulatory",
@@ -114,10 +114,10 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		Metadata:  make(map[string]interface{}),
 		CreatedAt: time.Now().AddDate(0, -1, 10),
 		UpdatedAt: time.Now().AddDate(0, 0, -4),
-	}
+	})
 
 	// Pending report
-	s.reports["rpt-004"] = &RiskReport{
+	s.reports.seed(tenantID, "rpt-004", &RiskReport{
 		ReportID:    "rpt-004",
 		TenantID:    tenantID,
 		ReportType:  "weekly",
@@ -135,16 +135,18 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		Metadata:  make(map[string]interface{}),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
-	}
+	})
 }
 
 // ListReports returns reports based on filters
-func (s *ReportService) ListReports(tenantID, reportType string) []*RiskReport {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ReportService) ListReports(tenantID, reportType string) ([]*RiskReport, error) {
 
 	var result []*RiskReport
-	for _, report := range s.reports {
+	__ALL__, __ERR__ := s.reports.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, report := range __ALL__ {
 		if report.TenantID != tenantID {
 			continue
 		}
@@ -153,16 +155,14 @@ func (s *ReportService) ListReports(tenantID, reportType string) []*RiskReport {
 		}
 		result = append(result, report)
 	}
-	return result
+	return result, nil
 }
 
 // GetReport retrieves a report by ID
 func (s *ReportService) GetReport(tenantID, reportID string) (*RiskReport, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	report, exists := s.reports[reportID]
-	if !exists || report.TenantID != tenantID {
+	report, err := s.reports.get(tenantID, reportID)
+	if err != nil {
 		return nil, errors.New("report not found")
 	}
 	return report, nil
@@ -170,8 +170,6 @@ func (s *ReportService) GetReport(tenantID, reportID string) (*RiskReport, error
 
 // CreateReport creates a new report
 func (s *ReportService) CreateReport(tenantID, userID, reportType, reportName string) (*RiskReport, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	report := &RiskReport{
 		ReportID:    uuid.New().String(),
@@ -187,17 +185,17 @@ func (s *ReportService) CreateReport(tenantID, userID, reportType, reportName st
 		UpdatedAt:   time.Now(),
 	}
 
-	s.reports[report.ReportID] = report
+	if err := s.reports.put(tenantID, report.ReportID, report); err != nil {
+		return nil, err
+	}
 	return report, nil
 }
 
 // ApproveReport approves a report
 func (s *ReportService) ApproveReport(tenantID, reportID, userID string) (*RiskReport, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	report, exists := s.reports[reportID]
-	if !exists || report.TenantID != tenantID {
+	report, err := s.reports.get(tenantID, reportID)
+	if err != nil {
 		return nil, errors.New("report not found")
 	}
 
@@ -211,16 +209,17 @@ func (s *ReportService) ApproveReport(tenantID, reportID, userID string) (*RiskR
 	report.ApprovedAt = &now
 	report.UpdatedAt = time.Now()
 
+	if err := s.reports.put(tenantID, report.ReportID, report); err != nil {
+		return nil, err
+	}
 	return report, nil
 }
 
 // SubmitReport submits a report
 func (s *ReportService) SubmitReport(tenantID, reportID string) (*RiskReport, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	report, exists := s.reports[reportID]
-	if !exists || report.TenantID != tenantID {
+	report, err := s.reports.get(tenantID, reportID)
+	if err != nil {
 		return nil, errors.New("report not found")
 	}
 
@@ -233,16 +232,21 @@ func (s *ReportService) SubmitReport(tenantID, reportID string) (*RiskReport, er
 	report.SubmittedAt = &now
 	report.UpdatedAt = time.Now()
 
+	if err := s.reports.put(tenantID, report.ReportID, report); err != nil {
+		return nil, err
+	}
 	return report, nil
 }
 
 // GetRegulatoryReports returns regulatory reports
-func (s *ReportService) GetRegulatoryReports(tenantID string) []*RiskReport {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ReportService) GetRegulatoryReports(tenantID string) ([]*RiskReport, error) {
 
 	var result []*RiskReport
-	for _, report := range s.reports {
+	__ALL__, __ERR__ := s.reports.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, report := range __ALL__ {
 		if report.TenantID != tenantID {
 			continue
 		}
@@ -250,5 +254,5 @@ func (s *ReportService) GetRegulatoryReports(tenantID string) []*RiskReport {
 			result = append(result, report)
 		}
 	}
-	return result
+	return result, nil
 }

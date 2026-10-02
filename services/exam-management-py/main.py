@@ -15,7 +15,9 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -210,6 +212,14 @@ class _PooledConn:
     def close(self):
         raw, self._raw = self._raw, None
         if raw is not None:
+            # B5-P1-B: with autocommit off, an uncommitted transaction
+            # (read-only, or aborted by an error) must be rolled back
+            # before the connection returns to the pool, otherwise the
+            # next borrower inherits an idle/aborted transaction.
+            try:
+                raw.rollback()
+            except Exception:
+                pass
             try:
                 _get_db_pool().putconn(raw)
             except Exception:
@@ -225,9 +235,17 @@ class _PooledConn:
             pass
 
 def get_db():
-    """Borrow a connection from the pool (thread-safe)."""
+    """Borrow a connection from the pool (thread-safe).
+
+    B5-P1-B: autocommit is OFF. Multi-statement write blocks (domain
+    write + INSERT INTO outbox) now commit as ONE transaction via the
+    explicit conn.commit() at the end of each block. Previously
+    autocommit=True made every execute() its own transaction and the
+    trailing conn.commit() a no-op, so a crash between the domain
+    write and the outbox insert silently lost the event (or the row).
+    """
     raw = _get_db_pool().getconn()
-    raw.autocommit = True
+    raw.autocommit = False
     return _PooledConn(raw)
 
 def release_db(conn):
@@ -394,7 +412,7 @@ def metrics():
         return {"service": "exam-management-py", "total_records": 0}
 
 
-@app.get("/api/v1/service_configs")
+@app.get("/api/v1/service_configs", dependencies=[Depends(require_permify("service_config", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
@@ -620,7 +638,14 @@ class _DegradationState:
 _degrade = _DegradationState()
 
 records = []
-audit_log = []
+# W12-C3-P2-AMB (c3-0905): removed dead `audit_log` list and its two appends
+# (former update-handler append and process-handler append below). Evidence:
+# both appends lived in `Handler(BaseHTTPRequestHandler)` (:642) which is
+# NEVER instantiated (no `HTTPServer(Handler)` anywhere in the tree; the
+# bootstrap at :889-897 is uvicorn-only on the FastAPI app), and the
+# enclosing `for rec in records` loops are gated on `records` (:638), which
+# is never populated (no append/insert anywhere). `audit_log` was never
+# read. Dead in-memory audit trail -> removed, not converted to PG.
 domain_stats = {"processed_today": 0}
 
 class Handler(BaseHTTPRequestHandler):
@@ -749,8 +774,6 @@ class Handler(BaseHTTPRequestHandler):
                     rec["data"].update({k: v for k, v in body.items() if k != "id"})
                     rec["updated_at"] = now_iso()
                     rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
                     self.respond(200, {"updated": True, "record": rec})
                     return
             self.respond(404, {"error": f"Record not found: {rid}"})
@@ -766,8 +789,6 @@ class Handler(BaseHTTPRequestHandler):
                     rec["updated_at"] = now_iso()
                     rec["version"] += 1
                     domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
                     self.respond(200, {"processed": True, "record": rec})
                     return
             self.respond(404, {"error": f"Record not found or not processable: {rid}"})
@@ -776,7 +797,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(200, result)
 
 
-@app.post("/api/v1/service_configs", status_code=201)
+@app.post("/api/v1/service_configs", status_code=201, dependencies=[Depends(require_permify("service_config", "create"))])
 def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
     tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
     status = body.status or "active"

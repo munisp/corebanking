@@ -3,6 +3,8 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -17,10 +19,159 @@ import (
 
 type MergedAgriService struct {
 	db *sql.DB
+	// domainReady gates the W12 domain_records store (fail-closed 503 when false).
+	domainReady bool
 }
 
 func NewMergedAgriService(db *sql.DB) *MergedAgriService {
 	return &MergedAgriService{db: db}
+}
+
+// ==================== W12 DOMAIN RECORD STORE (C3-P2-B5) ====================
+// The 13 per-domain in-memory `xxxRecords` slices were removed. All domain
+// rows live in domain_records (domain-scoped jsonb payload, natural key
+// (domain, id)); creates are real PG INSERTs (ON CONFLICT DO NOTHING on the
+// natural key) and lists are served from PG. When the store is unavailable
+// the endpoints fail closed (503) — no in-memory fallback claims durability
+// Postgres lacks. Boot seeds below are idempotent (ON CONFLICT DO NOTHING).
+
+// domainSeeds: slug -> JSON array of seed rows (previously the in-memory fixtures).
+var domainSeeds = map[string]string{
+	"agri-evoucher":              `[{"id": "AGR-001", "type": "active_facility", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "amount": 12000000, "status": "disbursed", "season": "2026A"}, {"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "hectares": 30, "lossPercent": 45, "status": "under_assessment", "cause": "flood"}, {"id": "AGR-003", "type": "guarantee", "farmer": "COOP-BENUE-008", "crop": "soybeans", "hectares": 100, "guaranteeAmount": 25000000, "status": "active", "guarantor": "NIRSAL"}]`,
+	"agri-input-marketplace":     `[{"id": "AGR-001", "type": "active_facility", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "amount": 12000000, "status": "disbursed", "season": "2026A"}, {"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "hectares": 30, "lossPercent": 45, "status": "under_assessment", "cause": "flood"}, {"id": "AGR-003", "type": "guarantee", "farmer": "COOP-BENUE-008", "crop": "soybeans", "hectares": 100, "guaranteeAmount": 25000000, "status": "active", "guarantor": "NIRSAL"}]`,
+	"agri-logistics":             `[{"id": "AGR-001", "type": "active_facility", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "amount": 12000000, "status": "disbursed", "season": "2026A"}, {"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "hectares": 30, "lossPercent": 45, "status": "under_assessment", "cause": "flood"}, {"id": "AGR-003", "type": "guarantee", "farmer": "COOP-BENUE-008", "crop": "soybeans", "hectares": 100, "guaranteeAmount": 25000000, "status": "active", "guarantor": "NIRSAL"}]`,
+	"agri-reinsurance":           `[{"id": "AGR-001", "type": "active_facility", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "amount": 12000000, "status": "disbursed", "season": "2026A"}, {"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "hectares": 30, "lossPercent": 45, "status": "under_assessment", "cause": "flood"}, {"id": "AGR-003", "type": "guarantee", "farmer": "COOP-BENUE-008", "crop": "soybeans", "hectares": 100, "guaranteeAmount": 25000000, "status": "active", "guarantor": "NIRSAL"}]`,
+	"agri-savings-cycles":        `[{"id": "AGR-001", "type": "active_facility", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "amount": 12000000, "status": "disbursed", "season": "2026A"}, {"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "hectares": 30, "lossPercent": 45, "status": "under_assessment", "cause": "flood"}, {"id": "AGR-003", "type": "guarantee", "farmer": "COOP-BENUE-008", "crop": "soybeans", "hectares": 100, "guaranteeAmount": 25000000, "status": "active", "guarantor": "NIRSAL"}]`,
+	"agri-esg-impact":            `[{"id": "AGR-001", "type": "active_facility", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "amount": 12000000, "status": "disbursed", "season": "2026A"}, {"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "hectares": 30, "lossPercent": 45, "status": "under_assessment", "cause": "flood"}, {"id": "AGR-003", "type": "guarantee", "farmer": "COOP-BENUE-008", "crop": "soybeans", "hectares": 100, "guaranteeAmount": 25000000, "status": "active", "guarantor": "NIRSAL"}]`,
+	"cbn-agri-returns":           `[{"id": "REG-001", "type": "cbn_return", "code": "MBR300", "period": "2026-04", "status": "submitted", "deadline": "2026-05-15", "submittedAt": "2026-05-09T10:00:00Z"}, {"id": "REG-002", "type": "cbn_return", "code": "MBR400", "period": "2026-04", "status": "pending_review", "deadline": "2026-05-20"}, {"id": "REG-003", "type": "nfiu_ctr", "threshold": 5000000, "count": 342, "period": "2026-05-09", "status": "auto_filed"}]`,
+	"interactive-ussd-agri":      `[{"id": "AGR-001", "type": "crop_assessment", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "yieldEstimate": 4.5, "season": "2026A"}, {"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "lossPercent": 45, "cause": "flood", "status": "under_assessment"}, {"id": "AGR-003", "type": "price_index", "commodity": "maize", "price": 420000, "unit": "per_ton", "market": "Lagos", "date": "2026-05-09"}]`,
+	"animal-id-traceability":     `[{"id": "ANM-001", "animalId": "NG-CATTLE-20260001", "species": "cattle", "breed": "White Fulani", "ownerId": "FRM-KANO-001", "dob": "2023-03-15", "weight": 320, "healthStatus": "healthy", "vaccinationStatus": "current", "location": "Kano State", "registeredAt": "2026-01-10T09:00:00Z"}, {"id": "ANM-002", "animalId": "NG-GOAT-20260042", "species": "goat", "breed": "Red Sokoto", "ownerId": "FRM-SOKOTO-007", "dob": "2024-06-01", "weight": 28, "healthStatus": "healthy", "vaccinationStatus": "current", "location": "Sokoto State", "registeredAt": "2026-02-14T11:00:00Z"}, {"id": "ANM-003", "animalId": "NG-SHEEP-20260018", "species": "sheep", "breed": "Yankasa", "ownerId": "FRM-ZAMFARA-003", "dob": "2023-11-20", "weight": 45, "healthStatus": "under_observation", "vaccinationStatus": "overdue", "location": "Zamfara State", "registeredAt": "2026-03-05T08:30:00Z"}]`,
+	"area-yield-index-insurance": `[{"id": "AYII-001", "zoneId": "ZONE-KANO-NORTH", "cropType": "maize", "season": "2026A", "triggerYield": 2.5, "actualYield": 1.8, "indemnityLevel": 0.72, "premium": 45000, "sumInsured": 2000000, "status": "claim_triggered", "farmersCount": 340}, {"id": "AYII-002", "zoneId": "ZONE-BENUE-CENTRAL", "cropType": "rice", "season": "2026A", "triggerYield": 3.2, "actualYield": 3.5, "indemnityLevel": 0.0, "premium": 62000, "sumInsured": 3500000, "status": "no_claim", "farmersCount": 520}, {"id": "AYII-003", "zoneId": "ZONE-KADUNA-SOUTH", "cropType": "soybeans", "season": "2026A", "triggerYield": 1.8, "actualYield": 0.9, "indemnityLevel": 0.5, "premium": 38000, "sumInsured": 1800000, "status": "claim_processing", "farmersCount": 215}]`,
+	"crop-yield-prediction":      `[{"id": "CYP-001", "farmId": "FARM-KADUNA-001", "cropType": "maize", "season": "2026A", "plantingDate": "2026-04-15", "predictedYield": 4.8, "confidence": 0.87, "ndviScore": 0.72, "soilMoisture": 68, "rainfallForecast": 850, "harvestWindow": "2026-09-10 to 2026-09-25"}, {"id": "CYP-002", "farmId": "FARM-BENUE-022", "cropType": "rice", "season": "2026A", "plantingDate": "2026-05-01", "predictedYield": 5.2, "confidence": 0.91, "ndviScore": 0.81, "soilMoisture": 78, "rainfallForecast": 1200, "harvestWindow": "2026-10-01 to 2026-10-20"}, {"id": "CYP-003", "farmId": "FARM-KEBBI-008", "cropType": "sorghum", "season": "2026A", "plantingDate": "2026-04-20", "predictedYield": 3.1, "confidence": 0.79, "ndviScore": 0.61, "soilMoisture": 55, "rainfallForecast": 680, "harvestWindow": "2026-09-15 to 2026-09-30"}]`,
+	"farm-boundary-mapping":      `[{"id": "FBM-001", "farmId": "FARM-KADUNA-001", "farmerId": "FRM-001", "declaredHectares": 12.5, "satelliteHectares": 12.2, "variance": -2.4, "cropType": "maize", "ndvi": 0.74, "soilType": "loamy", "irrigated": false, "verificationStatus": "verified", "lastUpdated": "2026-05-01T10:00:00Z"}, {"id": "FBM-002", "farmId": "FARM-BENUE-022", "farmerId": "FRM-022", "declaredHectares": 30.0, "satelliteHectares": 28.7, "variance": -4.3, "cropType": "rice", "ndvi": 0.82, "soilType": "clay", "irrigated": true, "verificationStatus": "verified", "lastUpdated": "2026-05-03T14:00:00Z"}, {"id": "FBM-003", "farmId": "FARM-KEBBI-008", "farmerId": "FRM-008", "declaredHectares": 8.0, "satelliteHectares": 9.1, "variance": 13.8, "cropType": "sorghum", "ndvi": 0.62, "soilType": "sandy", "irrigated": false, "verificationStatus": "pending_review", "lastUpdated": "2026-05-07T09:30:00Z"}]`,
+	"livestock-finance":          `[{"id": "LF-001", "farmerId": "FRM-KANO-001", "farmerName": "Alhaji Musa Garba", "livestockType": "cattle", "quantity": 20, "unitValue": 850000, "loanAmount": 12000000, "interestRate": 9.0, "tenor": 18, "status": "disbursed", "disbursedAt": "2026-02-15T10:00:00Z", "nextRepayment": "2026-06-15"}, {"id": "LF-002", "farmerId": "FRM-SOKOTO-007", "farmerName": "Fatima Usman", "livestockType": "goats", "quantity": 50, "unitValue": 85000, "loanAmount": 3000000, "interestRate": 9.0, "tenor": 12, "status": "active", "disbursedAt": "2026-03-10T09:00:00Z", "nextRepayment": "2026-06-10"}, {"id": "LF-003", "farmerId": "FRM-BORNO-015", "farmerName": "Ibrahim Shettima", "livestockType": "camels", "quantity": 5, "unitValue": 1200000, "loanAmount": 4500000, "interestRate": 9.0, "tenor": 24, "status": "pending_approval", "createdAt": "2026-05-09T08:00:00Z"}]`,
+	"fisheries-aquaculture":      `[{"id": "FSH-001", "facilityId": "FISH-LAGOS-001", "facilityName": "Lekki Catfish Farm", "ownerId": "FRM-LAGOS-001", "species": "catfish", "pondCount": 12, "stockingDensity": 25, "loanAmount": 8500000, "status": "active", "disbursedAt": "2026-03-01T10:00:00Z"}, {"id": "FSH-002", "facilityId": "FISH-DELTA-022", "facilityName": "Warri Tilapia Cooperative", "ownerId": "COOP-DELTA-022", "species": "tilapia", "pondCount": 6, "stockingDensity": 30, "loanAmount": 5200000, "status": "active", "disbursedAt": "2026-02-15T09:00:00Z"}, {"id": "FSH-003", "facilityId": "FISH-KOGI-008", "facilityName": "Lokoja River Catfish", "ownerId": "FRM-KOGI-008", "species": "catfish", "pondCount": 4, "stockingDensity": 20, "loanAmount": 3100000, "status": "pending_review", "createdAt": "2026-05-09T08:00:00Z"}]`,
+	"livestock-insurance":        `[{"id": "LI-001", "policyId": "LIP-2026-001", "farmerId": "FRM-KANO-001", "farmerName": "Alhaji Musa Garba", "livestockType": "cattle", "quantity": 20, "sumInsured": 17000000, "premium": 595000, "status": "active", "coverStart": "2026-01-01", "coverEnd": "2026-12-31", "provider": "NAIC"}, {"id": "LI-002", "policyId": "LIP-2026-022", "farmerId": "FRM-SOKOTO-007", "farmerName": "Fatima Usman", "livestockType": "goats", "quantity": 50, "sumInsured": 4250000, "premium": 148750, "status": "active", "coverStart": "2026-02-01", "coverEnd": "2027-01-31", "provider": "NAIC"}, {"id": "LI-003", "policyId": "LIP-2026-015", "farmerId": "FRM-BORNO-015", "farmerName": "Ibrahim Shettima", "livestockType": "cattle", "quantity": 8, "sumInsured": 6800000, "premium": 238000, "status": "claim_pending", "coverStart": "2026-01-15", "coverEnd": "2027-01-14", "provider": "AIICO"}]`,
+	"livestock-management":       `[{"id": "LM-001", "herdId": "HERD-KANO-001", "farmerId": "FRM-KANO-001", "species": "cattle", "totalCount": 45, "maleCount": 12, "femaleCount": 33, "breed": "White Fulani", "avgWeight": 310, "healthStatus": "healthy", "vaccinated": true, "feedingRegime": "grazing+supplemental", "location": "Kano State"}, {"id": "LM-002", "herdId": "HERD-SOKOTO-007", "farmerId": "FRM-SOKOTO-007", "species": "goats", "totalCount": 120, "maleCount": 25, "femaleCount": 95, "breed": "Red Sokoto", "avgWeight": 27, "healthStatus": "healthy", "vaccinated": true, "feedingRegime": "browse+concentrate", "location": "Sokoto State"}, {"id": "LM-003", "herdId": "HERD-PLATEAU-003", "farmerId": "FRM-PLATEAU-003", "species": "pigs", "totalCount": 80, "maleCount": 10, "femaleCount": 70, "breed": "Large White", "avgWeight": 95, "healthStatus": "under_treatment", "vaccinated": false, "feedingRegime": "commercial_feed", "location": "Plateau State"}]`,
+	"satellite-crop-monitor":     `[{"id": "SCM-001", "farmId": "FARM-KADUNA-001", "monitorDate": "2026-05-09", "cropType": "maize", "growthStage": "vegetative", "ndvi": 0.74, "healthScore": 82, "stressIndicators": ["mild_drought"], "satelliteSource": "Sentinel-2", "cloudCover": 12, "recommendation": "Apply 50kg/ha NPK fertilizer"}, {"id": "SCM-002", "farmId": "FARM-BENUE-022", "monitorDate": "2026-05-08", "cropType": "rice", "growthStage": "tillering", "ndvi": 0.82, "healthScore": 91, "stressIndicators": [], "satelliteSource": "Planet Labs", "cloudCover": 5, "recommendation": "No action required, optimal conditions"}, {"id": "SCM-003", "farmId": "FARM-KEBBI-008", "monitorDate": "2026-05-07", "cropType": "sorghum", "growthStage": "flowering", "ndvi": 0.58, "healthScore": 62, "stressIndicators": ["moderate_drought", "pest_risk"], "satelliteSource": "Sentinel-2", "cloudCover": 20, "recommendation": "Urgent: irrigate within 48hrs, scout for stem borers"}]`,
+	"soil-analysis":              `[{"id": "SA-001", "farmId": "FARM-KADUNA-001", "sampleDate": "2026-04-10", "ph": 6.5, "nitrogen": 42, "phosphorus": 28, "potassium": 185, "organicMatter": 3.2, "moisture": 38, "soilType": "loamy", "fertilityIndex": "high", "recommendation": "Apply 25kg/ha Urea for maize", "lab": "NASC Kaduna"}, {"id": "SA-002", "farmId": "FARM-BENUE-022", "sampleDate": "2026-04-15", "ph": 5.8, "nitrogen": 31, "phosphorus": 18, "potassium": 142, "organicMatter": 2.1, "moisture": 55, "soilType": "clay", "fertilityIndex": "medium", "recommendation": "Apply lime 1t/ha to correct acidity; supplement with NPK 20-10-10", "lab": "NASC Benue"}, {"id": "SA-003", "farmId": "FARM-KEBBI-008", "sampleDate": "2026-04-20", "ph": 7.2, "nitrogen": 22, "phosphorus": 15, "potassium": 98, "organicMatter": 1.2, "moisture": 22, "soilType": "sandy", "fertilityIndex": "low", "recommendation": "Urgent: apply organic compost 2t/ha; install irrigation", "lab": "NASC Kebbi"}]`,
+}
+
+func (s *MergedAgriService) initDomainStore() {
+	if s.db == nil {
+		log.Printf("[agricultural-service] domain store: no DB handle — domain endpoints fail closed (503)")
+		return
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS domain_records (
+		domain TEXT NOT NULL,
+		id TEXT NOT NULL,
+		payload JSONB NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (domain, id)
+	)`); err != nil {
+		log.Printf("[agricultural-service] domain_records DDL failed: %v — domain endpoints fail closed (503)", err)
+		return
+	}
+	for slug, rowsJSON := range domainSeeds {
+		var rows []map[string]interface{}
+		if err := json.Unmarshal([]byte(rowsJSON), &rows); err != nil {
+			log.Printf("[agricultural-service] domain seed decode failed for %s: %v", slug, err)
+			return
+		}
+		for _, row := range rows {
+			id, _ := row["id"].(string)
+			payload, _ := json.Marshal(row)
+			if _, err := s.db.Exec(`INSERT INTO domain_records (domain, id, payload)
+				VALUES ($1, $2, $3) ON CONFLICT (domain, id) DO NOTHING`, slug, id, payload); err != nil {
+				log.Printf("[agricultural-service] domain seed failed for %s/%s: %v — domain endpoints fail closed (503)", slug, id, err)
+				return
+			}
+		}
+	}
+	s.domainReady = true
+	log.Printf("[agricultural-service] domain_records store ready (%d domains seeded)", len(domainSeeds))
+}
+
+func (s *MergedAgriService) domainStoreUnavailable(w http.ResponseWriter) {
+	s.jsonResponse(w, http.StatusServiceUnavailable, map[string]string{"error": "domain record store unavailable (postgres down)"})
+}
+
+// domainInsert persists one domain row (idempotent on the (domain,id) natural
+// key). Returns false after writing 503.
+func (s *MergedAgriService) domainInsert(w http.ResponseWriter, slug string, body map[string]interface{}) bool {
+	if !s.domainReady {
+		s.domainStoreUnavailable(w)
+		return false
+	}
+	id, _ := body["id"].(string)
+	if id == "" {
+		id = fmt.Sprintf("REC-%d", time.Now().UnixNano())
+		body["id"] = id
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		s.domainStoreUnavailable(w)
+		return false
+	}
+	if _, err := s.db.Exec(`INSERT INTO domain_records (domain, id, payload)
+		VALUES ($1, $2, $3) ON CONFLICT (domain, id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()`, slug, id, payload); err != nil {
+		log.Printf("[agricultural-service] domain insert failed for %s/%s: %v", slug, id, err)
+		s.domainStoreUnavailable(w)
+		return false
+	}
+	return true
+}
+
+// domainList serves a domain's rows from Postgres.
+func (s *MergedAgriService) domainQuery(slug string) ([]map[string]interface{}, error) {
+	rows, err := s.db.Query(`SELECT payload FROM domain_records WHERE domain = $1 ORDER BY created_at, id`, slug)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []map[string]interface{}{}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var rec map[string]interface{}
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+func (s *MergedAgriService) domainList(w http.ResponseWriter, slug, label string) {
+	if !s.domainReady {
+		s.domainStoreUnavailable(w)
+		return
+	}
+	recs, err := s.domainQuery(slug)
+	if err != nil {
+		log.Printf("[agricultural-service] domain list failed for %s: %v", slug, err)
+		s.domainStoreUnavailable(w)
+		return
+	}
+	resp := map[string]interface{}{"records": recs, "total": len(recs)}
+	if label != "" {
+		resp["domain"] = label
+	}
+	s.jsonResponse(w, http.StatusOK, resp)
+}
+
+func (s *MergedAgriService) domainCount(slug string) int {
+	if !s.domainReady {
+		return 0
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM domain_records WHERE domain = $1`, slug).Scan(&n); err != nil {
+		return 0
+	}
+	return n
 }
 
 func (s *MergedAgriService) RegisterRoutes(r *mux.Router) {
@@ -161,12 +312,6 @@ func (s *MergedAgriService) jsonResponse(w http.ResponseWriter, code int, data i
 	json.NewEncoder(w).Encode(data)
 }
 
-var agriRecords = []map[string]interface{}{
-	{"id": "AGR-001", "type": "active_facility", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "amount": 12000000, "status": "disbursed", "season": "2026A"},
-	{"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "hectares": 30, "lossPercent": 45, "status": "under_assessment", "cause": "flood"},
-	{"id": "AGR-003", "type": "guarantee", "farmer": "COOP-BENUE-008", "crop": "soybeans", "hectares": 100, "guaranteeAmount": 25000000, "status": "active", "guarantor": "NIRSAL"},
-}
-
 var agriStats = map[string]interface{}{
 	"totalFarmers": 45000, "activeFacilities": 12500, "totalDisbursed": 8500000000,
 	"avgLoanSize": 680000, "repaymentRate": 94.2, "season": "2026A",
@@ -175,19 +320,18 @@ var agriStats = map[string]interface{}{
 // ==================== AGRI EVOUCHER ====================
 
 func (s *MergedAgriService) AgriEvoucherList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"records": agriRecords,
-		"total":   len(agriRecords),
-		"domain":  "Agri Evoucher",
-	})
+	s.domainList(w, "agri-evoucher", "Agri Evoucher")
 }
 
 func (s *MergedAgriService) AgriEvoucherCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "AGR-NEW-001"
+	body["id"] = fmt.Sprintf("AGR-%d", time.Now().UnixNano())
 	body["status"] = "initiated"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "agri-evoucher", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 
@@ -198,19 +342,18 @@ func (s *MergedAgriService) AgriEvoucherStats(w http.ResponseWriter, r *http.Req
 // ==================== AGRI INPUT MARKETPLACE ====================
 
 func (s *MergedAgriService) AgriInputMarketplaceList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"records": agriRecords,
-		"total":   len(agriRecords),
-		"domain":  "Agri Input Marketplace",
-	})
+	s.domainList(w, "agri-input-marketplace", "Agri Input Marketplace")
 }
 
 func (s *MergedAgriService) AgriInputMarketplaceCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "AGR-NEW-001"
+	body["id"] = fmt.Sprintf("AGR-%d", time.Now().UnixNano())
 	body["status"] = "initiated"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "agri-input-marketplace", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 
@@ -221,19 +364,18 @@ func (s *MergedAgriService) AgriInputMarketplaceStats(w http.ResponseWriter, r *
 // ==================== AGRI LOGISTICS ====================
 
 func (s *MergedAgriService) AgriLogisticsList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"records": agriRecords,
-		"total":   len(agriRecords),
-		"domain":  "Agri Logistics",
-	})
+	s.domainList(w, "agri-logistics", "Agri Logistics")
 }
 
 func (s *MergedAgriService) AgriLogisticsCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "AGR-NEW-001"
+	body["id"] = fmt.Sprintf("AGR-%d", time.Now().UnixNano())
 	body["status"] = "initiated"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "agri-logistics", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 
@@ -244,19 +386,18 @@ func (s *MergedAgriService) AgriLogisticsStats(w http.ResponseWriter, r *http.Re
 // ==================== AGRI REINSURANCE ====================
 
 func (s *MergedAgriService) AgriReinsuranceList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"records": agriRecords,
-		"total":   len(agriRecords),
-		"domain":  "Agri Reinsurance",
-	})
+	s.domainList(w, "agri-reinsurance", "Agri Reinsurance")
 }
 
 func (s *MergedAgriService) AgriReinsuranceCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "AGR-NEW-001"
+	body["id"] = fmt.Sprintf("AGR-%d", time.Now().UnixNano())
 	body["status"] = "initiated"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "agri-reinsurance", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 
@@ -267,19 +408,18 @@ func (s *MergedAgriService) AgriReinsuranceStats(w http.ResponseWriter, r *http.
 // ==================== AGRI SAVINGS CYCLES ====================
 
 func (s *MergedAgriService) AgriSavingsCyclesList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"records": agriRecords,
-		"total":   len(agriRecords),
-		"domain":  "Agri Savings Cycles",
-	})
+	s.domainList(w, "agri-savings-cycles", "Agri Savings Cycles")
 }
 
 func (s *MergedAgriService) AgriSavingsCyclesCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "AGR-NEW-001"
+	body["id"] = fmt.Sprintf("AGR-%d", time.Now().UnixNano())
 	body["status"] = "initiated"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "agri-savings-cycles", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 
@@ -290,9 +430,19 @@ func (s *MergedAgriService) AgriSavingsCyclesStats(w http.ResponseWriter, r *htt
 // ==================== AGRI ESG IMPACT ====================
 
 func (s *MergedAgriService) AgriESGImpactList(w http.ResponseWriter, r *http.Request) {
+	if !s.domainReady {
+		s.domainStoreUnavailable(w)
+		return
+	}
+	recs, err := s.domainQuery("agri-esg-impact")
+	if err != nil {
+		log.Printf("[agricultural-service] esg list failed: %v", err)
+		s.domainStoreUnavailable(w)
+		return
+	}
 	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"items":  agriRecords,
-		"total":  len(agriRecords),
+		"items":  recs,
+		"total":  len(recs),
 		"page":   1,
 		"limit":  50,
 		"source": "postgres",
@@ -301,52 +451,64 @@ func (s *MergedAgriService) AgriESGImpactList(w http.ResponseWriter, r *http.Req
 
 func (s *MergedAgriService) AgriESGImpactStats(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"total":   len(agriRecords),
+		"total":   s.domainCount("agri-esg-impact"),
 		"service": "agri-esg-impact",
 		"source":  "postgres",
 	})
 }
 
 func (s *MergedAgriService) AgriESGImpactGetByID(w http.ResponseWriter, r *http.Request) {
+	if !s.domainReady {
+		s.domainStoreUnavailable(w)
+		return
+	}
 	vars := mux.Vars(r)
 	id := vars["id"]
-	for _, rec := range agriRecords {
-		if rec["id"] == id {
-			s.jsonResponse(w, http.StatusOK, rec)
-			return
-		}
+	var raw []byte
+	err := s.db.QueryRow(`SELECT payload FROM domain_records WHERE domain = $1 AND id = $2`, "agri-esg-impact", id).Scan(&raw)
+	if err == sql.ErrNoRows {
+		s.jsonResponse(w, http.StatusNotFound, map[string]string{"error": "Not found"})
+		return
 	}
-	s.jsonResponse(w, http.StatusNotFound, map[string]string{"error": "Not found"})
+	if err != nil {
+		log.Printf("[agricultural-service] esg get failed: %v", err)
+		s.domainStoreUnavailable(w)
+		return
+	}
+	var rec map[string]interface{}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		s.domainStoreUnavailable(w)
+		return
+	}
+	s.jsonResponse(w, http.StatusOK, rec)
 }
 
 func (s *MergedAgriService) AgriESGImpactCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
+	body["id"] = fmt.Sprintf("ESG-%d", time.Now().UnixNano())
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "agri-esg-impact", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"message": "Created successfully", "data": body, "source": "postgres"})
 }
 
 // ==================== CBN AGRI RETURNS ====================
 
-var cbnAgriReturnsRecords = []map[string]interface{}{
-	{"id": "REG-001", "type": "cbn_return", "code": "MBR300", "period": "2026-04", "status": "submitted", "deadline": "2026-05-15", "submittedAt": "2026-05-09T10:00:00Z"},
-	{"id": "REG-002", "type": "cbn_return", "code": "MBR400", "period": "2026-04", "status": "pending_review", "deadline": "2026-05-20"},
-	{"id": "REG-003", "type": "nfiu_ctr", "threshold": 5000000, "count": 342, "period": "2026-05-09", "status": "auto_filed"},
-}
-
 func (s *MergedAgriService) CBNAgriReturnsList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"records": cbnAgriReturnsRecords,
-		"total":   len(cbnAgriReturnsRecords),
-	})
+	s.domainList(w, "cbn-agri-returns", "")
 }
 
 func (s *MergedAgriService) CBNAgriReturnsCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "REG-NEW-001"
+	body["id"] = fmt.Sprintf("REG-%d", time.Now().UnixNano())
 	body["status"] = "created"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "cbn-agri-returns", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 
@@ -362,25 +524,19 @@ func (s *MergedAgriService) CBNAgriReturnsStats(w http.ResponseWriter, r *http.R
 
 // ==================== INTERACTIVE USSD AGRI ====================
 
-var interactiveUSSDAgriRecords = []map[string]interface{}{
-	{"id": "AGR-001", "type": "crop_assessment", "farmer": "COOP-KADUNA-001", "crop": "maize", "hectares": 50, "yieldEstimate": 4.5, "season": "2026A"},
-	{"id": "AGR-002", "type": "insurance_claim", "farmer": "COOP-KANO-015", "crop": "rice", "lossPercent": 45, "cause": "flood", "status": "under_assessment"},
-	{"id": "AGR-003", "type": "price_index", "commodity": "maize", "price": 420000, "unit": "per_ton", "market": "Lagos", "date": "2026-05-09"},
-}
-
 func (s *MergedAgriService) InteractiveUSSDAgriList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"records": interactiveUSSDAgriRecords,
-		"total":   len(interactiveUSSDAgriRecords),
-	})
+	s.domainList(w, "interactive-ussd-agri", "")
 }
 
 func (s *MergedAgriService) InteractiveUSSDAgriCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "REC-NEW-001"
+	body["id"] = fmt.Sprintf("REC-%d", time.Now().UnixNano())
 	body["status"] = "created"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "interactive-ussd-agri", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 
@@ -623,26 +779,23 @@ func (s *MergedAgriService) AgriBankingCreateWarehouseReceipt(w http.ResponseWri
 
 // ==================== ANIMAL ID TRACEABILITY ====================
 
-var animalTraceabilityRecords = []map[string]interface{}{
-	{"id": "ANM-001", "animalId": "NG-CATTLE-20260001", "species": "cattle", "breed": "White Fulani", "ownerId": "FRM-KANO-001", "dob": "2023-03-15", "weight": 320, "healthStatus": "healthy", "vaccinationStatus": "current", "location": "Kano State", "registeredAt": "2026-01-10T09:00:00Z"},
-	{"id": "ANM-002", "animalId": "NG-GOAT-20260042", "species": "goat", "breed": "Red Sokoto", "ownerId": "FRM-SOKOTO-007", "dob": "2024-06-01", "weight": 28, "healthStatus": "healthy", "vaccinationStatus": "current", "location": "Sokoto State", "registeredAt": "2026-02-14T11:00:00Z"},
-	{"id": "ANM-003", "animalId": "NG-SHEEP-20260018", "species": "sheep", "breed": "Yankasa", "ownerId": "FRM-ZAMFARA-003", "dob": "2023-11-20", "weight": 45, "healthStatus": "under_observation", "vaccinationStatus": "overdue", "location": "Zamfara State", "registeredAt": "2026-03-05T08:30:00Z"},
-}
-
 var animalTraceabilityStats = map[string]interface{}{
 	"totalAnimals": 184320, "cattle": 62100, "goats": 89440, "sheep": 32780, "registeredToday": 142,
 	"healthyPercent": 97.3, "vaccinationCurrent": 89.5, "states": 36,
 }
 
 func (s *MergedAgriService) AnimalIdTraceabilityList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": animalTraceabilityRecords, "total": len(animalTraceabilityRecords), "domain": "Animal ID Traceability"})
+	s.domainList(w, "animal-id-traceability", "Animal ID Traceability")
 }
 func (s *MergedAgriService) AnimalIdTraceabilityCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "ANM-NEW-001"
+	body["id"] = fmt.Sprintf("ANM-%d", time.Now().UnixNano())
 	body["status"] = "registered"
 	body["registeredAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "animal-id-traceability", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) AnimalIdTraceabilityStats(w http.ResponseWriter, r *http.Request) {
@@ -651,26 +804,23 @@ func (s *MergedAgriService) AnimalIdTraceabilityStats(w http.ResponseWriter, r *
 
 // ==================== AREA YIELD INDEX INSURANCE ====================
 
-var ayiiRecords = []map[string]interface{}{
-	{"id": "AYII-001", "zoneId": "ZONE-KANO-NORTH", "cropType": "maize", "season": "2026A", "triggerYield": 2.5, "actualYield": 1.8, "indemnityLevel": 0.72, "premium": 45000, "sumInsured": 2000000, "status": "claim_triggered", "farmersCount": 340},
-	{"id": "AYII-002", "zoneId": "ZONE-BENUE-CENTRAL", "cropType": "rice", "season": "2026A", "triggerYield": 3.2, "actualYield": 3.5, "indemnityLevel": 0.0, "premium": 62000, "sumInsured": 3500000, "status": "no_claim", "farmersCount": 520},
-	{"id": "AYII-003", "zoneId": "ZONE-KADUNA-SOUTH", "cropType": "soybeans", "season": "2026A", "triggerYield": 1.8, "actualYield": 0.9, "indemnityLevel": 0.50, "premium": 38000, "sumInsured": 1800000, "status": "claim_processing", "farmersCount": 215},
-}
-
 var ayiiStats = map[string]interface{}{
 	"totalFarmers": 45000, "activePolicies": 12500, "pendingClaims": 89, "avgYield": 4.2, "totalHectares": 250000,
 	"totalPremiumCollected": 58500000, "totalClaimsPaid": 12300000, "claimRatio": 0.21,
 }
 
 func (s *MergedAgriService) AreaYieldIndexInsuranceList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": ayiiRecords, "total": len(ayiiRecords), "domain": "Area Yield Index Insurance"})
+	s.domainList(w, "area-yield-index-insurance", "Area Yield Index Insurance")
 }
 func (s *MergedAgriService) AreaYieldIndexInsuranceCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "AYII-NEW-001"
+	body["id"] = fmt.Sprintf("AYII-%d", time.Now().UnixNano())
 	body["status"] = "policy_issued"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "area-yield-index-insurance", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) AreaYieldIndexInsuranceStats(w http.ResponseWriter, r *http.Request) {
@@ -679,26 +829,23 @@ func (s *MergedAgriService) AreaYieldIndexInsuranceStats(w http.ResponseWriter, 
 
 // ==================== CROP YIELD PREDICTION ====================
 
-var cropYieldRecords = []map[string]interface{}{
-	{"id": "CYP-001", "farmId": "FARM-KADUNA-001", "cropType": "maize", "season": "2026A", "plantingDate": "2026-04-15", "predictedYield": 4.8, "confidence": 0.87, "ndviScore": 0.72, "soilMoisture": 68, "rainfallForecast": 850, "harvestWindow": "2026-09-10 to 2026-09-25"},
-	{"id": "CYP-002", "farmId": "FARM-BENUE-022", "cropType": "rice", "season": "2026A", "plantingDate": "2026-05-01", "predictedYield": 5.2, "confidence": 0.91, "ndviScore": 0.81, "soilMoisture": 78, "rainfallForecast": 1200, "harvestWindow": "2026-10-01 to 2026-10-20"},
-	{"id": "CYP-003", "farmId": "FARM-KEBBI-008", "cropType": "sorghum", "season": "2026A", "plantingDate": "2026-04-20", "predictedYield": 3.1, "confidence": 0.79, "ndviScore": 0.61, "soilMoisture": 55, "rainfallForecast": 680, "harvestWindow": "2026-09-15 to 2026-09-30"},
-}
-
 var cropYieldStats = map[string]interface{}{
 	"totalPredictions": 28450, "avgAccuracy": 91.2, "cropsCovered": 24, "farmsCovered": 14200,
 	"yieldImprovement": 18.5, "season": "2026A",
 }
 
 func (s *MergedAgriService) CropYieldPredictionList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": cropYieldRecords, "total": len(cropYieldRecords), "domain": "Crop Yield Prediction"})
+	s.domainList(w, "crop-yield-prediction", "Crop Yield Prediction")
 }
 func (s *MergedAgriService) CropYieldPredictionCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "CYP-NEW-001"
+	body["id"] = fmt.Sprintf("CYP-%d", time.Now().UnixNano())
 	body["status"] = "prediction_generated"
 	body["predictedAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "crop-yield-prediction", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) CropYieldPredictionStats(w http.ResponseWriter, r *http.Request) {
@@ -707,26 +854,23 @@ func (s *MergedAgriService) CropYieldPredictionStats(w http.ResponseWriter, r *h
 
 // ==================== FARM BOUNDARY MAPPING ====================
 
-var farmBoundaryRecords = []map[string]interface{}{
-	{"id": "FBM-001", "farmId": "FARM-KADUNA-001", "farmerId": "FRM-001", "declaredHectares": 12.5, "satelliteHectares": 12.2, "variance": -2.4, "cropType": "maize", "ndvi": 0.74, "soilType": "loamy", "irrigated": false, "verificationStatus": "verified", "lastUpdated": "2026-05-01T10:00:00Z"},
-	{"id": "FBM-002", "farmId": "FARM-BENUE-022", "farmerId": "FRM-022", "declaredHectares": 30.0, "satelliteHectares": 28.7, "variance": -4.3, "cropType": "rice", "ndvi": 0.82, "soilType": "clay", "irrigated": true, "verificationStatus": "verified", "lastUpdated": "2026-05-03T14:00:00Z"},
-	{"id": "FBM-003", "farmId": "FARM-KEBBI-008", "farmerId": "FRM-008", "declaredHectares": 8.0, "satelliteHectares": 9.1, "variance": 13.8, "cropType": "sorghum", "ndvi": 0.62, "soilType": "sandy", "irrigated": false, "verificationStatus": "pending_review", "lastUpdated": "2026-05-07T09:30:00Z"},
-}
-
 var farmBoundaryStats = map[string]interface{}{
 	"totalFarmsMapped": 84320, "totalHectares": 1245000, "verified": 79800, "pendingReview": 4520,
 	"avgVariance": 2.8, "irrigatedPercent": 34.5,
 }
 
 func (s *MergedAgriService) FarmBoundaryMappingList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": farmBoundaryRecords, "total": len(farmBoundaryRecords), "domain": "Farm Boundary Mapping"})
+	s.domainList(w, "farm-boundary-mapping", "Farm Boundary Mapping")
 }
 func (s *MergedAgriService) FarmBoundaryMappingCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "FBM-NEW-001"
+	body["id"] = fmt.Sprintf("FBM-%d", time.Now().UnixNano())
 	body["verificationStatus"] = "pending_verification"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "farm-boundary-mapping", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) FarmBoundaryMappingStats(w http.ResponseWriter, r *http.Request) {
@@ -735,26 +879,23 @@ func (s *MergedAgriService) FarmBoundaryMappingStats(w http.ResponseWriter, r *h
 
 // ==================== LIVESTOCK FINANCE ====================
 
-var livestockFinanceRecords = []map[string]interface{}{
-	{"id": "LF-001", "farmerId": "FRM-KANO-001", "farmerName": "Alhaji Musa Garba", "livestockType": "cattle", "quantity": 20, "unitValue": 850000, "loanAmount": 12000000, "interestRate": 9.0, "tenor": 18, "status": "disbursed", "disbursedAt": "2026-02-15T10:00:00Z", "nextRepayment": "2026-06-15"},
-	{"id": "LF-002", "farmerId": "FRM-SOKOTO-007", "farmerName": "Fatima Usman", "livestockType": "goats", "quantity": 50, "unitValue": 85000, "loanAmount": 3000000, "interestRate": 9.0, "tenor": 12, "status": "active", "disbursedAt": "2026-03-10T09:00:00Z", "nextRepayment": "2026-06-10"},
-	{"id": "LF-003", "farmerId": "FRM-BORNO-015", "farmerName": "Ibrahim Shettima", "livestockType": "camels", "quantity": 5, "unitValue": 1200000, "loanAmount": 4500000, "interestRate": 9.0, "tenor": 24, "status": "pending_approval", "createdAt": "2026-05-09T08:00:00Z"},
-}
-
 var livestockFinanceStats = map[string]interface{}{
 	"totalLoans": 8420, "totalDisbursed": 42500000000, "activePortfolio": 31200000000,
 	"repaymentRate": 94.8, "avgLoanSize": 5050000, "livestockTypes": 8,
 }
 
 func (s *MergedAgriService) LivestockFinanceList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": livestockFinanceRecords, "total": len(livestockFinanceRecords), "domain": "Livestock Finance"})
+	s.domainList(w, "livestock-finance", "Livestock Finance")
 }
 func (s *MergedAgriService) LivestockFinanceCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "LF-NEW-001"
+	body["id"] = fmt.Sprintf("LF-%d", time.Now().UnixNano())
 	body["status"] = "pending_approval"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "livestock-finance", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) LivestockFinanceStats(w http.ResponseWriter, r *http.Request) {
@@ -763,26 +904,23 @@ func (s *MergedAgriService) LivestockFinanceStats(w http.ResponseWriter, r *http
 
 // ==================== FISHERIES & AQUACULTURE ====================
 
-var fisheriesRecords = []map[string]interface{}{
-	{"id": "FSH-001", "facilityId": "FISH-LAGOS-001", "facilityName": "Lekki Catfish Farm", "ownerId": "FRM-LAGOS-001", "species": "catfish", "pondCount": 12, "stockingDensity": 25, "loanAmount": 8500000, "status": "active", "disbursedAt": "2026-03-01T10:00:00Z"},
-	{"id": "FSH-002", "facilityId": "FISH-DELTA-022", "facilityName": "Warri Tilapia Cooperative", "ownerId": "COOP-DELTA-022", "species": "tilapia", "pondCount": 6, "stockingDensity": 30, "loanAmount": 5200000, "status": "active", "disbursedAt": "2026-02-15T09:00:00Z"},
-	{"id": "FSH-003", "facilityId": "FISH-KOGI-008", "facilityName": "Lokoja River Catfish", "ownerId": "FRM-KOGI-008", "species": "catfish", "pondCount": 4, "stockingDensity": 20, "loanAmount": 3100000, "status": "pending_review", "createdAt": "2026-05-09T08:00:00Z"},
-}
-
 var fisheriesStats = map[string]interface{}{
 	"totalFacilities": 3420, "activeFacilities": 3100, "totalLoansDisbursed": 28500000000,
 	"repaymentRate": 92.4, "speciesCovered": 12, "totalPondArea": 84500,
 }
 
 func (s *MergedAgriService) FisheriesAquacultureList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": fisheriesRecords, "total": len(fisheriesRecords), "domain": "Fisheries Aquaculture"})
+	s.domainList(w, "fisheries-aquaculture", "Fisheries Aquaculture")
 }
 func (s *MergedAgriService) FisheriesAquacultureCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "FSH-NEW-001"
+	body["id"] = fmt.Sprintf("FSH-%d", time.Now().UnixNano())
 	body["status"] = "initiated"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "fisheries-aquaculture", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) FisheriesAquacultureStats(w http.ResponseWriter, r *http.Request) {
@@ -791,26 +929,23 @@ func (s *MergedAgriService) FisheriesAquacultureStats(w http.ResponseWriter, r *
 
 // ==================== LIVESTOCK INSURANCE ====================
 
-var livestockInsuranceRecords = []map[string]interface{}{
-	{"id": "LI-001", "policyId": "LIP-2026-001", "farmerId": "FRM-KANO-001", "farmerName": "Alhaji Musa Garba", "livestockType": "cattle", "quantity": 20, "sumInsured": 17000000, "premium": 595000, "status": "active", "coverStart": "2026-01-01", "coverEnd": "2026-12-31", "provider": "NAIC"},
-	{"id": "LI-002", "policyId": "LIP-2026-022", "farmerId": "FRM-SOKOTO-007", "farmerName": "Fatima Usman", "livestockType": "goats", "quantity": 50, "sumInsured": 4250000, "premium": 148750, "status": "active", "coverStart": "2026-02-01", "coverEnd": "2027-01-31", "provider": "NAIC"},
-	{"id": "LI-003", "policyId": "LIP-2026-015", "farmerId": "FRM-BORNO-015", "farmerName": "Ibrahim Shettima", "livestockType": "cattle", "quantity": 8, "sumInsured": 6800000, "premium": 238000, "status": "claim_pending", "coverStart": "2026-01-15", "coverEnd": "2027-01-14", "provider": "AIICO"},
-}
-
 var livestockInsuranceStats = map[string]interface{}{
 	"totalPolicies": 21450, "activePolicies": 20100, "claimsPaid": 345, "totalPremium": 4850000000,
 	"claimRatio": 0.18, "avgSumInsured": 8500000, "providers": 6,
 }
 
 func (s *MergedAgriService) LivestockInsuranceList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": livestockInsuranceRecords, "total": len(livestockInsuranceRecords), "domain": "Livestock Insurance"})
+	s.domainList(w, "livestock-insurance", "Livestock Insurance")
 }
 func (s *MergedAgriService) LivestockInsuranceCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "LI-NEW-001"
+	body["id"] = fmt.Sprintf("LI-%d", time.Now().UnixNano())
 	body["status"] = "policy_issued"
 	body["issuedAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "livestock-insurance", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) LivestockInsuranceStats(w http.ResponseWriter, r *http.Request) {
@@ -819,26 +954,23 @@ func (s *MergedAgriService) LivestockInsuranceStats(w http.ResponseWriter, r *ht
 
 // ==================== LIVESTOCK MANAGEMENT ====================
 
-var livestockManagementRecords = []map[string]interface{}{
-	{"id": "LM-001", "herdId": "HERD-KANO-001", "farmerId": "FRM-KANO-001", "species": "cattle", "totalCount": 45, "maleCount": 12, "femaleCount": 33, "breed": "White Fulani", "avgWeight": 310, "healthStatus": "healthy", "vaccinated": true, "feedingRegime": "grazing+supplemental", "location": "Kano State"},
-	{"id": "LM-002", "herdId": "HERD-SOKOTO-007", "farmerId": "FRM-SOKOTO-007", "species": "goats", "totalCount": 120, "maleCount": 25, "femaleCount": 95, "breed": "Red Sokoto", "avgWeight": 27, "healthStatus": "healthy", "vaccinated": true, "feedingRegime": "browse+concentrate", "location": "Sokoto State"},
-	{"id": "LM-003", "herdId": "HERD-PLATEAU-003", "farmerId": "FRM-PLATEAU-003", "species": "pigs", "totalCount": 80, "maleCount": 10, "femaleCount": 70, "breed": "Large White", "avgWeight": 95, "healthStatus": "under_treatment", "vaccinated": false, "feedingRegime": "commercial_feed", "location": "Plateau State"},
-}
-
 var livestockManagementStats = map[string]interface{}{
 	"totalHerds": 12840, "totalAnimals": 845000, "speciesBreakdown": map[string]interface{}{"cattle": 62000, "goats": 420000, "sheep": 185000, "pigs": 78000, "poultry": 100000},
 	"healthyPercent": 94.2, "vaccinationRate": 87.5,
 }
 
 func (s *MergedAgriService) LivestockManagementList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": livestockManagementRecords, "total": len(livestockManagementRecords), "domain": "Livestock Management"})
+	s.domainList(w, "livestock-management", "Livestock Management")
 }
 func (s *MergedAgriService) LivestockManagementCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "LM-NEW-001"
+	body["id"] = fmt.Sprintf("LM-%d", time.Now().UnixNano())
 	body["status"] = "registered"
 	body["createdAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "livestock-management", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) LivestockManagementStats(w http.ResponseWriter, r *http.Request) {
@@ -847,26 +979,23 @@ func (s *MergedAgriService) LivestockManagementStats(w http.ResponseWriter, r *h
 
 // ==================== SATELLITE CROP MONITOR ====================
 
-var satelliteCropRecords = []map[string]interface{}{
-	{"id": "SCM-001", "farmId": "FARM-KADUNA-001", "monitorDate": "2026-05-09", "cropType": "maize", "growthStage": "vegetative", "ndvi": 0.74, "healthScore": 82, "stressIndicators": []string{"mild_drought"}, "satelliteSource": "Sentinel-2", "cloudCover": 12, "recommendation": "Apply 50kg/ha NPK fertilizer"},
-	{"id": "SCM-002", "farmId": "FARM-BENUE-022", "monitorDate": "2026-05-08", "cropType": "rice", "growthStage": "tillering", "ndvi": 0.82, "healthScore": 91, "stressIndicators": []string{}, "satelliteSource": "Planet Labs", "cloudCover": 5, "recommendation": "No action required, optimal conditions"},
-	{"id": "SCM-003", "farmId": "FARM-KEBBI-008", "monitorDate": "2026-05-07", "cropType": "sorghum", "growthStage": "flowering", "ndvi": 0.58, "healthScore": 62, "stressIndicators": []string{"moderate_drought", "pest_risk"}, "satelliteSource": "Sentinel-2", "cloudCover": 20, "recommendation": "Urgent: irrigate within 48hrs, scout for stem borers"},
-}
-
 var satelliteCropStats = map[string]interface{}{
 	"totalFarmsMonitored": 84320, "avgNDVI": 0.72, "healthAlerts": 1240, "criticalAlerts": 89,
 	"lastScanDate": "2026-05-09", "coveragePercent": 94.5, "satelliteSources": 2,
 }
 
 func (s *MergedAgriService) SatelliteCropMonitorList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": satelliteCropRecords, "total": len(satelliteCropRecords), "domain": "Satellite Crop Monitor"})
+	s.domainList(w, "satellite-crop-monitor", "Satellite Crop Monitor")
 }
 func (s *MergedAgriService) SatelliteCropMonitorCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "SCM-NEW-001"
+	body["id"] = fmt.Sprintf("SCM-%d", time.Now().UnixNano())
 	body["status"] = "scan_requested"
 	body["requestedAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "satellite-crop-monitor", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) SatelliteCropMonitorStats(w http.ResponseWriter, r *http.Request) {
@@ -875,26 +1004,23 @@ func (s *MergedAgriService) SatelliteCropMonitorStats(w http.ResponseWriter, r *
 
 // ==================== SOIL ANALYSIS ====================
 
-var soilAnalysisRecords = []map[string]interface{}{
-	{"id": "SA-001", "farmId": "FARM-KADUNA-001", "sampleDate": "2026-04-10", "ph": 6.5, "nitrogen": 42, "phosphorus": 28, "potassium": 185, "organicMatter": 3.2, "moisture": 38, "soilType": "loamy", "fertilityIndex": "high", "recommendation": "Apply 25kg/ha Urea for maize", "lab": "NASC Kaduna"},
-	{"id": "SA-002", "farmId": "FARM-BENUE-022", "sampleDate": "2026-04-15", "ph": 5.8, "nitrogen": 31, "phosphorus": 18, "potassium": 142, "organicMatter": 2.1, "moisture": 55, "soilType": "clay", "fertilityIndex": "medium", "recommendation": "Apply lime 1t/ha to correct acidity; supplement with NPK 20-10-10", "lab": "NASC Benue"},
-	{"id": "SA-003", "farmId": "FARM-KEBBI-008", "sampleDate": "2026-04-20", "ph": 7.2, "nitrogen": 22, "phosphorus": 15, "potassium": 98, "organicMatter": 1.2, "moisture": 22, "soilType": "sandy", "fertilityIndex": "low", "recommendation": "Urgent: apply organic compost 2t/ha; install irrigation", "lab": "NASC Kebbi"},
-}
-
 var soilAnalysisStats = map[string]interface{}{
 	"totalSamples": 42800, "avgPH": 6.4, "highFertility": 28, "mediumFertility": 45, "lowFertility": 27,
 	"labsPartnered": 12, "avgTurnaround": 7,
 }
 
 func (s *MergedAgriService) SoilAnalysisList(w http.ResponseWriter, r *http.Request) {
-	s.jsonResponse(w, http.StatusOK, map[string]interface{}{"records": soilAnalysisRecords, "total": len(soilAnalysisRecords), "domain": "Soil Analysis"})
+	s.domainList(w, "soil-analysis", "Soil Analysis")
 }
 func (s *MergedAgriService) SoilAnalysisCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	body["id"] = "SA-NEW-001"
+	body["id"] = fmt.Sprintf("SA-%d", time.Now().UnixNano())
 	body["status"] = "sample_received"
 	body["receivedAt"] = time.Now().Format(time.RFC3339)
+	if !s.domainInsert(w, "soil-analysis", body) {
+		return
+	}
 	s.jsonResponse(w, http.StatusCreated, map[string]interface{}{"created": true, "record": body})
 }
 func (s *MergedAgriService) SoilAnalysisStats(w http.ResponseWriter, r *http.Request) {

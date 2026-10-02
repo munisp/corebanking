@@ -92,19 +92,51 @@ type DLPEvent struct {
 	Timestamp   time.Time `json:"timestamp"`
 }
 
+// W12-C3-PX (c3-0506): the DLP rule set is no longer an in-memory package
+// singleton. Rules are seeded into and read from the Postgres `dlp_rules`
+// table (per-domain config table; the register's auto-generated proposal
+// "velocity_rules" does not match this store's DLPRule shape — see
+// fix-dispositions). The rule ID is the natural key (idempotent seed/upsert).
+// defaultDLPRules is only seed data for first boot, never a runtime store.
+var defaultDLPRules = []*DLPRule{
+	{ID: "DLP-001", Name: "Bulk Customer Export", Pattern: "customer_data", MaxRecords: 1000, MaxBytes: 10_000_000, WindowMins: 60, Action: "block", Severity: "critical"},
+	{ID: "DLP-002", Name: "PII Mass Access", Pattern: "pii", MaxRecords: 500, MaxBytes: 5_000_000, WindowMins: 30, Action: "block", Severity: "high"},
+	{ID: "DLP-003", Name: "Transaction Bulk Download", Pattern: "transaction_export", MaxRecords: 5000, MaxBytes: 50_000_000, WindowMins: 60, Action: "alert", Severity: "medium"},
+	{ID: "DLP-004", Name: "Account Number Harvesting", Pattern: "account_numbers", MaxRecords: 200, MaxBytes: 1_000_000, WindowMins: 15, Action: "block", Severity: "critical"},
+	{ID: "DLP-005", Name: "Salary Data Access", Pattern: "salary_data", MaxRecords: 100, MaxBytes: 500_000, WindowMins: 60, Action: "block", Severity: "high"},
+}
+
 var (
-	mu    sync.RWMutex
-	rules = []*DLPRule{
-		{ID: "DLP-001", Name: "Bulk Customer Export", Pattern: "customer_data", MaxRecords: 1000, MaxBytes: 10_000_000, WindowMins: 60, Action: "block", Severity: "critical"},
-		{ID: "DLP-002", Name: "PII Mass Access", Pattern: "pii", MaxRecords: 500, MaxBytes: 5_000_000, WindowMins: 30, Action: "block", Severity: "high"},
-		{ID: "DLP-003", Name: "Transaction Bulk Download", Pattern: "transaction_export", MaxRecords: 5000, MaxBytes: 50_000_000, WindowMins: 60, Action: "alert", Severity: "medium"},
-		{ID: "DLP-004", Name: "Account Number Harvesting", Pattern: "account_numbers", MaxRecords: 200, MaxBytes: 1_000_000, WindowMins: 15, Action: "block", Severity: "critical"},
-		{ID: "DLP-005", Name: "Salary Data Access", Pattern: "salary_data", MaxRecords: 100, MaxBytes: 500_000, WindowMins: 60, Action: "block", Severity: "high"},
-	}
+	mu           sync.RWMutex
 	db           *sql.DB
 	blockedCount uint64
 	alertCount   uint64
 )
+
+// loadRules reads the authoritative DLP rule set from Postgres. Fail-closed:
+// an error here must block enforcement decisions (caller decides), never
+// silently fall back to an empty or stale in-memory rule set.
+func loadRules() ([]*DLPRule, error) {
+	if db == nil {
+		return nil, fmt.Errorf("persistence_unavailable: DATABASE_URL is not configured; DLP rules cannot be loaded")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT id, name, pattern, max_records, max_bytes, window_minutes, action, severity FROM dlp_rules ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("persistence_unavailable: %w", err)
+	}
+	defer rows.Close()
+	rules := make([]*DLPRule, 0)
+	for rows.Next() {
+		var r DLPRule
+		if err := rows.Scan(&r.ID, &r.Name, &r.Pattern, &r.MaxRecords, &r.MaxBytes, &r.WindowMins, &r.Action, &r.Severity); err != nil {
+			return nil, fmt.Errorf("persistence_unavailable: %w", err)
+		}
+		rules = append(rules, &r)
+	}
+	return rules, rows.Err()
+}
 
 func initSchema() {
 	if db == nil {
@@ -123,9 +155,27 @@ func initSchema() {
 			record_count INT, blocked BOOLEAN, timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
 		`CREATE INDEX IF NOT EXISTS idx_dlp_events_actor ON dlp_events(actor_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_dlp_events_time ON dlp_events(timestamp)`,
+		// W12-C3-PX (c3-0506): dlp_rules — PG home for the DLP rule set (was the
+		// in-memory `rules` package singleton). id is the natural key.
+		`CREATE TABLE IF NOT EXISTS dlp_rules (
+			id TEXT PRIMARY KEY, name TEXT NOT NULL, pattern TEXT NOT NULL,
+			max_records INT NOT NULL DEFAULT 0, max_bytes BIGINT NOT NULL DEFAULT 0,
+			window_minutes INT NOT NULL DEFAULT 60, action TEXT NOT NULL DEFAULT 'alert',
+			severity TEXT NOT NULL DEFAULT 'medium',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
 	} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			log.Printf("[dlp] schema: %v", err)
+		}
+	}
+	// W12-C3-PX: idempotent seed of the default rule set (ON CONFLICT DO
+	// NOTHING on the natural key) so first-boot behaviour is unchanged but
+	// rules survive restarts and are shared across replicas.
+	for _, r := range defaultDLPRules {
+		if _, err := db.ExecContext(ctx, `INSERT INTO dlp_rules (id, name, pattern, max_records, max_bytes, window_minutes, action, severity)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+			r.ID, r.Name, r.Pattern, r.MaxRecords, r.MaxBytes, r.WindowMins, r.Action, r.Severity); err != nil {
+			log.Printf("[dlp] rule seed %s: %v", r.ID, err)
 		}
 	}
 	log.Println("[dlp] PostgreSQL schema initialized")
@@ -207,6 +257,15 @@ func checkAccess(actorID, actorIP, dataType string, recordCount int, bytesReques
 		window.PIIAccess++
 	}
 
+	// W12-C3-PX (c3-0506): the authoritative rule set comes from PG. A DLP
+	// enforcement point must fail CLOSED when rules cannot be loaded — allowing
+	// traffic with no rules would be a silent control bypass.
+	rules, err := loadRules()
+	if err != nil {
+		log.Printf("[dlp] rule load failed, failing closed: %v", err)
+		return false, nil
+	}
+
 	var events []DLPEvent
 	blocked := false
 	for _, rule := range rules {
@@ -281,12 +340,28 @@ func handleListEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleListRules(w http.ResponseWriter, r *http.Request) {
+	// W12-C3-PX (c3-0506): list reads come from PG.
+	rules, err := loadRules()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rules)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	events := dbListEvents()
+	// W12-C3-PX (c3-0506): rule count comes from PG.
+	rules, err := loadRules()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"total_events": len(events), "blocked_count": atomic.LoadUint64(&blockedCount),

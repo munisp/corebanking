@@ -2,14 +2,34 @@
  * Embedded Finance SDK — JavaScript/Flutter SDK for partners to embed
  * 54Bank services (payments, accounts, KYC) into their own apps.
  * API key management, webhook configuration, SDK analytics, and sandbox.
+ *
+ * W12-C3-P2-MLIB (c3-1009): the SDK partner registry was module process
+ * memory (a restart dropped onboarded partners and their API-key records).
+ * Now Postgres-authoritative (table `embedded_partners`) via
+ * lib/pgJsonStore.ts; fail-closed 503 on PG outage, no degraded-memory
+ * fallback. (SDK_ENDPOINTS/WEBHOOK_EVENTS are out of this batch's scope.)
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeInsert, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const PARTNERS_TABLE = "embedded_partners";
+
+async function ensureSdkStores(): Promise<void> {
+  await ensureTables("embeddedFinanceSdk", storeDDL(PARTNERS_TABLE));
+  await storeSeed(PARTNERS_TABLE, PARTNERS_SEED, () => "");
+}
+
+async function loadPartners(): Promise<SDKPartner[]> {
+  await ensureSdkStores(); return storeList<SDKPartner>(PARTNERS_TABLE);
+}
 
 interface SDKPartner { id: string; name: string; industry: string; integrationTypes: string[]; apiKeys: { environment: string; keyPrefix: string; status: string; createdAt: string }[]; webhookUrl?: string; sdkVersion: string; platform: string; monthlyApiCalls: number; status: string; onboardedAt: string; }
 interface SDKEndpoint { category: string; path: string; method: string; description: string; sdkMethod: string; platforms: string[]; }
 interface WebhookEvent { id: string; partnerId: string; eventType: string; payload: Record<string, unknown>; status: string; attempts: number; deliveredAt?: string; }
 
-const PARTNERS: SDKPartner[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const PARTNERS_SEED: SDKPartner[] = [
   { id: "SDK-001", name: "Jumia Nigeria", industry: "e-commerce", integrationTypes: ["payments", "disbursements"], apiKeys: [{ environment: "production", keyPrefix: "sk_live_54b_jumia_", status: "active", createdAt: "2026-02-01T00:00:00Z" }, { environment: "sandbox", keyPrefix: "sk_test_54b_jumia_", status: "active", createdAt: "2026-01-15T00:00:00Z" }], webhookUrl: "https://api.jumia.com.ng/webhooks/54bank", sdkVersion: "2.3.0", platform: "javascript", monthlyApiCalls: 2500000, status: "active", onboardedAt: "2026-02-01T00:00:00Z" },
   { id: "SDK-002", name: "Gokada", industry: "ride-hailing", integrationTypes: ["payments", "wallets", "kyc"], apiKeys: [{ environment: "production", keyPrefix: "sk_live_54b_gokada_", status: "active", createdAt: "2026-03-01T00:00:00Z" }], webhookUrl: "https://api.gokada.ng/webhooks/54bank", sdkVersion: "2.3.0", platform: "flutter", monthlyApiCalls: 850000, status: "active", onboardedAt: "2026-03-01T00:00:00Z" },
   { id: "SDK-003", name: "Paga", industry: "fintech", integrationTypes: ["accounts", "transfers", "kyc"], apiKeys: [{ environment: "production", keyPrefix: "sk_live_54b_paga_", status: "active", createdAt: "2026-02-15T00:00:00Z" }], webhookUrl: "https://api.mypaga.com/webhooks/54bank", sdkVersion: "2.2.0", platform: "javascript", monthlyApiCalls: 1200000, status: "active", onboardedAt: "2026-02-15T00:00:00Z" },
@@ -36,19 +56,24 @@ const WEBHOOK_EVENTS: WebhookEvent[] = [
 ];
 
 export function registerEmbeddedFinanceSdk(app: Express) {
-  app.get("/api/sdk/v1/partners", (_req: Request, res: Response) => { res.json({ items: PARTNERS, total: PARTNERS.length }); });
+  app.get("/api/sdk/v1/partners", asyncRoute(async (_req: Request, res: Response) => {
+    const partners = await pgGuard(loadPartners());
+    res.json({ items: partners, total: partners.length });
+  }));
   app.get("/api/sdk/v1/endpoints", (_req: Request, res: Response) => { res.json({ items: SDK_ENDPOINTS, total: SDK_ENDPOINTS.length }); });
   app.get("/api/sdk/v1/webhooks", (_req: Request, res: Response) => { res.json({ items: WEBHOOK_EVENTS, total: WEBHOOK_EVENTS.length }); });
-  app.post("/api/sdk/v1/partners", (req: Request, res: Response) => {
+  app.post("/api/sdk/v1/partners", asyncRoute(async (req: Request, res: Response) => {
     const { name, industry, integrationTypes } = req.body ?? {};
-    const partner: SDKPartner = { id: `SDK-${String(PARTNERS.length + 1).padStart(3, "0")}`, name: name ?? "New Partner", industry: industry ?? "fintech", integrationTypes: integrationTypes ?? ["payments"], apiKeys: [{ environment: "sandbox", keyPrefix: `sk_test_54b_${(name ?? "new").toLowerCase().replace(/\s/g, "")}_`, status: "active", createdAt: new Date().toISOString() }], sdkVersion: "2.3.0", platform: "javascript", monthlyApiCalls: 0, status: "sandbox", onboardedAt: new Date().toISOString() };
-    PARTNERS.push(partner);
+    const partners = await pgGuard(loadPartners());
+    const partner: SDKPartner = { id: `SDK-${String(partners.length + 1).padStart(3, "0")}`, name: name ?? "New Partner", industry: industry ?? "fintech", integrationTypes: integrationTypes ?? ["payments"], apiKeys: [{ environment: "sandbox", keyPrefix: `sk_test_54b_${(name ?? "new").toLowerCase().replace(/\s/g, "")}_`, status: "active", createdAt: new Date().toISOString() }], sdkVersion: "2.3.0", platform: "javascript", monthlyApiCalls: 0, status: "sandbox", onboardedAt: new Date().toISOString() };
+    await pgGuard(storeInsert(PARTNERS_TABLE, "", partner));
     res.status(201).json(partner);
-  });
-  app.get("/api/sdk/v1/stats", (_req: Request, res: Response) => {
-    res.json({ totalPartners: PARTNERS.length, activePartners: PARTNERS.filter((p) => p.status === "active").length,
-      totalMonthlyApiCalls: PARTNERS.reduce((s, p) => s + p.monthlyApiCalls, 0), sdkEndpoints: SDK_ENDPOINTS.length,
+  }));
+  app.get("/api/sdk/v1/stats", asyncRoute(async (_req: Request, res: Response) => {
+    const partners = await pgGuard(loadPartners());
+    res.json({ totalPartners: partners.length, activePartners: partners.filter((p) => p.status === "active").length,
+      totalMonthlyApiCalls: partners.reduce((s, p) => s + p.monthlyApiCalls, 0), sdkEndpoints: SDK_ENDPOINTS.length,
       webhookDeliveryRate: 75, avgLatencyMs: 35, platforms: ["javascript", "flutter", "react_native"],
-      topPartner: PARTNERS.sort((a, b) => b.monthlyApiCalls - a.monthlyApiCalls)[0]?.name });
-  });
+      topPartner: [...partners].sort((a, b) => b.monthlyApiCalls - a.monthlyApiCalls)[0]?.name });
+  }));
 }

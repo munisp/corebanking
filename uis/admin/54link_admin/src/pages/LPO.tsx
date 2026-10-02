@@ -542,7 +542,7 @@ export default function LPO() {
     setProcessingIds(prev => new Set(prev).add(lpoId));
     
     try {
-      await apiClient.post(`/lpo/api/v1/lpo/${lpoId}/reject`, {
+      await apiClient.post(`/lpo/api/v1/lpo/${lpoId}/decline`, {
         lpo_id: lpoId,
         rejected_by: 'Admin User',
         reason: rejectionReason

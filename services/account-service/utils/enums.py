@@ -7,6 +7,7 @@ class AccountStatus(enum.Enum):
     SUSPENDED = "suspended"
     DELETED = "deleted"
     DORMANT = "dormant"      # MN-01: inactivity-enforced; debits blocked
+    FROZEN = "frozen"        # W12-A4-P0-D: customer-initiated freeze; debits blocked, reversible via unfreeze
     CLOSED = "closed"        # MN-02: terminal; all posting blocked
     DECEASED = "deceased"    # MN-05: estate handling; debits blocked
 

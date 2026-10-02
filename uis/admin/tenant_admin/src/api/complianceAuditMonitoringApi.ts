@@ -244,5 +244,5 @@ export const analyticsEngineApi = {
     apiClient.get<{ items: AnalyticsReport[]; total: number }>(`${APISIX.ANALYTICS_ENGINE}/v1/reports`, { params }).then((r) => r.data),
 
   getDashboard: () =>
-    apiClient.get(`${APISIX.ANALYTICS_ENGINE}/v1/dashboard`).then((r) => r.data),
+    apiClient.get(`${APISIX.ANALYTICS_ENGINE}/api/v1/reports/dashboard`).then((r) => r.data),
 };

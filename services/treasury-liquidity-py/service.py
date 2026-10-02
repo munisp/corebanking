@@ -12,6 +12,123 @@ from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from typing import List
 import uvicorn, os, uuid
+import json
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(row.get(self.key, "")), row.get(self.tenant_key),
+                          json.dumps(row, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
 import os
 
 app = FastAPI(title="54link-dev Treasury & Liquidity", version="1.0.0")
@@ -279,11 +396,27 @@ class ALMReport(BaseModel):
     duration_gap: float
     var_95: float  # Value at Risk 95%
 
-# --- Storage ---
-forecasts: list[CashForecast] = []
-placements: list[InterbankPlacement] = []
-fx_deals: list[FXDeal] = []
-investments: list[Investment] = []
+# --- Storage --- W12-C3P2B5: per-domain PG tables (jsonb payload pattern).
+# Money-adjacency note: these are deal/forecast RECORDS, not ledger balances;
+# no GL posting state is held here (TigerBeetle deferral N/A).
+FORECAST_STORE = _W12Store("cash_forecasts")
+PLACEMENT_STORE = _W12Store("interbank_placements")
+FX_DEAL_STORE = _W12Store("fx_deals")
+INVESTMENT_STORE = _W12Store("investments")
+
+
+def _w12_list(store):
+    try:
+        return store.all()
+    except Exception as e:
+        raise HTTPException(503, f"persistence_unavailable: {e}")
+
+
+def _w12_put(store, rid, payload):
+    try:
+        store.put(rid, payload)
+    except Exception as e:
+        raise HTTPException(503, f"persistence_unavailable: {e}")
 
 # --- FX Rates ---
 FX_RATES = {
@@ -320,7 +453,7 @@ def healthz():
 
 @app.get("/v1/treasury/forecasts")
 def list_forecasts():
-    return forecasts
+    return _w12_list(FORECAST_STORE)
 
 @app.post("/v1/treasury/forecasts", status_code=201)
 def create_forecast(req: CashForecast):
@@ -336,14 +469,14 @@ def create_forecast(req: CashForecast):
         req.confidence = 0.70
     if datetime.strptime(req.forecast_date, "%Y-%m-%d").day <= 5:
         req.factors.append("salary_season: higher deposit inflow expected")
-    forecasts.append(req)
+    _w12_put(FORECAST_STORE, req.id, req.model_dump())
     return req
 
 # --- Interbank Placements ---
 
 @app.get("/v1/treasury/placements")
 def list_placements():
-    return placements
+    return _w12_list(PLACEMENT_STORE)
 
 @app.post("/v1/treasury/placements", status_code=201)
 def create_placement(req: InterbankPlacement):
@@ -360,7 +493,7 @@ def create_placement(req: InterbankPlacement):
     req.accrued_interest = round(req.amount * (req.rate / 100) * (req.tenor_days / 365), 2)
     req.status = "active"
     req.created_at = datetime.utcnow().isoformat()
-    placements.append(req)
+    _w12_put(PLACEMENT_STORE, req.id, req.model_dump())
     return req
 
 # --- FX Dealing ---
@@ -371,7 +504,7 @@ def get_rates():
 
 @app.get("/v1/treasury/fx/deals")
 def list_fx_deals():
-    return fx_deals
+    return _w12_list(FX_DEAL_STORE)
 
 @app.post("/v1/treasury/fx/deals", status_code=201)
 def create_fx_deal(req: FXDeal):
@@ -393,14 +526,14 @@ def create_fx_deal(req: FXDeal):
     req.settlement_date = req.value_date
     req.status = "confirmed"
     req.created_at = datetime.utcnow().isoformat()
-    fx_deals.append(req)
+    _w12_put(FX_DEAL_STORE, req.id, req.model_dump())
     return req
 
 # --- Investment Portfolio ---
 
 @app.get("/v1/treasury/investments")
 def list_investments():
-    return investments
+    return _w12_list(INVESTMENT_STORE)
 
 @app.post("/v1/treasury/investments", status_code=201)
 def create_investment(req: Investment):
@@ -427,13 +560,15 @@ def create_investment(req: Investment):
 
     req.status = "active"
     req.created_at = datetime.utcnow().isoformat()
-    investments.append(req)
+    _w12_put(INVESTMENT_STORE, req.id, req.model_dump())
     return req
 
 # --- ALM Report ---
 
 @app.get("/v1/treasury/alm")
 def alm_report():
+    investments = [Investment(**r) for r in _w12_list(INVESTMENT_STORE)]
+    placements = [InterbankPlacement(**r) for r in _w12_list(PLACEMENT_STORE)]
     total_assets = sum(i.market_value for i in investments) + sum(p.amount for p in placements)
     total_liabilities = total_assets * 0.85  # simplified
     net_interest_income = sum(p.accrued_interest for p in placements) + sum(

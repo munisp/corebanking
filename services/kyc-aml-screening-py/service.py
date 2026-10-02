@@ -24,6 +24,122 @@ import os, uuid, json, re, csv, io, socket, difflib, threading
 import urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(row.get(self.key, "")), row.get(self.tenant_key),
+                          json.dumps(row, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
 from datetime import datetime, timezone
 from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -31,6 +147,10 @@ from typing import Optional
 import os
 import json
 import re
+
+# W12 B5-P1-F: real OpenSearch screening client (replaces SQL ILIKE candidate
+# narrowing). Import is side-effect free (env-only); network happens per call.
+import opensearch_screening as _os_screen
 
 
 def now_iso() -> str:
@@ -47,7 +167,10 @@ NIBSS_BVN_API_URL = os.environ.get("NIBSS_BVN_API_URL", "")
 NIBSS_API_KEY = os.environ.get("NIBSS_API_KEY", "")
 KAFKA_BROKERS = os.environ.get("KAFKA_BROKERS", "")
 REDIS_URL = os.environ.get("REDIS_URL", "")
-OPENSEARCH_URL = os.environ.get("OPENSEARCH_ENDPOINT", "")
+# W12 B5-P1-F: OPENSEARCH_URL is the fleet-canonical env (docker-compose.yml
+# gateway, opensearch-indexer-py); OPENSEARCH_ENDPOINT kept for back-compat.
+OPENSEARCH_URL = (os.environ.get("OPENSEARCH_URL")
+                  or os.environ.get("OPENSEARCH_ENDPOINT", "")).rstrip("/")
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_REALM_URL", "")
 APP_ENV = os.environ.get("APP_ENV", "production").lower()
 WATCHLIST_AUTO_SEED = os.environ.get("WATCHLIST_AUTO_SEED", "").lower() == "true"
@@ -298,18 +421,27 @@ def load_watchlists(force: bool = False) -> tuple[list[dict], list[dict]]:
     return pep, sanctions
 
 
-# ── W11 PY-449: per-query SQL candidate filtering ──
-# Previously every screening request loaded the ENTIRE screening_watchlist
-# table and fuzzy-matched in Python. Readiness (table present + non-empty) is
-# now a cached COUNT(*) probe, and candidate narrowing happens in SQL
-# (WHERE name ILIKE ANY(...) LIMIT 50) with a 60s TTL per-name cache.
-# Fail-closed contract unchanged: empty/missing table or DB failure raises
-# ScreeningUnavailable; never returns synthetic entries.
+# ── W12 B5-P1-F: candidate retrieval via real OpenSearch ──
+# History: W11 PY-449 narrowed candidates in SQL (WHERE name ILIKE ANY(...)
+# LIMIT 50). That ILIKE matching is now replaced by real OpenSearch queries:
+# screening_watchlist rows (the same real source, still seeded from OFAC/UN)
+# are bulk-indexed into the sanctions-names / pep-names indices and matched
+# with `match` + fuzziness=AUTO over an edge_ngram-analyzed name field
+# (mappings: config/opensearch/*.json — stock 2.19.0 analyzers only, no
+# phonetic plugin). Fail-closed contract unchanged: empty/missing table, DB
+# failure, or OpenSearch unavailability raises ScreeningUnavailable; never
+# returns synthetic entries.
 
 _watchlist_ready_cache: dict = {"checked_at": None}
 _screen_cache: dict = {}
 _screen_cache_lock = threading.Lock()
 _SCREEN_CACHE_MAX_ENTRIES = 1000
+_os_sync_lock = threading.Lock()
+_os_sync_state: dict = {"synced_at": None, "docs": 0}
+# pep-enhanced-dd-py dual-writes curated entries into the shared pep-names
+# index; inactive entries must never surface as screening candidates. Docs
+# without an `active` field (watchlist-sourced) are unaffected by must_not.
+_PEP_ACTIVE_FILTER = {"bool": {"must_not": [{"term": {"active": False}}]}}
 
 
 def _cache_fresh(checked_at) -> bool:
@@ -343,51 +475,144 @@ def _ensure_watchlist_ready() -> None:
     _watchlist_ready_cache["checked_at"] = datetime.now(timezone.utc)
 
 
-def _screening_candidates(name: str) -> tuple[list[dict], list[dict]]:
-    """Return PEP/sanctions candidate entries for `name`, narrowed in SQL.
+def _watchlist_doc(list_type: str, row: tuple) -> tuple[str, dict]:
+    """Build an OpenSearch doc (natural _id = wl-{row id}) from a real
+    screening_watchlist row — idempotent re-indexing."""
+    row_id, _lt, name, category, country, reason, risk, list_name = row[:8]
+    loaded_at = row[8] if len(row) > 8 else None
+    return f"wl-{row_id}", {
+        "watchlist_id": row_id,
+        "list_type": list_type,
+        "name": name,
+        "name_normalized": _normalize_name(name),
+        "category": category or "",
+        "country": country or "",
+        "reason": reason or "",
+        "risk": risk or "high",
+        "list_name": list_name or "",
+        "loaded_at": loaded_at.isoformat() if hasattr(loaded_at, "isoformat") else None,
+    }
 
-    Tokens of the normalized query name are matched with ILIKE ANY(...) and
-    the result is hard-capped at LIMIT 50; fuzzy scoring then runs on those
-    candidates only. Results are cached per normalized name for 60s.
+
+def sync_watchlist_indices(force: bool = False) -> dict:
+    """Bulk-index the real screening_watchlist rows into OpenSearch.
+
+    Source of truth: the screening_watchlist Postgres table (the exact data
+    the retired ILIKE ANY(...) query read). Idempotent via natural _id
+    (wl-{id}); the watchlist is append-only in this service — entries are
+    never deleted, so upsert-by-natural-id keeps the index consistent.
+    Runs once per process unless forced (POST /v1/aml/opensearch/reindex).
+    Raises ScreeningUnavailable on any failure (fail closed).
+    """
+    if not force and _os_sync_state["synced_at"]:
+        return {"status": "already_synced", "docs": _os_sync_state["docs"],
+                "syncedAt": _os_sync_state["synced_at"].isoformat()}
+    with _os_sync_lock:
+        if not force and _os_sync_state["synced_at"]:
+            return {"status": "already_synced", "docs": _os_sync_state["docs"],
+                    "syncedAt": _os_sync_state["synced_at"].isoformat()}
+        _ensure_watchlist_ready()  # PG source must exist and be non-empty
+        conn = _get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, list_type, name, category, country, reason, risk, "
+                    "list_name, loaded_at FROM screening_watchlist "
+                    "WHERE name IS NOT NULL AND name <> ''"
+                )
+                rows = cur.fetchall()
+        except ScreeningUnavailable:
+            raise
+        except Exception as e:
+            raise ScreeningUnavailable(f"watchlist read for opensearch sync failed: {e}")
+        finally:
+            conn.close()
+
+        try:
+            _os_screen.ensure_index(_os_screen.SANCTIONS_INDEX)
+            _os_screen.ensure_index(_os_screen.PEP_INDEX)
+            sanctions_docs = [_watchlist_doc("sanctions", r) for r in rows if r[1] != "pep"]
+            pep_docs = [_watchlist_doc("pep", r) for r in rows if r[1] == "pep"]
+            indexed = 0
+            if sanctions_docs:
+                indexed += _os_screen.bulk_index(_os_screen.SANCTIONS_INDEX, sanctions_docs)
+            if pep_docs:
+                indexed += _os_screen.bulk_index(_os_screen.PEP_INDEX, pep_docs)
+        except _os_screen.OpenSearchUnavailable as e:
+            raise ScreeningUnavailable(f"opensearch watchlist sync failed: {e}")
+
+        _os_sync_state["synced_at"] = datetime.now(timezone.utc)
+        _os_sync_state["docs"] = indexed
+        return {"status": "synced", "docs": indexed,
+                "sanctionsDocs": len(sanctions_docs), "pepDocs": len(pep_docs),
+                "syncedAt": _os_sync_state["synced_at"].isoformat()}
+
+
+def _ensure_indices_synced() -> None:
+    if not _os_sync_state["synced_at"]:
+        sync_watchlist_indices()
+
+
+def _hit_to_watchlist_entry(hit: dict) -> dict:
+    """Map an OpenSearch hit to the existing screening entry contract
+    ({name, category, country, reason, risk, list}) unchanged for callers."""
+    src = hit.get("_source", {})
+    if src.get("entry_id"):
+        # Curated pep_entries doc dual-written by pep-enhanced-dd-py into the
+        # shared pep-names index: position/tier instead of category/reason.
+        tier, position = src.get("tier", "") or "", src.get("position", "") or ""
+        return {
+            "name": src.get("name", ""),
+            "category": position or "pep",
+            "country": src.get("country", "") or "",
+            "reason": (f"PEP {tier} — {position}" if (tier or position)
+                       else "curated PEP listing"),
+            "risk": src.get("risk") or "high",
+            "list": src.get("list_name") or src.get("source") or "pep_entries",
+        }
+    return {
+        "name": src.get("name", ""),
+        "category": src.get("category") or "",
+        "country": src.get("country") or "",
+        "reason": src.get("reason") or "",
+        "risk": src.get("risk") or "high",
+        "list": src.get("list_name") or "",
+    }
+
+
+def _screening_candidates(name: str) -> tuple[list[dict], list[dict]]:
+    """Return PEP/sanctions candidate entries for `name`, matched in OpenSearch.
+
+    W12 B5-P1-F: candidates are retrieved from the real sanctions-names /
+    pep-names indices (`match` + fuzziness=AUTO over an edge_ngram-analyzed
+    name field, hard-capped by SCREENING_OS_CANDIDATE_LIMIT) instead of SQL
+    ILIKE ANY(...). Fuzzy scoring (SCREENING_MATCH_THRESHOLD) then runs on
+    those candidates exactly as before. Results are cached per
+    (normalized name, match threshold, OS min_score) for 60s.
     """
     norm = _normalize_name(name)
     if not norm:
         _ensure_watchlist_ready()  # still fail closed on an empty/missing list
         return [], []
+    cache_key = (norm, FUZZY_MATCH_THRESHOLD, _os_screen.SCREENING_MIN_SCORE)
     with _screen_cache_lock:
-        entry = _screen_cache.get(norm)
+        entry = _screen_cache.get(cache_key)
         if entry and _cache_fresh(entry["fetched_at"]):
             return entry["pep"], entry["sanctions"]
 
     _ensure_watchlist_ready()
-    tokens = [t for t in norm.split() if len(t) >= 2]
-    if not tokens:
-        return [], []
-    patterns = [f"%{t}%" for t in tokens]
-
-    conn = _get_db_connection()
+    _ensure_indices_synced()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT list_type, name, category, country, reason, risk, list_name "
-                "FROM screening_watchlist WHERE name IS NOT NULL AND name <> '' "
-                "AND name ILIKE ANY(%s) LIMIT 50",
-                (patterns,),
-            )
-            rows = cur.fetchall()
-    except ScreeningUnavailable:
-        raise
-    except Exception as e:
+        sanctions_hits = _os_screen.search_name_candidates(
+            _os_screen.SANCTIONS_INDEX, name)
+        pep_hits = _os_screen.search_name_candidates(
+            _os_screen.PEP_INDEX, name, extra_filter=_PEP_ACTIVE_FILTER)
+    except _os_screen.OpenSearchUnavailable as e:
         # Fail closed: a failed candidate query must never auto-clear.
         raise ScreeningUnavailable(f"watchlist candidate query failed: {e}")
-    finally:
-        conn.close()
 
-    pep, sanctions = [], []
-    for list_type, wname, category, country, reason, risk, list_name in rows:
-        entry = {"name": wname, "category": category or "", "country": country or "",
-                 "reason": reason or "", "risk": risk or "high", "list": list_name or ""}
-        (pep if list_type == "pep" else sanctions).append(entry)
+    sanctions = [_hit_to_watchlist_entry(h) for h in sanctions_hits]
+    pep = [_hit_to_watchlist_entry(h) for h in pep_hits]
 
     with _screen_cache_lock:
         if len(_screen_cache) >= _SCREEN_CACHE_MAX_ENTRIES:
@@ -397,7 +622,7 @@ def _screening_candidates(name: str) -> tuple[list[dict], list[dict]]:
                 _screen_cache.pop(k, None)
             if len(_screen_cache) >= _SCREEN_CACHE_MAX_ENTRIES:
                 _screen_cache.clear()
-        _screen_cache[norm] = {
+        _screen_cache[cache_key] = {
             "fetched_at": datetime.now(timezone.utc), "pep": pep, "sanctions": sanctions,
         }
     return pep, sanctions
@@ -405,8 +630,17 @@ def _screening_candidates(name: str) -> tuple[list[dict], list[dict]]:
 
 # ── State ──
 
-kyc_records: list[KYCRecord] = []
-screening_results: list[ScreeningResult] = []
+# W12-C3P2B5: PG-backed KYC/AML stores (tables kyc_records, screening_results).
+#
+# PII NOTICE (NDPR): kyc_records payloads contain BVN, national ID numbers,
+# phone, email and address. At rest they rely on Postgres storage encryption
+# (volume/TDE); field-level KMS envelope encryption is a TRACKED FOLLOW-UP —
+# no envelope helper exists in this service today (see fix dispositions).
+# RETENTION: CBN KYC retention is a minimum of 5 years after the customer
+# relationship ends; purge/anonymization via scheduled job on
+# kyc_records.updated_at is a follow-up (see dispositions).
+KYC_STORE = _W12Store("kyc_records")
+SCREENING_STORE = _W12Store("screening_results")
 
 
 # ── Business Logic ──
@@ -529,8 +763,9 @@ def screen_name(name: str) -> tuple[list[dict], str]:
     Fails closed: raises ScreeningUnavailable when watchlists cannot be loaded;
     callers must treat this as 'cannot clear', never auto-clear.
 
-    W11 PY-449: candidates are narrowed in SQL (ILIKE ANY + LIMIT 50) behind a
-    60s TTL cache instead of loading the entire watchlist table per request.
+    W12 B5-P1-F: candidates are retrieved from the real OpenSearch
+    sanctions-names / pep-names indices (fuzzy match, 60s TTL cache keyed on
+    (name, match threshold, OS min_score)) instead of SQL ILIKE narrowing.
     """
     pep_list, sanctions_list = _screening_candidates(name)
     matches = []
@@ -588,7 +823,7 @@ def _seed():
     # OBVIOUSLY SYNTHETIC demo identities. No real names, BVNs, phone numbers,
     # or ID numbers: every field is a placeholder and every record carries
     # demo=True plus "DEMO-" identifiers.
-    kyc_records.extend([
+    _demo_rows = [
         KYCRecord(
             id="DEMO-KYC-001", customer_id="DEMO-CUST-001", bvn="00000000001", full_name="Demo Person A",
             date_of_birth="1970-01-01", phone="+2340000000001", email="demo.person.a@example.invalid",
@@ -630,7 +865,12 @@ def _seed():
             created_at="1970-01-01T00:00:00Z", updated_at="1970-01-01T00:00:00Z",
             demo=True,
         ),
-    ])
+    ]
+    for _r in _demo_rows:
+        try:
+            KYC_STORE.put(_r.id, asdict(_r))
+        except Exception as _e:
+            print(f"W12-DEGRADED demo seed persist failed: {_e}")
 
 # Demo records are clearly synthetic (Demo Person A/B/C, BVN 0000000000N,
 # demo=True markers) and only load behind an explicit opt-in, never in production.
@@ -705,7 +945,9 @@ def build_health() -> dict:
         "kafka": _probe_kafka,
         "postgres": _probe_postgres,
         "redis": _probe_redis,
-        "opensearch": lambda: _probe_http(OPENSEARCH_URL),
+        # W12 B5-P1-F: real cluster reachability + health status (screening
+        # decisions now depend on this cluster — see opensearch_screening.py).
+        "opensearch": _os_screen.ping,
         "keycloak": lambda: _probe_http(KEYCLOAK_URL),
         "nibss_bvn": lambda: (
             (False, "not_configured") if not NIBSS_BVN_API_URL
@@ -898,18 +1140,32 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
                                 "middleware": middleware,
                                 "port": os.environ.get("PORT", "8136")})
         elif path == "/v1/kyc/records":
-            self._respond(200, {"items": [asdict(r) for r in kyc_records], "total": len(kyc_records)})
+            try:
+                _items = KYC_STORE.all()
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._respond(200, {"items": _items, "total": len(_items)})
         elif path.startswith("/v1/kyc/records/"):
             cid = path.split("/")[-1]
-            rec = next((r for r in kyc_records if r.id == cid or r.customer_id == cid), None)
+            try:
+                rec = KYC_STORE.get(cid) or _w12_get_by(KYC_STORE, "customer_id", cid)
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             if rec:
-                self._respond(200, asdict(rec))
+                self._respond(200, rec)
             else:
                 self._respond(404, {"message": "KYC record not found"})
         elif path == "/v1/kyc/tiers":
             self._respond(200, KYC_TIER_LIMITS)
         elif path == "/v1/aml/screenings":
-            self._respond(200, {"items": [asdict(r) for r in screening_results], "total": len(screening_results)})
+            try:
+                _items = SCREENING_STORE.all()
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._respond(200, {"items": _items, "total": len(_items)})
         else:
             self._respond(404, {"message": "Not found"})
 
@@ -937,6 +1193,9 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             self._upgrade_tier(body)
         elif path == "/v1/kyc/risk-score":
             self._compute_risk(body)
+        elif path == "/v1/aml/opensearch/reindex":
+            # W12 B5-P1-F: admin resync (JWT-protected — not probe-exempt).
+            self._reindex_opensearch(body)
         else:
             self._respond(404, {"message": "Not found"})
 
@@ -1011,7 +1270,11 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             documents=[],
             created_at=now_iso(), updated_at=now_iso(),
         )
-        kyc_records.append(rec)
+        try:
+            KYC_STORE.put(rec.id, asdict(rec))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(201, asdict(rec))
 
     def _screen_customer(self, body: dict):
@@ -1038,7 +1301,11 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             notes=f"{len(matches)} match(es) found" if matches else "No matches",
             screened_at=now_iso(),
         )
-        screening_results.append(result)
+        try:
+            SCREENING_STORE.put(result.id, asdict(result))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(200, asdict(result))
 
     def _batch_screen(self, body: dict):
@@ -1079,7 +1346,12 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
 
     def _upgrade_tier(self, body: dict):
         customer_id = body.get("customerId", "")
-        rec = next((r for r in kyc_records if r.customer_id == customer_id), None)
+        try:
+            _row = _w12_get_by(KYC_STORE, "customer_id", customer_id)
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
+        rec = KYCRecord(**_row) if _row else None
         if not rec:
             self._respond(404, {"message": "KYC record not found"})
             return
@@ -1103,6 +1375,11 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
         rec.updated_at = now_iso()
         limits = KYC_TIER_LIMITS[rec.tier]
 
+        try:
+            KYC_STORE.put(rec.id, asdict(rec))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(200, {
             "customerId": customer_id,
             "previousTier": old_tier,
@@ -1118,9 +1395,34 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
                             "eddRequired": level in ("high", "prohibited"),
                             "factors": body})
 
+    def _reindex_opensearch(self, body: dict):
+        """W12 B5-P1-F admin endpoint: force a full screening_watchlist ->
+        OpenSearch resync (idempotent, natural _id). Fail closed: 503 when the
+        source table or the cluster is unavailable."""
+        try:
+            result = sync_watchlist_indices(force=True)
+        except ScreeningUnavailable as e:
+            self._respond(503, {"error": "sanctions_list_unavailable", "message": str(e)})
+            return
+        self._respond(200, result)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8136"))
+
+    # W12 B5-P1-F: warm the OpenSearch screening indices in the background so
+    # the first screening request doesn't pay bulk-index latency. Failure here
+    # is NOT fatal: the screening path lazily re-syncs and fails closed (503)
+    # if the cluster is genuinely unreachable.
+    def _boot_opensearch_sync():
+        try:
+            result = sync_watchlist_indices()
+            print(f"[kyc-aml] opensearch watchlist sync: {result}")
+        except Exception as e:
+            print(f"[kyc-aml] opensearch boot sync deferred: {e}")
+
+    threading.Thread(target=_boot_opensearch_sync, daemon=True).start()
+
     server = HTTPServer(("0.0.0.0", port), KYCAMLHandler)
     print(f"KYC/AML Screening Service listening on :{port}")
     server.serve_forever()

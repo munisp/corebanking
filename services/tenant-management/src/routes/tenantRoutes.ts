@@ -12,12 +12,15 @@ import { postUnsuspendTenant } from "../controllers/tenant/postUnsuspendTenant";
 import { postSuspendBranch } from "../controllers/branch/postSuspendBranch";
 import { postUnsuspendBranch } from "../controllers/branch/postUnsuspendBranch";
 import { putUpdateBranch } from "../controllers/branch/putUpdateBranch";
+import { authenticateRequest } from "../middlewares/auth";
 
 const router = Router();
 
-router.route("/branch").post(postCreateBranch).get(getBranches);
+// W12-B5-P0-A: branch create/update are privileged mutations that were
+// previously anonymous — now behind verified JWT / service-token auth.
+router.route("/branch").post(authenticateRequest, postCreateBranch).get(getBranches);
 
-router.route("/branch/:tenant_id/:branch_id").put(putUpdateBranch);
+router.route("/branch/:tenant_id/:branch_id").put(authenticateRequest, putUpdateBranch);
 
 router.route("/branch/:tenant_id/:branch_id/suspend").post(postSuspendBranch);
 

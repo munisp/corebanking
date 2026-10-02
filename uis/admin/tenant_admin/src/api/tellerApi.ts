@@ -49,7 +49,7 @@ import type {
 
 const API_BASE_URL =
   import.meta.env.VITE_TELLER_SERVICE_URL ||
-  `${BACKEND_URL}/teller/api/v1`;
+  `${BACKEND_URL}/teller-operations/v1`;
 
 const tellerApi = axios.create({
   baseURL: API_BASE_URL,

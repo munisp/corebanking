@@ -11,7 +11,7 @@ import (
 // EngagementService handles audit engagement operations
 type EngagementService struct {
 	tenantID    string
-	engagements map[string]*AuditEngagement
+	engagements *repo[AuditEngagement]
 	mu          sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type EngagementService struct {
 func NewEngagementService(tenantID string) *EngagementService {
 	svc := &EngagementService{
 		tenantID:    tenantID,
-		engagements: make(map[string]*AuditEngagement),
+		engagements: newRepo[AuditEngagement](serviceDB, "audit_engagements"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewEngagementService(tenantID string) *EngagementService {
 
 func (s *EngagementService) initializeDefaultData(tenantID string) {
 	// Active fieldwork engagement
-	s.engagements["eng-001"] = &AuditEngagement{
+	s.engagements.seed(tenantID, "eng-001", &AuditEngagement{
 		EngagementID:   "eng-001",
 		TenantID:       tenantID,
 		PlanID:         "plan-001",
@@ -48,10 +48,10 @@ func (s *EngagementService) initializeDefaultData(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, 0, -15),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Planning engagement
-	s.engagements["eng-002"] = &AuditEngagement{
+	s.engagements.seed(tenantID, "eng-002", &AuditEngagement{
 		EngagementID:   "eng-002",
 		TenantID:       tenantID,
 		PlanID:         "plan-001",
@@ -72,10 +72,10 @@ func (s *EngagementService) initializeDefaultData(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, 0, -5),
 		UpdatedAt:      time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// Reporting engagement
-	s.engagements["eng-003"] = &AuditEngagement{
+	s.engagements.seed(tenantID, "eng-003", &AuditEngagement{
 		EngagementID:   "eng-003",
 		TenantID:       tenantID,
 		PlanID:         "plan-004",
@@ -96,10 +96,10 @@ func (s *EngagementService) initializeDefaultData(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, -2, -15),
 		UpdatedAt:      time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// Closed engagement
-	s.engagements["eng-004"] = &AuditEngagement{
+	s.engagements.seed(tenantID, "eng-004", &AuditEngagement{
 		EngagementID:   "eng-004",
 		TenantID:       tenantID,
 		PlanID:         "plan-004",
@@ -120,16 +120,18 @@ func (s *EngagementService) initializeDefaultData(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, -3, -15),
 		UpdatedAt:      time.Now().AddDate(0, -1, -15),
-	}
+	})
 }
 
 // ListEngagements returns engagements based on filters
-func (s *EngagementService) ListEngagements(tenantID, status string) []*AuditEngagement {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *EngagementService) ListEngagements(tenantID, status string) ([]*AuditEngagement, error) {
 
 	var result []*AuditEngagement
-	for _, eng := range s.engagements {
+	__ALL__, __ERR__ := s.engagements.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, eng := range __ALL__ {
 		if eng.TenantID != tenantID {
 			continue
 		}
@@ -138,16 +140,14 @@ func (s *EngagementService) ListEngagements(tenantID, status string) []*AuditEng
 		}
 		result = append(result, eng)
 	}
-	return result
+	return result, nil
 }
 
 // GetEngagement retrieves an engagement by ID
 func (s *EngagementService) GetEngagement(tenantID, engagementID string) (*AuditEngagement, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	eng, exists := s.engagements[engagementID]
-	if !exists || eng.TenantID != tenantID {
+	eng, err := s.engagements.get(tenantID, engagementID)
+	if err != nil {
 		return nil, errors.New("engagement not found")
 	}
 	return eng, nil
@@ -155,8 +155,6 @@ func (s *EngagementService) GetEngagement(tenantID, engagementID string) (*Audit
 
 // CreateEngagement creates a new engagement
 func (s *EngagementService) CreateEngagement(tenantID, auditorID string, eng *AuditEngagement) (*AuditEngagement, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	eng.EngagementID = uuid.New().String()
 	eng.TenantID = tenantID
@@ -168,93 +166,76 @@ func (s *EngagementService) CreateEngagement(tenantID, auditorID string, eng *Au
 	eng.CreatedAt = time.Now()
 	eng.UpdatedAt = time.Now()
 
-	s.engagements[eng.EngagementID] = eng
+	if err := s.engagements.put(tenantID, eng.EngagementID, eng); err != nil {
+		return nil, err
+	}
 	return eng, nil
 }
 
 // UpdateEngagement updates an engagement
 func (s *EngagementService) UpdateEngagement(eng *AuditEngagement) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.engagements[eng.EngagementID]
-	if !exists || existing.TenantID != eng.TenantID {
+	existing, err := s.engagements.get(eng.TenantID, eng.EngagementID)
+	if err != nil {
 		return errors.New("engagement not found")
 	}
 
 	eng.CreatedAt = existing.CreatedAt
 	eng.UpdatedAt = time.Now()
-	s.engagements[eng.EngagementID] = eng
-	return nil
+	return s.engagements.put(eng.TenantID, eng.EngagementID, eng)
 }
 
 // StartFieldwork starts fieldwork phase
 func (s *EngagementService) StartFieldwork(tenantID, engagementID string) (*AuditEngagement, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.engagements.update(tenantID, engagementID, func(eng *AuditEngagement) error {
+		if eng.Status != "planning" {
+			return errors.New("engagement is not in planning phase")
+		}
 
-	eng, exists := s.engagements[engagementID]
-	if !exists || eng.TenantID != tenantID {
-		return nil, errors.New("engagement not found")
-	}
+		eng.Status = "fieldwork"
+		eng.UpdatedAt = time.Now()
 
-	if eng.Status != "planning" {
-		return nil, errors.New("engagement is not in planning phase")
-	}
-
-	eng.Status = "fieldwork"
-	eng.UpdatedAt = time.Now()
-
-	return eng, nil
+		return nil
+	})
 }
 
 // StartReporting starts reporting phase
 func (s *EngagementService) StartReporting(tenantID, engagementID string) (*AuditEngagement, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.engagements.update(tenantID, engagementID, func(eng *AuditEngagement) error {
+		if eng.Status != "fieldwork" {
+			return errors.New("engagement is not in fieldwork phase")
+		}
 
-	eng, exists := s.engagements[engagementID]
-	if !exists || eng.TenantID != tenantID {
-		return nil, errors.New("engagement not found")
-	}
+		eng.Status = "reporting"
+		eng.UpdatedAt = time.Now()
 
-	if eng.Status != "fieldwork" {
-		return nil, errors.New("engagement is not in fieldwork phase")
-	}
-
-	eng.Status = "reporting"
-	eng.UpdatedAt = time.Now()
-
-	return eng, nil
+		return nil
+	})
 }
 
 // CloseEngagement closes an engagement
 func (s *EngagementService) CloseEngagement(tenantID, engagementID string) (*AuditEngagement, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.engagements.update(tenantID, engagementID, func(eng *AuditEngagement) error {
+		if eng.Status != "reporting" && eng.Status != "review" {
+			return errors.New("engagement cannot be closed from current status")
+		}
 
-	eng, exists := s.engagements[engagementID]
-	if !exists || eng.TenantID != tenantID {
-		return nil, errors.New("engagement not found")
-	}
+		eng.Status = "closed"
+		eng.UpdatedAt = time.Now()
 
-	if eng.Status != "reporting" && eng.Status != "review" {
-		return nil, errors.New("engagement cannot be closed from current status")
-	}
-
-	eng.Status = "closed"
-	eng.UpdatedAt = time.Now()
-
-	return eng, nil
+		return nil
+	})
 }
 
 // GetActiveEngagements returns active engagements
-func (s *EngagementService) GetActiveEngagements(tenantID string) []*AuditEngagement {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *EngagementService) GetActiveEngagements(tenantID string) ([]*AuditEngagement, error) {
 
 	var result []*AuditEngagement
-	for _, eng := range s.engagements {
+	__ALL__, __ERR__ := s.engagements.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, eng := range __ALL__ {
 		if eng.TenantID != tenantID {
 			continue
 		}
@@ -262,16 +243,14 @@ func (s *EngagementService) GetActiveEngagements(tenantID string) []*AuditEngage
 			result = append(result, eng)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // IncrementControlsTested increments controls tested count
 func (s *EngagementService) IncrementControlsTested(tenantID, engagementID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	eng, exists := s.engagements[engagementID]
-	if !exists || eng.TenantID != tenantID {
+	eng, err := s.engagements.get(tenantID, engagementID)
+	if err != nil {
 		return errors.New("engagement not found")
 	}
 
@@ -282,11 +261,9 @@ func (s *EngagementService) IncrementControlsTested(tenantID, engagementID strin
 
 // IncrementFindingsCount increments findings count
 func (s *EngagementService) IncrementFindingsCount(tenantID, engagementID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	eng, exists := s.engagements[engagementID]
-	if !exists || eng.TenantID != tenantID {
+	eng, err := s.engagements.get(tenantID, engagementID)
+	if err != nil {
 		return errors.New("engagement not found")
 	}
 

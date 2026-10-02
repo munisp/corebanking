@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls

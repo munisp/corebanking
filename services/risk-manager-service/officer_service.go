@@ -11,7 +11,7 @@ import (
 // OfficerService handles risk officer operations
 type OfficerService struct {
 	tenantID string
-	officers map[string]*RiskOfficer
+	officers *repo[RiskOfficer]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type OfficerService struct {
 func NewOfficerService(tenantID string) *OfficerService {
 	svc := &OfficerService{
 		tenantID: tenantID,
-		officers: make(map[string]*RiskOfficer),
+		officers: newRepo[RiskOfficer](serviceDB, "risk_officers"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewOfficerService(tenantID string) *OfficerService {
 
 func (s *OfficerService) initializeDefaultData(tenantID string) {
 	// Chief Risk Officer
-	s.officers["off-001"] = &RiskOfficer{
+	s.officers.seed(tenantID, "off-001", &RiskOfficer{
 		OfficerID:      "off-001",
 		TenantID:       tenantID,
 		EmployeeID:     "EMP-CRO-001",
@@ -40,10 +40,10 @@ func (s *OfficerService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-3, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Credit Risk Manager
-	s.officers["off-002"] = &RiskOfficer{
+	s.officers.seed(tenantID, "off-002", &RiskOfficer{
 		OfficerID:      "off-002",
 		TenantID:       tenantID,
 		EmployeeID:     "EMP-RM-001",
@@ -56,10 +56,10 @@ func (s *OfficerService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-2, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Market Risk Manager
-	s.officers["off-003"] = &RiskOfficer{
+	s.officers.seed(tenantID, "off-003", &RiskOfficer{
 		OfficerID:      "off-003",
 		TenantID:       tenantID,
 		EmployeeID:     "EMP-RM-002",
@@ -72,10 +72,10 @@ func (s *OfficerService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-2, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Operational Risk Manager
-	s.officers["off-004"] = &RiskOfficer{
+	s.officers.seed(tenantID, "off-004", &RiskOfficer{
 		OfficerID:      "off-004",
 		TenantID:       tenantID,
 		EmployeeID:     "EMP-RM-003",
@@ -88,10 +88,10 @@ func (s *OfficerService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-1, 6, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Senior Credit Risk Analyst
-	s.officers["off-005"] = &RiskOfficer{
+	s.officers.seed(tenantID, "off-005", &RiskOfficer{
 		OfficerID:      "off-005",
 		TenantID:       tenantID,
 		EmployeeID:     "EMP-RA-001",
@@ -104,10 +104,10 @@ func (s *OfficerService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Market Risk Analyst
-	s.officers["off-006"] = &RiskOfficer{
+	s.officers.seed(tenantID, "off-006", &RiskOfficer{
 		OfficerID:      "off-006",
 		TenantID:       tenantID,
 		EmployeeID:     "EMP-RA-002",
@@ -120,16 +120,18 @@ func (s *OfficerService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(0, -6, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 }
 
 // ListOfficers returns officers based on filters
-func (s *OfficerService) ListOfficers(tenantID, specialization string) []*RiskOfficer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OfficerService) ListOfficers(tenantID, specialization string) ([]*RiskOfficer, error) {
 
 	var result []*RiskOfficer
-	for _, officer := range s.officers {
+	__ALL__, __ERR__ := s.officers.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, officer := range __ALL__ {
 		if officer.TenantID != tenantID {
 			continue
 		}
@@ -138,16 +140,14 @@ func (s *OfficerService) ListOfficers(tenantID, specialization string) []*RiskOf
 		}
 		result = append(result, officer)
 	}
-	return result
+	return result, nil
 }
 
 // GetOfficer retrieves an officer by ID
 func (s *OfficerService) GetOfficer(tenantID, officerID string) (*RiskOfficer, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	officer, exists := s.officers[officerID]
-	if !exists || officer.TenantID != tenantID {
+	officer, err := s.officers.get(tenantID, officerID)
+	if err != nil {
 		return nil, errors.New("officer not found")
 	}
 	return officer, nil
@@ -155,8 +155,6 @@ func (s *OfficerService) GetOfficer(tenantID, officerID string) (*RiskOfficer, e
 
 // RegisterOfficer registers a new officer
 func (s *OfficerService) RegisterOfficer(tenantID string, officer *RiskOfficer) (*RiskOfficer, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	officer.OfficerID = uuid.New().String()
 	officer.TenantID = tenantID
@@ -164,22 +162,21 @@ func (s *OfficerService) RegisterOfficer(tenantID string, officer *RiskOfficer) 
 	officer.CreatedAt = time.Now()
 	officer.UpdatedAt = time.Now()
 
-	s.officers[officer.OfficerID] = officer
+	if err := s.officers.put(tenantID, officer.OfficerID, officer); err != nil {
+		return nil, err
+	}
 	return officer, nil
 }
 
 // UpdateOfficer updates an officer
 func (s *OfficerService) UpdateOfficer(officer *RiskOfficer) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.officers[officer.OfficerID]
-	if !exists || existing.TenantID != officer.TenantID {
+	existing, err := s.officers.get(officer.TenantID, officer.OfficerID)
+	if err != nil {
 		return errors.New("officer not found")
 	}
 
 	officer.CreatedAt = existing.CreatedAt
 	officer.UpdatedAt = time.Now()
-	s.officers[officer.OfficerID] = officer
-	return nil
+	return s.officers.put(officer.TenantID, officer.OfficerID, officer)
 }

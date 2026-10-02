@@ -1736,38 +1736,38 @@ func main() {
 	r.HandleFunc("/ready", handler.ReadyCheck).Methods("GET")
 
 	api := r.PathPrefix("/api/v1/esusu").Subrouter()
-	api.HandleFunc("/groups", handler.CreateGroup).Methods("POST")
-	api.HandleFunc("/groups", handler.ListGroups).Methods("GET")
-	api.HandleFunc("/groups/{id}", handler.GetGroup).Methods("GET")
-	api.HandleFunc("/groups/{id}/join", handler.JoinGroup).Methods("POST")
-	api.HandleFunc("/groups/{id}/start", handler.StartGroup).Methods("POST")
-	api.HandleFunc("/groups/{id}/contributions", handler.RecordContribution).Methods("POST")
-	api.HandleFunc("/groups/{id}/payout", handler.ProcessPayout).Methods("POST")
-	api.HandleFunc("/groups/{id}/analytics", handler.GetAnalytics).Methods("GET")
+	api.HandleFunc("/groups", permifyAuthzGuard("esusu_service", "create", handler.CreateGroup)).Methods("POST")
+	api.HandleFunc("/groups", permifyAuthzGuard("esusu_service", "view", handler.ListGroups)).Methods("GET")
+	api.HandleFunc("/groups/{id}", permifyAuthzGuard("esusu_service", "view", handler.GetGroup)).Methods("GET")
+	api.HandleFunc("/groups/{id}/join", permifyAuthzGuard("esusu_service", "join", handler.JoinGroup)).Methods("POST")
+	api.HandleFunc("/groups/{id}/start", permifyAuthzGuard("esusu_service", "start", handler.StartGroup)).Methods("POST")
+	api.HandleFunc("/groups/{id}/contributions", permifyAuthzGuard("esusu_service", "create", handler.RecordContribution)).Methods("POST")
+	api.HandleFunc("/groups/{id}/payout", permifyAuthzGuard("esusu_service", "payout", handler.ProcessPayout)).Methods("POST")
+	api.HandleFunc("/groups/{id}/analytics", permifyAuthzGuard("esusu_service", "view", handler.GetAnalytics)).Methods("GET")
 
 	// Meetings (cooperative society meetings)
-	api.HandleFunc("/groups/{id}/meetings", handler.ListMeetings).Methods("GET")
-	api.HandleFunc("/groups/{id}/meetings", handler.CreateMeeting).Methods("POST")
-	api.HandleFunc("/groups/{id}/meetings/stats", handler.GetMeetingStats).Methods("GET")
+	api.HandleFunc("/groups/{id}/meetings", permifyAuthzGuard("esusu_service", "view", handler.ListMeetings)).Methods("GET")
+	api.HandleFunc("/groups/{id}/meetings", permifyAuthzGuard("esusu_service", "create", handler.CreateMeeting)).Methods("POST")
+	api.HandleFunc("/groups/{id}/meetings/stats", permifyAuthzGuard("esusu_service", "view", handler.GetMeetingStats)).Methods("GET")
 
 	// Financials (aggregated from contributions + payouts)
-	api.HandleFunc("/groups/{id}/financials", handler.GetFinancials).Methods("GET")
+	api.HandleFunc("/groups/{id}/financials", permifyAuthzGuard("esusu_service", "view", handler.GetFinancials)).Methods("GET")
 
 	// Credit scoring (derived from member AI profiles)
-	api.HandleFunc("/groups/{id}/credit-scores", handler.GetCreditScores).Methods("GET")
+	api.HandleFunc("/groups/{id}/credit-scores", permifyAuthzGuard("esusu_service", "view", handler.GetCreditScores)).Methods("GET")
 
 	// Management records (decisions, disputes, policy changes)
-	api.HandleFunc("/groups/{id}/management", handler.ListManagement).Methods("GET")
-	api.HandleFunc("/groups/{id}/management", handler.CreateManagementRecord).Methods("POST")
+	api.HandleFunc("/groups/{id}/management", permifyAuthzGuard("esusu_service", "view", handler.ListManagement)).Methods("GET")
+	api.HandleFunc("/groups/{id}/management", permifyAuthzGuard("esusu_service", "management", handler.CreateManagementRecord)).Methods("POST")
 
 	// Penalties (late/missed payment enforcement)
-	api.HandleFunc("/groups/{id}/penalties", handler.ListPenalties).Methods("GET")
-	api.HandleFunc("/groups/{id}/penalties", handler.CreatePenalty).Methods("POST")
-	api.HandleFunc("/groups/{id}/penalties/{penaltyId}", handler.UpdatePenaltyStatus).Methods("PUT")
+	api.HandleFunc("/groups/{id}/penalties", permifyAuthzGuard("esusu_service", "view", handler.ListPenalties)).Methods("GET")
+	api.HandleFunc("/groups/{id}/penalties", permifyAuthzGuard("esusu_service", "create", handler.CreatePenalty)).Methods("POST")
+	api.HandleFunc("/groups/{id}/penalties/{penaltyId}", permifyAuthzGuard("esusu_service", "update", handler.UpdatePenaltyStatus)).Methods("PUT")
 
 	// Rotation schedule
-	api.HandleFunc("/groups/{id}/rotation", handler.GetRotation).Methods("GET")
-	api.HandleFunc("/groups/{id}/rotation", handler.SetRotation).Methods("POST")
+	api.HandleFunc("/groups/{id}/rotation", permifyAuthzGuard("esusu_service", "view", handler.GetRotation)).Methods("GET")
+	api.HandleFunc("/groups/{id}/rotation", permifyAuthzGuard("esusu_service", "rotation", handler.SetRotation)).Methods("POST")
 
 	portEnv := os.Getenv("PORT")
 	if portEnv == "" {

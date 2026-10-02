@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
 use sha2::{Digest, Sha256};
+use std::time::Instant;
+use actix_web::HttpMessage;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -139,10 +141,11 @@ async fn process_batch(
     state: web::Data<AppState>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "transfer", "create").await { return resp; } // W12-B5D1
 
     let auth = req
         .headers()
@@ -388,10 +391,11 @@ async fn retry_failed(
     state: web::Data<AppState>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "transfer", "create").await { return resp; } // W12-B5D1
     let batch_id = path.into_inner();
     let db = match &state.db_client {
         Some(c) => c.clone(),
@@ -576,6 +580,7 @@ async fn get_batch(
 /// x-maker-checker-approval-id header.
 async fn not_implemented(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "transfer", "approve").await { return resp; } // W12-B5D1
     HttpResponse::NotImplemented().json(json!({
         "error": "not_implemented",
         "detail": "batch approve/cancel workflow is not implemented; batch maker-checker is enforced in POST /v1/bulk-payments via x-maker-checker-approval-id"
@@ -588,10 +593,11 @@ async fn not_implemented(req: actix_web::HttpRequest) -> HttpResponse {
 /// or 404. The previous implementation ignored batch state and returned
 /// compute_batch_hash() of caller-supplied amounts — deleted as fiction.
 async fn batch_status(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "transfer", "view").await { return resp; } // W12-B5D1
     let input = body.into_inner();
     let batch_id = match input.get("batch_id").and_then(|v| v.as_str()) {
         Some(b) if !b.is_empty() => b.to_string(),
@@ -633,10 +639,11 @@ async fn batch_status(req: actix_web::HttpRequest, state: web::Data<AppState>, b
 }
 
 async fn generate_return_file(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger", "report").await { return resp; } // W12-B5D1
     let input = body.into_inner();
     let total = input.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let successful = input.get("successful").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -699,8 +706,6 @@ async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpR
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -958,7 +963,7 @@ async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
@@ -1020,21 +1025,58 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:bulk-payments-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:bulk-payments-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 #[actix_web::main]
@@ -1142,6 +1184,7 @@ async fn main() -> std::io::Result<()> {
 
 /// create_record — POST /api/v1/payments (generic record intake).
 async fn create_record(state: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = permify::require_permify(&req, "payment_order", "create").await { return resp; } // W12-B5D1
     let id = uuid::Uuid::new_v4().to_string();
     let status = body.status.clone().unwrap_or_else(|| "active".to_string());
     let tenant = body.tenant_id.clone().unwrap_or_default();
@@ -1212,6 +1255,7 @@ mod tests {
 // tokio_postgres client against service_records, fail-closed without Postgres.
 async fn update_record(state: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "payment_order", "update").await { return resp; } // W12-B5D1
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
@@ -1232,6 +1276,7 @@ async fn update_record(state: web::Data<AppState>, path: web::Path<String>, body
 
 async fn delete_record(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "payment_order", "delete").await { return resp; } // W12-B5D1
     let id = path.into_inner();
     match &state.db_client {
         Some(client) => {
@@ -1247,3 +1292,6 @@ async fn delete_record(state: web::Data<AppState>, path: web::Path<String>, req:
         None => HttpResponse::ServiceUnavailable().json(json!({"error": "store_unavailable", "detail": "postgres not connected"})),
     }
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

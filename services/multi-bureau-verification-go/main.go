@@ -212,8 +212,18 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if db == nil {
+		bureauStoreUnavailable(w)
+		return
+	}
+	bureauList, err := dbListBureaus()
+	if err != nil {
+		log.Printf("[%s] bureau list failed: %v", serviceName, err)
+		bureauStoreUnavailable(w)
+		return
+	}
 	results := []VerificationResult{}
-	for _, b := range bureaus {
+	for _, b := range bureauList {
 		if b.Status != "down" {
 			results = append(results, simulateBureauCheck(b, idNumber))
 		}
@@ -247,10 +257,11 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:       time.Now().Format(time.RFC3339),
 	}
 
-	mu.Lock()
-	checks = append(checks, check)
-	stats["totalChecks"] = len(checks)
-	mu.Unlock()
+	if err := dbInsertCheck(&check); err != nil {
+		log.Printf("[%s] bureau check insert failed: %v", serviceName, err)
+		bureauStoreUnavailable(w)
+		return
+	}
 
 	dbData, _ := json.Marshal(map[string]string{"service": "multi_bureau_verification_go", "action": "create"})
 	if dbErr := dbInsert(fmt.Sprintf("multi_bureau_verification_go-%d", time.Now().UnixNano()), "multi_bureau_verification_go", "default", "active", dbData); dbErr != nil {
@@ -268,16 +279,34 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleBureaus(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		bureauStoreUnavailable(w)
+		return
+	}
+	bureauList, err := dbListBureaus()
+	if err != nil {
+		log.Printf("[%s] bureau list failed: %v", serviceName, err)
+		bureauStoreUnavailable(w)
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
-		"bureaus": bureaus, "total": len(bureaus),
+		"bureaus": bureauList, "total": len(bureauList),
 	})
 }
 
 func handleChecks(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	if db == nil {
+		bureauStoreUnavailable(w)
+		return
+	}
+	checkList, err := dbListChecks()
+	if err != nil {
+		log.Printf("[%s] check list failed: %v", serviceName, err)
+		bureauStoreUnavailable(w)
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
-		"checks": checks, "total": len(checks),
+		"checks": checkList, "total": len(checkList),
 	})
 }
 
@@ -414,7 +443,114 @@ func initDB() {
 		db = nil
 		return
 	}
+	// W12 C3-P2-B5: bureau registry + verification checks → PG (were in-memory
+	// slices). NOTE (PII): bureau_checks rows carry identity-document numbers
+	// (BVN/NIN class) — rely on cluster encryption-at-rest; retention/purge is
+	// owned by the data-lifecycle policy, not this service.
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS bureaus (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		provider TEXT NOT NULL DEFAULT '',
+		endpoint TEXT NOT NULL DEFAULT '',
+		id_type TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'active',
+		avg_response_ms INT NOT NULL DEFAULT 0,
+		uptime_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[%s] bureaus DDL failed: %v — endpoints fail closed (503)", serviceName, err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS bureau_checks (
+		id TEXT PRIMARY KEY,
+		customer_id TEXT NOT NULL DEFAULT '',
+		id_number TEXT NOT NULL DEFAULT '',
+		id_type TEXT NOT NULL DEFAULT '',
+		bureaus_queried INT NOT NULL DEFAULT 0,
+		bureaus_verified INT NOT NULL DEFAULT 0,
+		consensus_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+		overall_status TEXT NOT NULL DEFAULT '',
+		results JSONB NOT NULL DEFAULT '[]',
+		name_consistent BOOLEAN NOT NULL DEFAULT FALSE,
+		dob_consistent BOOLEAN NOT NULL DEFAULT FALSE,
+		created_at TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		log.Printf("[%s] bureau_checks DDL failed: %v — endpoints fail closed (503)", serviceName, err)
+		db = nil
+		return
+	}
+	// Idempotent boot seeds (previously the in-memory fixtures).
+	for _, b := range bureaus {
+		if _, err = db.Exec(`INSERT INTO bureaus (id, name, provider, endpoint, id_type, status, avg_response_ms, uptime_pct)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+			b.ID, b.Name, b.Provider, b.Endpoint, b.IDType, b.Status, b.AvgMs, b.Uptime); err != nil {
+			log.Printf("[%s] bureau seed failed: %v — endpoints fail closed (503)", serviceName, err)
+			db = nil
+			return
+		}
+	}
 	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+}
+
+func bureauStoreUnavailable(w http.ResponseWriter) {
+	respondJSON(w, 503, map[string]string{"error": "bureau store unavailable (postgres down)"})
+}
+
+// dbListBureaus serves the bureau registry from Postgres.
+func dbListBureaus() ([]Bureau, error) {
+	rows, err := db.Query(`SELECT id, name, provider, endpoint, id_type, status, avg_response_ms, uptime_pct FROM bureaus ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Bureau{}
+	for rows.Next() {
+		var b Bureau
+		if err := rows.Scan(&b.ID, &b.Name, &b.Provider, &b.Endpoint, &b.IDType, &b.Status, &b.AvgMs, &b.Uptime); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// dbInsertCheck persists one multi-bureau verification (idempotent on id).
+func dbInsertCheck(c *MultiBureauCheck) error {
+	res, err := json.Marshal(c.Results)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO bureau_checks (id, customer_id, id_number, id_type, bureaus_queried, bureaus_verified,
+		consensus_score, overall_status, results, name_consistent, dob_consistent, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING`,
+		c.ID, c.CustomerID, c.IDNumber, c.IDType, c.BureausQueried, c.BureausVerified,
+		c.ConsensusScore, c.OverallStatus, res, c.NameConsistent, c.DOBConsistent, c.CreatedAt)
+	return err
+}
+
+// dbListChecks serves verification history from Postgres.
+func dbListChecks() ([]MultiBureauCheck, error) {
+	rows, err := db.Query(`SELECT id, customer_id, id_number, id_type, bureaus_queried, bureaus_verified,
+		consensus_score, overall_status, results, name_consistent, dob_consistent, created_at
+		FROM bureau_checks ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []MultiBureauCheck{}
+	for rows.Next() {
+		var c MultiBureauCheck
+		var res []byte
+		if err := rows.Scan(&c.ID, &c.CustomerID, &c.IDNumber, &c.IDType, &c.BureausQueried, &c.BureausVerified,
+			&c.ConsensusScore, &c.OverallStatus, &res, &c.NameConsistent, &c.DOBConsistent, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		c.Results = []VerificationResult{}
+		_ = json.Unmarshal(res, &c.Results)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -991,8 +1127,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1000,10 +1143,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
+		"service_configs.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1040,7 +1193,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1048,25 +1208,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
+		"service_configs.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+		"service_configs.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1367,15 +1556,15 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "initiate", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "initiate", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/multi-bureau/verify", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleVerify)))
-	mux.Handle("/v1/multi-bureau/bureaus", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBureaus)))
-	mux.Handle("/v1/multi-bureau/checks", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleChecks)))
-	mux.Handle("/v1/multi-bureau/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/multi-bureau-verification/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(multi_bureau_verificationScoreHandler)))
-	mux.Handle("/v1/multi-bureau-verification/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(multi_bureau_verificationValidateRequestHandler)))
+	mux.Handle("/v1/multi-bureau/verify", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "verify", http.HandlerFunc(handleVerify))))
+	mux.Handle("/v1/multi-bureau/bureaus", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "verify", http.HandlerFunc(handleBureaus))))
+	mux.Handle("/v1/multi-bureau/checks", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "verify", http.HandlerFunc(handleChecks))))
+	mux.Handle("/v1/multi-bureau/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "initiate", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/multi-bureau-verification/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "verify", http.HandlerFunc(multi_bureau_verificationScoreHandler))))
+	mux.Handle("/v1/multi-bureau-verification/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("identity_verification", "verify", http.HandlerFunc(multi_bureau_verificationValidateRequestHandler))))
 	log.Printf("Multi-Bureau Verification v2.0 (Go) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

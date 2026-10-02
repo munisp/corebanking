@@ -8,6 +8,16 @@
  * and checks idempotency keys before processing mutations.
  */
 
+import { kvGetJson, kvSetJson } from "./redisKv";
+// W12-C3-P2-MLIB (c3-0996): the platform notification registry was module
+// process memory (a restart silently dropped operational notifications).
+// Now Postgres-authoritative (table `platform_notifications`) via
+// lib/pgJsonStore.ts; fail-closed 503 on PG outage, no degraded-memory
+// fallback. (Only the notifications store is converted here — the redis-backed
+// circuit-breaker/idempotency state is W12-C3-P1-B2's region.)
+import { ensureTables, storeDDL, storeInsert, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
 interface CircuitBreakerEntry {
   service: string;
   state: "closed" | "open" | "half_open";
@@ -44,12 +54,19 @@ const inProcessBreakers = new Map<string, {
   cooldownMs: number;
 }>();
 
-// In-process idempotency store (used when Go service is unavailable)
-const idempotencyStore = new Map<string, {
+// Idempotency store — redis-backed (W12 C3-P1-B2, c3-1034).
+// Key (register pattern): idem:{tenant}:{key}, TTL 86400s (24h, per register;
+// supersedes the previous 1h in-memory expiry so duplicate submissions are
+// caught for a full day, including across restarts and replicas — previously
+// a restart silently forgot processed idempotency keys, enabling duplicate
+// financial operations).
+// FAIL MODE: redis down => checkIdempotency/storeIdempotency throw and
+// callers must fail closed — an idempotency check is never silently skipped.
+interface CachedIdemResponse {
   statusCode: number;
   response: unknown;
-  expiresAt: number;
-}>();
+}
+const IDEMPOTENCY_TTL_SECONDS = 86400; // 24h per register
 
 function getOrCreateBreaker(service: string) {
   if (!inProcessBreakers.has(service)) {
@@ -93,27 +110,16 @@ function recordSuccess(service: string): void {
   cb.state = "closed";
 }
 
-function checkIdempotency(key: string): { duplicate: boolean; cached?: { statusCode: number; response: unknown } } {
-  const entry = idempotencyStore.get(key);
+async function checkIdempotency(key: string, tenant = "platform"): Promise<{ duplicate: boolean; cached?: { statusCode: number; response: unknown } }> {
+  const entry = await kvGetJson<CachedIdemResponse>(`idem:${tenant}:${key}`);
   if (!entry) return { duplicate: false };
-  if (entry.expiresAt < Date.now()) {
-    idempotencyStore.delete(key);
-    return { duplicate: false };
-  }
   return { duplicate: true, cached: { statusCode: entry.statusCode, response: entry.response } };
 }
 
-function storeIdempotency(key: string, statusCode: number, response: unknown): void {
-  idempotencyStore.set(key, { statusCode, response, expiresAt: Date.now() + 3600000 });
+async function storeIdempotency(key: string, statusCode: number, response: unknown, tenant = "platform"): Promise<void> {
+  const entry: CachedIdemResponse = { statusCode, response };
+  await kvSetJson(`idem:${tenant}:${key}`, entry, IDEMPOTENCY_TTL_SECONDS);
 }
-
-// Clean up expired keys every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  Array.from(idempotencyStore.entries()).forEach(([key, val]) => {
-    if (val.expiresAt < now) idempotencyStore.delete(key);
-  });
-}, 300000);
 
 // ── Seeded dashboard data for the PWA ──
 
@@ -186,14 +192,16 @@ export function registerCircuitBreakerGateway(app: any) {
   });
 
   // Notification endpoints
-  app.get("/api/platform/notifications", (_req: any, res: any) => {
+  app.get("/api/platform/notifications", asyncRoute(async (_req: any, res: any) => {
+    const notifications = await pgGuard(loadNotifications());
     res.json({ items: notifications, total: notifications.length });
-  });
+  }));
 
-  app.get("/api/platform/notifications/stats", (_req: any, res: any) => {
+  app.get("/api/platform/notifications/stats", asyncRoute(async (_req: any, res: any) => {
+    const notifications = await pgGuard(loadNotifications());
     const unread = notifications.filter(n => !n.read).length;
     res.json({ total: notifications.length, unread, channels: 6, escalationRules: 2 });
-  });
+  }));
 
   // Retry policies
   app.get("/api/platform/retry-policies", (_req: any, res: any) => {
@@ -238,7 +246,8 @@ const errorCatalog = [
   { id: "E-010", code: "TB_001", domain: "tigerbeetle", message: "Balance assertion failed", severity: "critical", category: "permanent", httpStatus: 500, retryable: false, remedy: "GL reconciliation" },
 ];
 
-const notifications = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const NOTIFICATIONS_SEED = [
   { id: "NF-001", type: "circuit_breaker_trip", channel: "push", title: "Circuit Breaker Tripped: nibss-gateway-go", severity: "critical", sentAt: new Date().toISOString(), read: false },
   { id: "NF-002", type: "error_spike", channel: "in_app", title: "Error Spike: 98 rate-limit hits", severity: "warning", sentAt: new Date().toISOString(), read: false },
   { id: "NF-003", type: "security_alert", channel: "sms", title: "Geo-fence violation blocked", severity: "critical", sentAt: new Date().toISOString(), read: true },
@@ -246,6 +255,19 @@ const notifications = [
   { id: "NF-005", type: "system_recovery", channel: "in_app", title: "Redis cache recovered", severity: "info", sentAt: new Date().toISOString(), read: true },
   { id: "NF-006", type: "compliance", channel: "email", title: "CBN Report Due: Q2 2026 eFASS", severity: "warning", sentAt: new Date().toISOString(), read: false },
 ];
+
+type PlatformNotification = (typeof NOTIFICATIONS_SEED)[number];
+
+const NOTIFICATIONS_TABLE = "platform_notifications";
+
+async function ensureNotificationStore(): Promise<void> {
+  await ensureTables("circuitBreakerGateway.notifications", storeDDL(NOTIFICATIONS_TABLE));
+  await storeSeed(NOTIFICATIONS_TABLE, NOTIFICATIONS_SEED, () => "");
+}
+
+async function loadNotifications(): Promise<PlatformNotification[]> {
+  await ensureNotificationStore(); return storeList<PlatformNotification>(NOTIFICATIONS_TABLE);
+}
 
 const retryPolicies = [
   { id: "RP-001", name: "Default API", maxRetries: 3, baseDelayMs: 1000, maxDelayMs: 30000, backoffMultiplier: 2.0, jitter: true },

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // APIKeyScope represents the scope/permissions of an API key
@@ -153,25 +155,17 @@ type APIKeySecurityManager struct {
 	db           *sql.DB
 	config       APIKeyConfig
 	tenantConfig map[string]APIKeyConfig
-	rateLimiter  map[string]*RateLimiter
 	mu           sync.RWMutex
 
-	// keyCache: short-TTL validation cache keyed by keyHash, including
-	// negative entries (GPT-25). Revocation/rotation propagate within
-	// apiKeyCacheTTL.
-	keyCache   map[string]apiKeyCacheEntry
-	keyCacheMu sync.RWMutex
+	// Rate limiting moved to a redis Lua token bucket (c3-0762,
+	// `ratelimit:apikey:{keyID}`); the validation cache moved to redis
+	// (c3-0763, `apikey:cache:{keyHash}` read-through incl. negative
+	// entries, apiKeyCacheTTL PRESERVED at 30s). See redis_store.go.
 
 	// usageCh buffers per-request usage updates for async batched writes
 	// (GPT-26); stopCh terminates background goroutines (GPT-39).
 	usageCh chan usageUpdate
 	stopCh  chan struct{}
-}
-
-// apiKeyCacheEntry caches one validated key record (nil key = negative entry).
-type apiKeyCacheEntry struct {
-	key       *APIKey
-	expiresAt time.Time
 }
 
 // usageUpdate is one buffered last-used/usage-count update.
@@ -181,21 +175,13 @@ type usageUpdate struct {
 }
 
 const (
-	apiKeyCacheTTL        = 30 * time.Second
-	apiKeyCacheMaxEntries = 10000
-	usageBatchSize        = 200
-	usageFlushInterval    = 5 * time.Second
-	maxRateLimiters       = 50000
+	// apiKeyCacheTTL is the redis validation-cache TTL. DEVIATION from the
+	// remediation register (which said 60s): 30s is PRESERVED from the
+	// in-memory cache because it bounds revocation/rotation propagation.
+	apiKeyCacheTTL     = 30 * time.Second
+	usageBatchSize     = 200
+	usageFlushInterval = 5 * time.Second
 )
-
-// RateLimiter implements a token bucket rate limiter
-type RateLimiter struct {
-	tokens     float64
-	maxTokens  float64
-	refillRate float64
-	lastRefill time.Time
-	mu         sync.Mutex
-}
 
 // NewAPIKeySecurityManager creates a new API key security manager
 func NewAPIKeySecurityManager(db *sql.DB) *APIKeySecurityManager {
@@ -203,8 +189,6 @@ func NewAPIKeySecurityManager(db *sql.DB) *APIKeySecurityManager {
 		db:           db,
 		config:       DefaultAPIKeyConfig,
 		tenantConfig: make(map[string]APIKeyConfig),
-		rateLimiter:  make(map[string]*RateLimiter),
-		keyCache:     make(map[string]apiKeyCacheEntry),
 		usageCh:      make(chan usageUpdate, 4096),
 		stopCh:       make(chan struct{}),
 	}
@@ -396,18 +380,80 @@ func (aksm *APIKeySecurityManager) loadTenantConfigs() {
 	}
 }
 
+// loadTenantConfigFromDB reads one tenant config from Postgres (the
+// authoritative store) and refreshes the read-through cache on hit.
+// W12-C3-PX (c3-0761).
+func (aksm *APIKeySecurityManager) loadTenantConfigFromDB(tenantID string) (APIKeyConfig, bool) {
+	if aksm.db == nil {
+		return APIKeyConfig{}, false
+	}
+	var configJSON []byte
+	err := aksm.db.QueryRow(`SELECT config FROM api_key_config WHERE tenant_id = $1`, tenantID).Scan(&configJSON)
+	if err != nil {
+		return APIKeyConfig{}, false
+	}
+	var config APIKeyConfig
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		return APIKeyConfig{}, false
+	}
+	aksm.mu.Lock()
+	aksm.tenantConfig[tenantID] = config
+	aksm.mu.Unlock()
+	return config, true
+}
+
 // GetConfig returns the applicable API key config
 func (aksm *APIKeySecurityManager) GetConfig(tenantID string) APIKeyConfig {
 	aksm.mu.RLock()
-	defer aksm.mu.RUnlock()
-
 	if tenantID != "" {
 		if config, ok := aksm.tenantConfig[tenantID]; ok {
+			aksm.mu.RUnlock()
+			return config
+		}
+	}
+	aksm.mu.RUnlock()
+
+	// W12-C3-PX (c3-0761): PG read-through on cache miss so configs written
+	// after boot (by SetTenantConfig or peer replicas) are honored without a
+	// restart. The map is only a read-through cache; PG is authoritative.
+	if tenantID != "" {
+		if config, ok := aksm.loadTenantConfigFromDB(tenantID); ok {
 			return config
 		}
 	}
 
 	return aksm.config
+}
+
+// SetTenantConfig upserts a tenant's API key config Postgres-first, then
+// refreshes the in-memory read-through cache. W12-C3-PX (c3-0761): previously
+// tenantConfig had no write path at all (boot-hydrate only), so runtime config
+// CRUD was impossible without direct SQL.
+func (aksm *APIKeySecurityManager) SetTenantConfig(tenantID string, config APIKeyConfig) error {
+	if aksm.db == nil {
+		return fmt.Errorf("persistence_unavailable: database is not configured")
+	}
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	_, err = aksm.db.Exec(`
+		INSERT INTO api_key_config (tenant_id, config)
+		VALUES ($1, $2)
+		ON CONFLICT (tenant_id) DO UPDATE SET
+			config = EXCLUDED.config,
+			updated_at = CURRENT_TIMESTAMP
+	`, tenantID, configJSON)
+	if err != nil {
+		return err
+	}
+
+	aksm.mu.Lock()
+	aksm.tenantConfig[tenantID] = config
+	aksm.mu.Unlock()
+
+	return nil
 }
 
 // GenerateAPIKey generates a new API key
@@ -641,15 +687,20 @@ func (aksm *APIKeySecurityManager) ValidateAPIKey(key, ipAddress string, require
 	return result, nil
 }
 
-// lookupKey resolves a keyHash to an APIKey record, backed by a short-TTL
-// cache including negative entries (GPT-25). Errors are never cached.
+// lookupKey resolves a keyHash to an APIKey record, backed by the redis
+// read-through cache `apikey:cache:{keyHash}` including negative ("null")
+// entries (GPT-25, c3-0763). TTL 30s PRESERVED. Errors are never cached; on
+// cache outage we fall through to Postgres.
 func (aksm *APIKeySecurityManager) lookupKey(keyHash string) (*APIKey, bool, error) {
-	now := time.Now()
-	aksm.keyCacheMu.RLock()
-	e, ok := aksm.keyCache[keyHash]
-	aksm.keyCacheMu.RUnlock()
-	if ok && now.Before(e.expiresAt) {
-		return e.key, e.key != nil, nil
+	cacheKey := "apikey:cache:" + keyHash
+	if raw, err := getRedisClient().Get(redisCtx, cacheKey).Result(); err == nil {
+		var cached *APIKey
+		if uerr := json.Unmarshal([]byte(raw), &cached); uerr == nil {
+			return cached, cached != nil, nil
+		}
+		// undecodable entry: treat as a miss and reload from the DB
+	} else if err != redis.Nil {
+		log.Printf("api-key validation cache unavailable (falling through to DB): %v", err)
 	}
 
 	var apiKey APIKey
@@ -694,76 +745,32 @@ func (aksm *APIKeySecurityManager) lookupKey(keyHash string) (*APIKey, bool, err
 		keyPtr = &apiKey
 	}
 
-	aksm.keyCacheMu.Lock()
-	if len(aksm.keyCache) >= apiKeyCacheMaxEntries {
-		for k, v := range aksm.keyCache { // evict expired first
-			if now.After(v.expiresAt) {
-				delete(aksm.keyCache, k)
-			}
-		}
-		if len(aksm.keyCache) >= apiKeyCacheMaxEntries { // still full: drop one
-			for k := range aksm.keyCache {
-				delete(aksm.keyCache, k)
-				break
-			}
+	// Populate the redis cache (a nil keyPtr marshals to "null" — the
+	// negative entry). Errors are never cached; cache write failures are
+	// logged only and the next read simply falls through to the DB again.
+	if data, merr := json.Marshal(keyPtr); merr == nil {
+		if err := getRedisClient().Set(redisCtx, cacheKey, data, apiKeyCacheTTL).Err(); err != nil {
+			log.Printf("api-key validation cache SET failed (key %s...): %v", keyHash[:8], err)
 		}
 	}
-	aksm.keyCache[keyHash] = apiKeyCacheEntry{key: keyPtr, expiresAt: now.Add(apiKeyCacheTTL)}
-	aksm.keyCacheMu.Unlock()
 
 	return keyPtr, keyPtr != nil, nil
 }
 
 func (aksm *APIKeySecurityManager) checkRateLimit(keyID string, rateLimit, burstLimit int) (bool, int) {
-	aksm.mu.Lock()
-	limiter, exists := aksm.rateLimiter[keyID]
-	if !exists {
-		if len(aksm.rateLimiter) >= maxRateLimiters {
-			// Hard cap: evict the least-recently-active limiter (GPT-27).
-			var oldestKey string
-			var oldestTime time.Time
-			first := true
-			for id, l := range aksm.rateLimiter {
-				l.mu.Lock()
-				lr := l.lastRefill
-				l.mu.Unlock()
-				if first || lr.Before(oldestTime) {
-					first = false
-					oldestKey, oldestTime = id, lr
-				}
-			}
-			delete(aksm.rateLimiter, oldestKey)
-		}
-		limiter = &RateLimiter{
-			tokens:     float64(burstLimit),
-			maxTokens:  float64(burstLimit),
-			refillRate: float64(rateLimit) / 60.0, // tokens per second
-			lastRefill: time.Now(),
-		}
-		aksm.rateLimiter[keyID] = limiter
+	// Redis Lua token bucket (c3-0762): identical refill math to the retired
+	// in-memory limiter (rateLimit/60 tokens per second, capped at
+	// burstLimit), bucket PEXPIRE 60s. This is PURE rate limiting, so it
+	// FAILS OPEN (logged): a redis outage must not take down API-key
+	// authentication itself.
+	res, err := apiKeyRateLimitScript.Run(redisCtx, getRedisClient(),
+		[]string{"ratelimit:apikey:" + keyID},
+		float64(rateLimit)/60.0, burstLimit, time.Now().UnixMilli()).IntSlice()
+	if err != nil || len(res) != 2 {
+		log.Printf("api-key rate limiter unavailable for key %s — FAIL-OPEN (allowing request): %v", keyID, err)
+		return false, -1
 	}
-	aksm.mu.Unlock()
-
-	limiter.mu.Lock()
-	defer limiter.mu.Unlock()
-
-	// Refill tokens
-	now := time.Now()
-	elapsed := now.Sub(limiter.lastRefill).Seconds()
-	limiter.tokens += elapsed * limiter.refillRate
-	if limiter.tokens > limiter.maxTokens {
-		limiter.tokens = limiter.maxTokens
-	}
-	limiter.lastRefill = now
-
-	// Check if we have tokens
-	if limiter.tokens < 1 {
-		return true, 0
-	}
-
-	// Consume a token
-	limiter.tokens--
-	return false, int(limiter.tokens)
+	return res[0] == 1, int(res[1])
 }
 
 // LogAPIKeyUsage logs an API key usage event
@@ -794,10 +801,10 @@ func (aksm *APIKeySecurityManager) RevokeAPIKey(keyID, revokedBy, reason string)
 		return fmt.Errorf("API key not found or already revoked")
 	}
 
-	// Clear rate limiter
-	aksm.mu.Lock()
-	delete(aksm.rateLimiter, keyID)
-	aksm.mu.Unlock()
+	// Clear the redis rate-limit bucket for the revoked key (c3-0762).
+	if err := getRedisClient().Del(redisCtx, "ratelimit:apikey:"+keyID).Err(); err != nil {
+		log.Printf("failed to clear rate-limit bucket for revoked key %s: %v", keyID, err)
+	}
 
 	return nil
 }
@@ -1094,16 +1101,8 @@ func (aksm *APIKeySecurityManager) backgroundCleanup() {
 			WHERE window_start < NOW() - INTERVAL '1 hour'
 		`)
 
-		// Clean up in-memory rate limiters for inactive keys
-		aksm.mu.Lock()
-		for keyID, limiter := range aksm.rateLimiter {
-			limiter.mu.Lock()
-			if time.Since(limiter.lastRefill) > 1*time.Hour {
-				delete(aksm.rateLimiter, keyID)
-			}
-			limiter.mu.Unlock()
-		}
-		aksm.mu.Unlock()
+		// NOTE (c3-0762): the 1-hour in-memory rate-limiter janitor was
+		// removed — redis buckets self-expire via PEXPIRE 60s.
 	}
 }
 

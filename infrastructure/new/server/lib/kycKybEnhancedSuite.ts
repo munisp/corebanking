@@ -8,8 +8,20 @@
  * Phase 5: Adverse Media, Corporate Monitoring, Data Quality, eFASS Returns
  *
  * 22 new polyglot microservices (8 Go, 6 Rust, 8 Python) with full 14-middleware integration.
+ *
+ * W12-C3-P2-MLIB (c3-0983/0984): the 'customerTiers' and 'txnAlerts' stores
+ * were module process memory (lost on restart, divergent across replicas).
+ * They are now Postgres-authoritative (tables `kyc_customer_tiers`,
+ * `kyc_txn_alerts`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at
+ * first use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the
+ * request (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
+ * The remaining collections in this file are static reference/seed data
+ * (tier definitions, monitoring rules, sanctions list metadata, etc.) and are
+ * not part of c3-0983/0984.
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
 
 // ── Phase 1: CBN Tiered KYC ──
 
@@ -30,7 +42,7 @@ const tierDefinitions: TierDefinition[] = [
   { tier: 3, name: "Tier 3 - High Value", dailyLimitNGN: Number.MAX_SAFE_INTEGER, singleTxLimitNGN: Number.MAX_SAFE_INTEGER, foreignTransferAllowed: true, requirements: ["BVN", "NIN", "Photo ID", "Address verification", "Biometric", "EDD"] },
 ];
 
-const customerTiers: CustomerTier[] = [
+const CUSTOMER_TIERS_SEED: CustomerTier[] = [
   { id: "CT-001", customerId: "CUS-1045", customerName: "Amina Yusuf", bvn: "22345678901", currentTier: 3, tierName: "Tier 3 - High Value", dailyLimitNGN: Number.MAX_SAFE_INTEGER, dailyUsedNGN: 2500000, evaluationScore: 98.5, status: "active", riskFlags: [] },
   { id: "CT-002", customerId: "CUS-2089", customerName: "Chinedu Okeke", bvn: "33456789012", currentTier: 2, tierName: "Tier 2 - Medium Value", dailyLimitNGN: 5000000, dailyUsedNGN: 1200000, evaluationScore: 72, status: "active", riskFlags: ["NIN_NOT_LINKED"] },
   { id: "CT-003", customerId: "CUS-3021", customerName: "Oluwaseun Adeyemi", bvn: "44567890123", currentTier: 1, tierName: "Tier 1 - Low Value", dailyLimitNGN: 300000, dailyUsedNGN: 250000, evaluationScore: 35, status: "active", riskFlags: ["TIER1_NEAR_DAILY_LIMIT"] },
@@ -97,7 +109,7 @@ const monitoringRules: MonitoringRule[] = [
   { id: "MR-008", name: "Velocity Spike", category: "velocity", scenarioCode: "INT-001", riskScoreImpact: 60, enabled: true, cbnPrescribed: false },
 ];
 
-const txnAlerts: TxnAlert[] = [
+const TXN_ALERTS_SEED: TxnAlert[] = [
   { id: "TA-001", customerId: "CUS-8001", ruleName: "Structuring Detection", riskScore: 92, status: "sar_filed", sarRecommended: true },
   { id: "TA-002", customerId: "CUS-2089", ruleName: "Rapid Fund Movement", riskScore: 85, status: "under_investigation", sarRecommended: true },
   { id: "TA-003", customerId: "CUS-5050", ruleName: "Dormant-Then-Active", riskScore: 75, status: "new", sarRecommended: false },
@@ -172,22 +184,52 @@ const efassReturns = [
   { id: "EF-002", period: "2026-Q1", type: "quarterly", remediationCount: 450, newAccountsKYCd: 3200, status: "accepted" },
 ];
 
+// ── Postgres-backed stores (fail-closed via pgJsonStore) ──
+
+const CUSTOMER_TIERS_TABLE = "kyc_customer_tiers";
+const TXN_ALERTS_TABLE = "kyc_txn_alerts";
+
+async function ensureCustomerTiersStore(): Promise<void> {
+  await ensureTables("kycKybEnhancedSuite.customerTiers", storeDDL(CUSTOMER_TIERS_TABLE));
+  await storeSeed(CUSTOMER_TIERS_TABLE, CUSTOMER_TIERS_SEED, () => "");
+}
+
+export async function loadCustomerTiers(): Promise<CustomerTier[]> {
+  await ensureCustomerTiersStore();
+  return storeList<CustomerTier>(CUSTOMER_TIERS_TABLE);
+}
+
+async function ensureTxnAlertsStore(): Promise<void> {
+  await ensureTables("kycKybEnhancedSuite.txnAlerts", storeDDL(TXN_ALERTS_TABLE));
+  await storeSeed(TXN_ALERTS_TABLE, TXN_ALERTS_SEED, () => "");
+}
+
+export async function loadTxnAlerts(): Promise<TxnAlert[]> {
+  await ensureTxnAlertsStore();
+  return storeList<TxnAlert>(TXN_ALERTS_TABLE);
+}
+
 export function registerKYCKYBEnhancedSuite(app: Express) {
   // Phase 1: CBN Tiered KYC
   app.get("/api/kyc-enhanced/tier-definitions", (_: Request, res: Response) => res.json({ items: tierDefinitions, total: tierDefinitions.length }));
-  app.get("/api/kyc-enhanced/customer-tiers", (_: Request, res: Response) => res.json({ items: customerTiers, total: customerTiers.length }));
-  app.post("/api/kyc-enhanced/tier-evaluate/:customerId", (req: Request, res: Response) => {
+  app.get("/api/kyc-enhanced/customer-tiers", asyncRoute(async (_: Request, res: Response) => {
+    const customerTiers = await pgGuard(loadCustomerTiers());
+    res.json({ items: customerTiers, total: customerTiers.length });
+  }));
+  app.post("/api/kyc-enhanced/tier-evaluate/:customerId", asyncRoute(async (req: Request, res: Response) => {
+    const customerTiers = await pgGuard(loadCustomerTiers());
     const ct = customerTiers.find(c => c.customerId === req.params.customerId);
     if (!ct) return res.status(404).json({ error: "customer not found" });
     res.json({ customerId: ct.customerId, currentTier: ct.currentTier, evaluationScore: ct.evaluationScore, riskFlags: ct.riskFlags });
-  });
-  app.post("/api/kyc-enhanced/limit-check", (req: Request, res: Response) => {
+  }));
+  app.post("/api/kyc-enhanced/limit-check", asyncRoute(async (req: Request, res: Response) => {
     const { customerId, amountNGN } = req.body || {};
+    const customerTiers = await pgGuard(loadCustomerTiers());
     const ct = customerTiers.find(c => c.customerId === customerId);
     if (!ct) return res.status(404).json({ error: "customer not found" });
     const allowed = ct.dailyUsedNGN + (amountNGN || 0) <= ct.dailyLimitNGN;
     res.json({ allowed, tier: ct.currentTier, dailyUsed: ct.dailyUsedNGN, dailyLimit: ct.dailyLimitNGN });
-  });
+  }));
 
   // Phase 1: BVN/NIN
   app.get("/api/kyc-enhanced/bvn-records", (_: Request, res: Response) => res.json({ items: bvnRecords, total: bvnRecords.length }));
@@ -229,7 +271,10 @@ export function registerKYCKYBEnhancedSuite(app: Express) {
 
   // Phase 2: Transaction Monitoring
   app.get("/api/kyc-enhanced/monitoring-rules", (_: Request, res: Response) => res.json({ items: monitoringRules, total: monitoringRules.length }));
-  app.get("/api/kyc-enhanced/txn-alerts", (_: Request, res: Response) => res.json({ items: txnAlerts, total: txnAlerts.length }));
+  app.get("/api/kyc-enhanced/txn-alerts", asyncRoute(async (_: Request, res: Response) => {
+    const txnAlerts = await pgGuard(loadTxnAlerts());
+    res.json({ items: txnAlerts, total: txnAlerts.length });
+  }));
 
   // Phase 2: Risk-Based Approach
   app.get("/api/kyc-enhanced/risk-scores", (_: Request, res: Response) => res.json({ items: riskScores, total: riskScores.length }));

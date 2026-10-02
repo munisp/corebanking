@@ -16,6 +16,17 @@ interface FXTransaction {
   createdAt: Date;
 }
 
+// W12-A4B: fx-service requires a tenant_id query/body field that must match
+// the x-tenant-id header (which api_service sets from tenant_config).
+const getTenantId = (): string => {
+  try {
+    const cfg = JSON.parse(localStorage.getItem('tenant_config') || '{}');
+    return String(cfg.tenant_id || cfg.id || '');
+  } catch {
+    return '';
+  }
+};
+
 const FXScreen: React.FC = () => {
   const { user } = useAuth();
   const { isDark } = useTheme();
@@ -60,17 +71,22 @@ const FXScreen: React.FC = () => {
     if (!user) return;
 
     try {
-      const response = await apiService.get(`${AppConfig.fxEndpoint}/transactions?user_id=${user.id}`);
-      const data = response.data as { success?: boolean; data?: Record<string, unknown>[]; message?: string };
-      if (data && data.success && Array.isArray(data.data)) {
+      // W12-A4B: fx-service GET /api/v1/fx/transactions?tenant_id&customer_id
+      // -> { transactions: [...] } (raw fx_transactions records).
+      const response = await apiService.get(`${AppConfig.fxEndpoint}/transactions`, {
+        tenant_id: getTenantId(),
+        customer_id: String(user.id),
+      });
+      const data = response.data as { transactions?: Record<string, unknown>[] };
+      if (data && Array.isArray(data.transactions)) {
         setTransactions(
-          data.data.map((tx) => ({
-            id: tx.id as string,
+          data.transactions.map((tx) => ({
+            id: (tx.transaction_id ?? tx.id) as string,
             fromCurrency: tx.from_currency as string,
             toCurrency: tx.to_currency as string,
-            fromAmount: tx.from_amount as number,
-            toAmount: tx.to_amount as number,
-            rate: tx.rate as number,
+            fromAmount: Number(tx.from_amount),
+            toAmount: Number(tx.to_amount),
+            rate: Number(tx.rate),
             status: tx.status as FXTransaction['status'],
             createdAt: new Date(tx.created_at as string),
           }))
@@ -92,15 +108,18 @@ const FXScreen: React.FC = () => {
     }
     try {
       setLoading(true);
+      // W12-A4B: fx-service GET /api/v1/fx/rates?tenant_id&from_currency&to_currency
+      // -> { rate, ... } (no envelope, no /rate singular route).
       const response = await apiService.get(
-        `${AppConfig.fxEndpoint}/rate?from=${fromCurrency}&to=${toCurrency}`
+        `${AppConfig.fxEndpoint}/rates`,
+        { tenant_id: getTenantId(), from_currency: fromCurrency, to_currency: toCurrency }
       );
-      const data = response.data as { success?: boolean; data?: { rate: number }; message?: string };
-      if (data && data.success && data.data && typeof data.data.rate === 'number') {
-        setExchangeRate(data.data.rate);
-        setConvertedAmount(parseFloat(amount) * data.data.rate);
+      const data = response.data as { rate?: number; detail?: string };
+      if (data && typeof data.rate === 'number') {
+        setExchangeRate(data.rate);
+        setConvertedAmount(parseFloat(amount) * data.rate);
       } else {
-        alert((data && data.message) || 'Failed to fetch exchange rate');
+        alert((data && data.detail) || 'Failed to fetch exchange rate');
       }
     } catch (error) {
       alert('Error fetching exchange rate');
@@ -114,16 +133,24 @@ const FXScreen: React.FC = () => {
 
     try {
       setTransactionLoading(true);
-      const response = await apiService.post(`${AppConfig.fxEndpoint}/exchange`, {
-        user_id: user.id,
-        from_currency: fromCurrency,
-        to_currency: toCurrency,
-        from_amount: parseFloat(amount),
-        rate: exchangeRate,
-      });
+      // W12-A4B: fx-service POST /api/v1/fx/exchange (ExchangeRequest:
+      // tenant_id/customer_id/from_currency/to_currency/from_amount) and an
+      // x-actor-id header; returns the fx_transactions record on success.
+      const response = await apiService.post(
+        `${AppConfig.fxEndpoint}/exchange`,
+        {
+          tenant_id: getTenantId(),
+          customer_id: String(user.id),
+          from_currency: fromCurrency,
+          to_currency: toCurrency,
+          from_amount: parseFloat(amount),
+        },
+        undefined,
+        { 'x-actor-id': String(user.id) }
+      );
 
       const data = response.data as any;
-      if (data && data.success) {
+      if (data && (data.transaction_id || data.id)) {
         alert('Exchange completed successfully!');
         setAmount('');
         setExchangeRate(null);

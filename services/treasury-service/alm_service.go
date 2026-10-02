@@ -1,34 +1,34 @@
 package main
 
 import (
-	"sync"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// ALMService handles Asset-Liability Management operations
+// ALMService handles Asset-Liability Management operations.
+// Postgres (tables alm_gaps, interest_rate_risks) is the system of record.
 type ALMService struct {
 	tenantID string
-	gaps     map[string]*ALMGap
-	risks    map[string]*InterestRateRisk
-	mu       sync.RWMutex
+	gaps     *repo[ALMGap]
+	risks    *repo[InterestRateRisk]
 }
 
 // NewALMService creates a new ALM service
 func NewALMService(tenantID string) *ALMService {
 	svc := &ALMService{
 		tenantID: tenantID,
-		gaps:     make(map[string]*ALMGap),
-		risks:    make(map[string]*InterestRateRisk),
+		gaps:     newRepo[ALMGap](serviceDB, "alm_gaps"),
+		risks:    newRepo[InterestRateRisk](serviceDB, "interest_rate_risks"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
 }
 
 func (s *ALMService) initializeDefaultData(tenantID string) {
-	// Initialize NGN gap analysis
-	s.gaps["NGN"] = &ALMGap{
+	// Initialize NGN gap analysis (idempotent seed)
+	s.gaps.seed(tenantID, "NGN", &ALMGap{
 		GapID:    uuid.New().String(),
 		TenantID: tenantID,
 		Date:     time.Now(),
@@ -81,10 +81,10 @@ func (s *ALMService) initializeDefaultData(tenantID string) {
 		GapRatio:         11.11,
 		Status:           "asset_sensitive",
 		CreatedAt:        time.Now(),
-	}
+	})
 
-	// Initialize interest rate risk
-	s.risks["NGN"] = &InterestRateRisk{
+	// Initialize interest rate risk (idempotent seed)
+	s.risks.seed(tenantID, "NGN", &InterestRateRisk{
 		RiskID:           uuid.New().String(),
 		TenantID:         tenantID,
 		Date:             time.Now(),
@@ -98,16 +98,17 @@ func (s *ALMService) initializeDefaultData(tenantID string) {
 		EVE:              50000000000, // 50B economic value
 		Status:           "moderate",
 		CreatedAt:        time.Now(),
-	}
+	})
 }
 
 // GetALMGap returns ALM gap for a currency
-func (s *ALMService) GetALMGap(tenantID, currency string) *ALMGap {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if gap, exists := s.gaps[currency]; exists && gap.TenantID == tenantID {
-		return gap
+func (s *ALMService) GetALMGap(tenantID, currency string) (*ALMGap, error) {
+	gap, err := s.gaps.get(tenantID, currency)
+	if err == nil {
+		return gap, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
 	}
 
 	return &ALMGap{
@@ -115,17 +116,17 @@ func (s *ALMService) GetALMGap(tenantID, currency string) *ALMGap {
 		Currency: currency,
 		Date:     time.Now(),
 		Status:   "unknown",
-	}
+	}, nil
 }
 
 // GetGapAnalysis returns comprehensive gap analysis
-func (s *ALMService) GetGapAnalysis(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ngnGap := s.gaps["NGN"]
-	if ngnGap == nil {
-		return map[string]interface{}{}
+func (s *ALMService) GetGapAnalysis(tenantID string) (map[string]interface{}, error) {
+	ngnGap, err := s.gaps.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]interface{}{}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return map[string]interface{}{
@@ -140,17 +141,17 @@ func (s *ALMService) GetGapAnalysis(tenantID string) map[string]interface{} {
 		"interpretation":   "Bank is asset-sensitive; NII will increase if rates rise",
 		"recommendation":   "Consider extending liability duration to reduce gap",
 		"timestamp":        time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetInterestRateRisk returns interest rate risk metrics
-func (s *ALMService) GetInterestRateRisk(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	risk := s.risks["NGN"]
-	if risk == nil {
-		return map[string]interface{}{}
+func (s *ALMService) GetInterestRateRisk(tenantID string) (map[string]interface{}, error) {
+	risk, err := s.risks.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]interface{}{}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return map[string]interface{}{
@@ -166,17 +167,17 @@ func (s *ALMService) GetInterestRateRisk(tenantID string) map[string]interface{}
 		"status":           risk.Status,
 		"riskLevel":        "moderate",
 		"timestamp":        time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetDurationAnalysis returns duration analysis
-func (s *ALMService) GetDurationAnalysis(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	risk := s.risks["NGN"]
-	if risk == nil {
-		return map[string]interface{}{}
+func (s *ALMService) GetDurationAnalysis(tenantID string) (map[string]interface{}, error) {
+	risk, err := s.risks.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]interface{}{}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return map[string]interface{}{
@@ -188,17 +189,17 @@ func (s *ALMService) GetDurationAnalysis(tenantID string) map[string]interface{}
 		"interpretation":    "Positive duration gap indicates asset-sensitive position",
 		"impactOf100bp":     risk.EaR,
 		"timestamp":         time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // RunStressTest runs a stress test scenario
-func (s *ALMService) RunStressTest(tenantID, scenario string, rateShift, fxShift float64) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	risk := s.risks["NGN"]
-	if risk == nil {
-		return map[string]interface{}{"error": "no risk data available"}
+func (s *ALMService) RunStressTest(tenantID, scenario string, rateShift, fxShift float64) (map[string]interface{}, error) {
+	risk, err := s.risks.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]interface{}{"error": "no risk data available"}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	// Calculate impact
@@ -217,7 +218,7 @@ func (s *ALMService) RunStressTest(tenantID, scenario string, rateShift, fxShift
 		"nsfrImpact":     -1.5 * rateShift,
 		"recommendation": "Maintain adequate capital buffers",
 		"timestamp":      time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetScenarioAnalysis returns predefined scenario analysis

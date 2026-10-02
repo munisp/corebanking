@@ -11,7 +11,7 @@ import (
 // ApprovalService handles approval operations
 type ApprovalService struct {
 	tenantID  string
-	approvals map[string]*ApprovalRequest
+	approvals *repo[ApprovalRequest]
 	mu        sync.RWMutex
 }
 
@@ -19,17 +19,19 @@ type ApprovalService struct {
 func NewApprovalService(tenantID string) *ApprovalService {
 	return &ApprovalService{
 		tenantID:  tenantID,
-		approvals: make(map[string]*ApprovalRequest),
+		approvals: newRepo[ApprovalRequest](serviceDB, "approval_requests"),
 	}
 }
 
 // ListApprovals returns approvals based on filters
-func (s *ApprovalService) ListApprovals(tenantID, branchID, status, requestType string) []*ApprovalRequest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ApprovalService) ListApprovals(tenantID, branchID, status, requestType string) ([]*ApprovalRequest, error) {
 
 	var result []*ApprovalRequest
-	for _, approval := range s.approvals {
+	__ALL__, __ERR__ := s.approvals.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, approval := range __ALL__ {
 		if approval.TenantID != tenantID {
 			continue
 		}
@@ -44,16 +46,14 @@ func (s *ApprovalService) ListApprovals(tenantID, branchID, status, requestType 
 		}
 		result = append(result, approval)
 	}
-	return result
+	return result, nil
 }
 
 // GetApproval retrieves an approval by ID
 func (s *ApprovalService) GetApproval(tenantID, requestID string) (*ApprovalRequest, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	approval, exists := s.approvals[requestID]
-	if !exists || approval.TenantID != tenantID {
+	approval, err := s.approvals.get(tenantID, requestID)
+	if err != nil {
 		return nil, errors.New("approval request not found")
 	}
 	return approval, nil
@@ -61,8 +61,6 @@ func (s *ApprovalService) GetApproval(tenantID, requestID string) (*ApprovalRequ
 
 // CreateApproval creates a new approval request
 func (s *ApprovalService) CreateApproval(tenantID, branchID, userID string, req *CreateApprovalRequest) (*ApprovalRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	approval := &ApprovalRequest{
 		RequestID:    uuid.New().String(),
@@ -99,87 +97,73 @@ func (s *ApprovalService) CreateApproval(tenantID, branchID, userID string, req 
 		approval.DueDate = &dueDate
 	}
 
-	s.approvals[approval.RequestID] = approval
+	if err := s.approvals.put(tenantID, approval.RequestID, approval); err != nil {
+		return nil, err
+	}
 	return approval, nil
 }
 
 // ApproveRequest approves a request
 func (s *ApprovalService) ApproveRequest(tenantID, userID string, req *ApproveRequestPayload) (*ApprovalRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.approvals.update(tenantID, req.RequestID, func(approval *ApprovalRequest) error {
+		if approval.Status != "pending" {
+			return errors.New("can only approve pending requests")
+		}
 
-	approval, exists := s.approvals[req.RequestID]
-	if !exists || approval.TenantID != tenantID {
-		return nil, errors.New("approval request not found")
-	}
+		now := time.Now()
+		approval.Status = "approved"
+		approval.ApprovedBy = userID
+		approval.ApprovedAt = &now
+		approval.UpdatedAt = time.Now()
 
-	if approval.Status != "pending" {
-		return nil, errors.New("can only approve pending requests")
-	}
-
-	now := time.Now()
-	approval.Status = "approved"
-	approval.ApprovedBy = userID
-	approval.ApprovedAt = &now
-	approval.UpdatedAt = time.Now()
-
-	return approval, nil
+		return nil
+	})
 }
 
 // RejectRequest rejects a request
 func (s *ApprovalService) RejectRequest(tenantID, userID string, req *RejectRequestPayload) (*ApprovalRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.approvals.update(tenantID, req.RequestID, func(approval *ApprovalRequest) error {
+		if approval.Status != "pending" {
+			return errors.New("can only reject pending requests")
+		}
 
-	approval, exists := s.approvals[req.RequestID]
-	if !exists || approval.TenantID != tenantID {
-		return nil, errors.New("approval request not found")
-	}
+		now := time.Now()
+		approval.Status = "rejected"
+		approval.ApprovedBy = userID
+		approval.ApprovedAt = &now
+		approval.RejectionNote = req.Reason
+		approval.UpdatedAt = time.Now()
 
-	if approval.Status != "pending" {
-		return nil, errors.New("can only reject pending requests")
-	}
-
-	now := time.Now()
-	approval.Status = "rejected"
-	approval.ApprovedBy = userID
-	approval.ApprovedAt = &now
-	approval.RejectionNote = req.Reason
-	approval.UpdatedAt = time.Now()
-
-	return approval, nil
+		return nil
+	})
 }
 
 // EscalateRequest escalates a request
 func (s *ApprovalService) EscalateRequest(tenantID, requestID, userID, escalateTo, reason string) (*ApprovalRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.approvals.update(tenantID, requestID, func(approval *ApprovalRequest) error {
+		if approval.Status != "pending" {
+			return errors.New("can only escalate pending requests")
+		}
 
-	approval, exists := s.approvals[requestID]
-	if !exists || approval.TenantID != tenantID {
-		return nil, errors.New("approval request not found")
-	}
+		now := time.Now()
+		approval.Status = "escalated"
+		approval.EscalatedTo = escalateTo
+		approval.EscalatedAt = &now
+		approval.UpdatedAt = time.Now()
 
-	if approval.Status != "pending" {
-		return nil, errors.New("can only escalate pending requests")
-	}
-
-	now := time.Now()
-	approval.Status = "escalated"
-	approval.EscalatedTo = escalateTo
-	approval.EscalatedAt = &now
-	approval.UpdatedAt = time.Now()
-
-	return approval, nil
+		return nil
+	})
 }
 
 // ListUrgentApprovals returns urgent pending approvals
-func (s *ApprovalService) ListUrgentApprovals(tenantID, branchID string) []*ApprovalRequest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ApprovalService) ListUrgentApprovals(tenantID, branchID string) ([]*ApprovalRequest, error) {
 
 	var result []*ApprovalRequest
-	for _, approval := range s.approvals {
+	__ALL__, __ERR__ := s.approvals.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, approval := range __ALL__ {
 		if approval.TenantID != tenantID {
 			continue
 		}
@@ -193,11 +177,14 @@ func (s *ApprovalService) ListUrgentApprovals(tenantID, branchID string) []*Appr
 			result = append(result, approval)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetPendingCount returns count of pending approvals
-func (s *ApprovalService) GetPendingCount(tenantID, branchID string) int {
-	approvals := s.ListApprovals(tenantID, branchID, "pending", "")
-	return len(approvals)
+func (s *ApprovalService) GetPendingCount(tenantID, branchID string) (int, error) {
+	approvals, err := s.ListApprovals(tenantID, branchID, "pending", "")
+	if err != nil {
+		return 0, err
+	}
+	return len(approvals), nil
 }

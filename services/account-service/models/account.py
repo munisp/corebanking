@@ -68,6 +68,9 @@ class Account(Base, SerializerMixin, TimestampMixin, SoftDeleteMixin):
     # MN-03: signing mandate — 'single' (default) or 'all' (every signatory
     # must approve; debits route through maker-checker).
     mandate: Mapped[str] = mapped_column(String, nullable=False, default="single")
+    # W12-A4-P0-D: primary-account flag (at most one per keycloak user, enforced
+    # by POST /account/{id}/set-primary clearing the previous primary).
+    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     def __repr__(self):
         return (

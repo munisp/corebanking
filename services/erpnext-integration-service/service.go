@@ -2,18 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,11 +15,12 @@ import (
 )
 
 type ERPNextIntegrationService struct {
-	db            *sql.DB
-	httpClient    *http.Client
-	encryptionKey []byte
-	connections   map[string]map[string]*ERPConnection
-	mu            sync.RWMutex
+	db         *sql.DB
+	httpClient *http.Client
+	// W12-C3-PX: the in-memory `encryptionKey` field and the `connections`
+	// shadow map were removed (c3-0517/c3-0518). Credential encryption is
+	// handled fail-closed by kms_envelope.go (KMS_MASTER_KEY); the
+	// erp_connections table is authoritative for ALL connection CRUD.
 }
 
 type HealthStatus struct {
@@ -333,16 +328,14 @@ func NewERPNextIntegrationService(ctx context.Context) (*ERPNextIntegrationServi
 
 	log.Printf("Database connection established successfully")
 
-	encKey := os.Getenv("ENCRYPTION_KEY")
-	if encKey == "" {
-		encKey = "54bank-erp-integration-key-32b!"
-	}
+	// W12-C3-PX (c3-0517): the ENCRYPTION_KEY env read and its hardcoded
+	// fallback key literal were removed (the literal was also a committed
+	// repository secret). Credential encryption now goes through
+	// kms_envelope.go and fails closed when KMS_MASTER_KEY is unset.
 
 	service := &ERPNextIntegrationService{
-		db:            db,
-		httpClient:    &http.Client{Timeout: 30 * time.Second},
-		encryptionKey: []byte(encKey),
-		connections:   make(map[string]map[string]*ERPConnection),
+		db:         db,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 
 	log.Printf("Initializing database schema...")
@@ -613,53 +606,19 @@ func (s *ERPNextIntegrationService) HealthCheck() HealthStatus {
 	return status
 }
 
+// W12-C3-PX (c3-0517): encrypt/decrypt keep their original signatures so all
+// existing call sites (service.go/sync.go) are unchanged, but now delegate to
+// the KMS envelope (kms_envelope.go): AES-256-GCM under KMS_MASTER_KEY with a
+// versioned `v1:<kid>:<iv>:<tag>:<ct>` format, fail-closed with no fallback.
 func (s *ERPNextIntegrationService) encrypt(plaintext string) (string, error) {
-	block, err := aes.NewCipher(s.encryptionKey)
-	if err != nil {
-		return "", err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", err
-	}
-
-	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	return envelopeEncrypt([]byte(plaintext))
 }
 
 func (s *ERPNextIntegrationService) decrypt(ciphertext string) (string, error) {
-	data, err := base64.StdEncoding.DecodeString(ciphertext)
+	plaintext, err := envelopeDecrypt(ciphertext)
 	if err != nil {
 		return "", err
 	}
-
-	block, err := aes.NewCipher(s.encryptionKey)
-	if err != nil {
-		return "", err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", err
-	}
-
-	nonceSize := gcm.NonceSize()
-	if len(data) < nonceSize {
-		return "", fmt.Errorf("ciphertext too short")
-	}
-
-	nonce, ciphertextBytes := data[:nonceSize], data[nonceSize:]
-	plaintext, err := gcm.Open(nil, nonce, ciphertextBytes, nil)
-	if err != nil {
-		return "", err
-	}
-
 	return string(plaintext), nil
 }
 
@@ -692,28 +651,25 @@ func (s *ERPNextIntegrationService) CreateConnection(ctx context.Context, tenant
 		}
 	}
 
-	if s.db != nil {
-		settingsJSON, _ := json.Marshal(conn.Settings)
-		bankAccountsJSON, _ := json.Marshal(conn.BankAccounts)
-
-		_, err = s.db.ExecContext(ctx, `
-			INSERT INTO erp_connections (id, tenant_id, customer_id, name, erp_type, base_url, 
-				api_key_encrypted, api_secret_encrypted, status, sync_frequency, settings, bank_accounts, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		`, conn.ID, tenantID, customerID, conn.Name, conn.ERPType, conn.BaseURL,
-			apiKeyEnc, apiSecretEnc, conn.Status, conn.SyncFrequency, settingsJSON, bankAccountsJSON, conn.CreatedAt, conn.UpdatedAt)
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to create connection: %w", err)
-		}
+	// W12-C3-PX (c3-0518): erp_connections is authoritative — fail closed
+	// when the database is unavailable instead of caching in memory.
+	if s.db == nil {
+		return nil, fmt.Errorf("database unavailable — cannot create connection")
 	}
 
-	s.mu.Lock()
-	if s.connections[tenantID] == nil {
-		s.connections[tenantID] = make(map[string]*ERPConnection)
+	settingsJSON, _ := json.Marshal(conn.Settings)
+	bankAccountsJSON, _ := json.Marshal(conn.BankAccounts)
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO erp_connections (id, tenant_id, customer_id, name, erp_type, base_url,
+			api_key_encrypted, api_secret_encrypted, status, sync_frequency, settings, bank_accounts, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	`, conn.ID, tenantID, customerID, conn.Name, conn.ERPType, conn.BaseURL,
+		apiKeyEnc, apiSecretEnc, conn.Status, conn.SyncFrequency, settingsJSON, bankAccountsJSON, conn.CreatedAt, conn.UpdatedAt)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection: %w", err)
 	}
-	s.connections[tenantID][conn.ID] = conn
-	s.mu.Unlock()
 
 	conn.APIKey = ""
 	conn.APISecret = ""
@@ -722,19 +678,10 @@ func (s *ERPNextIntegrationService) CreateConnection(ctx context.Context, tenant
 }
 
 func (s *ERPNextIntegrationService) GetConnection(ctx context.Context, tenantID, customerID, connectionID string) (*ERPConnection, error) {
-	s.mu.RLock()
-	if tenantConns, ok := s.connections[tenantID]; ok {
-		if conn, ok := tenantConns[connectionID]; ok {
-			if conn.CustomerID == customerID {
-				s.mu.RUnlock()
-				return conn, nil
-			}
-		}
-	}
-	s.mu.RUnlock()
-
+	// W12-C3-PX (c3-0518): the in-memory shadow map was removed — reads are
+	// served from erp_connections only, so no stale cache is ever returned.
 	if s.db == nil {
-		return nil, fmt.Errorf("connection not found")
+		return nil, fmt.Errorf("database unavailable — cannot get connection")
 	}
 
 	var conn ERPConnection
@@ -775,16 +722,7 @@ func (s *ERPNextIntegrationService) ListConnections(ctx context.Context, tenantI
 	connections := make([]*ERPConnection, 0)
 
 	if s.db == nil {
-		s.mu.RLock()
-		if tenantConns, ok := s.connections[tenantID]; ok {
-			for _, conn := range tenantConns {
-				if conn.CustomerID == customerID {
-					connections = append(connections, conn)
-				}
-			}
-		}
-		s.mu.RUnlock()
-		return connections, nil
+		return nil, fmt.Errorf("database unavailable — cannot list connections")
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
@@ -869,30 +807,20 @@ func (s *ERPNextIntegrationService) UpdateConnection(ctx context.Context, tenant
 		}
 	}
 
-	s.mu.Lock()
-	if s.connections[tenantID] != nil {
-		s.connections[tenantID][connectionID] = conn
-	}
-	s.mu.Unlock()
-
 	return conn, nil
 }
 
 func (s *ERPNextIntegrationService) DeleteConnection(ctx context.Context, tenantID, customerID, connectionID string) error {
-	if s.db != nil {
-		_, err := s.db.ExecContext(ctx, `
-			DELETE FROM erp_connections WHERE id = $1 AND tenant_id = $2 AND customer_id = $3
-		`, connectionID, tenantID, customerID)
-		if err != nil {
-			return err
-		}
+	if s.db == nil {
+		return fmt.Errorf("database unavailable — cannot delete connection")
 	}
 
-	s.mu.Lock()
-	if s.connections[tenantID] != nil {
-		delete(s.connections[tenantID], connectionID)
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM erp_connections WHERE id = $1 AND tenant_id = $2 AND customer_id = $3
+	`, connectionID, tenantID, customerID)
+	if err != nil {
+		return err
 	}
-	s.mu.Unlock()
 
 	return nil
 }

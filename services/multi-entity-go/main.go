@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto"
+	"database/sql"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -49,16 +52,92 @@ type BankEntity struct {
 	Status       string  `json:"status"`
 }
 
-var (
-	mu    sync.RWMutex
-	items = []BankEntity{
-		{ID: "ENT-001", EntityName: "54Bank Nigeria Ltd", EntityType: "commercial_bank", Country: "NG", RegNumber: "RC-123456", Currency: "NGN", TotalAssets: 2500000000000.0, Subsidiary: false, ParentEntity: "", Status: "active"},
-		{ID: "ENT-002", EntityName: "54Bank Ghana Ltd", EntityType: "commercial_bank", Country: "GH", RegNumber: "GH-CB-0045", Currency: "GHS", TotalAssets: 500000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
-		{ID: "ENT-003", EntityName: "54Bank Kenya Ltd", EntityType: "commercial_bank", Country: "KE", RegNumber: "KE-CBK-0078", Currency: "KES", TotalAssets: 750000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
-		{ID: "ENT-004", EntityName: "54Capital Asset Mgmt", EntityType: "asset_management", Country: "NG", RegNumber: "SEC-AM-0012", Currency: "NGN", TotalAssets: 150000000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
-		{ID: "ENT-005", EntityName: "54Insurance Ltd", EntityType: "insurance", Country: "NG", RegNumber: "NAICOM-0034", Currency: "NGN", TotalAssets: 50000000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
+// ── Postgres persistence (W12 C3-P2-B5) ─────────────────────────────────────
+// The in-memory `items` slice was removed. domain_items is authoritative;
+// reads are served from PG. When DATABASE_URL is unset/unreachable the
+// list/stats endpoints fail closed (503) — no in-memory fallback claims
+// durability Postgres lacks. (Read-only service: no mutation endpoints exist.)
+
+var db *sql.DB
+
+var seedBankEntities = []BankEntity{
+	{ID: "ENT-001", EntityName: "54Bank Nigeria Ltd", EntityType: "commercial_bank", Country: "NG", RegNumber: "RC-123456", Currency: "NGN", TotalAssets: 2500000000000.0, Subsidiary: false, ParentEntity: "", Status: "active"},
+	{ID: "ENT-002", EntityName: "54Bank Ghana Ltd", EntityType: "commercial_bank", Country: "GH", RegNumber: "GH-CB-0045", Currency: "GHS", TotalAssets: 500000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
+	{ID: "ENT-003", EntityName: "54Bank Kenya Ltd", EntityType: "commercial_bank", Country: "KE", RegNumber: "KE-CBK-0078", Currency: "KES", TotalAssets: 750000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
+	{ID: "ENT-004", EntityName: "54Capital Asset Mgmt", EntityType: "asset_management", Country: "NG", RegNumber: "SEC-AM-0012", Currency: "NGN", TotalAssets: 150000000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
+	{ID: "ENT-005", EntityName: "54Insurance Ltd", EntityType: "insurance", Country: "NG", RegNumber: "NAICOM-0034", Currency: "NGN", TotalAssets: 50000000000.0, Subsidiary: true, ParentEntity: "ENT-001", Status: "active"},
+}
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[multi-entity-go] DATABASE_URL not set — entity endpoints fail closed (503)")
+		return
 	}
-)
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[multi-entity-go] DB open failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[multi-entity-go] DB ping failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS domain_items (
+		id TEXT PRIMARY KEY,
+		entity_name TEXT NOT NULL DEFAULT '',
+		entity_type TEXT NOT NULL DEFAULT '',
+		country TEXT NOT NULL DEFAULT '',
+		reg_number TEXT NOT NULL DEFAULT '',
+		currency TEXT NOT NULL DEFAULT '',
+		total_assets DOUBLE PRECISION NOT NULL DEFAULT 0,
+		is_subsidiary BOOLEAN NOT NULL DEFAULT FALSE,
+		parent_entity TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[multi-entity-go] DDL failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	// Idempotent boot seeds (previously the in-memory fixtures).
+	for _, e := range seedBankEntities {
+		if _, err = db.Exec(`INSERT INTO domain_items
+			(id, entity_name, entity_type, country, reg_number, currency, total_assets, is_subsidiary, parent_entity, status)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
+			e.ID, e.EntityName, e.EntityType, e.Country, e.RegNumber, e.Currency, e.TotalAssets, e.Subsidiary, e.ParentEntity, e.Status); err != nil {
+			log.Printf("[multi-entity-go] seed failed: %v — endpoints fail closed (503)", err)
+			db = nil
+			return
+		}
+	}
+	log.Printf("[multi-entity-go] Postgres connected (pool: 10/2), domain_items ready")
+}
+
+func listBankEntities() ([]BankEntity, error) {
+	rows, err := db.Query(`SELECT id, entity_name, entity_type, country, reg_number, currency, total_assets, is_subsidiary, parent_entity, status
+		FROM domain_items ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []BankEntity{}
+	for rows.Next() {
+		var e BankEntity
+		if err := rows.Scan(&e.ID, &e.EntityName, &e.EntityType, &e.Country, &e.RegNumber, &e.Currency, &e.TotalAssets, &e.Subsidiary, &e.ParentEntity, &e.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -84,15 +163,39 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func listItems(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
+	if db == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "entity store unavailable (postgres down)"})
+		return
+	}
+	items, err := listBankEntities()
+	if err != nil {
+		log.Printf("[multi-entity-go] list failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "entity store unavailable (postgres down)"})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items)})
+	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
 }
 
 func getStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
+	if db == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "entity store unavailable (postgres down)"})
+		return
+	}
+	items, err := listBankEntities()
+	if err != nil {
+		log.Printf("[multi-entity-go] stats query failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "entity store unavailable (postgres down)"})
+		return
+	}
 	var total float64
 	subs := 0
 	for _, d := range items {
@@ -281,13 +384,14 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	port := envOr("PORT", "8184")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/entities", listItems)
-	http.HandleFunc("/v1/entities/stats", getStats)
+	http.HandleFunc("/v1/entities", permifyAuthzGuard("multi_entity", "manage", listItems))
+	http.HandleFunc("/v1/entities/stats", permifyAuthzGuard("multi_entity", "view", getStats))
 	fmt.Printf("Multi-Entity Management Service running on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

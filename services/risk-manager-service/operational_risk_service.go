@@ -11,7 +11,7 @@ import (
 // OperationalRiskService handles operational risk operations
 type OperationalRiskService struct {
 	tenantID string
-	risks    map[string]*OperationalRisk
+	risks    *repo[OperationalRisk]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type OperationalRiskService struct {
 func NewOperationalRiskService(tenantID string) *OperationalRiskService {
 	svc := &OperationalRiskService{
 		tenantID: tenantID,
-		risks:    make(map[string]*OperationalRisk),
+		risks:    newRepo[OperationalRisk](serviceDB, "operational_risks"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -28,7 +28,7 @@ func NewOperationalRiskService(tenantID string) *OperationalRiskService {
 func (s *OperationalRiskService) initializeDefaultData(tenantID string) {
 	// Fraud event
 	resolvedAt := time.Now().AddDate(0, 0, -5)
-	s.risks["or-001"] = &OperationalRisk{
+	s.risks.seed(tenantID, "or-001", &OperationalRisk{
 		RiskID:           "or-001",
 		TenantID:         tenantID,
 		EventType:        "fraud",
@@ -54,10 +54,10 @@ func (s *OperationalRiskService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, 0, -10),
 		UpdatedAt:        time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// System failure
-	s.risks["or-002"] = &OperationalRisk{
+	s.risks.seed(tenantID, "or-002", &OperationalRisk{
 		RiskID:         "or-002",
 		TenantID:       tenantID,
 		EventType:      "system_failure",
@@ -78,10 +78,10 @@ func (s *OperationalRiskService) initializeDefaultData(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, 0, -3),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Process error
-	s.risks["or-003"] = &OperationalRisk{
+	s.risks.seed(tenantID, "or-003", &OperationalRisk{
 		RiskID:         "or-003",
 		TenantID:       tenantID,
 		EventType:      "process_error",
@@ -101,10 +101,10 @@ func (s *OperationalRiskService) initializeDefaultData(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, 0, -1),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
 	// Compliance breach
-	s.risks["or-004"] = &OperationalRisk{
+	s.risks.seed(tenantID, "or-004", &OperationalRisk{
 		RiskID:         "or-004",
 		TenantID:       tenantID,
 		EventType:      "compliance",
@@ -125,16 +125,18 @@ func (s *OperationalRiskService) initializeDefaultData(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, 0, -7),
 		UpdatedAt:      time.Now(),
-	}
+	})
 }
 
 // ListRisks returns operational risks based on filters
-func (s *OperationalRiskService) ListRisks(tenantID, status, eventType string) []*OperationalRisk {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OperationalRiskService) ListRisks(tenantID, status, eventType string) ([]*OperationalRisk, error) {
 
 	var result []*OperationalRisk
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -146,16 +148,14 @@ func (s *OperationalRiskService) ListRisks(tenantID, status, eventType string) [
 		}
 		result = append(result, risk)
 	}
-	return result
+	return result, nil
 }
 
 // GetRisk retrieves a risk by ID
 func (s *OperationalRiskService) GetRisk(tenantID, riskID string) (*OperationalRisk, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	risk, exists := s.risks[riskID]
-	if !exists || risk.TenantID != tenantID {
+	risk, err := s.risks.get(tenantID, riskID)
+	if err != nil {
 		return nil, errors.New("risk not found")
 	}
 	return risk, nil
@@ -163,8 +163,6 @@ func (s *OperationalRiskService) GetRisk(tenantID, riskID string) (*OperationalR
 
 // CreateRisk creates a new operational risk
 func (s *OperationalRiskService) CreateRisk(tenantID, userID string, req *CreateOperationalRiskRequest) (*OperationalRisk, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	occurrenceDate, _ := time.Parse("2006-01-02", req.OccurrenceDate)
 
@@ -189,33 +187,30 @@ func (s *OperationalRiskService) CreateRisk(tenantID, userID string, req *Create
 		UpdatedAt:      time.Now(),
 	}
 
-	s.risks[risk.RiskID] = risk
+	if err := s.risks.put(tenantID, risk.RiskID, risk); err != nil {
+		return nil, err
+	}
 	return risk, nil
 }
 
 // UpdateRisk updates an operational risk
 func (s *OperationalRiskService) UpdateRisk(risk *OperationalRisk) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.risks[risk.RiskID]
-	if !exists || existing.TenantID != risk.TenantID {
+	existing, err := s.risks.get(risk.TenantID, risk.RiskID)
+	if err != nil {
 		return errors.New("risk not found")
 	}
 
 	risk.CreatedAt = existing.CreatedAt
 	risk.UpdatedAt = time.Now()
-	s.risks[risk.RiskID] = risk
-	return nil
+	return s.risks.put(risk.TenantID, risk.RiskID, risk)
 }
 
 // AssignRisk assigns a risk to an officer
 func (s *OperationalRiskService) AssignRisk(tenantID, riskID, assignTo string) (*OperationalRisk, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	risk, exists := s.risks[riskID]
-	if !exists || risk.TenantID != tenantID {
+	risk, err := s.risks.get(tenantID, riskID)
+	if err != nil {
 		return nil, errors.New("risk not found")
 	}
 
@@ -223,16 +218,17 @@ func (s *OperationalRiskService) AssignRisk(tenantID, riskID, assignTo string) (
 	risk.Status = "investigating"
 	risk.UpdatedAt = time.Now()
 
+	if err := s.risks.put(tenantID, risk.RiskID, risk); err != nil {
+		return nil, err
+	}
 	return risk, nil
 }
 
 // ResolveRisk resolves an operational risk
 func (s *OperationalRiskService) ResolveRisk(tenantID, riskID, userID, rootCause, correctiveAction, preventiveAction string) (*OperationalRisk, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	risk, exists := s.risks[riskID]
-	if !exists || risk.TenantID != tenantID {
+	risk, err := s.risks.get(tenantID, riskID)
+	if err != nil {
 		return nil, errors.New("risk not found")
 	}
 
@@ -245,20 +241,25 @@ func (s *OperationalRiskService) ResolveRisk(tenantID, riskID, userID, rootCause
 	risk.ResolvedAt = &now
 	risk.UpdatedAt = time.Now()
 
+	if err := s.risks.put(tenantID, risk.RiskID, risk); err != nil {
+		return nil, err
+	}
 	return risk, nil
 }
 
 // GetSummary returns operational risk summary
-func (s *OperationalRiskService) GetSummary(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OperationalRiskService) GetSummary(tenantID string) (map[string]interface{}, error) {
 
 	var openEvents, investigatingEvents, resolvedEvents int
 	var totalLosses, totalRecovery int64
 	severityCounts := make(map[string]int)
 	eventTypeCounts := make(map[string]int)
 
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -287,19 +288,21 @@ func (s *OperationalRiskService) GetSummary(tenantID string) map[string]interfac
 		"bySeverity":          severityCounts,
 		"byEventType":         eventTypeCounts,
 		"timestamp":           time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetLossDistribution returns loss distribution analysis
-func (s *OperationalRiskService) GetLossDistribution(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OperationalRiskService) GetLossDistribution(tenantID string) (map[string]interface{}, error) {
 
 	byCategory := make(map[string]int64)
 	byDepartment := make(map[string]int64)
 	byBusinessLine := make(map[string]int64)
 
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -313,5 +316,5 @@ func (s *OperationalRiskService) GetLossDistribution(tenantID string) map[string
 		"byDepartment":   byDepartment,
 		"byBusinessLine": byBusinessLine,
 		"timestamp":      time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

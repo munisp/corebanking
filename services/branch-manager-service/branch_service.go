@@ -11,7 +11,7 @@ import (
 // BranchService handles branch operations
 type BranchService struct {
 	tenantID string
-	branches map[string]*Branch
+	branches *repo[Branch]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type BranchService struct {
 func NewBranchService(tenantID string) *BranchService {
 	svc := &BranchService{
 		tenantID: tenantID,
-		branches: make(map[string]*Branch),
+		branches: newRepo[Branch](serviceDB, "bm_branches"),
 	}
 	svc.initializeDefaultBranches()
 	return svc
@@ -126,19 +126,29 @@ func (s *BranchService) initializeDefaultBranches() {
 	}
 
 	for _, branch := range defaultBranches {
+		branch := branch
 		branch.CreatedAt = time.Now()
 		branch.UpdatedAt = time.Now()
-		s.branches[branch.BranchID] = &branch
+		s.branches.seed(s.tenantID, branch.BranchID, &branch)
 	}
 }
 
 // ListBranches returns branches based on filters
-func (s *BranchService) ListBranches(tenantID, region, status string) []*Branch {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *BranchService) ListBranches(tenantID, region, status string) ([]*Branch, error) {
 
 	var result []*Branch
-	for _, branch := range s.branches {
+	__ALL__, __ERR__ := s.branches.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	if s.tenantID != tenantID {
+		more, err := s.branches.list(s.tenantID)
+		if err != nil {
+			return nil, err
+		}
+		__ALL__ = append(__ALL__, more...)
+	}
+	for _, branch := range __ALL__ {
 		if branch.TenantID != tenantID && branch.TenantID != s.tenantID {
 			continue
 		}
@@ -150,16 +160,32 @@ func (s *BranchService) ListBranches(tenantID, region, status string) []*Branch 
 		}
 		result = append(result, branch)
 	}
-	return result
+	return result, nil
+}
+
+// getBranch loads a branch, falling back to the service tenant (seeded
+// branches live under the service tenant, matching the legacy map semantics).
+func (s *BranchService) getBranch(tenantID, branchID string) (*Branch, error) {
+	branch, err := s.branches.get(tenantID, branchID)
+	if errors.Is(err, ErrNotFound) && tenantID != s.tenantID {
+		return s.branches.get(s.tenantID, branchID)
+	}
+	return branch, err
+}
+
+// updateBranch is the transactional counterpart of getBranch.
+func (s *BranchService) updateBranch(tenantID, branchID string, fn func(*Branch) error) (*Branch, error) {
+	branch, err := s.branches.update(tenantID, branchID, fn)
+	if errors.Is(err, ErrNotFound) && tenantID != s.tenantID {
+		return s.branches.update(s.tenantID, branchID, fn)
+	}
+	return branch, err
 }
 
 // GetBranch retrieves a branch by ID
 func (s *BranchService) GetBranch(tenantID, branchID string) (*Branch, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	branch, exists := s.branches[branchID]
-	if !exists {
+	branch, err := s.getBranch(tenantID, branchID)
+	if err != nil {
 		return nil, errors.New("branch not found")
 	}
 	return branch, nil
@@ -167,8 +193,6 @@ func (s *BranchService) GetBranch(tenantID, branchID string) (*Branch, error) {
 
 // CreateBranch creates a new branch
 func (s *BranchService) CreateBranch(tenantID string, req *CreateBranchRequest) (*Branch, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	branch := &Branch{
 		BranchID:    uuid.New().String(),
@@ -192,53 +216,44 @@ func (s *BranchService) CreateBranch(tenantID string, req *CreateBranchRequest) 
 		UpdatedAt:   time.Now(),
 	}
 
-	s.branches[branch.BranchID] = branch
+	if err := s.branches.put(tenantID, branch.BranchID, branch); err != nil {
+		return nil, err
+	}
 	return branch, nil
 }
 
 // UpdateBranch updates a branch
 func (s *BranchService) UpdateBranch(branch *Branch) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.branches[branch.BranchID]
-	if !exists {
+	existing, err := s.getBranch(branch.TenantID, branch.BranchID)
+	if err != nil {
 		return errors.New("branch not found")
 	}
 
 	branch.CreatedAt = existing.CreatedAt
 	branch.UpdatedAt = time.Now()
-	s.branches[branch.BranchID] = branch
-	return nil
+	return s.branches.put(branch.TenantID, branch.BranchID, branch)
 }
 
 // UpdateBranchStatus updates branch status
 func (s *BranchService) UpdateBranchStatus(tenantID, branchID, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	branch, exists := s.branches[branchID]
-	if !exists {
-		return errors.New("branch not found")
-	}
-
-	branch.Status = status
-	branch.UpdatedAt = time.Now()
-	return nil
+	_, err := s.updateBranch(tenantID, branchID, func(branch *Branch) error {
+		branch.Status = status
+		branch.UpdatedAt = time.Now()
+		return nil
+	})
+	return err
 }
 
 // AssignManager assigns a manager to a branch
 func (s *BranchService) AssignManager(tenantID, branchID, managerID, managerName string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	branch, exists := s.branches[branchID]
-	if !exists {
-		return errors.New("branch not found")
-	}
-
-	branch.ManagerID = managerID
-	branch.ManagerName = managerName
-	branch.UpdatedAt = time.Now()
-	return nil
+	_, err := s.updateBranch(tenantID, branchID, func(branch *Branch) error {
+		branch.ManagerID = managerID
+		branch.ManagerName = managerName
+		branch.UpdatedAt = time.Now()
+		return nil
+	})
+	return err
 }

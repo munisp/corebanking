@@ -521,6 +521,13 @@ func handleBVNVerify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bvn is required")
 		return
 	}
+	entityID := strings.TrimSpace(req.CustomerID)
+	if entityID == "" {
+		entityID = strings.TrimSpace(req.BVN)
+	}
+	if !permifyAuthorize(w, r, "identity_verification", entityID, "verify") {
+		return
+	}
 	bvn := strings.TrimSpace(req.BVN)
 	tid := tenantID(r)
 
@@ -566,6 +573,13 @@ func handleNINVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.NIN) == "" {
 		writeError(w, http.StatusBadRequest, "nin is required")
+		return
+	}
+	entityID := strings.TrimSpace(req.CustomerID)
+	if entityID == "" {
+		entityID = strings.TrimSpace(req.NIN)
+	}
+	if !permifyAuthorize(w, r, "identity_verification", entityID, "verify") {
 		return
 	}
 	nin := strings.TrimSpace(req.NIN)
@@ -620,6 +634,13 @@ func handleBVNNINLinkage(w http.ResponseWriter, r *http.Request) {
 	nin := strings.TrimSpace(req.NIN)
 	if bvn == "" || nin == "" {
 		writeError(w, http.StatusBadRequest, "bvn and nin are required")
+		return
+	}
+	entityID := strings.TrimSpace(req.CustomerID)
+	if entityID == "" {
+		entityID = bvn
+	}
+	if !permifyAuthorize(w, r, "identity_verification", entityID, "verify") {
 		return
 	}
 	tid := tenantID(r)
@@ -926,6 +947,113 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Permify authorization (W12-B5-P0-D2) — every mutating handler performs a
+// REAL Permify permission check after jwtAuthMiddleware has authenticated the
+// caller. Subject = verified X-User-Id (stamped from the JWT sub claim by the
+// middleware), tenant = verified X-Tenant-ID, resource = domain entity id,
+// permission per action (schema entities:
+// services/auth-service/schemas/permify/v2-kyc-compliance.fragment).
+// FAIL-CLOSED: Permify unreachable/non-200 => 503; denied => 403.
+// Canonical pattern: services/permify-authz-go/main.go:428 (check call) and
+// :479 (30s decision cache; errors are never cached).
+// ---------------------------------------------------------------------------
+
+var permifyHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+func permifyBaseURL() string {
+	if v := strings.TrimRight(os.Getenv("PERMIFY_URL"), "/"); v != "" {
+		return v
+	}
+	return "http://permify:3476"
+}
+
+type permifyDecision struct {
+	allowed   bool
+	expiresAt time.Time
+}
+
+var (
+	permifyDecisions   = make(map[string]permifyDecision)
+	permifyDecisionsMu sync.RWMutex
+)
+
+// permifyAuthorize enforces <permission> on entityType:entityID for the
+// authenticated caller. On denial or check failure it writes the response
+// (403 / 503) and returns false; the handler must return without executing.
+func permifyAuthorize(w http.ResponseWriter, r *http.Request, entityType, entityID, permission string) bool {
+	subject := strings.TrimSpace(r.Header.Get("X-User-Id"))
+	tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
+	if tenantID == "" {
+		if v := os.Getenv("PERMIFY_DEFAULT_TENANT"); v != "" {
+			tenantID = v
+		} else {
+			tenantID = "bpmgd"
+		}
+	}
+	if subject == "" || entityID == "" {
+		http.Error(w, `{"error":"forbidden","detail":"authorization context incomplete"}`, http.StatusForbidden)
+		return false
+	}
+	key := tenantID + "|" + subject + "|" + entityType + "|" + entityID + "|" + permission
+	now := time.Now()
+	permifyDecisionsMu.RLock()
+	cached, hit := permifyDecisions[key]
+	permifyDecisionsMu.RUnlock()
+	if hit && now.Before(cached.expiresAt) {
+		if !cached.allowed {
+			http.Error(w, `{"error":"forbidden","detail":"permify: `+permission+` denied on `+entityType+`:`+entityID+`"}`, http.StatusForbidden)
+		}
+		return cached.allowed
+	}
+	payload := map[string]interface{}{
+		"metadata":   map[string]interface{}{"schema_version": "", "snap_token": "", "depth": 20},
+		"entity":     map[string]string{"type": entityType, "id": entityID},
+		"permission": permission,
+		"subject":    map[string]string{"type": "user", "id": subject},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, `{"error":"permify_encode_failed"}`, http.StatusInternalServerError)
+		return false
+	}
+	url := fmt.Sprintf("%s/v1/tenants/%s/permissions/check", permifyBaseURL(), tenantID)
+	resp, err := permifyHTTPClient.Post(url, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		log.Printf("[permify] FAIL-CLOSED check %s on %s:%s unreachable: %v", permission, entityType, entityID, err)
+		http.Error(w, `{"error":"authorization_unavailable","detail":"permify unreachable (fail-closed)"}`, http.StatusServiceUnavailable)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[permify] FAIL-CLOSED check %s on %s:%s http=%d", permission, entityType, entityID, resp.StatusCode)
+		http.Error(w, `{"error":"authorization_unavailable","detail":"permify check failed (fail-closed)"}`, http.StatusServiceUnavailable)
+		return false
+	}
+	var result struct {
+		Can string `json:"can"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		http.Error(w, `{"error":"authorization_unavailable","detail":"permify malformed response (fail-closed)"}`, http.StatusServiceUnavailable)
+		return false
+	}
+	allowed := result.Can == "CHECK_RESULT_ALLOWED"
+	permifyDecisionsMu.Lock()
+	if len(permifyDecisions) >= 10000 { // evict expired entries first
+		for k, v := range permifyDecisions {
+			if now.After(v.expiresAt) {
+				delete(permifyDecisions, k)
+			}
+		}
+	}
+	permifyDecisions[key] = permifyDecision{allowed: allowed, expiresAt: now.Add(30 * time.Second)}
+	permifyDecisionsMu.Unlock()
+	if !allowed {
+		http.Error(w, `{"error":"forbidden","detail":"permify: `+permission+` denied on `+entityType+`:`+entityID+`"}`, http.StatusForbidden)
+	}
+	return allowed
 }
 
 func main() {

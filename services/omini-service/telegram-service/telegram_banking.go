@@ -6,20 +6,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -147,13 +148,15 @@ type TelegramBankingService struct {
 	botToken      string
 	webhookSecret string
 	apiBaseURL    string
-	sessions      map[int64]*TelegramSession
-	mutex         sync.RWMutex
-	httpClient    *http.Client
-	tenantID      string
-	keycloakURL   string
-	permifyURL    string
-	daprURL       string
+	// W12 C3-P1-B2 (c3-0663): the per-process sessions map + mutex are gone —
+	// sessions live in redis (B2R) with a 900s sliding TTL, so they survive
+	// replicas and restarts and there is no in-process state to guard.
+	httpClient  *http.Client
+	tenantID    string
+	keycloakURL string
+	permifyURL  string
+	daprURL     string
+	ledger      *tbLedger // TigerBeetle ledger of record; PG accounts rows are a read-model
 }
 
 type TelegramConfig struct {
@@ -196,12 +199,12 @@ func NewTelegramBankingService(cfg *TelegramConfig) (*TelegramBankingService, er
 		botToken:      cfg.BotToken,
 		webhookSecret: cfg.WebhookSecret,
 		apiBaseURL:    "https://api.telegram.org/bot" + cfg.BotToken,
-		sessions:      make(map[int64]*TelegramSession),
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
 		tenantID:      cfg.TenantID,
 		keycloakURL:   cfg.KeycloakURL,
 		permifyURL:    cfg.PermifyURL,
 		daprURL:       cfg.DaprURL,
+		ledger:        newTBLedger(),
 	}, nil
 }
 
@@ -645,7 +648,7 @@ func (s *TelegramBankingService) handleTransferPIN(ctx context.Context, session 
 
 	var senderAccountID string
 	err = tx.QueryRow(ctx, `
-		SELECT account_id FROM accounts 
+		SELECT account_id FROM accounts
 		WHERE customer_id = $1 AND is_primary = true
 		FOR UPDATE
 	`, session.CustomerID).Scan(&senderAccountID)
@@ -654,41 +657,68 @@ func (s *TelegramBankingService) handleTransferPIN(ctx context.Context, session 
 		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
 	}
 
+	// Resolve the recipient ledger account. Internal (54bank) transfers credit
+	// the recipient customer account; external transfers credit the platform
+	// outbound-settlement account.
+	isInternal := session.Data["transfer_type"] == "54bank"
+	recipientLedgerAccount := settlementAccountID("outbound-transfer")
+	if isInternal {
+		var recipientAccountID string
+		err = tx.QueryRow(ctx, `
+			SELECT account_id FROM accounts
+			WHERE account_number = $1
+		`, recipient).Scan(&recipientAccountID)
+		if err != nil {
+			return s.sendMessage(ctx, session.ChatID, "❌ Recipient account not found.", nil)
+		}
+		recipientLedgerAccount = recipientAccountID
+	}
+
+	// AUTHORITATIVE LEDGER MOVEMENT (TigerBeetle). Fail-closed: unless the
+	// cluster confirms the transfer, no PostgreSQL read-model row is touched
+	// and the operation aborts. Transfer ID is derived from txnRef so a
+	// retried operation is idempotent at the cluster.
+	if err = s.ledger.move(ctx, senderAccountID, recipientLedgerAccount, true, isInternal, amount, txnRef, tbCodeP2PTransfer); err != nil {
+		if errors.Is(err, errLedgerInsufficientFunds) {
+			return s.sendMessage(ctx, session.ChatID, "❌ Insufficient balance.", nil)
+		}
+		log.Printf("[telegram-banking] transfer ledger posting FAILED ref=%s: %v", txnRef, err)
+		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
+	}
+
+	// READ-MODEL updates (PostgreSQL). The accounts rows mirror the TB ledger
+	// and are updated only after the cluster confirmed the movement, in the
+	// same transaction as the operation's own state row.
 	_, err = tx.Exec(ctx, `
 		UPDATE accounts SET balance = balance - $1, available_balance = available_balance - $1
 		WHERE account_id = $2
 	`, amount, senderAccountID)
 
-	if err != nil {
-		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
-	}
-
-	if session.Data["transfer_type"] == "54bank" {
+	if err == nil && isInternal {
 		_, err = tx.Exec(ctx, `
 			UPDATE accounts SET balance = balance + $1, available_balance = available_balance + $1
 			WHERE account_number = $2
 		`, amount, recipient)
-
-		if err != nil {
-			return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
-		}
 	}
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO transactions (account_id, transaction_type, amount, reference, description, channel, created_at)
-		VALUES ($1, 'transfer_out', $2, $3, $4, 'telegram', NOW())
-	`, senderAccountID, amount, txnRef, "Telegram Transfer to "+recipientName)
+	if err == nil {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO transactions (account_id, transaction_type, amount, reference, description, channel, created_at)
+			VALUES ($1, 'transfer_out', $2, $3, $4, 'telegram', NOW())
+		`, senderAccountID, amount, txnRef, "Telegram Transfer to "+recipientName)
+	}
+
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
 
 	if err != nil {
+		// The ledger moved the funds but the read-model/state row failed:
+		// compensate with a reverse TB transfer so the ledger and the
+		// read-model never diverge silently.
+		s.ledger.compensate(context.Background(), senderAccountID, recipientLedgerAccount, true, isInternal, amount, txnRef, tbCodeP2PTransfer)
 		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
 	}
-
-	err = tx.Commit(ctx)
-	if err != nil {
-		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
-	}
-
-	s.recordTransferInTigerBeetle(ctx, senderAccountID, recipient, amount, txnRef)
 
 	s.publishEvent(ctx, "telegram.transfer.completed", map[string]interface{}{
 		"customer_id": session.CustomerID,
@@ -799,17 +829,33 @@ func (s *TelegramBankingService) handleAirtimeAmount(ctx context.Context, sessio
 	txnRef := fmt.Sprintf("AIR%d", time.Now().UnixNano())
 
 	var accountID string
-	s.db.QueryRow(ctx, `
-		SELECT account_id FROM accounts 
+	err = s.db.QueryRow(ctx, `
+		SELECT account_id FROM accounts
 		WHERE customer_id = $1 AND is_primary = true
 	`, session.CustomerID).Scan(&accountID)
 
+	if err != nil {
+		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
+	}
+
+	// AUTHORITATIVE LEDGER MOVEMENT (TigerBeetle): debit the customer, credit
+	// the airtime settlement account. Fail-closed before any read-model write.
+	if err = s.ledger.move(ctx, accountID, settlementAccountID("airtime"), true, false, amount, txnRef, tbCodeAirtimePurchase); err != nil {
+		if errors.Is(err, errLedgerInsufficientFunds) {
+			return s.sendMessage(ctx, session.ChatID, "❌ Insufficient balance.", nil)
+		}
+		log.Printf("[telegram-banking] airtime ledger posting FAILED ref=%s: %v", txnRef, err)
+		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
+	}
+
+	// READ-MODEL update (PostgreSQL) after TB confirmation.
 	_, err = s.db.Exec(ctx, `
 		UPDATE accounts SET balance = balance - $1, available_balance = available_balance - $1
 		WHERE account_id = $2
 	`, amount, accountID)
 
 	if err != nil {
+		s.ledger.compensate(context.Background(), accountID, settlementAccountID("airtime"), true, false, amount, txnRef, tbCodeAirtimePurchase)
 		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
 	}
 
@@ -942,17 +988,35 @@ func (s *TelegramBankingService) handleBillAmount(ctx context.Context, session *
 	txnRef := fmt.Sprintf("BILL%d", time.Now().UnixNano())
 
 	var accountID string
-	s.db.QueryRow(ctx, `
-		SELECT account_id FROM accounts 
+	err = s.db.QueryRow(ctx, `
+		SELECT account_id FROM accounts
 		WHERE customer_id = $1 AND is_primary = true
 	`, session.CustomerID).Scan(&accountID)
 
+	if err != nil {
+		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
+	}
+
+	// AUTHORITATIVE LEDGER MOVEMENT (TigerBeetle): debit the customer, credit
+	// the biller's settlement account (one per bill type). Fail-closed before
+	// any read-model write.
+	billerSettlement := settlementAccountID("bills/" + billType)
+	if err = s.ledger.move(ctx, accountID, billerSettlement, true, false, amount, txnRef, tbCodeBillPayment); err != nil {
+		if errors.Is(err, errLedgerInsufficientFunds) {
+			return s.sendMessage(ctx, session.ChatID, "❌ Insufficient balance.", nil)
+		}
+		log.Printf("[telegram-banking] bill payment ledger posting FAILED ref=%s: %v", txnRef, err)
+		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
+	}
+
+	// READ-MODEL update (PostgreSQL) after TB confirmation.
 	_, err = s.db.Exec(ctx, `
 		UPDATE accounts SET balance = balance - $1, available_balance = available_balance - $1
 		WHERE account_id = $2
 	`, amount, accountID)
 
 	if err != nil {
+		s.ledger.compensate(context.Background(), accountID, billerSettlement, true, false, amount, txnRef, tbCodeBillPayment)
 		return s.sendMessage(ctx, session.ChatID, "❌ Transaction failed. Please try again.", nil)
 	}
 
@@ -1231,11 +1295,12 @@ func (s *TelegramBankingService) handleHelp(ctx context.Context, session *Telegr
 }
 
 func (s *TelegramBankingService) handleLogout(ctx context.Context, session *TelegramSession) error {
-	s.mutex.Lock()
-	delete(s.sessions, session.ChatID)
-	s.mutex.Unlock()
-
-	s.redis.Del(ctx, fmt.Sprintf("telegram:session:%d", session.ChatID))
+	// W12 C3-P1-B2 (c3-0663): logout deletes the redis session key — with the
+	// local map gone this is the only copy, so revocation is immediate and
+	// fleet-wide.
+	if err := s.redis.Del(ctx, s.sessionKey(session.ChatID)).Err(); err != nil {
+		log.Printf("[telegram] session delete failed chat=%d: %v", session.ChatID, err)
+	}
 
 	s.publishEvent(ctx, "telegram.session.ended", map[string]interface{}{
 		"chat_id":     session.ChatID,
@@ -1269,25 +1334,32 @@ func (s *TelegramBankingService) handleConfirmation(ctx context.Context, session
 	}
 }
 
+// sessionKey — W12 C3-P1-B2 (c3-0663): tenant-scoped session key.
+// Was telegram:session:{chatID} with a 24h TTL; now session:{tenant}:{chatID}
+// with a 900s sliding TTL, so idle sessions expire in 15 minutes and active
+// sessions stay alive across replicas and restarts.
+func (s *TelegramBankingService) sessionKey(chatID int64) string {
+	return fmt.Sprintf("session:%s:%d", s.tenantID, chatID)
+}
+
+const telegramSessionTTL = 900 * time.Second
+
 func (s *TelegramBankingService) getOrCreateSession(chatID, userID int64) *TelegramSession {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if session, exists := s.sessions[chatID]; exists {
-		session.LastActivity = time.Now()
-		return session
-	}
-
 	ctx := context.Background()
-	sessionKey := fmt.Sprintf("telegram:session:%d", chatID)
-	data, err := s.redis.Get(ctx, sessionKey).Bytes()
+	data, err := s.redis.Get(ctx, s.sessionKey(chatID)).Bytes()
 	if err == nil {
 		var session TelegramSession
 		if json.Unmarshal(data, &session) == nil {
 			session.LastActivity = time.Now()
-			s.sessions[chatID] = &session
+			// Sliding expiration: refresh the 900s TTL on every touch.
+			s.saveSession(ctx, &session)
 			return &session
 		}
+	} else if err != redis.Nil {
+		// FAIL CLOSED for auth: on redis outage we cannot recover the stored
+		// session, so the caller gets a fresh UNVERIFIED session — the user
+		// must re-authenticate rather than inheriting unverifiable state.
+		log.Printf("[telegram] session load failed chat=%d (failing closed to unverified): %v", chatID, err)
 	}
 
 	session := &TelegramSession{
@@ -1298,20 +1370,19 @@ func (s *TelegramBankingService) getOrCreateSession(chatID, userID int64) *Teleg
 		LastActivity: time.Now(),
 		IsVerified:   false,
 	}
-	s.sessions[chatID] = session
+	s.saveSession(ctx, session)
 	telegramActiveUsers.Inc()
 
 	return session
 }
 
 func (s *TelegramBankingService) saveSession(ctx context.Context, session *TelegramSession) {
-	s.mutex.Lock()
-	s.sessions[session.ChatID] = session
-	s.mutex.Unlock()
-
-	sessionKey := fmt.Sprintf("telegram:session:%d", session.ChatID)
 	data, _ := json.Marshal(session)
-	s.redis.Set(ctx, sessionKey, data, 24*time.Hour)
+	if err := s.redis.Set(ctx, s.sessionKey(session.ChatID), data, telegramSessionTTL).Err(); err != nil {
+		// FAIL CLOSED for auth: an unpersisted session is dropped on the next
+		// touch, which forces re-verification rather than elevating state.
+		log.Printf("[telegram] session persist failed chat=%d: %v", session.ChatID, err)
+	}
 }
 
 func (s *TelegramBankingService) verifyPIN(ctx context.Context, customerID, pin string) bool {
@@ -1388,33 +1459,11 @@ func (s *TelegramBankingService) recordToLakehouse(ctx context.Context, eventTyp
 	}, nil)
 }
 
-func (s *TelegramBankingService) recordTransferInTigerBeetle(ctx context.Context, senderAccountID, recipientAccountID string, amount float64, reference string) {
-	// Call transaction-service via Dapr to record the transfer
-	payload := map[string]interface{}{
-		"from_account_id": senderAccountID,
-		"to_account_id":   recipientAccountID,
-		"amount":          fmt.Sprintf("%.2f", amount),
-		"currency":        "NGN",
-		"reference":       reference,
-		"description":     "Telegram transfer",
-		"channel":         "telegram",
-		"tenant_id":       s.tenantID,
-	}
-
-	body, _ := json.Marshal(payload)
-	url := fmt.Sprintf("%s/v1.0/invoke/transaction-service/method/api/v1/transactions", s.daprURL)
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(body)))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	s.httpClient.Do(req)
-}
-
 func (s *TelegramBankingService) Close() {
 	s.db.Close()
 	s.redis.Close()
 	s.kafkaProducer.Close()
+	s.ledger.close()
 }
 
 func main() {

@@ -1,5 +1,6 @@
 #![allow(unused)]
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use chrono::{NaiveDate, Datelike};
@@ -81,6 +82,7 @@ struct AccrueRequest {
 
 async fn accrue(req: actix_web::HttpRequest, body: web::Json<AccrueRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "interest_batch", "accrue").await { return resp; } // W12-B5D1
     let start = match NaiveDate::parse_from_str(&body.start_date, "%Y-%m-%d") {
         Ok(d) => d, Err(_) => return HttpResponse::BadRequest().json(json!({"error": "invalid start_date"})),
     };
@@ -121,6 +123,7 @@ async fn accrue(req: actix_web::HttpRequest, body: web::Json<AccrueRequest>) -> 
 
 async fn compare_conventions(req: actix_web::HttpRequest, body: web::Json<AccrueRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "interest_batch", "view").await { return resp; } // W12-B5D1
     let start = NaiveDate::parse_from_str(&body.start_date, "%Y-%m-%d").unwrap();
     let end = NaiveDate::parse_from_str(&body.end_date, "%Y-%m-%d").unwrap();
     let conventions = vec![
@@ -351,3 +354,6 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/interest/compare", web::post().to(compare_conventions))
     }).bind(("0.0.0.0", port))?.run().await
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

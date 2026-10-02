@@ -19,6 +19,49 @@ import type { Request, Response, NextFunction } from "express";
 const OPENAPPSEC_URL = process.env.OPENAPPSEC_URL || "http://openappsec:8080";
 const OPENAPPSEC_TOKEN = process.env.OPENAPPSEC_TOKEN || "local-dev-token";
 
+/**
+ * WAF mode resolution (B5-P0-C). OPENAPPSEC_MODE=prevent|learning is the
+ * primary switch (aligned with docker-compose.yml's openappsec service);
+ * OPENAPPSEC_PREVENT_MODE is the legacy boolean fallback. Default: prevent.
+ */
+function resolveWafMode(): "learning" | "prevent" {
+  const raw = (process.env.OPENAPPSEC_MODE ?? "").toLowerCase();
+  if (raw === "learning" || raw === "prevent") return raw;
+  if (process.env.OPENAPPSEC_PREVENT_MODE !== undefined) {
+    return process.env.OPENAPPSEC_PREVENT_MODE === "true" ? "prevent" : "learning";
+  }
+  return "prevent";
+}
+
+const OPENAPPSEC_MODE: "learning" | "prevent" = resolveWafMode();
+
+/**
+ * Mutating (non-GET/HEAD/OPTIONS) requests to these prefixes FAIL CLOSED
+ * (503) when the WAF is unreachable or inspection errors — money-movement
+ * surface derived from infrastructure/apisix-resources/routes/*.yaml (B5-P0-C).
+ * All other paths fail open to preserve availability. Override via
+ * OPENAPPSEC_FAIL_CLOSED_PATHS (comma-separated prefixes).
+ */
+const DEFAULT_FAIL_CLOSED_PATHS = [
+  "/api/v1",
+  "/bulk-payments",
+  "/payment-hub",
+  "/payment-processing",
+  "/payment-rails-connectors",
+  "/qr-payments",
+  "/remittance",
+  "/stk",
+  "/utility-payments",
+  "/whatsapp-payment-integration",
+  "/wire-transfer-monitor",
+];
+
+const FAIL_CLOSED_PATHS: string[] =
+  process.env.OPENAPPSEC_FAIL_CLOSED_PATHS?.split(",").map((p) => p.trim()).filter(Boolean) ??
+  DEFAULT_FAIL_CLOSED_PATHS;
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
 // ── OpenAppSec availability probe ────────────────────────────────────────────
 
 let wafAvailable = false;
@@ -136,9 +179,11 @@ export async function recordLearningData(
 export function openappsecMiddleware(options?: {
   mode?: "learning" | "prevent";
   excludePaths?: string[];
+  failClosedPaths?: string[];
 }) {
-  const mode = options?.mode ?? (process.env.OPENAPPSEC_PREVENT_MODE === "true" ? "prevent" : "learning");
+  const mode = options?.mode ?? OPENAPPSEC_MODE;
   const excludePaths = options?.excludePaths ?? ["/health", "/metrics", "/dapr/subscribe"];
+  const failClosedPaths = options?.failClosedPaths ?? FAIL_CLOSED_PATHS;
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     // Skip excluded paths
@@ -151,7 +196,26 @@ export function openappsecMiddleware(options?: {
     const tenantId = (req as Request & { tenantId?: string }).tenantId ??
       req.headers["x-tenant-id"] as string | undefined;
 
-    if (wafAvailable) {
+    // Fail-closed decision (B5-P0-C): mutating requests on money paths are
+    // rejected with 503 when the WAF cannot inspect them; everything else
+    // fails open for availability.
+    const failClosed =
+      !SAFE_METHODS.has(req.method) && failClosedPaths.some((p) => req.path.startsWith(p));
+
+    if (!wafAvailable) {
+      if (failClosed) {
+        res.status(503).json({
+          error: "WAF unavailable — mutating money-path request rejected (fail-closed)",
+          code: "WAF_UNAVAILABLE",
+          requestId: req.headers["x-request-id"],
+        });
+        return;
+      }
+      next();
+      return;
+    }
+
+    {
       try {
         const inspectRes = await fetch(`${OPENAPPSEC_URL}/inspect`, {
           method: "POST",
@@ -203,7 +267,18 @@ export function openappsecMiddleware(options?: {
           }
         }
       } catch {
-        // WAF inspection timeout or error — allow request through (fail open)
+        // WAF inspection timeout or error
+        if (failClosed) {
+          // Fail closed on mutating money paths (B5-P0-C)
+          res.status(503).json({
+            error: "WAF inspection failed — mutating money-path request rejected (fail-closed)",
+            code: "WAF_INSPECTION_FAILED",
+            requestId: req.headers["x-request-id"],
+          });
+          return;
+        }
+        // Otherwise allow request through (fail open) — availability preserved;
+        // alerting via the syslog→Vector→Loki pipeline (see docker-compose.yml).
       }
     }
 
@@ -221,7 +296,7 @@ export function getWafStatus(): {
   return {
     available: wafAvailable,
     url: OPENAPPSEC_URL,
-    mode: process.env.OPENAPPSEC_PREVENT_MODE === "true" ? "prevent" : "learning",
+    mode: OPENAPPSEC_MODE,
   };
 }
 

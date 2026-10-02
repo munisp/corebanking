@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -72,20 +74,105 @@ type KPIAlert struct {
 	CreatedAt   string  `json:"createdAt"`
 }
 
-var (
-	mu      sync.RWMutex
-	counter int
-	kpis    = []KPI{
-		{ID: "kpi-001", Name: "Transaction Success Rate", Category: "operations", Value: 98.7, Target: 99.0, Unit: "%", Period: "daily", Trend: "up", TrendValue: 0.3, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
-		{ID: "kpi-002", Name: "Average Transaction Time", Category: "operations", Value: 1.2, Target: 2.0, Unit: "seconds", Period: "daily", Trend: "down", TrendValue: -0.1, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
-		{ID: "kpi-003", Name: "Customer Acquisition Rate", Category: "growth", Value: 320, Target: 300, Unit: "customers/day", Period: "daily", Trend: "up", TrendValue: 12.5, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
-		{ID: "kpi-004", Name: "Loan Approval Rate", Category: "credit", Value: 74.2, Target: 70.0, Unit: "%", Period: "weekly", Trend: "up", TrendValue: 2.1, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
-		{ID: "kpi-005", Name: "Non-Performing Loan Ratio", Category: "credit", Value: 2.1, Target: 3.0, Unit: "%", Period: "monthly", Trend: "stable", TrendValue: 0.0, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
-		{ID: "kpi-006", Name: "Revenue per Customer", Category: "finance", Value: 4250.0, Target: 4000.0, Unit: "NGN", Period: "monthly", Trend: "up", TrendValue: 6.25, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
-		{ID: "kpi-007", Name: "Agent Network Coverage", Category: "agent_banking", Value: 87.3, Target: 90.0, Unit: "%", Period: "monthly", Trend: "up", TrendValue: 1.8, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
-		{ID: "kpi-008", Name: "Fraud Detection Rate", Category: "risk", Value: 96.4, Target: 95.0, Unit: "%", Period: "daily", Trend: "stable", TrendValue: 0.1, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+// ── Postgres persistence (W12 C3-P2-B5) ─────────────────────────────────────
+// The in-memory `kpis` slice was removed. The kpis table is authoritative;
+// recompute is a real PG UPDATE and all reads are served from PG. When
+// DATABASE_URL is unset/unreachable the KPI endpoints fail closed (503).
+
+var seedKPIs = []KPI{
+	{ID: "kpi-001", Name: "Transaction Success Rate", Category: "operations", Value: 98.7, Target: 99.0, Unit: "%", Period: "daily", Trend: "up", TrendValue: 0.3, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+	{ID: "kpi-002", Name: "Average Transaction Time", Category: "operations", Value: 1.2, Target: 2.0, Unit: "seconds", Period: "daily", Trend: "down", TrendValue: -0.1, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+	{ID: "kpi-003", Name: "Customer Acquisition Rate", Category: "growth", Value: 320, Target: 300, Unit: "customers/day", Period: "daily", Trend: "up", TrendValue: 12.5, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+	{ID: "kpi-004", Name: "Loan Approval Rate", Category: "credit", Value: 74.2, Target: 70.0, Unit: "%", Period: "weekly", Trend: "up", TrendValue: 2.1, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+	{ID: "kpi-005", Name: "Non-Performing Loan Ratio", Category: "credit", Value: 2.1, Target: 3.0, Unit: "%", Period: "monthly", Trend: "stable", TrendValue: 0.0, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+	{ID: "kpi-006", Name: "Revenue per Customer", Category: "finance", Value: 4250.0, Target: 4000.0, Unit: "NGN", Period: "monthly", Trend: "up", TrendValue: 6.25, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+	{ID: "kpi-007", Name: "Agent Network Coverage", Category: "agent_banking", Value: 87.3, Target: 90.0, Unit: "%", Period: "monthly", Trend: "up", TrendValue: 1.8, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+	{ID: "kpi-008", Name: "Fraud Detection Rate", Category: "risk", Value: 96.4, Target: 95.0, Unit: "%", Period: "daily", Trend: "stable", TrendValue: 0.1, ComputedAt: time.Now().UTC().Format(time.RFC3339)},
+}
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[kpi-engine-go] DATABASE_URL not set — KPI endpoints fail closed (503)")
+		return
 	}
-)
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[kpi-engine-go] DB open failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[kpi-engine-go] DB ping failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS kpis (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		category TEXT NOT NULL DEFAULT '',
+		value DOUBLE PRECISION NOT NULL DEFAULT 0,
+		target DOUBLE PRECISION NOT NULL DEFAULT 0,
+		unit TEXT NOT NULL DEFAULT '',
+		period TEXT NOT NULL DEFAULT '',
+		trend TEXT NOT NULL DEFAULT '',
+		trend_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+		computed_at TEXT NOT NULL DEFAULT '',
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[kpi-engine-go] DDL failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(`CREATE SEQUENCE IF NOT EXISTS kpi_jobs_seq START 1`); err != nil {
+		log.Printf("[kpi-engine-go] sequence DDL failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	// Idempotent boot seeds (previously the in-memory fixtures).
+	for _, k := range seedKPIs {
+		if _, err = db.Exec(`INSERT INTO kpis (id, name, category, value, target, unit, period, trend, trend_value, computed_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
+			k.ID, k.Name, k.Category, k.Value, k.Target, k.Unit, k.Period, k.Trend, k.TrendValue, k.ComputedAt); err != nil {
+			log.Printf("[kpi-engine-go] seed failed: %v — endpoints fail closed (503)", err)
+			db = nil
+			return
+		}
+	}
+	log.Printf("[kpi-engine-go] Postgres connected (pool: 10/2), kpis ready")
+}
+
+func kpiStoreUnavailable(w http.ResponseWriter) {
+	respondJSON(w, 503, map[string]string{"error": "kpi store unavailable (postgres down)"})
+}
+
+func queryKPIs(category string) ([]KPI, error) {
+	q := `SELECT id, name, category, value, target, unit, period, trend, trend_value, computed_at FROM kpis`
+	args := []interface{}{}
+	if category != "" {
+		q += ` WHERE category = $1`
+		args = append(args, category)
+	}
+	q += ` ORDER BY id`
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []KPI{}
+	for rows.Next() {
+		var k KPI
+		if err := rows.Scan(&k.ID, &k.Name, &k.Category, &k.Value, &k.Target, &k.Unit, &k.Period, &k.Trend, &k.TrendValue, &k.ComputedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
 
@@ -255,6 +342,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	port := getEnv("PORT", "9173")
 	mux := http.NewServeMux()
@@ -264,70 +352,95 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	// GET all KPIs (optionally filtered by category)
-	mux.HandleFunc("/v1/kpis", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/kpis", permifyAuthzGuard("kpi", "kpis", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			respondJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
 		category := r.URL.Query().Get("category")
-		mu.RLock()
-		result := make([]KPI, 0, len(kpis))
-		for _, k := range kpis {
-			if category == "" || k.Category == category {
-				result = append(result, k)
-			}
+		if db == nil {
+			kpiStoreUnavailable(w)
+			return
 		}
-		mu.RUnlock()
+		result, err := queryKPIs(category)
+		if err != nil {
+			log.Printf("[kpi-engine-go] list failed: %v", err)
+			kpiStoreUnavailable(w)
+			return
+		}
 		respondJSON(w, 200, map[string]interface{}{"kpis": result, "total": len(result)})
-	})
+	}))
 
 	// POST trigger recomputation of all KPIs
-	mux.HandleFunc("/v1/kpis/recompute", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/kpis/recompute", permifyAuthzGuard("kpi", "recompute", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			respondJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
-		mu.Lock()
-		counter++
-		// Update computedAt to simulate recompute
-		for i := range kpis {
-			kpis[i].ComputedAt = time.Now().UTC().Format(time.RFC3339)
+		if db == nil {
+			kpiStoreUnavailable(w)
+			return
 		}
-		mu.Unlock()
+		now := time.Now().UTC().Format(time.RFC3339)
+		// One atomic UPDATE: recompute stamps every KPI + allocates the job id.
+		var jobSeq, kpisCount int64
+		if err := db.QueryRow(`WITH j AS (SELECT nextval('kpi_jobs_seq') AS seq),
+			u AS (UPDATE kpis SET computed_at = $1, updated_at = NOW())
+			SELECT (SELECT seq FROM j), (SELECT COUNT(*) FROM kpis)`, now).Scan(&jobSeq, &kpisCount); err != nil {
+			log.Printf("[kpi-engine-go] recompute failed: %v", err)
+			kpiStoreUnavailable(w)
+			return
+		}
 		respondJSON(w, 200, map[string]interface{}{
 			"message":    "KPI recomputation triggered",
-			"job_id":     fmt.Sprintf("job-%03d", counter),
-			"kpis_count": len(kpis),
-			"started_at": time.Now().UTC().Format(time.RFC3339),
+			"job_id":     fmt.Sprintf("job-%03d", jobSeq),
+			"kpis_count": kpisCount,
+			"started_at": now,
 		})
-	})
+	}))
 
 	// GET KPI by ID
-	mux.HandleFunc("/v1/kpis/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/kpis/", permifyAuthzGuard("kpi", "kpis", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			respondJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
 		id := r.URL.Path[len("/v1/kpis/"):]
-		mu.RLock()
-		for _, k := range kpis {
-			if k.ID == id {
-				mu.RUnlock()
-				respondJSON(w, 200, k)
-				return
-			}
+		if db == nil {
+			kpiStoreUnavailable(w)
+			return
 		}
-		mu.RUnlock()
-		respondJSON(w, 404, map[string]string{"error": "KPI not found"})
-	})
+		var k KPI
+		err := db.QueryRow(`SELECT id, name, category, value, target, unit, period, trend, trend_value, computed_at
+			FROM kpis WHERE id = $1`, id).Scan(&k.ID, &k.Name, &k.Category, &k.Value, &k.Target, &k.Unit, &k.Period, &k.Trend, &k.TrendValue, &k.ComputedAt)
+		if err == sql.ErrNoRows {
+			respondJSON(w, 404, map[string]string{"error": "KPI not found"})
+			return
+		}
+		if err != nil {
+			log.Printf("[kpi-engine-go] get failed: %v", err)
+			kpiStoreUnavailable(w)
+			return
+		}
+		respondJSON(w, 200, k)
+	}))
 
 	// GET KPI alerts (targets breached)
-	mux.HandleFunc("/v1/kpis/alerts", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/kpis/alerts", permifyAuthzGuard("kpi", "alerts", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			respondJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
-		mu.RLock()
+		if db == nil {
+			kpiStoreUnavailable(w)
+			return
+		}
+		kpis, err := queryKPIs("")
+		if err != nil {
+			log.Printf("[kpi-engine-go] alerts query failed: %v", err)
+			kpiStoreUnavailable(w)
+			return
+		}
 		alerts := []KPIAlert{}
 		for _, k := range kpis {
 			if k.Trend == "down" && k.Value < k.Target {
@@ -342,17 +455,25 @@ func main() {
 				})
 			}
 		}
-		mu.RUnlock()
 		respondJSON(w, 200, map[string]interface{}{"alerts": alerts, "total": len(alerts)})
-	})
+	}))
 
 	// GET summary stats
-	mux.HandleFunc("/v1/kpis/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/kpis/stats", permifyAuthzGuard("kpi", "view", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			respondJSON(w, 405, map[string]string{"error": "method not allowed"})
 			return
 		}
-		mu.RLock()
+		if db == nil {
+			kpiStoreUnavailable(w)
+			return
+		}
+		kpis, err := queryKPIs("")
+		if err != nil {
+			log.Printf("[kpi-engine-go] stats query failed: %v", err)
+			kpiStoreUnavailable(w)
+			return
+		}
 		onTarget, belowTarget := 0, 0
 		for _, k := range kpis {
 			if k.Value >= k.Target {
@@ -361,7 +482,6 @@ func main() {
 				belowTarget++
 			}
 		}
-		mu.RUnlock()
 		respondJSON(w, 200, map[string]interface{}{
 			"total_kpis":    len(kpis),
 			"on_target":     onTarget,
@@ -369,7 +489,7 @@ func main() {
 			"last_computed": time.Now().UTC().Format(time.RFC3339),
 			"categories":    []string{"operations", "growth", "credit", "finance", "agent_banking", "risk"},
 		})
-	})
+	}))
 
 	log.Printf("[kpi-engine-go] KPI engine on :%s", port)
 	log.Fatal((&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
@@ -377,11 +497,17 @@ func main() {
 
 // healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	kpisTracked := -1 // unknown when the store is down; healthz stays 200
+	if db != nil {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM kpis`).Scan(&kpisTracked); err != nil {
+			kpisTracked = -1
+		}
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"service":      "kpi-engine-go",
 		"status":       "healthy",
 		"uptime_secs":  int(time.Since(startTime).Seconds()),
-		"kpis_tracked": len(kpis),
+		"kpis_tracked": kpisTracked,
 		"categories":   []string{"operations", "growth", "credit", "finance", "agent_banking", "risk"},
 	})
 }

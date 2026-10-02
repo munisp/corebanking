@@ -29,7 +29,8 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5P1DF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -219,6 +220,14 @@ class _PooledConn:
     def close(self):
         raw, self._raw = self._raw, None
         if raw is not None:
+            # B5-P1-B: with autocommit off, an uncommitted transaction
+            # (read-only, or aborted by an error) must be rolled back
+            # before the connection returns to the pool, otherwise the
+            # next borrower inherits an idle/aborted transaction.
+            try:
+                raw.rollback()
+            except Exception:
+                pass
             try:
                 _get_db_pool().putconn(raw)
             except Exception:
@@ -234,9 +243,17 @@ class _PooledConn:
             pass
 
 def get_db():
-    """Borrow a connection from the pool (thread-safe)."""
+    """Borrow a connection from the pool (thread-safe).
+
+    B5-P1-B: autocommit is OFF. Multi-statement write blocks (domain
+    write + INSERT INTO outbox) now commit as ONE transaction via the
+    explicit conn.commit() at the end of each block. Previously
+    autocommit=True made every execute() its own transaction and the
+    trailing conn.commit() a no-op, so a crash between the domain
+    write and the outbox insert silently lost the event (or the row).
+    """
     raw = _get_db_pool().getconn()
-    raw.autocommit = True
+    raw.autocommit = False
     return _PooledConn(raw)
 
 def release_db(conn):
@@ -252,6 +269,9 @@ def db_insert(service, record):
         cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
                     (data, service))
         row = cur.fetchone()
+    # B5-P1-B: commit explicitly; this write previously relied on
+    # autocommit=True and would be rolled back under transactional mode.
+    conn.commit()
     record["id"] = str(row[0])
     record["created_at"] = str(row[1])
     return record
@@ -416,7 +436,7 @@ def metrics():
         return {"service": "statement-generator-py", "total_records": 0}
 
 
-@app.get("/api/v1/service_configs")
+@app.get("/api/v1/service_configs", dependencies=[Depends(require_permify("report", "view"))])
 def list_records(page: int = 1, limit: int = 50, x_tenant_id: Optional[str] = Header(None)):
     conn = get_db()
     try:
@@ -701,9 +721,17 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-records = []
-audit_log = []
-domain_stats = {"processed_today": 0}
+# W12-C3-P2-AMB (c3-0915): removed dead in-memory `records` list. It was
+# iterated by the /v1/statement-generator/update and /process branches below
+# but NEVER appended anywhere, and it shadowed the real DB table `records`
+# (CREATE TABLE at :285, INSERT at :268). The real DB path is untouched.
+# W12-C3-P2-AMB (c3-0916): removed dead `audit_log` list + its two appends
+# (inside the removed branches). Both appends were doubly unreachable:
+# `Handler(BaseHTTPRequestHandler)` (:727) is never instantiated (bootstrap
+# is uvicorn-only :974-977) and `records` was never populated. `audit_log`
+# was never read. Reachability verdict: DEAD -> removed, not converted to PG.
+# (`domain_stats` was also removed: its only writer was the removed dead
+# /process branch and it had no readers.)
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -816,36 +844,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             cache_set("statement_generator:last_post", str(body))
             self.respond(201, {"created": True, "data": result})
-        elif path == "/v1/statement-generator/update":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid:
-                    if "status" in body:
-                        rec["status"] = body["status"]
-                    rec["data"].update({k: v for k, v in body.items() if k != "id"})
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
-                    self.respond(200, {"updated": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found: {rid}"})
-
-        elif path == "/v1/statement-generator/process":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid and rec["status"] in ("pending", "active"):
-                    rec["status"] = "completed"
-                    rec["data"]["processed_at"] = now_iso()
-                    rec["data"]["processing_result"] = "success"
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
-                    self.respond(200, {"processed": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found or not processable: {rid}"})
+        # W12-C3-P2-AMB (c3-0915/c3-0916): removed the dead
+        # /v1/statement-generator/update and /process branches — they iterated
+        # the never-populated in-memory `records` list (removed above) and
+        # appended to the never-read `audit_log` (removed above), inside a
+        # Handler class that is never served. No live route is affected.
         elif path == "/v1/statement-generator/generate":
             try:
                 result = generate_statement(body.get("account_id",""), body.get("transactions",[]), body.get("period_start",""), body.get("period_end",""), body.get("currency","NGN"))
@@ -858,7 +861,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"error": "Not found"})
 
 
-@app.post("/api/v1/service_configs", status_code=201)
+@app.post("/api/v1/service_configs", status_code=201, dependencies=[Depends(require_permify("report", "service_configs"))])
 def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
     tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
     status = body.status or "active"

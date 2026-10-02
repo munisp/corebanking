@@ -21,7 +21,9 @@ from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -422,17 +424,17 @@ def _not_implemented():
     raise HTTPException(status_code=501, detail=_NOT_IMPLEMENTED_DETAIL)
 
 
-@app.get("/api/v1/payments")
+@app.get("/api/v1/payments", dependencies=[Depends(require_permify("soc2_evidence", "view"))])
 def list_records():
     _not_implemented()
 
 
-@app.get("/api/v1/evidence")
+@app.get("/api/v1/evidence", dependencies=[Depends(require_permify("soc2_evidence", "view"))])
 def list_evidence():
     _not_implemented()
 
 
-@app.post("/api/v1/evidence/collect", status_code=501)
+@app.post("/api/v1/evidence/collect", status_code=501, dependencies=[Depends(require_permify("soc2_evidence", "create"))])
 def collect_evidence():
     _not_implemented()
 # --- JWT Auth ---
@@ -696,22 +698,22 @@ _degrade = _DegradationState()
 
 # Legacy scaffold paths kept as explicit fail-closed 501s so callers receive
 # an honest not_implemented instead of a fabricated record or a bare 404.
-@app.post("/api/v1/payments", status_code=501)
+@app.post("/api/v1/payments", status_code=501, dependencies=[Depends(require_permify("soc2_evidence", "create"))])
 def create_record():
     _not_implemented()
 
 
-@app.get("/api/v1/payments/{record_id}")
+@app.get("/api/v1/payments/{record_id}", dependencies=[Depends(require_permify("soc2_evidence", "view"))])
 def get_record(record_id: str):
     _not_implemented()
 
 
-@app.put("/api/v1/payments/{record_id}")
+@app.put("/api/v1/payments/{record_id}", dependencies=[Depends(require_permify("soc2_evidence", "update"))])
 def update_record(record_id: str):
     _not_implemented()
 
 
-@app.delete("/api/v1/payments/{record_id}", status_code=501)
+@app.delete("/api/v1/payments/{record_id}", status_code=501, dependencies=[Depends(require_permify("soc2_evidence", "delete"))])
 def delete_record(record_id: str):
     _not_implemented()
 

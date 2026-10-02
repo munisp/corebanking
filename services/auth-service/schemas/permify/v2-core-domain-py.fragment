@@ -1,0 +1,361 @@
+// ============================================================================
+// W12-B5-P1-D-C: core-domain-py + kyc/compliance-py schema FRAGMENT
+// (69 Python services, permify wave 2 batch D-C). This fragment is merged
+// into the canonical v2.perm by the integrator; it is kept in a separate
+// file so peer batches (D-A/D-B/D1/D2) never edit the same file. Syntax is
+// identical to v2.perm. The `user` entity is declared in the canonical file
+// and referenced here by type only.
+//
+// Convention: every domain route in the D-C fleet checks
+//   subject = verified JWT sub (user), resource = <entity>:<domain-id>,
+//   permission = <entity>.<action> as defined below. Checks fail closed.
+// Reused entities (NOT redefined here): v2.perm `service_config`
+// (W12-B5D1, api/v1/service_configs cluster) and v2-kyc-compliance.fragment
+// `kyb_application` (business-service POST /business/kyb/complete).
+// ============================================================================
+
+// KYC records served by the kyc engine cluster (kyc-engine-py, kyb-engine-py,
+// kyc-data-quality-py, kyc-event-consumer-py, kyc-self-service-py,
+// kyc-analytics-dashboard-py, efass-kyc-returns-py).
+entity kyc_record {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Compliance records served by the regulatory/compliance cluster
+// (aml-compliance-dashboard-py, cbn-compliance-checker-py, cbn-returns-py,
+// gl-regulatory-pipeline-py, regulatory-automation-py,
+// regulatory-reporting-py).
+entity compliance_record {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Accessibility audit events (accessibility-auditor-py).
+entity audit_event {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Insurance products (insurance-py, area-yield-index-insurance-py).
+entity insurance_product {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Credit/loan applications and scoring runs (credit-scoring-py,
+// cooperative-credit-scoring-py).
+entity credit_application {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Customer profiles (customer-360-py, customer-engagement-py,
+// customer-feedback-py). PII-bearing: reads are guarded with `view`.
+entity customer_profile {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Dormant-account monitoring records (dormant-account-monitor-py).
+entity monitored_account {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// GNN fraud alerts (gnn-fraud-detection-py).
+entity fraud_alert {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// SOC2 evidence collection records (soc2-evidence-collector-py).
+entity soc2_evidence {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// UEBA analytics reports (ueba-analytics-py).
+entity analytics_report {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// CBN regulatory reports (cbn-service).
+entity cbn_report {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Admin accounts (admin-service).
+entity admin_account {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Businesses (business-service).
+entity business {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Business bank accounts (business-service).
+entity business_account {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Business users (business-service).
+entity business_user {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Insurance policies (insurance-service).
+entity insurance_policy {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Insurance claims (insurance-service).
+entity insurance_claim {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// LPO financing applications (lpo-service).
+entity lpo_financing {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// LPO suppliers (lpo-service).
+entity lpo_supplier {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Supply-chain financing (supply-chain-service).
+entity supply_chain_financing {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Supply-chain buyer/supplier relationships (supply-chain-service).
+entity supply_chain_relationship {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// User profiles incl. KYC lifecycle actions (user-service).
+entity user_profile {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// User feedback (user-service).
+entity user_feedback {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// NDPR data-subject requests (ndpr-compliance-py). PII-bearing: reads are
+// guarded with `view`.
+entity ndpr_dsr {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Video-KYC sessions (video-kyc-py).
+entity video_kyc_session {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}
+
+// Stored card records (postgres-vacuum-py /api/v1/cards).
+entity stored_card {
+  relation admin   @user
+  relation manager @user
+  relation viewer  @user
+
+  permission view   = admin or manager or viewer
+  permission create = admin or manager
+  permission update = admin or manager
+  permission delete = admin
+  permission manage = admin or manager
+}

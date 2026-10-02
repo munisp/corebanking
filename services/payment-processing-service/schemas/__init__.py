@@ -1,6 +1,7 @@
 from .payment import (
     InitiatePaymentSchema,
     InitiateDepositSchema,
+    InitiateWithdrawalSchema,
     InitiateDepositWithAccountNumberSchema,
     TransactionEventSchema,
     InitiateLoanPaymentSchema,

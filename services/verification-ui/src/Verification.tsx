@@ -25,8 +25,15 @@ import {
 const API_BASE_URL =
   import.meta.env.VITE_VERIFICATION_API_URL ||
   "https://54link-dev.upi.dev/verification";
-const API_KEY = import.meta.env.VITE_KYC_FLOW_API_KEY || "";
-const FALLBACK_KYC_API_KEY = "Zr6lIvOEuGDlzlDyV+/dEDcUX7cChZKs";
+// W12-A4-P0-E: hardcoded FALLBACK_KYC_API_KEY removed (same compromised
+// literal as verificationAPI.ts — must be rotated). Key comes from the
+// build-time env only; empty string means the gateway rejects calls (loud
+// failure, no baked-in credential).
+const API_KEY = (
+  import.meta.env.VITE_VERIFICATION_API_KEY ||
+  import.meta.env.VITE_KYC_FLOW_API_KEY ||
+  ""
+).trim();
 
 export default function Verification() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -142,7 +149,7 @@ export default function Verification() {
 
       // Add API key as Authorization header. Prefer env, then URL, then fallback.
       const apiKeyFromUrl = params.get("api_key") || "";
-      const resolvedApiKey = (API_KEY || apiKeyFromUrl || FALLBACK_KYC_API_KEY).trim();
+      const resolvedApiKey = (API_KEY || apiKeyFromUrl || "").trim();
       if (!resolvedApiKey) {
         throw new Error("Missing KYC API key configuration.");
       }

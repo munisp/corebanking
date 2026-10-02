@@ -2,31 +2,30 @@ package main
 
 import (
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// OfficerService handles treasury officer management
+// OfficerService handles treasury officer management.
+// Postgres (table treasury_officers) is the system of record.
 type OfficerService struct {
 	tenantID string
-	officers map[string]*TreasuryOfficer
-	mu       sync.RWMutex
+	officers *repo[TreasuryOfficer]
 }
 
 // NewOfficerService creates a new officer service
 func NewOfficerService(tenantID string) *OfficerService {
 	svc := &OfficerService{
 		tenantID: tenantID,
-		officers: make(map[string]*TreasuryOfficer),
+		officers: newRepo[TreasuryOfficer](serviceDB, "treasury_officers"),
 	}
 	svc.initializeDefaultOfficers(tenantID)
 	return svc
 }
 
 func (s *OfficerService) initializeDefaultOfficers(tenantID string) {
-	s.officers["officer-001"] = &TreasuryOfficer{
+	s.officers.seed(tenantID, "officer-001", &TreasuryOfficer{
 		OfficerID:    "officer-001",
 		TenantID:     tenantID,
 		EmployeeID:   "EMP-T001",
@@ -40,9 +39,9 @@ func (s *OfficerService) initializeDefaultOfficers(tenantID string) {
 		Status:       "active",
 		CreatedAt:    time.Now().AddDate(-2, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
-	s.officers["officer-002"] = &TreasuryOfficer{
+	s.officers.seed(tenantID, "officer-002", &TreasuryOfficer{
 		OfficerID:    "officer-002",
 		TenantID:     tenantID,
 		EmployeeID:   "EMP-T002",
@@ -56,9 +55,9 @@ func (s *OfficerService) initializeDefaultOfficers(tenantID string) {
 		Status:       "active",
 		CreatedAt:    time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
-	s.officers["officer-003"] = &TreasuryOfficer{
+	s.officers.seed(tenantID, "officer-003", &TreasuryOfficer{
 		OfficerID:    "officer-003",
 		TenantID:     tenantID,
 		EmployeeID:   "EMP-T003",
@@ -72,9 +71,9 @@ func (s *OfficerService) initializeDefaultOfficers(tenantID string) {
 		Status:       "active",
 		CreatedAt:    time.Now().AddDate(0, -6, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
-	s.officers["officer-004"] = &TreasuryOfficer{
+	s.officers.seed(tenantID, "officer-004", &TreasuryOfficer{
 		OfficerID:    "officer-004",
 		TenantID:     tenantID,
 		EmployeeID:   "EMP-T004",
@@ -88,34 +87,29 @@ func (s *OfficerService) initializeDefaultOfficers(tenantID string) {
 		Status:       "active",
 		CreatedAt:    time.Now().AddDate(0, -3, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 }
 
 // ListOfficers returns officers based on filters
-func (s *OfficerService) ListOfficers(tenantID, desk string) []*TreasuryOfficer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *OfficerService) ListOfficers(tenantID, desk string) ([]*TreasuryOfficer, error) {
+	all, err := s.officers.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	var result []*TreasuryOfficer
-	for _, officer := range s.officers {
-		if officer.TenantID != tenantID {
-			continue
-		}
+	for _, officer := range all {
 		if desk != "" && officer.Desk != desk {
 			continue
 		}
 		result = append(result, officer)
 	}
-	return result
+	return result, nil
 }
 
 // GetOfficer retrieves an officer by ID
 func (s *OfficerService) GetOfficer(tenantID, officerID string) (*TreasuryOfficer, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	officer, exists := s.officers[officerID]
-	if !exists || officer.TenantID != tenantID {
+	officer, err := s.officers.get(tenantID, officerID)
+	if err != nil {
 		return nil, errors.New("officer not found")
 	}
 	return officer, nil
@@ -123,44 +117,42 @@ func (s *OfficerService) GetOfficer(tenantID, officerID string) (*TreasuryOffice
 
 // RegisterOfficer registers a new officer
 func (s *OfficerService) RegisterOfficer(tenantID string, officer *TreasuryOfficer) (*TreasuryOfficer, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	officer.OfficerID = uuid.New().String()
 	officer.TenantID = tenantID
 	officer.Status = "active"
 	officer.CreatedAt = time.Now()
 	officer.UpdatedAt = time.Now()
 
-	s.officers[officer.OfficerID] = officer
+	if err := s.officers.put(tenantID, officer.OfficerID, officer); err != nil {
+		return nil, err
+	}
 	return officer, nil
 }
 
 // UpdateOfficer updates an officer
 func (s *OfficerService) UpdateOfficer(officer *TreasuryOfficer) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	existing, exists := s.officers[officer.OfficerID]
-	if !exists || existing.TenantID != officer.TenantID {
+	existing, err := s.officers.get(officer.TenantID, officer.OfficerID)
+	if err != nil {
 		return errors.New("officer not found")
 	}
 
 	officer.CreatedAt = existing.CreatedAt
 	officer.UpdatedAt = time.Now()
-	s.officers[officer.OfficerID] = officer
-	return nil
+	return s.officers.put(officer.TenantID, officer.OfficerID, officer)
 }
 
 // GetOfficerDeals returns deals for an officer
-func (s *OfficerService) GetOfficerDeals(tenantID, officerID string, fxService *FXService, interbankService *InterbankService) map[string]interface{} {
+func (s *OfficerService) GetOfficerDeals(tenantID, officerID string, fxService *FXService, interbankService *InterbankService) (map[string]interface{}, error) {
 	officer, err := s.GetOfficer(tenantID, officerID)
 	if err != nil {
-		return map[string]interface{}{"error": "officer not found"}
+		return map[string]interface{}{"error": "officer not found"}, nil
 	}
 
 	// Get FX deals
-	fxDeals := fxService.ListFXDeals(tenantID, "", "")
+	fxDeals, err := fxService.ListFXDeals(tenantID, "", "")
+	if err != nil {
+		return nil, err
+	}
 	var officerFXDeals []*FXDeal
 	for _, deal := range fxDeals {
 		if deal.DealerID == officerID {
@@ -169,7 +161,10 @@ func (s *OfficerService) GetOfficerDeals(tenantID, officerID string, fxService *
 	}
 
 	// Get interbank deals
-	interbankDeals := interbankService.ListInterbankDeals(tenantID, "", "")
+	interbankDeals, err := interbankService.ListInterbankDeals(tenantID, "", "")
+	if err != nil {
+		return nil, err
+	}
 	var officerInterbankDeals []*InterbankDeal
 	for _, deal := range interbankDeals {
 		if deal.DealerID == officerID {
@@ -187,5 +182,5 @@ func (s *OfficerService) GetOfficerDeals(tenantID, officerID string, fxService *
 		"interbankCount": len(officerInterbankDeals),
 		"dealingLimit":   officer.DealingLimit,
 		"timestamp":      time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

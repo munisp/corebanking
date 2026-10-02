@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
@@ -345,6 +346,7 @@ async fn metrics(data: web::Data<AppState>) -> HttpResponse {
 
 async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "view").await { return resp; } // W12-B5P1DF
     // Tenant identity comes from verified JWT claims (request extensions), never raw headers.
     let tenant_id = match claims_tenant(&req) {
         Some(t) if !t.is_empty() => t,
@@ -374,6 +376,7 @@ async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
 
 async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "service_configs").await { return resp; } // W12-B5P1DF
     // Tenant identity comes from verified JWT claims (request extensions), never raw headers/body.
     let tenant_id = match claims_tenant(&req) {
         Some(t) if !t.is_empty() => t,
@@ -382,22 +385,31 @@ async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>
 
     let status = body.status.clone().unwrap_or_else(|| "active".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
     )
     .bind(&tenant_id)
     .bind(&status)
-    .fetch_one(&data.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
         Ok(id) => {
             let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.created")
                 .bind(id.to_string())
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -406,6 +418,7 @@ async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>
 
 async fn get_record(req: actix_web::HttpRequest, data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "view").await { return resp; } // W12-B5P1DF
     let id = path.into_inner();
     let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
         .bind(&id)
@@ -425,23 +438,33 @@ async fn get_record(req: actix_web::HttpRequest, data: web::Data<AppState>, path
 
 async fn update_record(req: actix_web::HttpRequest, data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "update").await { return resp; } // W12-B5P1DF
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -450,19 +473,33 @@ async fn update_record(req: actix_web::HttpRequest, data: web::Data<AppState>, p
 
 async fn delete_record(req: actix_web::HttpRequest, data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "delete").await { return resp; } // W12-B5P1DF
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }
+
+// Wave-12 B5-P1-D-F: Permify authorization guard module.
+mod permify;

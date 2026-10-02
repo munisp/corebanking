@@ -122,9 +122,9 @@ export const initializeVerification = asyncHandler(async (req: Request, res: Res
 
   // Create session with UUID as key (when linked) so GET/POST /verification/:id/...
   // using that UUID resolves correctly via getSession(UUID).
-  const session = createSession(metadata, linkedId);
+  const session = await createSession(metadata, linkedId);
   if (linkedId) {
-    updateSession(session.id, { linkedVerificationId: linkedId });
+    await updateSession(session.id, { linkedVerificationId: linkedId });
     logger.info(`[verification] Session ${session.id} linked to workflow ${linkedId}`);
   }
 
@@ -139,7 +139,7 @@ export const initializeVerification = asyncHandler(async (req: Request, res: Res
 
 /** GET /api/v1/verification/:id/session */
 export const getVerificationSession = asyncHandler(async (req: Request, res: Response) => {
-  const session = getSession(req.params.id);
+  const session = await getSession(req.params.id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
 
   return res.json({
@@ -156,11 +156,11 @@ export const getVerificationSession = asyncHandler(async (req: Request, res: Res
 
 /** PATCH /api/v1/verification/:id/session */
 export const patchVerificationSession = asyncHandler(async (req: Request, res: Response) => {
-  const session = getSession(req.params.id);
+  const session = await getSession(req.params.id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
 
   const { country, documentType } = req.body || {};
-  const updated = updateSession(req.params.id, {
+  const updated = await updateSession(req.params.id, {
     ...(country      !== undefined && { country }),
     ...(documentType !== undefined && { documentType }),
   });
@@ -216,7 +216,7 @@ export const getCountryConfig = asyncHandler(async (req: Request, res: Response)
 /** POST /api/v1/verification/:id/documents/upload  (multipart/form-data) */
 export const uploadDocument = asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
 
   const file = req.file;
@@ -225,7 +225,7 @@ export const uploadDocument = asyncHandler(async (req: Request, res: Response) =
   const side = (req.body?.side === "back" ? "back" : "front") as "front" | "back";
   const base64 = file.buffer.toString("base64");
 
-  const doc = addDocument(id, {
+  const doc = await addDocument(id, {
     side,
     base64:     `data:${file.mimetype};base64,${base64}`,
     mimeType:   file.mimetype,
@@ -246,14 +246,14 @@ export const processOcr = asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const { documentType } = req.body || {};
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
 
   const frontDoc = session.documents.find(d => d.side === "front");
   if (!frontDoc) throw new ApiError(httpStatus.BAD_REQUEST, "Front document image required", "VER-400-02", "verification-service");
 
-  const job = createOcrJob(id)!;
-  updateOcrJob(id, job.jobId, { status: "processing" });
+  const job = (await createOcrJob(id))!;
+  await updateOcrJob(id, job.jobId, { status: "processing" });
 
   // Run OCR in background — controller returns immediately with jobId
   runOcrJob(id, job.jobId, {
@@ -270,10 +270,10 @@ export const processOcr = asyncHandler(async (req: Request, res: Response) => {
 export const getOcrResult = asyncHandler(async (req: Request, res: Response) => {
   const { id, jobId } = req.params;
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
 
-  const job = getOcrJob(id, jobId);
+  const job = await getOcrJob(id, jobId);
   if (!job) throw new ApiError(httpStatus.NOT_FOUND, "OCR job not found", "VER-404-03", "verification-service");
 
   if (job.status === "failed") {
@@ -305,17 +305,17 @@ export const faceMatch = asyncHandler(async (req: Request, res: Response) => {
   // used: the provider verifies the selfie against the identity reference.
   const { selfieImage } = req.body || {};
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
   if (!selfieImage) throw new ApiError(httpStatus.BAD_REQUEST, "selfieImage is required", "VER-400-03", "verification-service");
 
-  updateSession(id, { selfieBase64: selfieImage });
+  await updateSession(id, { selfieBase64: selfieImage });
 
   // The identity reference (NIN) must come from session metadata captured at
   // initialization — never from the face-match request body.
   const nin = (session.metadata?.nin ?? session.metadata?.UIN) as string | undefined;
   const result = await compareFaces(selfieImage, nin);
-  updateSession(id, { faceMatchScore: result.score });
+  await updateSession(id, { faceMatchScore: result.score });
 
   return res.json({
     verified:   result.verified,
@@ -331,14 +331,14 @@ export const livenessCheck = asyncHandler(async (req: Request, res: Response) =>
   const { id } = req.params;
   const { proof } = req.body || {};
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
   if (!proof)   throw new ApiError(httpStatus.BAD_REQUEST, "Liveness proof is required", "VER-400-04", "verification-service");
 
   const result = await validateLivenessProof({ livenessProof: proof, sessionId: id });
 
   // Store the raw proof — needed to build the Temporal signal payload at submit time
-  updateSession(id, {
+  await updateSession(id, {
     livenessVerified:    result.isValid,
     livenessConfidence:  proof.confidence ?? 0,
     livenessProof:       proof,
@@ -364,10 +364,10 @@ export const submitVerification = asyncHandler(async (req: Request, res: Respons
   const { id } = req.params;
   const { documentVerified, faceMatched, livenessVerified, metadata } = req.body || {};
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
 
-  if (metadata) updateSession(id, { metadata });
+  if (metadata) await updateSession(id, { metadata });
 
   // ── Path A: linked to an existing Temporal workflow ─────────────────────────
   // When the tenant initialised via POST /kyc/initialize-verification (old flow),
@@ -428,7 +428,7 @@ export const submitVerification = asyncHandler(async (req: Request, res: Respons
         }
 
         logger.info(`[submit:${id}] signal sent OK`);
-        updateSession(id, { status: "processing" });
+        await updateSession(id, { status: "processing" });
 
         return res.json({
           status:         "processing",
@@ -449,7 +449,7 @@ export const submitVerification = asyncHandler(async (req: Request, res: Respons
                : score >= 0.4 ? "manual_review"
                : "rejected";
 
-  updateSession(id, { status: status as any, score });
+  await updateSession(id, { status: status as any, score });
 
   // Fire webhook if a callbackUrl was included in session metadata
   const callbackUrl = (session.metadata?.callbackUrl || session.metadata?.callback_url) as string | undefined;
@@ -479,7 +479,7 @@ export const submitVerification = asyncHandler(async (req: Request, res: Respons
 
 /** GET /api/v1/verification/:id/status */
 export const getVerificationStatus = asyncHandler(async (req: Request, res: Response) => {
-  const session = getSession(req.params.id);
+  const session = await getSession(req.params.id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
 
   return res.json({
@@ -520,12 +520,12 @@ async function runOcrJob(
       },
     };
 
-    updateOcrJob(sessionId, jobId, { status: "completed", result: ocrResult });
+    await updateOcrJob(sessionId, jobId, { status: "completed", result: ocrResult });
   } catch (err: any) {
     // M-54: provider/upstream error details stay in server logs; the client only
     // ever sees a generic failure message.
     logger.error(`[ocrJob:${jobId}] document processing failed`, { error: String(err?.message ?? err) });
-    updateOcrJob(sessionId, jobId, { status: "failed", error: "Document processing failed" });
+    await updateOcrJob(sessionId, jobId, { status: "failed", error: "Document processing failed" });
   }
 }
 
@@ -570,7 +570,7 @@ async function compareFaces(selfie: string, nin?: string): Promise<{ score: numb
  *   Liveness                 → 20%
  */
 function computeScore(
-  session: NonNullable<ReturnType<typeof getSession>>,
+  session: NonNullable<Awaited<ReturnType<typeof getSession>>>,
   flags: { documentVerified?: boolean; faceMatched?: boolean; livenessVerified?: boolean },
 ): number {
   const completedOcr   = Object.values(session.ocrJobs).find(j => j.status === "completed");

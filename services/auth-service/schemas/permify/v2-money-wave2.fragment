@@ -1,0 +1,317 @@
+// ============================================================================
+// Wave-12 B5-P1-D-D: money-movement wave-2 / ledger / kyc-compliance schema
+// FRAGMENT. Merged into the canonical v2.perm by the integrator; kept in a
+// separate file so the canonical-schema owner (B5-P0-D1) and the kyc fragment
+// owner (B5-P0-D2/D3) never share an edit surface with this batch. Syntax
+// identical to v2.perm; the `user` entity is declared in the canonical file
+// and referenced here by type only. ONLY genuinely new domain entities live
+// here — canonical entities (account, transfer, settlement, payment_order,
+// facility, sweep, terminal, journal_entry, savings, derivative, kyc_case,
+// aml_case, ubo_graph, regulatory_filing, regulatory_scenario, fraud_case,
+// identity_verification, kyb_application, coa_mapping, ...) are REUSED, never
+// redefined.
+//
+// Convention: every mutating handler checks
+//   subject = verified JWT identity, resource = <entity>:<domain-id>,
+//   permission = <entity>.<action> as defined below. Checks fail closed
+//   (Permify unreachable -> 502, denied -> 403) via the batch guard modules.
+// ============================================================================
+
+entity contingent_liability {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity escrow {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission evaluate = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity factoring {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity fixed_asset {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity interest_rate {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission compute = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity lease {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity liquidity_position {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity liquidity_report {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity loan_application {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission approve = admin or approver
+  permission audit = admin or operator
+  permission emi_calculator = admin or operator
+  permission evaluate = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+}
+
+entity materialized_view {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity mojaloop_participant {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity money_market_deal {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission calculate = admin or operator
+}
+
+entity mortgage {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity payment_investigation {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission compute_fee = admin or operator
+  permission process = admin or operator
+  permission route = admin or operator
+}
+
+entity revaluation_run {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity scratch_card {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity security_order {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity standing_charge {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity swift_message {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission validate_mt103 = admin or operator
+}
+
+entity tax_report {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity training_record {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit = admin or operator
+  permission process = admin or operator
+  permission risk_score = admin or operator
+  permission screen = admin or operator
+}

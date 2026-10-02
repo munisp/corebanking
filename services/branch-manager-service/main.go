@@ -513,7 +513,11 @@ func (s *BranchServer) listBranchesHandler(w http.ResponseWriter, r *http.Reques
 	region := r.URL.Query().Get("region")
 	status := r.URL.Query().Get("status")
 
-	branches := s.branchService.ListBranches(tenantID, region, status)
+	branches, err := s.branchService.ListBranches(tenantID, region, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"branches": branches})
 }
 
@@ -598,7 +602,11 @@ func (s *BranchServer) listStaffHandler(w http.ResponseWriter, r *http.Request) 
 	role := r.URL.Query().Get("role")
 	status := r.URL.Query().Get("status")
 
-	staff := s.staffService.ListStaff(tenantID, branchID, role, status)
+	staff, err := s.staffService.ListStaff(tenantID, branchID, role, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"staff": staff})
 }
 
@@ -706,7 +714,11 @@ func (s *BranchServer) listSchedulesHandler(w http.ResponseWriter, r *http.Reque
 	branchID := getBranchID(r)
 	date := r.URL.Query().Get("date")
 
-	schedules := s.scheduleService.ListSchedules(tenantID, branchID, date)
+	schedules, err := s.scheduleService.ListSchedules(tenantID, branchID, date)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"schedules": schedules})
 }
 
@@ -791,7 +803,11 @@ func (s *BranchServer) getWeeklyScheduleHandler(w http.ResponseWriter, r *http.R
 	branchID := getBranchID(r)
 	startDate := r.URL.Query().Get("start_date")
 
-	schedule := s.scheduleService.GetWeeklySchedule(tenantID, branchID, startDate)
+	schedule, err := s.scheduleService.GetWeeklySchedule(tenantID, branchID, startDate)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, schedule)
 }
 
@@ -824,7 +840,11 @@ func (s *BranchServer) listLeaveRequestsHandler(w http.ResponseWriter, r *http.R
 	branchID := getBranchID(r)
 	status := r.URL.Query().Get("status")
 
-	requests := s.scheduleService.ListLeaveRequests(tenantID, branchID, status)
+	requests, err := s.scheduleService.ListLeaveRequests(tenantID, branchID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"leaveRequests": requests})
 }
 
@@ -917,7 +937,11 @@ func (s *BranchServer) listApprovalsHandler(w http.ResponseWriter, r *http.Reque
 	status := r.URL.Query().Get("status")
 	requestType := r.URL.Query().Get("type")
 
-	approvals := s.approvalService.ListApprovals(tenantID, branchID, status, requestType)
+	approvals, err := s.approvalService.ListApprovals(tenantID, branchID, status, requestType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"approvals": approvals})
 }
 
@@ -1027,7 +1051,11 @@ func (s *BranchServer) listPendingApprovalsHandler(w http.ResponseWriter, r *htt
 	tenantID := getTenantID(r)
 	branchID := getBranchID(r)
 
-	approvals := s.approvalService.ListApprovals(tenantID, branchID, "pending", "")
+	approvals, err := s.approvalService.ListApprovals(tenantID, branchID, "pending", "")
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"approvals": approvals})
 }
 
@@ -1035,7 +1063,11 @@ func (s *BranchServer) listUrgentApprovalsHandler(w http.ResponseWriter, r *http
 	tenantID := getTenantID(r)
 	branchID := getBranchID(r)
 
-	approvals := s.approvalService.ListUrgentApprovals(tenantID, branchID)
+	approvals, err := s.approvalService.ListUrgentApprovals(tenantID, branchID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"approvals": approvals})
 }
 
@@ -1045,7 +1077,11 @@ func (s *BranchServer) listTargetsHandler(w http.ResponseWriter, r *http.Request
 	branchID := getBranchID(r)
 	period := r.URL.Query().Get("period")
 
-	targets := s.performanceService.ListTargets(tenantID, branchID, period)
+	targets, err := s.performanceService.ListTargets(tenantID, branchID, period)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"targets": targets})
 }
 
@@ -1108,7 +1144,11 @@ func (s *BranchServer) getPerformanceHandler(w http.ResponseWriter, r *http.Requ
 	branchID := getBranchID(r)
 	period := r.URL.Query().Get("period")
 
-	performance := s.performanceService.GetPerformance(tenantID, branchID, period)
+	performance, err := s.performanceService.GetPerformance(tenantID, branchID, period)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, performance)
 }
 
@@ -1117,7 +1157,11 @@ func (s *BranchServer) getDailyPerformanceHandler(w http.ResponseWriter, r *http
 	branchID := getBranchID(r)
 	date := r.URL.Query().Get("date")
 
-	performance := s.performanceService.GetDailyPerformance(tenantID, branchID, date)
+	performance, err := s.performanceService.GetDailyPerformance(tenantID, branchID, date)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, performance)
 }
 
@@ -1127,7 +1171,11 @@ func (s *BranchServer) getMonthlyPerformanceHandler(w http.ResponseWriter, r *ht
 	month := r.URL.Query().Get("month")
 	year := r.URL.Query().Get("year")
 
-	performance := s.performanceService.GetMonthlyPerformance(tenantID, branchID, month, year)
+	performance, err := s.performanceService.GetMonthlyPerformance(tenantID, branchID, month, year)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, performance)
 }
 
@@ -1137,7 +1185,11 @@ func (s *BranchServer) comparePerformanceHandler(w http.ResponseWriter, r *http.
 	compareTo := r.URL.Query().Get("compare_to")
 	period := r.URL.Query().Get("period")
 
-	comparison := s.performanceService.ComparePerformance(tenantID, branchID, compareTo, period)
+	comparison, err := s.performanceService.ComparePerformance(tenantID, branchID, compareTo, period)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, comparison)
 }
 
@@ -1146,7 +1198,11 @@ func (s *BranchServer) getCashPositionHandler(w http.ResponseWriter, r *http.Req
 	tenantID := getTenantID(r)
 	branchID := getBranchID(r)
 
-	position := s.cashService.GetCashPosition(tenantID, branchID)
+	position, err := s.cashService.GetCashPosition(tenantID, branchID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	cashPosition.WithLabelValues(branchID).Set(float64(position.ClosingBalance))
 	respondJSON(w, http.StatusOK, position)
 }
@@ -1156,7 +1212,11 @@ func (s *BranchServer) getDailyCashHandler(w http.ResponseWriter, r *http.Reques
 	branchID := getBranchID(r)
 	date := r.URL.Query().Get("date")
 
-	cash := s.cashService.GetDailyCash(tenantID, branchID, date)
+	cash, err := s.cashService.GetDailyCash(tenantID, branchID, date)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, cash)
 }
 
@@ -1188,7 +1248,11 @@ func (s *BranchServer) listCashRequestsHandler(w http.ResponseWriter, r *http.Re
 	branchID := getBranchID(r)
 	status := r.URL.Query().Get("status")
 
-	requests := s.cashService.ListCashRequests(tenantID, branchID, status)
+	requests, err := s.cashService.ListCashRequests(tenantID, branchID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"cashRequests": requests})
 }
 
@@ -1267,7 +1331,11 @@ func (s *BranchServer) listIncidentsHandler(w http.ResponseWriter, r *http.Reque
 	status := r.URL.Query().Get("status")
 	severity := r.URL.Query().Get("severity")
 
-	incidents := s.incidentService.ListIncidents(tenantID, branchID, status, severity)
+	incidents, err := s.incidentService.ListIncidents(tenantID, branchID, status, severity)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"incidents": incidents})
 }
 
@@ -1393,7 +1461,11 @@ func (s *BranchServer) getDashboardHandler(w http.ResponseWriter, r *http.Reques
 	tenantID := getTenantID(r)
 	branchID := getBranchID(r)
 
-	dashboard := s.getDashboard(tenantID, branchID)
+	dashboard, err := s.getDashboard(tenantID, branchID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, dashboard)
 }
 
@@ -1401,7 +1473,11 @@ func (s *BranchServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http
 	tenantID := getTenantID(r)
 	branchID := getBranchID(r)
 
-	summary := s.getDashboardSummary(tenantID, branchID)
+	summary, err := s.getDashboardSummary(tenantID, branchID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, summary)
 }
 
@@ -1413,7 +1489,7 @@ func (s *BranchServer) getQueueStatusHandler(w http.ResponseWriter, r *http.Requ
 	respondJSON(w, http.StatusOK, queue)
 }
 
-func (s *BranchServer) getDashboard(tenantID, branchID string) *BranchDashboard {
+func (s *BranchServer) getDashboard(tenantID, branchID string) (*BranchDashboard, error) {
 	branch, _ := s.branchService.GetBranch(tenantID, branchID)
 
 	dashboard := &BranchDashboard{
@@ -1425,7 +1501,10 @@ func (s *BranchServer) getDashboard(tenantID, branchID string) *BranchDashboard 
 	}
 
 	// Staff summary
-	staff := s.staffService.ListStaff(tenantID, branchID, "", "")
+	staff, err := s.staffService.ListStaff(tenantID, branchID, "", "")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.TotalStaff = len(staff)
 	for _, st := range staff {
 		if st.Status == "active" {
@@ -1436,7 +1515,10 @@ func (s *BranchServer) getDashboard(tenantID, branchID string) *BranchDashboard 
 	}
 
 	// Pending approvals
-	approvals := s.approvalService.ListApprovals(tenantID, branchID, "pending", "")
+	approvals, err := s.approvalService.ListApprovals(tenantID, branchID, "pending", "")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.PendingApprovals = len(approvals)
 	for _, a := range approvals {
 		if a.Priority == "urgent" {
@@ -1445,11 +1527,17 @@ func (s *BranchServer) getDashboard(tenantID, branchID string) *BranchDashboard 
 	}
 
 	// Leave requests
-	leaveRequests := s.scheduleService.ListLeaveRequests(tenantID, branchID, "pending")
+	leaveRequests, err := s.scheduleService.ListLeaveRequests(tenantID, branchID, "pending")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.PendingLeaveRequests = len(leaveRequests)
 
 	// Cash position
-	cashPos := s.cashService.GetCashPosition(tenantID, branchID)
+	cashPos, err := s.cashService.GetCashPosition(tenantID, branchID)
+	if err != nil {
+		return nil, err
+	}
 	if cashPos != nil {
 		dashboard.CurrentCashPosition = cashPos.ClosingBalance
 		dashboard.CashLimit = cashPos.CashLimit
@@ -1459,7 +1547,10 @@ func (s *BranchServer) getDashboard(tenantID, branchID string) *BranchDashboard 
 	}
 
 	// Incidents
-	incidents := s.incidentService.ListIncidents(tenantID, branchID, "open", "")
+	incidents, err := s.incidentService.ListIncidents(tenantID, branchID, "open", "")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.OpenIncidents = len(incidents)
 	for _, inc := range incidents {
 		if inc.Severity == "critical" {
@@ -1468,7 +1559,10 @@ func (s *BranchServer) getDashboard(tenantID, branchID string) *BranchDashboard 
 	}
 
 	// Performance
-	performance := s.performanceService.GetDailyPerformance(tenantID, branchID, "")
+	performance, err := s.performanceService.GetDailyPerformance(tenantID, branchID, "")
+	if err != nil {
+		return nil, err
+	}
 	if performance != nil {
 		dashboard.TodayTransactions = performance.TotalTransactions
 		dashboard.TodayDeposits = performance.TotalDepositAmount
@@ -1487,11 +1581,15 @@ func (s *BranchServer) getDashboard(tenantID, branchID string) *BranchDashboard 
 		dashboard.AvgWaitTime = avgWait
 	}
 
-	return dashboard
+	return dashboard, nil
+
 }
 
-func (s *BranchServer) getDashboardSummary(tenantID, branchID string) map[string]interface{} {
-	dashboard := s.getDashboard(tenantID, branchID)
+func (s *BranchServer) getDashboardSummary(tenantID, branchID string) (map[string]interface{}, error) {
+	dashboard, err := s.getDashboard(tenantID, branchID)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{
 		"branchID":          dashboard.BranchID,
 		"branchName":        dashboard.BranchName,
@@ -1499,7 +1597,7 @@ func (s *BranchServer) getDashboardSummary(tenantID, branchID string) map[string
 		"pendingApprovals":  dashboard.PendingApprovals,
 		"openIncidents":     dashboard.OpenIncidents,
 		"staffPresent":      dashboard.PresentToday,
-	}
+	}, nil
 }
 
 // Report handlers
@@ -1508,7 +1606,11 @@ func (s *BranchServer) getDailyReportHandler(w http.ResponseWriter, r *http.Requ
 	branchID := getBranchID(r)
 	date := r.URL.Query().Get("date")
 
-	report := s.performanceService.GetDailyReport(tenantID, branchID, date)
+	report, err := s.performanceService.GetDailyReport(tenantID, branchID, date)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, report)
 }
 
@@ -1536,6 +1638,10 @@ func (s *BranchServer) getStaffPerformanceReportHandler(w http.ResponseWriter, r
 	branchID := getBranchID(r)
 	period := r.URL.Query().Get("period")
 
-	report := s.performanceService.GetStaffPerformanceReport(tenantID, branchID, period, s.staffService)
+	report, err := s.performanceService.GetStaffPerformanceReport(tenantID, branchID, period, s.staffService)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, report)
 }

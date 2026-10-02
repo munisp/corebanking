@@ -14,12 +14,17 @@ export class AppConfig {
   static readonly loanEndpoint: string = "/loan/api/v1/loans";
   static readonly lpoEndpoint: string = "/lpo/api/v1";
   static readonly chequeEndpoint: string = "/payment-processing/cheques";
+  // W12-A4B: scheduled payments are served by standing-orders-go
+  // (gateway /standing-orders/* -> /v1/standing-orders*); payment-processing
+  // never had a scheduled-payments route.
   static readonly scheduledPaymentEndpoint: string =
-    "/payment-processing/scheduled-payments";
+    "/standing-orders/v1/standing-orders";
   static readonly transactionEndpoint: string = "/ledger/txn";
   static readonly savingsEndpoint: string = "/savings/api/v1";
   static readonly disputeEndpoint: string = "/dispute/api/v1/disputes";
-  static readonly fxEndpoint: string = "/payment-processing/fx";
+  // W12-A4B: fx-service is gateway-exposed at /fx/* with rewrite
+  // /fx/v1/(.*) -> /api/v1/fx/$1 (rates/exchange/transactions).
+  static readonly fxEndpoint: string = "/fx/v1";
   static readonly pensionEndpoint: string = "/orchestrator/pensions";
   static readonly carbonEndpoint: string = "/carbon";
   static readonly cardEndpoint: string = "/card/api/v1/cards";
@@ -32,7 +37,9 @@ export class AppConfig {
   static readonly orchestratorEndpoint: string = "/orchestrator";
   static readonly rewardEndpoint: string = "/orchestrator/rewards";
   static readonly investmentEndpoint: string = "/investments";
-  static readonly billEndpoint: string = "/payment-processing/bills";
+  // W12-A4B: bills/billers are served by mobile-bff
+  // (/mobile-bff/* -> /api/v1/*; routes /api/v1/bills/pay|validate, /api/v1/billers).
+  static readonly billEndpoint: string = "/mobile-bff/api/v1/bills";
   static readonly agricultureEndpoint: string =
     "/agricultural/api/v1/agriculture";
   static readonly voiceBankingEndpoint: string = "/voice-banking";

@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, responses, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from sqlalchemy.orm import Session
 from typing import Optional
 import os
@@ -17,7 +19,7 @@ logger = create_logger(__name__)
 
 user_router = APIRouter()
 
-@user_router.post("")
+@user_router.post("", dependencies=[Depends(require_permify("user_profile", "create"))])
 def create_user(
     payload: CreateUserSchema, 
     db: Session = Depends(get_session),
@@ -78,7 +80,7 @@ def create_user(
         "user": user.to_dict(),
     }, status_code=200)
 
-@user_router.get("/tenant")
+@user_router.get("/tenant", dependencies=[Depends(require_permify("user_profile", "view"))])
 def get_tenant_users(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -105,7 +107,7 @@ def get_tenant_users(
         "limit": limit,
     }
 
-@user_router.get("/all")
+@user_router.get("/all", dependencies=[Depends(require_permify("user_profile", "view"))])
 def get_all_users(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -135,7 +137,7 @@ def get_metrics(
         "metrics": { "total_count": total_count }
     }
 
-@user_router.post("/kyc/save")
+@user_router.post("/kyc/save", dependencies=[Depends(require_permify("user_profile", "create"))])
 def save_kyc_state(
     db: Session = Depends(get_session),
     payload: dict = None,
@@ -180,7 +182,7 @@ def save_kyc_state(
         "message": "success",
     }
 
-@user_router.post("/kyc/complete")
+@user_router.post("/kyc/complete", dependencies=[Depends(require_permify("user_profile", "manage"))])
 def complete_kyc(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -225,7 +227,7 @@ def complete_kyc(
         "message": "success",
     }
 
-@user_router.post("/tier/assign")
+@user_router.post("/tier/assign", dependencies=[Depends(require_permify("user_profile", "manage"))])
 def assign_tier(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -264,7 +266,7 @@ def assign_tier(
         "tier": user.tier,
     }
 
-@user_router.post("/kyc/fail")
+@user_router.post("/kyc/fail", dependencies=[Depends(require_permify("user_profile", "manage"))])
 def fail_kyc(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -306,7 +308,7 @@ def fail_kyc(
         "message": "success",
     }
 
-@user_router.get("")
+@user_router.get("", dependencies=[Depends(require_permify("user_profile", "view"))])
 def get_user(
     keycloak_id_query: Optional[str] = None, 
     db: Session = Depends(get_session),
@@ -339,7 +341,7 @@ def get_user(
         "user": user.to_dict()
     }   
 
-@user_router.put("/{id}")
+@user_router.put("/{id}", dependencies=[Depends(require_permify("user_profile", "update"))])
 def update_user(
     id: str, 
     payload: UserSchema, 
@@ -387,7 +389,7 @@ def update_user(
         "user": user
     }
 
-@user_router.put("/{id}/activate")
+@user_router.put("/{id}/activate", dependencies=[Depends(require_permify("user_profile", "manage"))])
 def activate_user(
     id: str,
     db: Session = Depends(get_session),
@@ -432,7 +434,7 @@ def activate_user(
         "user": user
     }
 
-@user_router.put("/{id}/suspend")
+@user_router.put("/{id}/suspend", dependencies=[Depends(require_permify("user_profile", "manage"))])
 def suspend_user(
     id: str,
     db: Session = Depends(get_session),
@@ -476,7 +478,7 @@ def suspend_user(
         "message": "User suspended successfully",
         "user": user
     }
-@user_router.post("/kyc/liveness-check")
+@user_router.post("/kyc/liveness-check", dependencies=[Depends(require_permify("user_profile", "create"))])
 def liveness_check(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),

@@ -144,6 +144,12 @@ const LivestockManagementScreen = lazy(() => import('./pages/customer_screens/ag
 const MultiPerilCropInsuranceScreen = lazy(() => import('./pages/customer_screens/agriculture/MultiPerilCropInsuranceScreen'));
 const NirsalAgroGeocoopScreen = lazy(() => import('./pages/customer_screens/agriculture/NirsalAgroGeocoopScreen'));
 const NirsalCreditGuaranteeScreen = lazy(() => import('./pages/customer_screens/agriculture/NirsalCreditGuaranteeScreen'));
+// W12-A4P2WEB: previously-orphaned agriculture feature pages wired into router (P2-C WIRE batch)
+const AgriLoanApplicationScreen = lazy(() => import('./pages/customer_screens/agriculture/AgriLoanApplicationScreen'));
+const AnimalTraceabilityScreen = lazy(() => import('./pages/customer_screens/agriculture/AnimalTraceabilityScreen'));
+const FisheriesAquacultureScreen = lazy(() => import('./pages/customer_screens/agriculture/FisheriesAquacultureScreen'));
+const SatelliteCropMonitorScreen = lazy(() => import('./pages/customer_screens/agriculture/SatelliteCropMonitorScreen'));
+const SoilAnalysisScreen = lazy(() => import('./pages/customer_screens/agriculture/SoilAnalysisScreen'));
 const IslamicBankingDashboard = lazy(() => import('./pages/customer_screens/islamic_banking/IslamicBankingDashboard'));
 const MurabahaScreen = lazy(() => import('./pages/customer_screens/islamic_banking/MurabahaScreen'));
 const MusharakaScreen = lazy(() => import('./pages/customer_screens/islamic_banking/MusharakaScreen'));
@@ -399,6 +405,12 @@ function App() {
             <Route path="/agriculture/multi-peril-insurance" element={<MultiPerilCropInsuranceScreen />} />
             <Route path="/agriculture/nirsal-geocoop" element={<NirsalAgroGeocoopScreen />} />
             <Route path="/agriculture/nirsal-credit-guarantee" element={<NirsalCreditGuaranteeScreen />} />
+            {/* W12-A4P2WEB: restored agriculture feature screens (P2-C WIRE batch) */}
+            <Route path="/agriculture/loans/apply" element={<AgriLoanApplicationScreen />} />
+            <Route path="/agriculture/animal-traceability" element={<AnimalTraceabilityScreen />} />
+            <Route path="/agriculture/fisheries" element={<FisheriesAquacultureScreen />} />
+            <Route path="/agriculture/satellite-monitoring" element={<SatelliteCropMonitorScreen />} />
+            <Route path="/agriculture/soil-analysis" element={<SoilAnalysisScreen />} />
 
             {/* Trade Finance */}
             <Route path="/trade-finance" element={<TradeFinanceDashboardScreen />} />

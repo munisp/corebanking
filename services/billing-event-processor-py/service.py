@@ -11,6 +11,124 @@ from dataclasses import dataclass, asdict, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 
 @dataclass
 class MeteringEvent:
@@ -93,7 +211,7 @@ class PipelineStatus:
     temporal_workflow_id: str
 
 
-METERING_EVENTS: list[MeteringEvent] = [
+_METERING_SEED: list[MeteringEvent] = [
     MeteringEvent("ME-001", "tenant-unit-mfb-001", "payments-hub", "transfer.completed", "transfer_posted", "nip_payments", 1, 12.0, "NGN", "2026-05-09T10:00:00Z", 0, 1001, "billing-metering", "settled", "billing-event-sink"),
     MeteringEvent("ME-002", "tenant-state-mfb-001", "card-switch", "card.authorized", "card_transaction", "card_processing", 1, 10.0, "NGN", "2026-05-09T10:01:00Z", 1, 1002, "billing-metering", "settled", "billing-event-sink"),
     MeteringEvent("ME-003", "tenant-commercial-t2-001", "api-gateway", "api.call", "api_call", "open_banking", 100, 0.5, "NGN", "2026-05-09T10:02:00Z", 2, 1003, "billing-metering", "rated", "billing-event-sink"),
@@ -104,7 +222,7 @@ METERING_EVENTS: list[MeteringEvent] = [
     MeteringEvent("ME-008", "tenant-agent-net-001", "airtime-vtu", "airtime.sold", "airtime_vtu", "vas", 1, 10.0, "NGN", "2026-05-09T10:07:00Z", 1, 1008, "billing-metering", "settled", "billing-event-sink"),
 ]
 
-REVENUE_CAPTURES: list[RevenueCapture] = [
+_REVENUE_SEED: list[RevenueCapture] = [
     RevenueCapture("RC-001", "tenant-unit-mfb-001", "2026-05", "unit_mfb", "per_transaction", 1828800, 150000, 83333, 2062133, 1237280, 618640, 206213, "NGN", "tb-billing-ledger", "revenue_captures_iceberg", "2026-05-09T14:00:00Z"),
     RevenueCapture("RC-002", "tenant-state-mfb-001", "2026-05", "state_mfb", "hybrid", 8000000, 500000, 250000, 8750000, 4812500, 3062500, 875000, "NGN", "tb-billing-ledger", "revenue_captures_iceberg", "2026-05-09T14:00:00Z"),
     RevenueCapture("RC-003", "tenant-commercial-t2-001", "2026-05", "commercial_t2", "subscription", 25000000, 10000000, 8333333, 43333333, 21666667, 15166667, 4333333, "NGN", "tb-billing-ledger", "revenue_captures_iceberg", "2026-05-09T14:00:00Z"),
@@ -113,7 +231,7 @@ REVENUE_CAPTURES: list[RevenueCapture] = [
     RevenueCapture("RC-006", "tenant-cooperative-001", "2026-05", "cooperative", "subscription", 45000, 30000, 25000, 100000, 70000, 20000, 10000, "NGN", "tb-billing-ledger", "revenue_captures_iceberg", "2026-05-09T14:00:00Z"),
 ]
 
-OVERHEAD_ALLOCATIONS: list[OverheadAllocation] = [
+_OVERHEAD_SEED: list[OverheadAllocation] = [
     OverheadAllocation("OA-001", "Infrastructure", "Cloud Hosting", 15000000, 6, 2500000, "NGN", True, "2026-05-01T00:00:00Z", "admin-001"),
     OverheadAllocation("OA-002", "Infrastructure", "Database Cluster", 5000000, 6, 833333, "NGN", True, "2026-05-01T00:00:00Z", "admin-001"),
     OverheadAllocation("OA-003", "Infrastructure", "Kafka/Redis/OpenSearch", 8000000, 6, 1333333, "NGN", True, "2026-05-01T00:00:00Z", "admin-001"),
@@ -124,13 +242,13 @@ OVERHEAD_ALLOCATIONS: list[OverheadAllocation] = [
     OverheadAllocation("OA-008", "Travel", "Client Onboarding", 4000000, 6, 666667, "NGN", True, "2026-03-01T00:00:00Z", "admin-003"),
 ]
 
-ALERTS: list[BillingAlert] = [
+_ALERT_SEED: list[BillingAlert] = [
     BillingAlert("AL-001", "tenant-commercial-t2-001", "spike", "warning", "Card transaction volume 58% above baseline", 5200000, 3300000, "billing.alerts", "billing-alerts-*", True, "2026-05-09T12:00:00Z"),
     BillingAlert("AL-002", "tenant-agent-net-001", "threshold_breach", "critical", "Daily transaction cap approaching ₦1.2M CBN limit", 1150000, 1200000, "billing.alerts", "billing-alerts-*", False, "2026-05-09T13:00:00Z"),
     BillingAlert("AL-003", "tenant-fintech-001", "anomaly", "info", "API call pattern changed — 40% increase in evening hours", 960000, 600000, "billing.alerts", "billing-alerts-*", False, "2026-05-09T14:00:00Z"),
 ]
 
-PIPELINES: list[PipelineStatus] = [
+_PIPELINE_SEED: list[PipelineStatus] = [
     PipelineStatus("PL-001", "metering-ingest", "running", 2847500, 342, 4.2, 150, "2026-05-09T14:59:00Z", "wf-metering-pipeline-001"),
     PipelineStatus("PL-002", "rating-engine", "running", 2847158, 0, 8.7, 0, "2026-05-09T14:59:00Z", "wf-rating-pipeline-001"),
     PipelineStatus("PL-003", "settlement-processor", "running", 2400000, 12, 15.3, 200, "2026-05-09T14:58:00Z", "wf-settlement-pipeline-001"),
@@ -277,6 +395,14 @@ def validate_jwt(headers):
     return payload, None
 
 
+# W12-C3P2B5: PG-backed billing event stores (idempotent seeds).
+METERING_STORE = _W12Store("metering_events", seed=[asdict(e) for e in _METERING_SEED])
+REVENUE_STORE = _W12Store("revenue_captures", seed=[asdict(r) for r in _REVENUE_SEED])
+OVERHEAD_STORE = _W12Store("overhead_allocations", seed=[asdict(o) for o in _OVERHEAD_SEED])
+ALERT_STORE = _W12Store("billing_alerts", seed=[asdict(a) for a in _ALERT_SEED])
+PIPELINE_STORE = _W12Store("pipeline_status", seed=[asdict(x) for x in _PIPELINE_SEED])
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, body: Any) -> None:
         self.send_response(status)
@@ -319,16 +445,50 @@ class Handler(BaseHTTPRequestHandler):
                 },
             })
         elif self.path == "/v1/billing/events/metering":
-            self._json(200, {"items": [asdict(e) for e in METERING_EVENTS], "total": len(METERING_EVENTS)})
+            try:
+                _lst = METERING_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _lst, "total": len(_lst)})
         elif self.path == "/v1/billing/events/revenue-captures":
-            self._json(200, {"items": [asdict(r) for r in REVENUE_CAPTURES], "total": len(REVENUE_CAPTURES)})
+            try:
+                _lst = REVENUE_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _lst, "total": len(_lst)})
         elif self.path == "/v1/billing/events/overhead-allocations":
-            self._json(200, {"items": [asdict(o) for o in OVERHEAD_ALLOCATIONS], "total": len(OVERHEAD_ALLOCATIONS)})
+            try:
+                _lst = OVERHEAD_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _lst, "total": len(_lst)})
         elif self.path == "/v1/billing/events/alerts":
-            self._json(200, {"items": [asdict(a) for a in ALERTS], "total": len(ALERTS)})
+            try:
+                _lst = ALERT_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _lst, "total": len(_lst)})
         elif self.path == "/v1/billing/events/pipelines":
-            self._json(200, {"items": [asdict(p) for p in PIPELINES], "total": len(PIPELINES)})
+            try:
+                _lst = PIPELINE_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _lst, "total": len(_lst)})
         elif self.path == "/v1/billing/events/stats":
+            try:
+                METERING_EVENTS = [MeteringEvent(**r) for r in METERING_STORE.all()]
+                REVENUE_CAPTURES = [RevenueCapture(**r) for r in REVENUE_STORE.all()]
+                OVERHEAD_ALLOCATIONS = [OverheadAllocation(**r) for r in OVERHEAD_STORE.all()]
+                ALERTS = [BillingAlert(**r) for r in ALERT_STORE.all()]
+                PIPELINES = [PipelineStatus(**r) for r in PIPELINE_STORE.all()]
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             total_events = len(METERING_EVENTS)
             settled_events = sum(1 for e in METERING_EVENTS if e.processing_status == "settled")
             total_revenue = sum(r.total_revenue for r in REVENUE_CAPTURES)
@@ -387,7 +547,13 @@ class Handler(BaseHTTPRequestHandler):
             if not body.get("tenantId") or not body.get("meterKey"):
                 self._json(400, {"error": "tenantId and meterKey required"})
                 return
-            event_id = f"ME-{len(METERING_EVENTS) + 1:03d}"
+            try:
+                METERING_STORE.ensure()
+                _me_n = _w12_run("SELECT COUNT(*) AS n FROM metering_events", fetch="one")["n"]
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            event_id = f"ME-{_me_n + 1:03d}"
             event = MeteringEvent(
                 id=event_id,
                 tenant_id=body["tenantId"],
@@ -400,12 +566,16 @@ class Handler(BaseHTTPRequestHandler):
                 currency=body.get("currency", "NGN"),
                 timestamp=body.get("timestamp", "2026-05-09T15:00:00Z"),
                 kafka_partition=0,
-                kafka_offset=len(METERING_EVENTS) + 1000,
+                kafka_offset=_me_n + 1000,
                 fluvio_stream="billing-metering",
                 processing_status="received",
                 dapr_binding="billing-event-sink",
             )
-            METERING_EVENTS.append(event)
+            try:
+                METERING_STORE.put(event.id, asdict(event))
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             self._json(202, asdict(event))
         elif self.path == "/v1/billing/events/adjust-overhead":
             body = self._body()
@@ -414,17 +584,27 @@ class Handler(BaseHTTPRequestHandler):
             if not overhead_id or new_cost is None:
                 self._json(400, {"error": "id and monthlyCost required"})
                 return
-            for o in OVERHEAD_ALLOCATIONS:
-                if o.id == overhead_id:
-                    if not o.adjustable:
-                        self._json(403, {"error": f"Overhead {overhead_id} is not adjustable (regulatory/fixed)"})
-                        return
-                    o.monthly_cost = new_cost
-                    o.cost_per_tenant = new_cost / max(o.allocated_tenants, 1)
-                    o.last_adjusted_at = "2026-05-09T15:00:00Z"
-                    o.adjusted_by = body.get("adjustedBy", "admin")
-                    self._json(200, asdict(o))
+            try:
+                _row = OVERHEAD_STORE.get(overhead_id)
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            if _row:
+                o = OverheadAllocation(**_row)
+                if not o.adjustable:
+                    self._json(403, {"error": f"Overhead {overhead_id} is not adjustable (regulatory/fixed)"})
                     return
+                o.monthly_cost = new_cost
+                o.cost_per_tenant = new_cost / max(o.allocated_tenants, 1)
+                o.last_adjusted_at = "2026-05-09T15:00:00Z"
+                o.adjusted_by = body.get("adjustedBy", "admin")
+                try:
+                    OVERHEAD_STORE.put(o.id, asdict(o))
+                except Exception as _e:
+                    self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                    return
+                self._json(200, asdict(o))
+                return
             self._json(404, {"error": f"Overhead {overhead_id} not found"})
         else:
             self._json(404, {"error": "not found"})

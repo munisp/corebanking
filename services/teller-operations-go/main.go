@@ -1008,8 +1008,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1017,10 +1024,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
+		"service_configs.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1057,7 +1074,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1065,25 +1089,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
+		"service_configs.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+		"service_configs.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1317,6 +1370,602 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ── Teller console API (P0-H): till sessions, cash-desk transactions, teller directory ──
+// Real persistence via the shared service_records table (data JSONB), mirroring
+// listHandler/createHandler above. Records are discriminated by the `type` column:
+//   "session"          — teller till sessions
+//   "cash_transaction" — deposits/withdrawals recorded against a session
+//   "teller"           — teller directory entries
+
+func srString(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		switch t := v.(type) {
+		case string:
+			return t
+		case float64:
+			return strconv.FormatFloat(t, 'f', -1, 64)
+		}
+	}
+	return ""
+}
+
+func srFloat(m map[string]interface{}, key string) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	return 0
+}
+
+func sessionToJSON(id, status string, data map[string]interface{}, createdAt string) map[string]interface{} {
+	cashBalance := srFloat(data, "cashBalance")
+	if _, ok := data["cashBalance"]; !ok {
+		cashBalance = srFloat(data, "openingCash")
+	}
+	openedAt := srString(data, "openedAt")
+	if openedAt == "" {
+		openedAt = createdAt
+	}
+	return map[string]interface{}{
+		"sessionId":   id,
+		"tellerId":    srString(data, "tellerId"),
+		"branchId":    srString(data, "branchId"),
+		"windowId":    srString(data, "windowId"),
+		"status":      status,
+		"cashBalance": cashBalance,
+		"currency":    srString(data, "currency"),
+		"openedAt":    openedAt,
+	}
+}
+
+func txnToJSON(id, status string, data map[string]interface{}, createdAt string) map[string]interface{} {
+	processedAt := srString(data, "processedAt")
+	if processedAt == "" {
+		processedAt = createdAt
+	}
+	return map[string]interface{}{
+		"transactionId": id,
+		"type":          srString(data, "type"),
+		"accountId":     srString(data, "accountId"),
+		"amount":        srFloat(data, "amount"),
+		"currency":      srString(data, "currency"),
+		"narration":     srString(data, "narration"),
+		"status":        status,
+		"processedAt":   processedAt,
+	}
+}
+
+func tellerToJSON(id, recStatus string, data map[string]interface{}, createdAt, updatedAt string) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range data {
+		out[k] = v
+	}
+	out["id"] = id
+	out["teller_id"] = id
+	if srString(out, "status") == "" {
+		out["status"] = recStatus
+	}
+	out["created_at"] = createdAt
+	out["updated_at"] = updatedAt
+	return out
+}
+
+// sessionsHandler dispatches GET (list) and POST (open) on /v1/sessions.
+func sessionsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		listSessionsHandler(w, r)
+	case http.MethodPost:
+		openSessionHandler(w, r)
+	default:
+		jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+	}
+}
+
+func listSessionsHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		jsonResp(w, 200, map[string]interface{}{"items": []interface{}{}, "total": 0, "source": dbSourceTag()})
+		return
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit < 1 {
+		limit = 50
+	}
+	offset := (page - 1) * limit
+	status := r.URL.Query().Get("status")
+	branchId := r.URL.Query().Get("branchId")
+	rows, err := db.Query(
+		`SELECT id, status, data, created_at FROM service_records
+		 WHERE service=$1 AND type='session'
+		   AND ($2 = '' OR status = $2)
+		   AND ($3 = '' OR data->>'branchId' = $3)
+		 ORDER BY created_at DESC LIMIT $4 OFFSET $5`,
+		serviceName, status, branchId, limit, offset)
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	items := []interface{}{}
+	for rows.Next() {
+		var id, st, raw, ts string
+		if err := rows.Scan(&id, &st, &raw, &ts); err != nil {
+			continue
+		}
+		data := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(raw), &data)
+		items = append(items, sessionToJSON(id, st, data, ts))
+	}
+	var total int
+	db.QueryRow(
+		`SELECT COUNT(*) FROM service_records
+		 WHERE service=$1 AND type='session'
+		   AND ($2 = '' OR status = $2)
+		   AND ($3 = '' OR data->>'branchId' = $3)`,
+		serviceName, status, branchId).Scan(&total)
+	jsonResp(w, 200, map[string]interface{}{"items": items, "total": total, "page": page, "limit": limit, "source": "database"})
+}
+
+func openSessionHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TellerId    string  `json:"tellerId"`
+		BranchId    string  `json:"branchId"`
+		WindowId    string  `json:"windowId"`
+		OpeningCash float64 `json:"openingCash"`
+		Currency    string  `json:"currency"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.BranchId == "" || req.WindowId == "" {
+		jsonResp(w, 400, map[string]interface{}{"error": "branchId and windowId are required"})
+		return
+	}
+	if req.OpeningCash < 0 {
+		jsonResp(w, 400, map[string]interface{}{"error": "openingCash must be non-negative"})
+		return
+	}
+	if db == nil {
+		jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable"})
+		return
+	}
+	if req.Currency == "" {
+		req.Currency = "NGN"
+	}
+	id := fmt.Sprintf("SES-%d", time.Now().UnixNano())
+	now := time.Now().UTC().Format(time.RFC3339)
+	data := map[string]interface{}{
+		"sessionId":   id,
+		"tellerId":    sanitizeInput(req.TellerId),
+		"branchId":    sanitizeInput(req.BranchId),
+		"windowId":    sanitizeInput(req.WindowId),
+		"openingCash": req.OpeningCash,
+		"cashBalance": req.OpeningCash,
+		"currency":    sanitizeInput(req.Currency),
+		"openedAt":    now,
+	}
+	dataBytes, _ := json.Marshal(data)
+	if _, err := db.Exec(
+		"INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+		id, serviceName, "session", "open", string(dataBytes)); err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": "db_insert_failed", "detail": err.Error()})
+		return
+	}
+	cacheSet("teller_operations_list", "", 1) // invalidate list cache
+	jsonResp(w, 201, sessionToJSON(id, "open", data, now))
+}
+
+// sessionSubHandler routes /v1/sessions/{id}/close and /v1/sessions/{id}/transactions.
+func sessionSubHandler(w http.ResponseWriter, r *http.Request) {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || parts[0] == "" {
+		jsonResp(w, 404, map[string]interface{}{"error": "not_found"})
+		return
+	}
+	switch parts[1] {
+	case "close":
+		if r.Method != http.MethodPost {
+			jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+			return
+		}
+		closeSessionHandler(w, r, parts[0])
+	case "transactions":
+		if r.Method != http.MethodGet {
+			jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+			return
+		}
+		sessionTransactionsHandler(w, r, parts[0])
+	default:
+		jsonResp(w, 404, map[string]interface{}{"error": "not_found"})
+	}
+}
+
+func closeSessionHandler(w http.ResponseWriter, r *http.Request, sessionId string) {
+	var req struct {
+		ClosingCash float64 `json:"closingCash"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if db == nil {
+		jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable"})
+		return
+	}
+	var st, raw, ts string
+	err := db.QueryRow(
+		"SELECT status, data, created_at FROM service_records WHERE service=$1 AND type='session' AND id=$2",
+		serviceName, sessionId).Scan(&st, &raw, &ts)
+	if err == sql.ErrNoRows {
+		jsonResp(w, 404, map[string]interface{}{"error": "session_not_found"})
+		return
+	}
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if st != "open" {
+		jsonResp(w, 409, map[string]interface{}{"error": "session_not_open", "status": st})
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	patch, _ := json.Marshal(map[string]interface{}{
+		"closingCash": req.ClosingCash,
+		"cashBalance": req.ClosingCash,
+		"closedAt":    now,
+	})
+	if _, err := db.Exec(
+		"UPDATE service_records SET status='closed', updated_at=NOW(), data = data || $3::jsonb WHERE service=$1 AND type='session' AND id=$2",
+		serviceName, sessionId, string(patch)); err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": "db_update_failed", "detail": err.Error()})
+		return
+	}
+	data := map[string]interface{}{}
+	_ = json.Unmarshal([]byte(raw), &data)
+	data["closingCash"] = req.ClosingCash
+	data["cashBalance"] = req.ClosingCash
+	data["closedAt"] = now
+	cacheSet("teller_operations_list", "", 1)
+	jsonResp(w, 200, sessionToJSON(sessionId, "closed", data, ts))
+}
+
+func sessionTransactionsHandler(w http.ResponseWriter, r *http.Request, sessionId string) {
+	if db == nil {
+		jsonResp(w, 200, map[string]interface{}{"items": []interface{}{}, "total": 0, "source": dbSourceTag()})
+		return
+	}
+	rows, err := db.Query(
+		`SELECT id, status, data, created_at FROM service_records
+		 WHERE service=$1 AND type='cash_transaction' AND data->>'sessionId'=$2
+		 ORDER BY created_at DESC LIMIT 500`,
+		serviceName, sessionId)
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	items := []interface{}{}
+	for rows.Next() {
+		var id, st, raw, ts string
+		if err := rows.Scan(&id, &st, &raw, &ts); err != nil {
+			continue
+		}
+		data := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(raw), &data)
+		items = append(items, txnToJSON(id, st, data, ts))
+	}
+	jsonResp(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "database"})
+}
+
+// cashDeskHandler records a deposit/withdrawal against an open session and
+// adjusts the session cash balance atomically-ish (same DB, two statements).
+func cashDeskHandler(txnType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+			return
+		}
+		var req struct {
+			SessionId string  `json:"sessionId"`
+			TellerId  string  `json:"tellerId"`
+			AccountId string  `json:"accountId"`
+			Amount    float64 `json:"amount"`
+			Currency  string  `json:"currency"`
+			Narration string  `json:"narration"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.SessionId == "" || req.AccountId == "" {
+			jsonResp(w, 400, map[string]interface{}{"error": "sessionId and accountId are required"})
+			return
+		}
+		if req.Amount <= 0 {
+			jsonResp(w, 400, map[string]interface{}{"error": "amount must be positive"})
+			return
+		}
+		if db == nil {
+			jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable"})
+			return
+		}
+		if req.Currency == "" {
+			req.Currency = "NGN"
+		}
+		// Attribute the transaction to the session's teller when not supplied.
+		tellerId := sanitizeInput(req.TellerId)
+		if tellerId == "" {
+			_ = db.QueryRow(
+				"SELECT data->>'tellerId' FROM service_records WHERE service=$1 AND type='session' AND id=$2",
+				serviceName, req.SessionId).Scan(&tellerId)
+		}
+		id := fmt.Sprintf("TXN-%d", time.Now().UnixNano())
+		now := time.Now().UTC().Format(time.RFC3339)
+		data := map[string]interface{}{
+			"sessionId":   sanitizeInput(req.SessionId),
+			"tellerId":    tellerId,
+			"type":        txnType,
+			"accountId":   sanitizeInput(req.AccountId),
+			"amount":      req.Amount,
+			"currency":    sanitizeInput(req.Currency),
+			"narration":   sanitizeInput(req.Narration),
+			"processedAt": now,
+		}
+		dataBytes, _ := json.Marshal(data)
+		if _, err := db.Exec(
+			"INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+			id, serviceName, "cash_transaction", "completed", string(dataBytes)); err != nil {
+			jsonResp(w, 500, map[string]interface{}{"error": "db_insert_failed", "detail": err.Error()})
+			return
+		}
+		delta := req.Amount
+		if txnType == "withdrawal" {
+			delta = -req.Amount
+		}
+		if _, err := db.Exec(
+			`UPDATE service_records
+			 SET data = jsonb_set(data, '{cashBalance}', to_jsonb(COALESCE((data->>'cashBalance')::float8, 0) + $2)),
+			     updated_at = NOW()
+			 WHERE service=$1 AND type='session' AND id=$3`,
+			serviceName, delta, req.SessionId); err != nil {
+			log.Printf("[%s] cash balance update failed for session %s: %v", serviceName, sanitizeLogValue(req.SessionId), err)
+		}
+		cacheSet("teller_operations_list", "", 1)
+		jsonResp(w, 201, txnToJSON(id, "completed", data, now))
+	}
+}
+
+// tellersHandler dispatches GET (list) and POST (register) on /v1/tellers.
+func tellersHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		listTellersHandler(w, r)
+	case http.MethodPost:
+		registerTellerHandler(w, r)
+	default:
+		jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+	}
+}
+
+func listTellersHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		jsonResp(w, 200, map[string]interface{}{"tellers": []interface{}{}, "total": 0, "source": dbSourceTag()})
+		return
+	}
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit < 1 {
+		limit = 10
+	}
+	offset := (page - 1) * limit
+	status := r.URL.Query().Get("status")
+	rows, err := db.Query(
+		`SELECT id, status, data, created_at, updated_at FROM service_records
+		 WHERE service=$1 AND type='teller' AND ($2 = '' OR status = $2)
+		 ORDER BY created_at DESC LIMIT $3 OFFSET $4`,
+		serviceName, status, limit, offset)
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	items := []interface{}{}
+	for rows.Next() {
+		var id, st, raw, created, updated string
+		if err := rows.Scan(&id, &st, &raw, &created, &updated); err != nil {
+			continue
+		}
+		data := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(raw), &data)
+		items = append(items, tellerToJSON(id, st, data, created, updated))
+	}
+	var total int
+	db.QueryRow(
+		"SELECT COUNT(*) FROM service_records WHERE service=$1 AND type='teller' AND ($2 = '' OR status = $2)",
+		serviceName, status).Scan(&total)
+	jsonResp(w, 200, map[string]interface{}{"tellers": items, "total": total, "page": page, "limit": limit, "source": "database"})
+}
+
+func registerTellerHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserId                 string  `json:"user_id"`
+		EmployeeNumber         string  `json:"employee_number"`
+		FirstName              string  `json:"first_name"`
+		LastName               string  `json:"last_name"`
+		Email                  string  `json:"email"`
+		Phone                  string  `json:"phone"`
+		DailyTransactionLimit  float64 `json:"daily_transaction_limit"`
+		SingleTransactionLimit float64 `json:"single_transaction_limit"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.UserId == "" || req.EmployeeNumber == "" {
+		jsonResp(w, 400, map[string]interface{}{"error": "user_id and employee_number are required"})
+		return
+	}
+	if db == nil {
+		jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable"})
+		return
+	}
+	id := fmt.Sprintf("TLR-%d", time.Now().UnixNano())
+	now := time.Now().UTC().Format(time.RFC3339)
+	data := map[string]interface{}{
+		"user_id":                  sanitizeInput(req.UserId),
+		"employee_number":          sanitizeInput(req.EmployeeNumber),
+		"first_name":               sanitizeInput(req.FirstName),
+		"last_name":                sanitizeInput(req.LastName),
+		"email":                    sanitizeInput(req.Email),
+		"phone":                    sanitizeInput(req.Phone),
+		"daily_transaction_limit":  req.DailyTransactionLimit,
+		"single_transaction_limit": req.SingleTransactionLimit,
+		"status":                   "active",
+	}
+	dataBytes, _ := json.Marshal(data)
+	if _, err := db.Exec(
+		"INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+		id, serviceName, "teller", "active", string(dataBytes)); err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": "db_insert_failed", "detail": err.Error()})
+		return
+	}
+	jsonResp(w, 201, tellerToJSON(id, "active", data, now, now))
+}
+
+// tellerSubHandler routes /v1/tellers/{id}, /{id}/status and /{id}/stats.
+func tellerSubHandler(w http.ResponseWriter, r *http.Request) {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/tellers/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		if r.Method != http.MethodGet {
+			jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+			return
+		}
+		getTellerHandler(w, r, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[0] != "" {
+		switch parts[1] {
+		case "status":
+			if r.Method != http.MethodPatch {
+				jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+				return
+			}
+			updateTellerStatusHandler(w, r, parts[0])
+		case "stats":
+			if r.Method != http.MethodGet {
+				jsonResp(w, http.StatusMethodNotAllowed, map[string]interface{}{"error": "method_not_allowed"})
+				return
+			}
+			tellerStatsHandler(w, r, parts[0])
+		default:
+			jsonResp(w, 404, map[string]interface{}{"error": "not_found"})
+		}
+		return
+	}
+	jsonResp(w, 404, map[string]interface{}{"error": "not_found"})
+}
+
+func getTellerHandler(w http.ResponseWriter, r *http.Request, tellerId string) {
+	if db == nil {
+		jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable"})
+		return
+	}
+	var st, raw, created, updated string
+	err := db.QueryRow(
+		"SELECT status, data, created_at, updated_at FROM service_records WHERE service=$1 AND type='teller' AND id=$2",
+		serviceName, tellerId).Scan(&st, &raw, &created, &updated)
+	if err == sql.ErrNoRows {
+		jsonResp(w, 404, map[string]interface{}{"error": "teller_not_found"})
+		return
+	}
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	data := map[string]interface{}{}
+	_ = json.Unmarshal([]byte(raw), &data)
+	jsonResp(w, 200, tellerToJSON(tellerId, st, data, created, updated))
+}
+
+func updateTellerStatusHandler(w http.ResponseWriter, r *http.Request, tellerId string) {
+	var req struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	switch req.Status {
+	case "active", "inactive", "suspended", "on_break":
+	default:
+		jsonResp(w, 400, map[string]interface{}{"error": "status must be one of active|inactive|suspended|on_break"})
+		return
+	}
+	if db == nil {
+		jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable"})
+		return
+	}
+	patch, _ := json.Marshal(map[string]interface{}{
+		"status":        req.Status,
+		"status_reason": sanitizeInput(req.Reason),
+	})
+	res, err := db.Exec(
+		"UPDATE service_records SET status=$3, updated_at=NOW(), data = data || $4::jsonb WHERE service=$1 AND type='teller' AND id=$2",
+		serviceName, tellerId, req.Status, string(patch))
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": "db_update_failed", "detail": err.Error()})
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		jsonResp(w, 404, map[string]interface{}{"error": "teller_not_found"})
+		return
+	}
+	getTellerHandler(w, r, tellerId)
+}
+
+func tellerStatsHandler(w http.ResponseWriter, r *http.Request, tellerId string) {
+	if db == nil {
+		jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable"})
+		return
+	}
+	var (
+		totalTxns, totalVolume                                        float64
+		depositsCount, depositsVolume                                 float64
+		withdrawalsCount, withdrawalsVolume                           float64
+		todayTxns, todayVolume                                        float64
+	)
+	err := db.QueryRow(
+		`SELECT
+		   COUNT(*),
+		   COALESCE(SUM((data->>'amount')::float8), 0),
+		   COALESCE(SUM(CASE WHEN data->>'type' = 'deposit' THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN data->>'type' = 'deposit' THEN (data->>'amount')::float8 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN data->>'type' = 'withdrawal' THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN data->>'type' = 'withdrawal' THEN (data->>'amount')::float8 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN created_at::date = CURRENT_DATE THEN 1 ELSE 0 END), 0),
+		   COALESCE(SUM(CASE WHEN created_at::date = CURRENT_DATE THEN (data->>'amount')::float8 ELSE 0 END), 0)
+		 FROM service_records
+		 WHERE service=$1 AND type='cash_transaction' AND data->>'tellerId' = $2`,
+		serviceName, tellerId).Scan(
+		&totalTxns, &totalVolume,
+		&depositsCount, &depositsVolume,
+		&withdrawalsCount, &withdrawalsVolume,
+		&todayTxns, &todayVolume)
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	jsonResp(w, 200, map[string]interface{}{
+		"teller_id":                 tellerId,
+		"total_transactions":        int64(totalTxns),
+		"total_volume":              totalVolume,
+		"deposits_count":            int64(depositsCount),
+		"deposits_volume":           depositsVolume,
+		"withdrawals_count":         int64(withdrawalsCount),
+		"withdrawals_volume":        withdrawalsVolume,
+		"average_transaction_time":  0,
+		"today_transactions":        int64(todayTxns),
+		"today_volume":              todayVolume,
+		"last_updated":              time.Now().UTC().Format(time.RFC3339),
+		"source":                    "database",
+	})
+}
+
 // --- Integration Tests ---
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1348,6 +1997,14 @@ func main() {
 	mux.Handle("/v1/teller/deposit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(cashDepositHandler)))
 	mux.Handle("/v1/teller/withdrawal", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(cashWithdrawalHandler)))
 	mux.Handle("/v1/teller/vault-balance", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(vaultBalanceHandler)))
+
+	// Teller console (tenant_admin): sessions, cash desk, teller directory.
+	mux.Handle("/v1/sessions", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(sessionsHandler)))
+	mux.Handle("/v1/sessions/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(sessionSubHandler)))
+	mux.Handle("/v1/cash/deposit", jwtMiddleware(jwtRealmURL(), cashDeskHandler("deposit")))
+	mux.Handle("/v1/cash/withdrawal", jwtMiddleware(jwtRealmURL(), cashDeskHandler("withdrawal")))
+	mux.Handle("/v1/tellers", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(tellersHandler)))
+	mux.Handle("/v1/tellers/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(tellerSubHandler)))
 
 	log.Printf("teller-operations-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

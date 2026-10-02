@@ -639,11 +639,11 @@ func main() {
 	mux.HandleFunc("/api/list", listHandler)
 	mux.HandleFunc("/api/stats", statsHandler)
 	mux.HandleFunc("/api/get", getByIdHandler)
-	mux.HandleFunc("/api/create", createHandler)
-	mux.HandleFunc("/v1/core/post", postingHandler)
-	mux.HandleFunc("/v1/core/eod-batch", eodBatchHandler)
-	mux.HandleFunc("/v1/core/account-tier", accountTierHandler)
-	mux.HandleFunc("/v1/core/interest-calc", interestCalcHandler)
+	mux.HandleFunc("/api/create", permifyAuthzGuard("account", "create", createHandler))
+	mux.HandleFunc("/v1/core/post", permifyAuthzGuard("journal_entry", "create", postingHandler))
+	mux.HandleFunc("/v1/core/eod-batch", permifyAuthzGuard("ledger", "eod", eodBatchHandler))
+	mux.HandleFunc("/v1/core/account-tier", permifyAuthzGuard("account", "update", accountTierHandler))
+	mux.HandleFunc("/v1/core/interest-calc", permifyAuthzGuard("interest_batch", "accrue", interestCalcHandler))
 
 	server := &http.Server{
 		Addr:              ":" + port,

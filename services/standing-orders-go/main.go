@@ -566,6 +566,112 @@ func handleStandingOrders(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(405)
 }
 
+// W12-A4B: item-level GET/PUT/DELETE for a single standing order (?id=SO-...).
+// Mirrors handleStandingOrders storage patterns (payload JSON column); soft
+// DELETE sets status='cancelled' exactly like handlePauseOrder sets 'paused'.
+func handleOrderItem(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if dbUnavailable(w) {
+		return
+	}
+	switch r.Method {
+	case "GET":
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeJSONSO(w, 400, map[string]string{"error": "id query parameter is required"})
+			return
+		}
+		var payload string
+		err := db.QueryRowContext(r.Context(), `SELECT payload FROM standing_orders WHERE id = $1`, id).Scan(&payload)
+		if err == sql.ErrNoRows {
+			writeJSONSO(w, 404, map[string]string{"error": "order not found"})
+			return
+		}
+		if err != nil {
+			writeJSONSO(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(payload))
+	case "PUT":
+		var body struct {
+			ID            string  `json:"id"`
+			Amount        float64 `json:"amount"`
+			Frequency     string  `json:"frequency"`
+			EndDate       string  `json:"endDate"`
+			Narration     string  `json:"narration"`
+			MaxExecutions int     `json:"maxExecutions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+			writeJSONSO(w, 400, map[string]string{"error": "id is required"})
+			return
+		}
+		var payload string
+		err := db.QueryRowContext(r.Context(), `SELECT payload FROM standing_orders WHERE id = $1`, body.ID).Scan(&payload)
+		if err == sql.ErrNoRows {
+			writeJSONSO(w, 404, map[string]string{"error": "order not found"})
+			return
+		}
+		if err != nil {
+			writeJSONSO(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		var so StandingOrder
+		if err := json.Unmarshal([]byte(payload), &so); err != nil {
+			writeJSONSO(w, 500, map[string]string{"error": "stored order payload corrupt: " + err.Error()})
+			return
+		}
+		if body.Amount > 0 {
+			so.Amount = body.Amount
+		}
+		if body.Frequency != "" {
+			validFreq := map[string]bool{"daily": true, "weekly": true, "biweekly": true, "monthly": true, "quarterly": true, "annually": true}
+			if !validFreq[body.Frequency] {
+				writeJSONSO(w, 400, map[string]string{"error": "frequency must be: daily, weekly, biweekly, monthly, quarterly, annually"})
+				return
+			}
+			so.Frequency = body.Frequency
+			so.NextExecutionAt = nextExecutionAfter(so.Frequency, time.Now()).Format(time.RFC3339)
+		}
+		if body.EndDate != "" {
+			so.EndDate = body.EndDate
+		}
+		if body.Narration != "" {
+			so.Narration = body.Narration
+		}
+		if body.MaxExecutions > 0 {
+			so.MaxExecutions = body.MaxExecutions
+		}
+		newPayload, _ := json.Marshal(so)
+		if _, err := db.ExecContext(r.Context(), `UPDATE standing_orders
+			SET amount=$2, frequency=$3, narration=$4, max_executions=$5, end_date=NULLIF($6,''), next_execution_at=$7, payload=$8, updated_at=NOW()
+			WHERE id=$1`,
+			body.ID, so.Amount, so.Frequency, so.Narration, so.MaxExecutions, so.EndDate, so.NextExecutionAt, string(newPayload)); err != nil {
+			writeJSONSO(w, 500, map[string]string{"error": "order update failed: " + err.Error()})
+			return
+		}
+		writeJSONSO(w, 200, so)
+	case "DELETE":
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			writeJSONSO(w, 400, map[string]string{"error": "id query parameter is required"})
+			return
+		}
+		res, err := db.ExecContext(r.Context(), `UPDATE standing_orders SET status='cancelled', updated_at=NOW() WHERE id=$1 AND status <> 'cancelled'`, id)
+		if err != nil {
+			writeJSONSO(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			writeJSONSO(w, 404, map[string]string{"error": "order not found or already cancelled"})
+			return
+		}
+		writeJSONSO(w, 200, map[string]string{"id": id, "status": "cancelled"})
+	default:
+		w.WriteHeader(405)
+	}
+}
+
 func handlePauseOrder(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != "POST" {
@@ -1154,13 +1260,17 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
 	})
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/standing-orders", handleStandingOrders)
-	mux.HandleFunc("/v1/standing-orders/pause", handlePauseOrder)
-	mux.HandleFunc("/v1/standing-orders/resume", handleResumeOrder)
-	mux.HandleFunc("/v1/standing-orders/executions", listHandler)
-	mux.HandleFunc("/v1/mandates", handleMandates)
-	mux.HandleFunc("/v1/mandates/revoke", handleRevokeMandate)
-	mux.HandleFunc("/v1/scheduled-payments", handleScheduledPayments)
+	mux.HandleFunc("/v1/standing-orders", permifyAuthzGuard("standing_orders", "manage", handleStandingOrders))
+	mux.HandleFunc("/v1/standing-orders/pause", permifyAuthzGuard("standing_orders", "pause", handlePauseOrder))
+	mux.HandleFunc("/v1/standing-orders/resume", permifyAuthzGuard("standing_orders", "resume", handleResumeOrder))
+	mux.HandleFunc("/v1/standing-orders/executions", permifyAuthzGuard("standing_orders", "manage", listHandler))
+	mux.HandleFunc("/v1/mandates", permifyAuthzGuard("standing_orders", "manage", handleMandates))
+	mux.HandleFunc("/v1/mandates/revoke", permifyAuthzGuard("standing_orders", "revoke", handleRevokeMandate))
+	mux.HandleFunc("/v1/scheduled-payments", permifyAuthzGuard("standing_orders", "manage", handleScheduledPayments))
+	// W12-A4B: item-level operations for UI scheduled-payment screens
+	// (GET/PUT/DELETE /payment-processing/scheduled-payments/{id} had no
+	// backend anywhere; collection + pause/resume already existed here).
+	mux.HandleFunc("/v1/standing-orders/order", handleOrderItem)
 
 	handler := corsMiddleware(jwtAuthMiddleware(rateLimitMiddleware(mux))) // CORS is handled by APISIX gateway
 	log.Printf("Standing Orders Service starting on :%s", port)

@@ -63,6 +63,11 @@ const AgricultureDashboardScreen: React.FC = () => {
     { label: 'Risk Alerts', route: '/agriculture/risk-alerts', emoji: '⚠️' },
     { label: 'Value Chain', route: '/agriculture/value-chain', emoji: '🔗' },
     { label: 'Proactive Risk', route: '/agriculture/proactive-risk', emoji: '🔮' },
+    { label: 'Loan Application', route: '/agriculture/loans/apply', emoji: '📝' },
+    { label: 'Animal Traceability', route: '/agriculture/animal-traceability', emoji: '🐄' },
+    { label: 'Fisheries & Aquaculture', route: '/agriculture/fisheries', emoji: '🐟' },
+    { label: 'Satellite Monitoring', route: '/agriculture/satellite-monitoring', emoji: '🛰️' },
+    { label: 'Soil Analysis', route: '/agriculture/soil-analysis', emoji: '🧪' },
   ];
 
   return (

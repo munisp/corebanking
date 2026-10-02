@@ -85,8 +85,11 @@ class AccountService {
   /// Create a new account
   Future<Map<String, dynamic>> createAccount(CreateAccountParams params) async {
     try {
+      // W12-A4-P0-D: accountEndpoint already resolves to the service create
+      // route (/account/account -> gateway rewrite -> service POST /account);
+      // appending another /account produced /account/account/account (404).
       final response = await _apiService.post(
-        '${AppConfig.accountEndpoint}/account',
+        '${AppConfig.accountEndpoint}',
         data: {
           'user_id': params.userId,
           'account_name': params.accountName,

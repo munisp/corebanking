@@ -513,6 +513,7 @@ const routeConfigs: RouteConfig[] = [
   { basePath: "/api/db/customers", repo: "customers", idParam: "customerId", domain: "Core Banking" },
   // Tenants
   { basePath: "/api/db/tenants", repo: "tenants", idParam: "tenantId", domain: "Platform" },
+  { basePath: "/api/db/tenant-feature-flags", repo: "tenantFeatureFlags", idParam: "featureKey", domain: "Platform" },
   // Billing
   { basePath: "/api/db/billing-accounts", repo: "billingAccounts", idParam: "id", domain: "Billing" },
   { basePath: "/api/db/billing-invoices", repo: "billingInvoices", idParam: "id", domain: "Billing" },

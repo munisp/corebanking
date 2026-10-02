@@ -1,5 +1,22 @@
 // Murabaha Profit Rate Calculator — Islamic finance cost-plus financing computation engine
+//
+// W12-C3-P2-MLIB (c3-1023): the murabaha quote store was module process
+// memory (lost on restart, divergent across replicas). Now Postgres-authoritative
+// (table `murabaha_quotes`) via lib/pgJsonStore.ts; fail-closed 503 on PG outage,
+// no degraded-memory fallback.
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const TABLE = "murabaha_quotes";
+
+async function loadQuotes(): Promise<MurabahaQuote[]> {
+  return pgGuard((async () => {
+    await ensureTables("murabahaCalculator", storeDDL(TABLE));
+    await storeSeed(TABLE, QUOTES_SEED, () => "");
+    return storeList<MurabahaQuote>(TABLE);
+  })());
+}
 
 interface MurabahaQuote {
   id: string;
@@ -19,7 +36,8 @@ interface MurabahaQuote {
   createdAt: string;
 }
 
-const quotes: MurabahaQuote[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const QUOTES_SEED: MurabahaQuote[] = [
   {
     id: "MRB-001", customerId: "CUST-001", assetDescription: "Toyota Hilux 2026 Model",
     costPrice: 45000000, profitMargin: 15.0, sellingPrice: 51750000,
@@ -50,7 +68,8 @@ const quotes: MurabahaQuote[] = [
   },
 ];
 
-function calculateMurabaha(costPrice: number, profitMarginPct: number, tenorMonths: number, downPaymentPct: number = 20): MurabahaQuote {
+async function calculateMurabaha(costPrice: number, profitMarginPct: number, tenorMonths: number, downPaymentPct: number = 20): Promise<MurabahaQuote> {
+  const quotes = await loadQuotes();
   const downPayment = Math.round(costPrice * (downPaymentPct / 100));
   const financedAmount = costPrice - downPayment;
   const totalProfit = Math.round(financedAmount * (profitMarginPct / 100));
@@ -67,26 +86,29 @@ function calculateMurabaha(costPrice: number, profitMarginPct: number, tenorMont
   };
 }
 
-function comparativeAnalysis(costPrice: number, tenorMonths: number) {
+async function comparativeAnalysis(costPrice: number, tenorMonths: number) {
   const margins = [8, 10, 12, 15, 18, 20, 25];
-  return margins.map(margin => {
-    const q = calculateMurabaha(costPrice, margin, tenorMonths);
-    return {
+  const out = [];
+  for (const margin of margins) {
+    const q = await calculateMurabaha(costPrice, margin, tenorMonths);
+    out.push({
       profitMargin: margin,
       totalProfit: q.totalProfit,
       monthlyInstallment: q.monthlyInstallment,
       annualizedRate: q.annualizedRate,
       sellingPrice: q.sellingPrice,
-    };
-  });
+    });
+  }
+  return out;
 }
 
 export function registerMurabahaCalculatorRoutes(app: Express): void {
-  app.get("/api/platform/islamic/murabaha/quotes", (_req: Request, res: Response) => {
+  app.get("/api/platform/islamic/murabaha/quotes", asyncRoute(async (_req: Request, res: Response) => {
+    const quotes = await loadQuotes();
     res.json({ items: quotes, total: quotes.length });
-  });
+  }));
 
-  app.post("/api/platform/islamic/murabaha/calculate", (req: Request, res: Response) => {
+  app.post("/api/platform/islamic/murabaha/calculate", asyncRoute(async (req: Request, res: Response) => {
     const { costPrice, profitMarginPct, tenorMonths, downPaymentPct } = req.body;
     if (!costPrice || !profitMarginPct || !tenorMonths) {
       return res.status(400).json({ error: "costPrice, profitMarginPct, and tenorMonths are required" });
@@ -97,21 +119,22 @@ export function registerMurabahaCalculatorRoutes(app: Express): void {
     if (profitMarginPct > 50) {
       return res.status(400).json({ error: "Profit margin exceeds Sharia-compliant threshold (max 50%)" });
     }
-    const quote = calculateMurabaha(costPrice, profitMarginPct, tenorMonths, downPaymentPct || 20);
+    const quote = await calculateMurabaha(costPrice, profitMarginPct, tenorMonths, downPaymentPct || 20);
     res.json(quote);
-  });
+  }));
 
-  app.post("/api/platform/islamic/murabaha/comparative", (req: Request, res: Response) => {
+  app.post("/api/platform/islamic/murabaha/comparative", asyncRoute(async (req: Request, res: Response) => {
     const { costPrice, tenorMonths } = req.body;
     if (!costPrice || !tenorMonths) {
       return res.status(400).json({ error: "costPrice and tenorMonths are required" });
     }
-    res.json({ analysis: comparativeAnalysis(costPrice, tenorMonths), costPrice, tenorMonths });
-  });
+    res.json({ analysis: await comparativeAnalysis(costPrice, tenorMonths), costPrice, tenorMonths });
+  }));
 
-  app.get("/api/platform/islamic/murabaha/quotes/:id", (req: Request, res: Response) => {
+  app.get("/api/platform/islamic/murabaha/quotes/:id", asyncRoute(async (req: Request, res: Response) => {
+    const quotes = await loadQuotes();
     const quote = quotes.find(q => q.id === req.params.id);
     if (!quote) return res.status(404).json({ error: "Quote not found" });
     res.json(quote);
-  });
+  }));
 }

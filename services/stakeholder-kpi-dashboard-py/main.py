@@ -648,6 +648,58 @@ def validate_jwt(headers):
     return payload, None
 
 
+# ============================================================================
+# W12-B5P1DF: Permify authorization for the mutating dashboard routes.
+# Mirrors the landed wave-12 guard semantics (services/permify-authz-go/
+# main.go:470): real POST {PERMIFY_URL}/v1/tenants/{tenant}/permissions/check
+# with a 30s in-process decision cache; errors are never cached. Runs AFTER
+# validate_jwt authenticated the caller. FAIL-CLOSED: Permify unreachable/
+# non-200 -> 502; denied -> 403. Stdlib-only (no new dependencies).
+# ============================================================================
+_time = time
+_urllib_request = urllib.request
+_PERMIFY_URL = _jwt_os.environ.get("PERMIFY_URL", "http://permify:3476").rstrip("/")
+_PERMIFY_DECISION_TTL = 30.0
+_permify_decisions = {}
+
+
+def _permify_check(tenant_id, user_id, entity_type, entity_id, permission):
+    """Real Permify permissions/check call with a 30s decision cache."""
+    key = (tenant_id, user_id, entity_type, entity_id, permission)
+    now = _time.time()
+    hit = _permify_decisions.get(key)
+    if hit and now < hit[1]:
+        return hit[0]
+    payload = _jwt_json.dumps({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": user_id},
+    }).encode()
+    req = _urllib_request.Request(
+        f"{_PERMIFY_URL}/v1/tenants/{tenant_id}/permissions/check",
+        data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    with _urllib_request.urlopen(req, timeout=5) as resp:
+        result = _jwt_json.loads(resp.read().decode())
+    allowed = result.get("can") == "CHECK_RESULT_ALLOWED"
+    if len(_permify_decisions) >= 10000:
+        for k in [k for k, v in _permify_decisions.items() if now >= v[1]]:
+            _permify_decisions.pop(k, None)
+        if len(_permify_decisions) >= 10000:
+            _permify_decisions.pop(next(iter(_permify_decisions)), None)
+    _permify_decisions[key] = (allowed, now + _PERMIFY_DECISION_TTL)
+    return allowed
+
+
+# Mutating dashboard routes -> kpi permission (entity `kpi`,
+# v2-analytics-notification.fragment).
+_PERMIFY_POST_PERMS = {
+    "/v1/dashboard/ask": "ask",
+    "/v1/dashboard/alert-config": "alert_config",
+    "/v1/dashboard/export": "export",
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):
@@ -840,6 +892,30 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
         body = json.loads(sanitize_input(raw.decode("utf-8")))
         logger.info(f"POST {path} trace={trace_id}")
+
+        # W12-B5P1DF: Permify authorization on mutating dashboard routes
+        # (fail-closed; runs after validate_jwt authenticated the caller).
+        if path in _PERMIFY_POST_PERMS:
+            _pf_claims = _n1_claims or {}
+            _pf_user = (_pf_claims.get("sub") or _pf_claims.get("user_id")
+                        or _pf_claims.get("preferred_username") or "")
+            _pf_tenant = (_pf_claims.get("tenant_id") or _pf_claims.get("tenant")
+                          or self.get_tenant_id())
+            if not _pf_user:
+                self.respond(403, {"error": "missing authenticated subject"})
+                return
+            _pf_perm = _PERMIFY_POST_PERMS[path]
+            _pf_eid = (body.get("kpi_id") or body.get("id")
+                       or ("scope:" + path.lstrip("/")))
+            try:
+                _pf_allowed = _permify_check(_pf_tenant, _pf_user, "kpi", _pf_eid, _pf_perm)
+            except Exception:
+                inc_errors()
+                self.respond(502, {"error": "authorization service unavailable"})
+                return
+            if not _pf_allowed:
+                self.respond(403, {"error": f"forbidden: missing permission kpi:{_pf_perm}"})
+                return
 
         if path == "/v1/dashboard/ask":
             if not self.check_jwt(): return

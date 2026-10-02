@@ -5,6 +5,8 @@ import businessRoute from "../routes/businessRoutes";
 import customerRoute from "../routes/customerRoute";
 import employeeRoute from "../routes/employeeRoute";
 import healthCheckRoute from "../routes/healthCheckRoute";
+import notificationRoute from "../routes/notificationRoute";
+import rewardRoute from "../routes/rewardRoute";
 import tenantRoute from "../routes/tenantRoute";
 import { authenticateRequest } from "../middlewares/auth";
 
@@ -20,4 +22,7 @@ export default function setupRoutes(app: Application): void {
   app.use("/tenant", authenticateRequest, tenantRoute);
   // OB-14: mount the previously-unwired employee onboarding route.
   app.use("/employee", authenticateRequest, employeeRoute);
+  // Customer console: in-app notification inbox and rewards ledger.
+  app.use("/notifications", authenticateRequest, notificationRoute);
+  app.use("/rewards", authenticateRequest, rewardRoute);
 }

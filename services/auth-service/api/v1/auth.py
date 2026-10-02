@@ -8,6 +8,12 @@ from schemas.v1 import (
     ForgotPassword,
     ResetPassword,
     ChangePassword,
+    VerifyOTP,
+    VerifyEmail,
+    ResendOTP,
+    ResendVerification,
+    CreatePin,
+    UpdateUser,
     Context,
 )
 from database import get_session
@@ -302,4 +308,335 @@ def change_password(
             status_code=500,
             message="Change password failed.",
             code="AUTH-AUTH-INT-5005",
+        )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# W12-A4A: session-family endpoints called by the mobile/web2 UIs. Created to
+# close 8 UI-called paths that previously 404'd (verify-otp, verify-email,
+# resend-otp, resend-verification, logout, me, create-pin, PUT user).
+# Convention: gateway /auth/* strips the first segment, so the UI reaches
+# these as /auth/auth/<path>.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _resolve_keycloak_id(body_keycloak_id, header_keycloak_id) -> str:
+    """OTP flows are unauthenticated (login), so the UI supplies the identity
+    either in the body or via the x-keycloak-id header the API clients attach."""
+    keycloak_id = body_keycloak_id or header_keycloak_id
+    if not keycloak_id:
+        raise_http_exception_handler(
+            status_code=400,
+            message="keycloak_id is required (body or x-keycloak-id header).",
+            code="AUTH-AUTH-OTP-4001",
+        )
+    return keycloak_id
+
+
+@auth_router.post("/verify-otp")
+def verify_otp(
+    payload: VerifyOTP,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    x_keycloak_id: str = Header(None, alias="x-keycloak-id"),
+):
+    """Verify a login OTP (mobile/web2 verify-otp)."""
+
+    try:
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        keycloak_id = _resolve_keycloak_id(payload.keycloak_id, x_keycloak_id)
+        otp_code = payload.resolved_otp()
+        if not otp_code:
+            raise_http_exception_handler(
+                status_code=400,
+                message="OTP code is required.",
+                code="AUTH-AUTH-OTP-4002",
+            )
+
+        result = auth_service.verify_otp(keycloak_id, otp_code, context)
+
+        return responses.JSONResponse(
+            content={"message": "success", "success": True, **result},
+            status_code=200,
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during verify_otp: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="OTP verification failed.",
+            code="AUTH-AUTH-INT-5010",
+        )
+
+
+@auth_router.post("/verify-email")
+def verify_email(
+    payload: VerifyEmail,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    x_keycloak_id: str = Header(None, alias="x-keycloak-id"),
+):
+    """Verify the emailed verification token (mobile/web2 verify-email)."""
+
+    try:
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        keycloak_id = _resolve_keycloak_id(payload.keycloak_id, x_keycloak_id)
+        result = auth_service.verify_email(keycloak_id, payload.token, context)
+
+        return responses.JSONResponse(
+            content={"message": "success", "success": True, **result},
+            status_code=200,
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during verify_email: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Email verification failed.",
+            code="AUTH-AUTH-INT-5011",
+        )
+
+
+@auth_router.post("/resend-otp")
+def resend_otp(
+    payload: ResendOTP,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    x_keycloak_id: str = Header(None, alias="x-keycloak-id"),
+):
+    """Regenerate a login OTP (mobile/web2 resend-otp)."""
+
+    try:
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        keycloak_id = _resolve_keycloak_id(payload.keycloak_id, x_keycloak_id)
+        result = auth_service.resend_otp(keycloak_id, context)
+
+        return responses.JSONResponse(
+            content={"message": "success", "success": True, **result},
+            status_code=200,
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during resend_otp: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Resend OTP failed.",
+            code="AUTH-AUTH-INT-5012",
+        )
+
+
+@auth_router.post("/resend-verification")
+def resend_verification(
+    payload: ResendVerification,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    x_keycloak_id: str = Header(None, alias="x-keycloak-id"),
+):
+    """Resend the email-verification OTP (mobile/web2 resend-verification)."""
+
+    try:
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        keycloak_id = _resolve_keycloak_id(payload.keycloak_id, x_keycloak_id)
+        result = auth_service.resend_verification(keycloak_id, context)
+
+        return responses.JSONResponse(
+            content={"message": "success", "success": True, **result},
+            status_code=200,
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during resend_verification: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Resend verification failed.",
+            code="AUTH-AUTH-INT-5013",
+        )
+
+
+@auth_router.post("/logout")
+def logout(
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Logout (requires authentication): revoke Keycloak sessions + OTP state."""
+
+    try:
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        auth_service.logout(current_user["keycloak_id"], context)
+
+        return responses.JSONResponse(content={"message": "success"}, status_code=200)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during logout: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Logout failed.",
+            code="AUTH-AUTH-INT-5014",
+        )
+
+
+@auth_router.get("/me")
+def get_me(
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the authenticated user's auth profile (web2 getCurrentUser)."""
+
+    try:
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        profile = auth_service.get_me(current_user["keycloak_id"], context)
+
+        return responses.JSONResponse(
+            content={"message": "success", "data": profile}, status_code=200
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during get_me: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Failed to fetch current user.",
+            code="AUTH-AUTH-INT-5015",
+        )
+
+
+@auth_router.post("/create-pin")
+def create_pin(
+    payload: CreatePin,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create/rotate the transaction PIN (requires authentication)."""
+
+    try:
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        result = auth_service.create_pin(
+            current_user["keycloak_id"],
+            payload.new_pin,
+            payload.current_pin,
+            context,
+        )
+
+        return responses.JSONResponse(
+            content={"message": "success", **result}, status_code=200
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during create_pin: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Create PIN failed.",
+            code="AUTH-AUTH-INT-5016",
+        )
+
+
+@auth_router.put("/user")
+def update_user(
+    payload: UpdateUser,
+    keycloak_id: str = None,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Update the authenticated user's profile (mobile PUT /auth/user).
+
+    Ownership is enforced: the optional ?keycloak_id= query param the mobile
+    client sends must match the token subject."""
+
+    try:
+        token_keycloak_id = current_user["keycloak_id"]
+        if keycloak_id and keycloak_id != token_keycloak_id:
+            raise_http_exception_handler(
+                status_code=403,
+                message="Cannot update another user's profile.",
+                code="AUTH-AUTH-USER-4031",
+            )
+
+        auth_service = AuthService(db)
+        context = Context(
+            tenant_id=tenant_id,
+            keycloak_realm=keycloak_realm,
+            keycloak_pub_key=keycloak_pub_key,
+        )
+
+        profile = auth_service.update_user(token_keycloak_id, payload, context)
+
+        return responses.JSONResponse(
+            content={"message": "success", "user": profile}, status_code=200
+        )
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during update_user: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Update user failed.",
+            code="AUTH-AUTH-INT-5017",
         )

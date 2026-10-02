@@ -1,7 +1,13 @@
 /**
  * Inter-bank settlement engine — NIBSS clearing, net settlement positions,
  * settlement window management, and dispute tracking.
+ *
+ * W12-C3-P0 (top-risk #7): settlement batches/net positions were computed
+ * from an in-memory array. They are now Postgres-authoritative
+ * (settlement_batches) via the server's drizzle pool; seeds inserted once.
  */
+
+import { ensureTables, storeDDL, storeSeed, storeList } from "./pgJsonStore";
 
 export interface SettlementBatch {
   id: string;
@@ -19,7 +25,7 @@ export interface SettlementBatch {
   settledAt?: string;
 }
 
-const batches: SettlementBatch[] = [
+const BATCH_SEED: SettlementBatch[] = [
   { id: "SB-001", type: "nip", settlementDate: "2026-05-09", window: "09:00-12:00", totalInbound: 12_500_000_000, totalOutbound: 11_800_000_000, netPosition: 700_000_000, positionType: "long", transactionCount: 45_230, currency: "NGN", status: "settled", counterparties: 22, settledAt: "2026-05-09T12:30:00Z" },
   { id: "SB-002", type: "nip", settlementDate: "2026-05-09", window: "12:00-15:00", totalInbound: 8_200_000_000, totalOutbound: 9_100_000_000, netPosition: -900_000_000, positionType: "short", transactionCount: 32_150, currency: "NGN", status: "settled", counterparties: 20, settledAt: "2026-05-09T15:30:00Z" },
   { id: "SB-003", type: "neft", settlementDate: "2026-05-09", window: "T+1", totalInbound: 3_400_000_000, totalOutbound: 2_800_000_000, netPosition: 600_000_000, positionType: "long", transactionCount: 8_420, currency: "NGN", status: "settled", counterparties: 18, settledAt: "2026-05-09T16:00:00Z" },
@@ -29,9 +35,19 @@ const batches: SettlementBatch[] = [
   { id: "SB-007", type: "direct_debit", settlementDate: "2026-05-09", window: "T+1", totalInbound: 890_000_000, totalOutbound: 1_050_000_000, netPosition: -160_000_000, positionType: "short", transactionCount: 12_500, currency: "NGN", status: "settled", counterparties: 8, settledAt: "2026-05-09T15:45:00Z" },
 ];
 
-export function getSettlementBatches() { return batches; }
+function ensure(): Promise<void> {
+  return ensureTables("interbankSettlement", storeDDL("settlement_batches")).then(() =>
+    storeSeed("settlement_batches", BATCH_SEED, () => ""),
+  );
+}
 
-export function getSettlementSummary() {
+export async function getSettlementBatches(): Promise<SettlementBatch[]> {
+  await ensure();
+  return storeList<SettlementBatch>("settlement_batches");
+}
+
+export async function getSettlementSummary() {
+  const batches = await getSettlementBatches();
   let totalInbound = 0;
   let totalOutbound = 0;
   let settledCount = 0;

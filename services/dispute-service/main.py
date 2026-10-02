@@ -1,6 +1,6 @@
 """Dispute Resolution Service"""
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -218,6 +218,69 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
 
 
 app.add_middleware(JWTAuthMiddleware)
+# --- Permify authorization (W12-B5-P0-D2) ---
+# Every mutating handler performs a REAL Permify permission check AFTER
+# JWTAuthMiddleware has authenticated the caller. Subject = verified JWT sub,
+# tenant = verified tenant claim, resource = domain entity id, permission per
+# action (schema entities: services/auth-service/schemas/permify/
+# v2-kyc-compliance.fragment). FAIL-CLOSED: Permify unreachable/non-200 => 503;
+# denied => 403. Canonical pattern: services/auth-service/adapters/permify.py
+# check_permission (REST /v1/tenants/{tenant}/permissions/check).
+import logging as _permify_logging
+import json as _permify_json
+
+import requests as _permify_requests
+
+
+def _permify_http_post(url, payload):
+    """POST a Permify check; returns (status, json_body) or None on transport error."""
+    try:
+        resp = _permify_requests.post(url, json=payload, timeout=5)
+        try:
+            return resp.status_code, resp.json()
+        except Exception:
+            return resp.status_code, None
+    except Exception as exc:
+        _permify_logger.error("permify check unreachable: %s", exc)
+        return None
+
+_PERMIFY_URL = os.getenv("PERMIFY_URL", "http://permify:3476").rstrip("/")
+_PERMIFY_DEFAULT_TENANT = os.getenv("PERMIFY_DEFAULT_TENANT", "bpmgd")
+_permify_logger = _permify_logging.getLogger(__name__)
+
+
+def permify_authorize(request, entity_type, entity_id, permission):
+    """Enforce <permission> on entity_type:entity_id for the JWT-verified caller.
+
+    Raises HTTPException(403) on denial and HTTPException(503) when Permify is
+    unreachable or errors (fail-closed). Returns True when allowed.
+    """
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    subject = claims.get("sub") or claims.get("keycloak_id") or ""
+    tenant_id = claims.get("tenant_id") or claims.get("tenant") or _PERMIFY_DEFAULT_TENANT
+    entity_id = str(entity_id or "")
+    if not subject or not entity_id:
+        raise HTTPException(status_code=403, detail="authorization context incomplete")
+    payload = {
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    }
+    url = f"{_PERMIFY_URL}/v1/tenants/{tenant_id}/permissions/check"
+    resp = _permify_http_post(url, payload)
+    if resp is None:
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify unreachable (fail-closed)")
+    status, body = resp
+    if status != 200:
+        _permify_logger.error("permify check %s on %s:%s http=%s", permission, entity_type, entity_id, status)
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify check failed (fail-closed)")
+    can = (body or {}).get("can")
+    allowed = can == "CHECK_RESULT_ALLOWED" or can is True
+    if not allowed:
+        raise HTTPException(status_code=403, detail=f"permify: {permission} denied on {entity_type}:{entity_id}")
+    return True
+
 
 
 _CORS_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",") if o.strip()]
@@ -293,12 +356,14 @@ async def health_check():
 
 @app.post("/api/v1/disputes")
 async def create_dispute(
+    request: Request,
     payload: DisputeSchema,
     db=Depends(lambda: db_pool),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
     ledger_id: str = Header(..., alias="x-ledger-id"),
 ):
+    permify_authorize(request, "dispute", payload.transaction_id, "create")
     dispute_id = f"DSP{int(datetime.now().timestamp())}"
 
     context = Context(
@@ -514,6 +579,7 @@ def _post_provisional_credit(
 
 @app.put("/api/v1/administration/disputes/{dispute_id}/resolve")
 async def resolve_dispute(
+    request: Request,
     dispute_id: str,
     resolution: str,
     db=Depends(lambda: db_pool),
@@ -521,6 +587,7 @@ async def resolve_dispute(
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
     ledger_id: str = Header("1", alias="x-ledger-id"),
 ):
+    permify_authorize(request, "dispute", dispute_id, "resolve")
     resolution_norm = (resolution or "").strip().lower()
     context = Context(tenant_id=tenant_id, keycloak_id=keycloak_id, ledger_id=ledger_id)
 

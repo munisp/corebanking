@@ -12,7 +12,7 @@ export default function ESGBankingWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/agri-esg-impact/count")
+    fetch("/api/db/agri-esg-impact/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

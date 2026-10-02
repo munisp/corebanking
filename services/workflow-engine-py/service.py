@@ -14,6 +14,124 @@ Handles:
 import json
 import os
 import uuid
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
@@ -51,9 +169,10 @@ WORKFLOW_TEMPLATES = {
     },
 }
 
-workflows: list[dict] = []
-activities: list[dict] = []
-signals: list[dict] = []
+# W12-C3P2B5: workflow instances + signals are PG-backed (jsonb payload).
+WF_STORE = _W12Store("workflow_instances")
+SIGNAL_STORE = _W12Store("workflow_signals")
+activities: list[dict] = []  # activity-task outbox: transient dispatch buffer
 wf_counter = 0
 act_counter = 0
 
@@ -91,63 +210,87 @@ def create_workflow(body: dict) -> tuple[dict, int]:
         "startedAt": now_iso(),
         "completedAt": None,
     }
-    workflows.append(wf)
+    try:
+        WF_STORE.put(wf["id"], wf)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
     return wf, 201
 
 
 def advance_workflow(wf_id: str) -> tuple[dict, int]:
-    for wf in workflows:
-        if wf["id"] == wf_id:
-            if wf["status"] != "running":
-                return {"error": f"workflow is {wf['status']}, cannot advance"}, 400
+    try:
+        wf = WF_STORE.get(wf_id)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
+    if not wf:
+        return {"error": "workflow not found"}, 404
+    if wf["status"] != "running":
+        return {"error": f"workflow is {wf['status']}, cannot advance"}, 400
 
-            next_idx = wf["stepIndex"] + 1
-            if next_idx >= wf["totalSteps"]:
-                wf["status"] = "completed"
-                wf["completedAt"] = now_iso()
-                wf["history"].append({"step": wf["currentStep"], "status": "completed", "timestamp": now_iso()})
-                return wf, 200
+    next_idx = wf["stepIndex"] + 1
+    if next_idx >= wf["totalSteps"]:
+        wf["status"] = "completed"
+        wf["completedAt"] = now_iso()
+        wf["history"].append({"step": wf["currentStep"], "status": "completed", "timestamp": now_iso()})
+    else:
+        wf["stepIndex"] = next_idx
+        wf["currentStep"] = wf["steps"][next_idx]
+        wf["history"].append({"step": wf["currentStep"], "status": "started", "timestamp": now_iso()})
 
-            wf["stepIndex"] = next_idx
-            wf["currentStep"] = wf["steps"][next_idx]
-            wf["history"].append({"step": wf["currentStep"], "status": "started", "timestamp": now_iso()})
-            return wf, 200
-
-    return {"error": "workflow not found"}, 404
+    try:
+        WF_STORE.put(wf["id"], wf)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
+    return wf, 200
 
 
 def fail_step(wf_id: str, body: dict) -> tuple[dict, int]:
-    for wf in workflows:
-        if wf["id"] == wf_id:
-            if wf["status"] != "running":
-                return {"error": f"workflow is {wf['status']}"}, 400
+    try:
+        wf = WF_STORE.get(wf_id)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
+    if not wf:
+        return {"error": "workflow not found"}, 404
+    if wf["status"] != "running":
+        return {"error": f"workflow is {wf['status']}"}, 400
 
-            reason = body.get("reason", "unknown error")
-            retry_count = sum(1 for h in wf["history"] if h.get("status") == "retried" and h.get("step") == wf["currentStep"])
-            max_retries = wf["retryPolicy"]["max_retries"]
+    reason = body.get("reason", "unknown error")
+    retry_count = sum(1 for h in wf["history"] if h.get("status") == "retried" and h.get("step") == wf["currentStep"])
+    max_retries = wf["retryPolicy"]["max_retries"]
 
-            if retry_count < max_retries:
-                wf["history"].append({"step": wf["currentStep"], "status": "retried", "reason": reason, "timestamp": now_iso()})
-                return {"id": wf["id"], "action": "retried", "retryCount": retry_count + 1, "maxRetries": max_retries}, 200
-            else:
-                wf["status"] = "failed"
-                wf["completedAt"] = now_iso()
-                wf["history"].append({"step": wf["currentStep"], "status": "failed", "reason": reason, "timestamp": now_iso()})
-                return wf, 200
+    if retry_count < max_retries:
+        wf["history"].append({"step": wf["currentStep"], "status": "retried", "reason": reason, "timestamp": now_iso()})
+        result = {"id": wf["id"], "action": "retried", "retryCount": retry_count + 1, "maxRetries": max_retries}
+    else:
+        wf["status"] = "failed"
+        wf["completedAt"] = now_iso()
+        wf["history"].append({"step": wf["currentStep"], "status": "failed", "reason": reason, "timestamp": now_iso()})
+        result = wf
 
-    return {"error": "workflow not found"}, 404
+    try:
+        WF_STORE.put(wf["id"], wf)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
+    return result, 200
 
 
 def cancel_workflow(wf_id: str) -> tuple[dict, int]:
-    for wf in workflows:
-        if wf["id"] == wf_id:
-            if wf["status"] in ("completed", "cancelled"):
-                return {"error": f"workflow already {wf['status']}"}, 400
-            wf["status"] = "cancelled"
-            wf["completedAt"] = now_iso()
-            wf["history"].append({"step": wf["currentStep"], "status": "cancelled", "timestamp": now_iso()})
-            return wf, 200
-    return {"error": "workflow not found"}, 404
+    try:
+        wf = WF_STORE.get(wf_id)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
+    if not wf:
+        return {"error": "workflow not found"}, 404
+    if wf["status"] in ("completed", "cancelled"):
+        return {"error": f"workflow already {wf['status']}"}, 400
+    wf["status"] = "cancelled"
+    wf["completedAt"] = now_iso()
+    wf["history"].append({"step": wf["currentStep"], "status": "cancelled", "timestamp": now_iso()})
+    try:
+        WF_STORE.put(wf["id"], wf)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
+    return wf, 200
 
 
 def send_signal(body: dict) -> tuple[dict, int]:
@@ -156,7 +299,10 @@ def send_signal(body: dict) -> tuple[dict, int]:
     if not wf_id or not signal_name:
         return {"error": "workflowId and signal are required"}, 400
 
-    found = any(wf["id"] == wf_id for wf in workflows)
+    try:
+        found = WF_STORE.get(wf_id) is not None
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
     if not found:
         return {"error": "workflow not found"}, 404
 
@@ -167,7 +313,10 @@ def send_signal(body: dict) -> tuple[dict, int]:
         "payload": body.get("payload", {}),
         "timestamp": now_iso(),
     }
-    signals.append(sig)
+    try:
+        SIGNAL_STORE.put(sig["id"], sig)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
     return sig, 201
 
 
@@ -370,7 +519,12 @@ class WorkflowHandler(BaseHTTPRequestHandler):
             }})
 
         elif path == "/v1/workflows":
-            self._send({"items": workflows, "total": len(workflows)})
+            try:
+                _items = WF_STORE.all()
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
+            self._send({"items": _items, "total": len(_items)})
 
         elif path == "/v1/workflows/templates":
             templates = []
@@ -381,16 +535,30 @@ class WorkflowHandler(BaseHTTPRequestHandler):
 
         elif path.startswith("/v1/workflows/") and path.count("/") == 3:
             wf_id = path.split("/")[-1]
-            found = next((wf for wf in workflows if wf["id"] == wf_id), None)
+            try:
+                found = WF_STORE.get(wf_id)
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
             if found:
                 self._send(found)
             else:
                 self._send({"error": "workflow not found"}, 404)
 
         elif path == "/v1/workflows/signals":
-            self._send({"items": signals, "total": len(signals)})
+            try:
+                _items = SIGNAL_STORE.all()
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
+            self._send({"items": _items, "total": len(_items)})
 
         elif path == "/v1/workflows/stats":
+            try:
+                workflows = WF_STORE.all()
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
             stats = {"total": len(workflows), "running": 0, "completed": 0, "failed": 0, "cancelled": 0}
             for wf in workflows:
                 if wf["status"] in stats:

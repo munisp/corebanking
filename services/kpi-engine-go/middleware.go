@@ -13,16 +13,8 @@ import (
 	"time"
 )
 
-// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
-// (replaces per-call &http.Client{} construction).
-var sharedHTTPClient = &http.Client{
-	Timeout: 10 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 25,
-		IdleConnTimeout:     90 * time.Second,
-	},
-}
+// sharedHTTPClient lives in main.go (W12 drive-by: the duplicate declaration
+// here was a pre-existing build breakage — both files declared it identically).
 
 // ─── MIDDLEWARE STATUS TRACKING ─────────────────────────────────────────────
 

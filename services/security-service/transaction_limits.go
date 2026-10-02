@@ -168,10 +168,44 @@ func NewTransactionLimitManager(db *sql.DB) *TransactionLimitManager {
 	// Create necessary tables
 	tlm.createTables()
 
+	// W12-C3-PX (c3-0768): persist the (env-overridden) default tier limits to
+	// PG, idempotently keyed on (tenant_id='default', tier), so the global
+	// limit configuration is durable and shared across replicas.
+	tlm.seedDefaultLimits()
+
 	// Load tenant-specific limits from database
 	tlm.loadTenantLimits()
 
 	return tlm
+}
+
+// seedDefaultLimits upserts nothing when rows already exist: first boot writes
+// the code/env defaults under tenant_id 'default'; subsequent boots keep the
+// persisted rows (no lost updates on restart). W12-C3-PX (c3-0768).
+func (tlm *TransactionLimitManager) seedDefaultLimits() {
+	if tlm.db == nil {
+		return
+	}
+	tlm.mu.RLock()
+	defaults := make(map[UserTier]TransactionLimitConfig, len(tlm.limits))
+	for tier, config := range tlm.limits {
+		defaults[tier] = config
+	}
+	tlm.mu.RUnlock()
+
+	for tier, config := range defaults {
+		channelLimitsJSON, _ := json.Marshal(config.ChannelLimits)
+		if _, err := tlm.db.Exec(`
+			INSERT INTO transaction_limits (tenant_id, tier, daily_limit, single_tx_limit, weekly_limit,
+				monthly_limit, max_tx_per_day, max_tx_per_hour, max_recipients_per_day, mfa_threshold, channel_limits)
+			VALUES ('default', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (tenant_id, tier) DO NOTHING
+		`, string(tier), config.DailyLimit, config.SingleTxLimit, config.WeeklyLimit,
+			config.MonthlyLimit, config.MaxTxPerDay, config.MaxTxPerHour, config.MaxRecipientsPerDay,
+			config.MFAThreshold, channelLimitsJSON); err != nil {
+			log.Printf("Warning: Failed to seed default %s limits: %v", tier, err)
+		}
+	}
 }
 
 func (tlm *TransactionLimitManager) loadEnvOverrides() {
@@ -296,6 +330,14 @@ func (tlm *TransactionLimitManager) loadTenantLimits() {
 			json.Unmarshal(channelLimitsJSON, &config.ChannelLimits)
 		}
 
+		// W12-C3-PX (c3-0768): rows under tenant_id 'default' are the persisted
+		// global tier defaults — they overlay the code/env defaults so PG is
+		// authoritative across restarts and replicas.
+		if tenantID == "default" {
+			tlm.limits[UserTier(tier)] = config
+			continue
+		}
+
 		if tlm.tenantLimits[tenantID] == nil {
 			tlm.tenantLimits[tenantID] = make(map[UserTier]TransactionLimitConfig)
 		}
@@ -303,17 +345,60 @@ func (tlm *TransactionLimitManager) loadTenantLimits() {
 	}
 }
 
+// loadTenantLimitFromDB reads one (tenant, tier) limit row from Postgres (the
+// authoritative store) and refreshes the read-through cache on hit.
+// W12-C3-PX (c3-0769).
+func (tlm *TransactionLimitManager) loadTenantLimitFromDB(tenantID string, tier UserTier) (TransactionLimitConfig, bool) {
+	if tlm.db == nil {
+		return TransactionLimitConfig{}, false
+	}
+	var config TransactionLimitConfig
+	var channelLimitsJSON []byte
+	err := tlm.db.QueryRow(`
+		SELECT daily_limit, single_tx_limit, weekly_limit, monthly_limit,
+		       max_tx_per_day, max_tx_per_hour, max_recipients_per_day, mfa_threshold, channel_limits
+		FROM transaction_limits WHERE tenant_id = $1 AND tier = $2
+	`, tenantID, string(tier)).Scan(&config.DailyLimit, &config.SingleTxLimit, &config.WeeklyLimit,
+		&config.MonthlyLimit, &config.MaxTxPerDay, &config.MaxTxPerHour, &config.MaxRecipientsPerDay,
+		&config.MFAThreshold, &channelLimitsJSON)
+	if err != nil {
+		return TransactionLimitConfig{}, false
+	}
+	if channelLimitsJSON != nil {
+		json.Unmarshal(channelLimitsJSON, &config.ChannelLimits)
+	}
+	tlm.mu.Lock()
+	if tlm.tenantLimits[tenantID] == nil {
+		tlm.tenantLimits[tenantID] = make(map[UserTier]TransactionLimitConfig)
+	}
+	tlm.tenantLimits[tenantID][tier] = config
+	tlm.mu.Unlock()
+	return config, true
+}
+
 // GetLimits returns the applicable limits for a user
 func (tlm *TransactionLimitManager) GetLimits(tenantID string, tier UserTier) TransactionLimitConfig {
 	tlm.mu.RLock()
-	defer tlm.mu.RUnlock()
-
 	// Check for tenant-specific limits first
 	if tenantLimits, ok := tlm.tenantLimits[tenantID]; ok {
 		if config, ok := tenantLimits[tier]; ok {
+			tlm.mu.RUnlock()
 			return config
 		}
 	}
+	tlm.mu.RUnlock()
+
+	// W12-C3-PX (c3-0769): PG read-through on cache miss so limits written
+	// after boot (by SetTenantLimits or peer replicas) are honored without a
+	// restart. The maps are only read-through caches; PG is authoritative.
+	if tenantID != "" && tenantID != "default" {
+		if config, ok := tlm.loadTenantLimitFromDB(tenantID, tier); ok {
+			return config
+		}
+	}
+
+	tlm.mu.RLock()
+	defer tlm.mu.RUnlock()
 
 	// Fall back to default limits
 	if config, ok := tlm.limits[tier]; ok {

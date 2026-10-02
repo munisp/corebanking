@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,9 @@ type ChartOfAccountsService struct {
 	// Separate mutex for TigerBeetle operations (CGo is not thread-safe)
 	tbMu sync.Mutex
 
-	reconciliationStatus map[string]ReconciliationStatus
+	// W12-C3-P2-B2 (GO-SVC-FIELD-MAPS): the reconciliationStatus
+	// map[string]ReconciliationStatus was removed — per-tenant reconciliation
+	// status now lives in the PG reconciliation_status table (postgres.go).
 
 	// Semaphore to limit concurrent async operations
 	eventSem chan struct{} // Limit concurrent event publishing
@@ -36,7 +39,6 @@ type ChartOfAccountsService struct {
 
 func NewChartOfAccountsService(ctx context.Context) (*ChartOfAccountsService, error) {
 	service := &ChartOfAccountsService{
-		reconciliationStatus: make(map[string]ReconciliationStatus),
 		// Limit concurrent async ops to prevent goroutine explosion
 		eventSem: make(chan struct{}, 100),
 	}
@@ -1573,11 +1575,18 @@ func (s *ChartOfAccountsService) ReconcileWithTigerBeetle(ctx context.Context, t
 		result.Status = "completed_with_discrepancies"
 	}
 
-	s.reconciliationStatus[tenantID] = ReconciliationStatus{
-		TenantID:           tenantID,
-		LastReconciliation: result.CompletedAt,
-		Status:             result.Status,
-		DiscrepancyCount:   len(result.Discrepancies),
+	// W12-C3-P2-B2: reconciliation status is persisted to PG
+	// (reconciliation_status table) — the in-memory map was removed so the
+	// status survives restarts and is consistent across replicas.
+	if s.postgres != nil {
+		if err := s.postgres.UpsertReconciliationStatus(ctx, ReconciliationStatus{
+			TenantID:           tenantID,
+			LastReconciliation: result.CompletedAt,
+			Status:             result.Status,
+			DiscrepancyCount:   len(result.Discrepancies),
+		}); err != nil {
+			log.Printf("WARNING: failed to persist reconciliation status for tenant %s: %v", tenantID, err)
+		}
 	}
 
 	go s.publishEvent(context.Background(), CoAEvent{
@@ -1595,16 +1604,20 @@ func (s *ChartOfAccountsService) ReconcileWithTigerBeetle(ctx context.Context, t
 }
 
 func (s *ChartOfAccountsService) GetReconciliationStatus(ctx context.Context, tenantID string) (*ReconciliationStatus, error) {
-
-	status, exists := s.reconciliationStatus[tenantID]
-	if !exists {
-		return &ReconciliationStatus{
-			TenantID: tenantID,
-			Status:   "never_run",
-		}, nil
+	// W12-C3-P2-B2: served from PG (reconciliation_status), not a map.
+	if s.postgres != nil {
+		status, err := s.postgres.GetReconciliationStatus(ctx, tenantID)
+		if err == nil {
+			return status, nil
+		}
+		if err != sql.ErrNoRows {
+			return nil, fmt.Errorf("reconciliation status lookup failed: %w", err)
+		}
 	}
-
-	return &status, nil
+	return &ReconciliationStatus{
+		TenantID: tenantID,
+		Status:   "never_run",
+	}, nil
 }
 
 // All Chart of Accounts use ledger 1 to allow transfers between any accounts

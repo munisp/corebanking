@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 
+from permify_guard import require_permify
 from middleware_events import (
     LedgerPostError,
     ledger_transfer_id,
@@ -89,7 +90,7 @@ class SettlementAdjustment(BaseModel):
     reason: str
     reference: Optional[str] = None
 
-@router.post("/{merchant_id}/settlements/calculate")
+@router.post("/{merchant_id}/settlements/calculate", dependencies=[Depends(require_permify("merchant", "settle"))])
 async def calculate_settlement(
     merchant_id: str,
     period_start: datetime,
@@ -197,7 +198,7 @@ async def calculate_settlement(
             ]
         }
 
-@router.post("/{merchant_id}/settlements/create")
+@router.post("/{merchant_id}/settlements/create", dependencies=[Depends(require_permify("merchant", "settle"))])
 async def create_settlement(
     merchant_id: str,
     settlement: SettlementCreate,
@@ -257,7 +258,7 @@ async def create_settlement(
             "summary": summary
         }
 
-@router.post("/{merchant_id}/settlements/{settlement_id}/process")
+@router.post("/{merchant_id}/settlements/{settlement_id}/process", dependencies=[Depends(require_permify("merchant", "payout"))])
 async def process_settlement(
     merchant_id: str,
     settlement_id: str,
@@ -459,7 +460,7 @@ async def get_settlement(
             "transactions": [dict(t) for t in transactions]
         }
 
-@router.post("/{merchant_id}/settlements/config")
+@router.post("/{merchant_id}/settlements/config", dependencies=[Depends(require_permify("merchant", "manage"))])
 async def set_settlement_config(
     merchant_id: str,
     config: SettlementConfig,
@@ -526,7 +527,7 @@ async def get_settlement_config(merchant_id: str, db: asyncpg.Pool = Depends(get
             "config": dict(config)
         }
 
-@router.post("/{merchant_id}/settlements/{settlement_id}/adjust")
+@router.post("/{merchant_id}/settlements/{settlement_id}/adjust", dependencies=[Depends(require_permify("merchant", "settle"))])
 async def adjust_settlement(
     merchant_id: str,
     settlement_id: str,

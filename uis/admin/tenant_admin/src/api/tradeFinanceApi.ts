@@ -71,7 +71,7 @@ export const tradeFinanceApi = {
     apiClient.put(`${APISIX.TRADE_FINANCE}/api/v1/lc/${id}`, body).then((r) => r.data),
 
   getStats: () =>
-    apiClient.get(`${APISIX.TRADE_FINANCE}/api/v1/stats`).then((r) => r.data),
+    apiClient.get(`${APISIX.TRADE_FINANCE}/api/stats`).then((r) => r.data),
 };
 
 // ─── Bank Guarantees ──────────────────────────────────────────────────────────
@@ -92,13 +92,13 @@ export interface BankGuarantee {
 
 export const bankGuaranteesApi = {
   list: (params?: { page?: number; limit?: number; type?: string; status?: string }) =>
-    apiClient.get<{ items: BankGuarantee[]; total: number }>(`${APISIX.BANK_GUARANTEES}/api/v1/guarantees`, { params }).then((r) => r.data),
+    apiClient.get<{ items: BankGuarantee[]; total: number }>(`/agricultural/api/v1/agriculture/insurance/guarantees`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
     apiClient.get<BankGuarantee>(`${APISIX.BANK_GUARANTEES}/api/v1/guarantees/${id}`).then((r) => r.data),
 
   issue: (body: Partial<BankGuarantee>) =>
-    apiClient.post<BankGuarantee>(`${APISIX.BANK_GUARANTEES}/api/v1/guarantees`, body).then((r) => r.data),
+    apiClient.post<BankGuarantee>(`/agricultural/api/v1/agriculture/insurance/guarantees`, body).then((r) => r.data),
 
   extend: (id: string, body: { newExpiryDate: string; reason: string }) =>
     apiClient.post(`${APISIX.BANK_GUARANTEES}/api/v1/guarantees/${id}/extend`, body).then((r) => r.data),
@@ -107,7 +107,7 @@ export const bankGuaranteesApi = {
     apiClient.post(`${APISIX.BANK_GUARANTEES}/api/v1/guarantees/${id}/cancel`, { reason }).then((r) => r.data),
 
   getStats: () =>
-    apiClient.get(`${APISIX.BANK_GUARANTEES}/api/v1/stats`).then((r) => r.data),
+    apiClient.get(`${APISIX.BANK_GUARANTEES}/api/stats`).then((r) => r.data),
 };
 
 // ─── Factoring ────────────────────────────────────────────────────────────────
@@ -191,13 +191,13 @@ export interface SupplyChainInvoice {
 
 export const supplyChainFinanceApi = {
   listPrograms: (params?: { page?: number; limit?: number; status?: string }) =>
-    apiClient.get<{ items: SupplyChainProgram[]; total: number }>(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/programs`, { params }).then((r) => r.data),
+    apiClient.get<{ items: SupplyChainProgram[]; total: number }>(`/agricultural/api/v1/agriculture/programs`, { params }).then((r) => r.data),
 
   getProgramById: (id: string) =>
-    apiClient.get<SupplyChainProgram>(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/programs/${id}`).then((r) => r.data),
+    apiClient.get<SupplyChainProgram>(`/agricultural/api/v1/agriculture/programs/${id}`).then((r) => r.data),
 
   createProgram: (body: Partial<SupplyChainProgram>) =>
-    apiClient.post<SupplyChainProgram>(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/programs`, body).then((r) => r.data),
+    apiClient.post<SupplyChainProgram>(`/agricultural/api/v1/agriculture/programs`, body).then((r) => r.data),
 
   listInvoices: (programId: string, params?: { page?: number; limit?: number; status?: string }) =>
     apiClient.get<{ items: SupplyChainInvoice[]; total: number }>(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/programs/${programId}/invoices`, { params }).then((r) => r.data),
@@ -239,16 +239,16 @@ export interface DiasporaRemittance {
 
 export const diasporaBankingApi = {
   listAccounts: (params?: { page?: number; limit?: number; accountType?: string; status?: string }) =>
-    apiClient.get<{ items: DiasporaAccount[]; total: number }>(`${APISIX.DIASPORA_BANKING}/api/v1/accounts`, { params }).then((r) => r.data),
+    apiClient.get<{ items: DiasporaAccount[]; total: number }>(`${APISIX.DIASPORA_BANKING}/v1/diaspora/accounts`, { params }).then((r) => r.data),
 
   getAccountById: (id: string) =>
     apiClient.get<DiasporaAccount>(`${APISIX.DIASPORA_BANKING}/api/v1/accounts/${id}`).then((r) => r.data),
 
   openAccount: (body: Partial<DiasporaAccount>) =>
-    apiClient.post<DiasporaAccount>(`${APISIX.DIASPORA_BANKING}/api/v1/accounts`, body).then((r) => r.data),
+    apiClient.post<DiasporaAccount>(`${APISIX.DIASPORA_BANKING}/v1/diaspora/accounts`, body).then((r) => r.data),
 
   listRemittances: (params?: { page?: number; limit?: number; status?: string }) =>
-    apiClient.get<{ items: DiasporaRemittance[]; total: number }>(`${APISIX.DIASPORA_BANKING}/api/v1/remittances`, { params }).then((r) => r.data),
+    apiClient.get<{ items: DiasporaRemittance[]; total: number }>(`${APISIX.DIASPORA_BANKING}/v1/diaspora/remittances`, { params }).then((r) => r.data),
 
   getExchangeRates: (params?: { country?: string; currency?: string }) =>
     apiClient.get(`${APISIX.DIASPORA_BANKING}/api/v1/exchange-rates`, { params }).then((r) => r.data),
@@ -336,13 +336,13 @@ export interface PortfolioHolding {
 
 export const portfolioMgmtApi = {
   list: (params?: { page?: number; limit?: number; clientId?: string; strategy?: string; status?: string }) =>
-    apiClient.get<{ items: Portfolio[]; total: number }>(`${APISIX.PORTFOLIO_MGMT}/api/v1/portfolios`, { params }).then((r) => r.data),
+    apiClient.get<{ items: Portfolio[]; total: number }>(`${APISIX.PORTFOLIO_MGMT}/v1/portfolios`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<Portfolio>(`${APISIX.PORTFOLIO_MGMT}/api/v1/portfolios/${id}`).then((r) => r.data),
+    apiClient.get<Portfolio>(`/treasury/api/v1/portfolios/${id}`).then((r) => r.data),
 
   create: (body: Partial<Portfolio>) =>
-    apiClient.post<Portfolio>(`${APISIX.PORTFOLIO_MGMT}/api/v1/portfolios`, body).then((r) => r.data),
+    apiClient.post<Portfolio>(`${APISIX.PORTFOLIO_MGMT}/v1/portfolios`, body).then((r) => r.data),
 
   getHoldings: (id: string) =>
     apiClient.get<{ items: PortfolioHolding[] }>(`${APISIX.PORTFOLIO_MGMT}/api/v1/portfolios/${id}/holdings`).then((r) => r.data),
@@ -385,13 +385,13 @@ export interface CustodyHolding {
 
 export const custodyServiceApi = {
   listAccounts: (params?: { page?: number; limit?: number; custodyType?: string; status?: string }) =>
-    apiClient.get<{ items: CustodyAccount[]; total: number }>(`${APISIX.CUSTODY_SERVICE}/api/v1/accounts`, { params }).then((r) => r.data),
+    apiClient.get<{ items: CustodyAccount[]; total: number }>(`${APISIX.CUSTODY_SERVICE}/v1/custody/accounts`, { params }).then((r) => r.data),
 
   getAccountById: (id: string) =>
     apiClient.get<CustodyAccount>(`${APISIX.CUSTODY_SERVICE}/api/v1/accounts/${id}`).then((r) => r.data),
 
   openAccount: (body: Partial<CustodyAccount>) =>
-    apiClient.post<CustodyAccount>(`${APISIX.CUSTODY_SERVICE}/api/v1/accounts`, body).then((r) => r.data),
+    apiClient.post<CustodyAccount>(`${APISIX.CUSTODY_SERVICE}/v1/custody/accounts`, body).then((r) => r.data),
 
   getHoldings: (id: string, params?: { securityType?: string }) =>
     apiClient.get<{ items: CustodyHolding[] }>(`${APISIX.CUSTODY_SERVICE}/api/v1/accounts/${id}/holdings`, { params }).then((r) => r.data),
@@ -438,13 +438,13 @@ export interface EstateAdministration {
 
 export const trustEstateApi = {
   listTrusts: (params?: { page?: number; limit?: number; trustType?: string; status?: string }) =>
-    apiClient.get<{ items: TrustAccount[]; total: number }>(`${APISIX.TRUST_ESTATE}/api/v1/trusts`, { params }).then((r) => r.data),
+    apiClient.get<{ items: TrustAccount[]; total: number }>(`${APISIX.TRUST_ESTATE}/v1/trusts`, { params }).then((r) => r.data),
 
   getTrustById: (id: string) =>
     apiClient.get<TrustAccount>(`${APISIX.TRUST_ESTATE}/api/v1/trusts/${id}`).then((r) => r.data),
 
   createTrust: (body: Partial<TrustAccount>) =>
-    apiClient.post<TrustAccount>(`${APISIX.TRUST_ESTATE}/api/v1/trusts`, body).then((r) => r.data),
+    apiClient.post<TrustAccount>(`${APISIX.TRUST_ESTATE}/v1/trusts`, body).then((r) => r.data),
 
   getTrustAssets: (id: string) =>
     apiClient.get(`${APISIX.TRUST_ESTATE}/api/v1/trusts/${id}/assets`).then((r) => r.data),
@@ -460,4 +460,75 @@ export const trustEstateApi = {
 
   distributeEstate: (id: string, body: { distributions: { beneficiaryName: string; amount: number; currency: string }[] }) =>
     apiClient.post(`${APISIX.TRUST_ESTATE}/api/v1/estates/${id}/distribute`, body).then((r) => r.data),
+};
+
+// ─── Supply Chain Financing Ops (W12 A4-P1-A: /supply-chain/*) ──────────────
+// Invoice/PO financing applications, approval/disbursement, repayment recording
+// and supplier-buyer relationships served by supply-chain-service
+// (services/supply-chain-service/main.py).
+
+export interface ScfFinancingApplication {
+  financing_id?: string;
+  id?: string;
+  supplier_id?: string;
+  buyer_id?: string;
+  status?: string;
+  financing_amount?: number | string;
+  [key: string]: unknown;
+}
+
+export const supplyChainOpsApi = {
+  applyInvoiceFinancing: (body: {
+    supplier_id: string;
+    invoice_number: string;
+    invoice_amount: number;
+    financing_percentage: number;
+    invoice_due_date: string;
+    invoice_document_url: string;
+  }) =>
+    apiClient.post(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/invoice-financing/apply`, body).then((r) => r.data),
+
+  applyPoFinancing: (body: {
+    supplier_id: string;
+    buyer_id: string;
+    po_number: string;
+    po_amount: number;
+    financing_amount: number;
+    delivery_date: string;
+    po_document_url: string;
+  }) =>
+    apiClient.post(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/po-financing/apply`, body).then((r) => r.data),
+
+  getFinancing: (financingId: string) =>
+    apiClient.get<ScfFinancingApplication>(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/financing/${encodeURIComponent(financingId)}`).then((r) => r.data),
+
+  approveFinancing: (financingId: string) =>
+    apiClient.post(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/financing/${encodeURIComponent(financingId)}/approve`, {}).then((r) => r.data),
+
+  disburseFinancing: (financingId: string) =>
+    apiClient.post(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/financing/${encodeURIComponent(financingId)}/disburse`, {}).then((r) => r.data),
+
+  // System route — APISIX supply-chain.yaml maps /supply-chain/system/(.*) → /$1
+  recordPayment: (financingId: string, body: { transaction_id: string; amount: number; payment_date: string; payment_method: string }) =>
+    apiClient
+      .post(`${APISIX.SUPPLY_CHAIN_FINANCE}/system/api/v1/system/supply-chain/financing/record-payment/${encodeURIComponent(financingId)}`, body)
+      .then((r) => r.data),
+
+  createRelationship: (supplierId: string, buyerId: string) =>
+    apiClient
+      .post(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/relationships/create`, null, {
+        params: { supplier_id: supplierId, buyer_id: buyerId },
+      })
+      .then((r) => r.data),
+
+  getRelationship: (supplierId: string, buyerId: string) =>
+    apiClient
+      .get(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/relationships/${encodeURIComponent(supplierId)}/${encodeURIComponent(buyerId)}`)
+      .then((r) => r.data),
+
+  listSupplierFinancing: (supplierId: string) =>
+    apiClient.get(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/financing/supplier/${encodeURIComponent(supplierId)}`).then((r) => r.data),
+
+  listBuyerFinancing: (buyerId: string) =>
+    apiClient.get(`${APISIX.SUPPLY_CHAIN_FINANCE}/api/v1/supply-chain/financing/buyer/${encodeURIComponent(buyerId)}`).then((r) => r.data),
 };

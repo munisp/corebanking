@@ -129,20 +129,14 @@ type SyncQueue struct {
 	LastSyncAt   string `json:"lastSyncAt"`
 }
 
+// C3-P2-B5-go-2 (forms/agents register items): the in-memory forms/agents
+// slices were removed. KYC capture forms and field agents are business
+// records — they now live in Postgres (agent_kyc_forms, agent_kyc_agents;
+// see initSchema) with fail-closed handlers (503 persistence_unavailable) and
+// NO in-memory fallback. mu/syncQ/stats remain process-local volatile
+// telemetry snapshots (not register items).
 var (
-	mu     sync.Mutex
-	forms  = []CaptureForm{}
-	agents = []Agent{
-		{ID: "AGT-001", Name: "Ibrahim Musa", Phone: "08023456789", Region: "North-West",
-			Status: "active", DeviceID: "DEV-TECNO-001", CapturesTotal: 245, CapturesSync: 240,
-			CapturesPending: 5, LastActiveAt: "2026-05-09T10:00:00Z", GPSEnabled: true, Rating: 4.7},
-		{ID: "AGT-002", Name: "Fatima Bello", Phone: "08034567890", Region: "North-East",
-			Status: "active", DeviceID: "DEV-ITEL-002", CapturesTotal: 189, CapturesSync: 189,
-			CapturesPending: 0, LastActiveAt: "2026-05-09T09:30:00Z", GPSEnabled: true, Rating: 4.9},
-		{ID: "AGT-003", Name: "Emeka Obi", Phone: "07045678901", Region: "South-East",
-			Status: "offline", DeviceID: "DEV-INFX-003", CapturesTotal: 312, CapturesSync: 300,
-			CapturesPending: 12, LastActiveAt: "2026-05-08T18:00:00Z", GPSEnabled: false, Rating: 4.5},
-	}
+	mu    sync.Mutex
 	syncQ = SyncQueue{PendingTotal: 17, SyncedToday: 156, FailedToday: 3, AvgLatencyMs: 2400, LastSyncAt: "2026-05-09T10:05:00Z"}
 	stats = map[string]interface{}{
 		"totalCaptures": 746, "pendingSync": 17, "syncedToday": 156,
@@ -191,9 +185,61 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// requireDB fails closed when Postgres is unavailable: capture forms and
+// agents are business data with no in-memory fallback.
+func requireDB(w http.ResponseWriter) bool {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return false
+	}
+	return true
+}
+
+// formColumns is the canonical column list for agent_kyc_forms scans.
+const formColumns = `id, agent_id, customer_name, customer_phone, bvn, nin, document_type, photo_captured, gps_lat, gps_lon, gps_accuracy, capture_mode, sync_status, requested_tier, dob, gender, address, docs_submitted, ocr_routing, created_at, synced_at`
+
+func scanCaptureForm(sc interface {
+	Scan(dest ...interface{}) error
+}) (CaptureForm, error) {
+	var f CaptureForm
+	var docs []byte
+	var createdAt time.Time
+	err := sc.Scan(&f.ID, &f.AgentID, &f.CustomerName, &f.CustomerPhone, &f.BVN, &f.NIN,
+		&f.DocumentType, &f.PhotoCaptured, &f.GPSLat, &f.GPSLon, &f.GPSAccuracy,
+		&f.CaptureMode, &f.SyncStatus, &f.RequestedTier, &f.DOB, &f.Gender, &f.Address,
+		&docs, &f.OCRRouting, &createdAt, &f.SyncedAt)
+	f.CreatedAt = createdAt.Format(time.RFC3339)
+	f.DocsSubmitted = []string{}
+	if err == nil && len(docs) > 0 {
+		if json.Unmarshal(docs, &f.DocsSubmitted) != nil {
+			f.DocsSubmitted = []string{}
+		}
+	}
+	return f, err
+}
+
 func handleCaptures(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	if !requireDB(w) {
+		return
+	}
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT `+formColumns+` FROM agent_kyc_forms ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		log.Printf("[%s] handleCaptures query failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer rows.Close()
+	forms := []CaptureForm{}
+	for rows.Next() {
+		f, err := scanCaptureForm(rows)
+		if err != nil {
+			log.Printf("[%s] handleCaptures scan failed: %v", serviceName, err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		forms = append(forms, f)
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"captures": forms, "total": len(forms),
 	})
@@ -207,8 +253,9 @@ func handleCreateCapture(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	mu.Lock()
-	defer mu.Unlock()
+	if !requireDB(w) {
+		return
+	}
 
 	mode := "online"
 	if m, ok := body["captureMode"].(string); ok {
@@ -239,12 +286,35 @@ func handleCreateCapture(w http.ResponseWriter, r *http.Request) {
 		Address:       getString(body, "address"),
 		DocsSubmitted: []string{},
 		OCRRouting:    "paddleocr_v4",
-		CreatedAt:     time.Now().Format(time.RFC3339),
 	}
-	forms = append(forms, form)
-	syncQ.PendingTotal++
+	docsJSON, _ := json.Marshal(form.DocsSubmitted)
+	var createdAt time.Time
+	// Durable insert (idempotent on the CSPRNG form id) — the form only exists
+	// once it is committed in Postgres; there is no volatile copy.
+	if err := db.QueryRowContext(r.Context(),
+		`INSERT INTO agent_kyc_forms
+		 (id, agent_id, customer_name, customer_phone, bvn, nin, document_type, photo_captured,
+		  gps_lat, gps_lon, gps_accuracy, capture_mode, sync_status, requested_tier,
+		  dob, gender, address, docs_submitted, ocr_routing)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',$13,$14,$15,$16,$17,$18)
+		 ON CONFLICT (id) DO NOTHING
+		 RETURNING created_at`,
+		form.ID, form.AgentID, form.CustomerName, form.CustomerPhone, form.BVN, form.NIN,
+		form.DocumentType, form.PhotoCaptured, form.GPSLat, form.GPSLon, form.GPSAccuracy,
+		form.CaptureMode, form.RequestedTier, form.DOB, form.Gender, form.Address,
+		string(docsJSON), form.OCRRouting).Scan(&createdAt); err != nil {
+		log.Printf("[%s] handleCreateCapture insert failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	form.CreatedAt = createdAt.Format(time.RFC3339)
 
-	// Persist to database
+	mu.Lock()
+	syncQ.PendingTotal++
+	mu.Unlock()
+
+	// Generic service_records shadow write (pre-existing; owned by the
+	// C3-P2-B1 records region — intentionally left in place).
 	if db != nil {
 		id := fmt.Sprintf("%s-%d", serviceName, time.Now().UnixNano())
 		if dataBytes, err := json.Marshal(body); err == nil {
@@ -275,23 +345,43 @@ func handleSyncCapture(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&body)
 
 	captureID := getString(body, "captureId")
-	mu.Lock()
-	defer mu.Unlock()
-
-	for i := range forms {
-		if forms[i].ID == captureID {
-			forms[i].SyncStatus = "synced"
-			forms[i].SyncedAt = time.Now().Format(time.RFC3339)
-			syncQ.PendingTotal--
-			syncQ.SyncedToday++
-			respondJSON(w, 200, map[string]interface{}{
-				"synced": true, "capture": forms[i],
-				"ocr_triggered": true, "ocr_engine": "paddleocr_v4",
-			})
-			return
-		}
+	if !requireDB(w) {
+		return
 	}
-	respondJSON(w, 404, map[string]string{"error": "Capture not found: " + captureID})
+
+	// Durable sync transition; idempotent for already-synced forms (replays
+	// success without double-counting), 404 for unknown ids.
+	res, err := db.ExecContext(r.Context(),
+		`UPDATE agent_kyc_forms SET sync_status = 'synced', synced_at = NOW()
+		 WHERE id = $1 AND sync_status <> 'synced'`, captureID)
+	if err != nil {
+		log.Printf("[%s] handleSyncCapture update failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	affected, _ := res.RowsAffected()
+	if affected > 0 {
+		mu.Lock()
+		syncQ.PendingTotal--
+		syncQ.SyncedToday++
+		mu.Unlock()
+	}
+	var form CaptureForm
+	form, err = scanCaptureForm(db.QueryRowContext(r.Context(),
+		`SELECT `+formColumns+` FROM agent_kyc_forms WHERE id = $1`, captureID))
+	if err == sql.ErrNoRows {
+		respondJSON(w, 404, map[string]string{"error": "Capture not found: " + captureID})
+		return
+	}
+	if err != nil {
+		log.Printf("[%s] handleSyncCapture reload failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{
+		"synced": true, "capture": form,
+		"ocr_triggered": true, "ocr_engine": "paddleocr_v4",
+	})
 }
 
 func handleBatchSync(w http.ResponseWriter, r *http.Request) {
@@ -302,21 +392,27 @@ func handleBatchSync(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	synced := 0
-	for i := range forms {
-		if forms[i].SyncStatus == "pending" {
-			forms[i].SyncStatus = "synced"
-			forms[i].SyncedAt = time.Now().Format(time.RFC3339)
-			synced++
-		}
+	if !requireDB(w) {
+		return
 	}
+
+	// Durable batch transition of every pending form in one statement.
+	res, err := db.ExecContext(r.Context(),
+		`UPDATE agent_kyc_forms SET sync_status = 'synced', synced_at = NOW() WHERE sync_status = 'pending'`)
+	if err != nil {
+		log.Printf("[%s] handleBatchSync update failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	affected, _ := res.RowsAffected()
+	synced := int(affected)
+	mu.Lock()
 	syncQ.PendingTotal -= synced
 	syncQ.SyncedToday += synced
+	remaining := syncQ.PendingTotal
+	mu.Unlock()
 	respondJSON(w, 200, map[string]interface{}{
-		"batch_synced": synced, "remaining_pending": syncQ.PendingTotal,
+		"batch_synced": synced, "remaining_pending": remaining,
 	})
 }
 
@@ -328,8 +424,9 @@ func handleUSSDCapture(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	mu.Lock()
-	defer mu.Unlock()
+	if !requireDB(w) {
+		return
+	}
 
 	form := CaptureForm{
 		ID:            fmt.Sprintf("USSD-%08X", secureUint32()),
@@ -341,9 +438,21 @@ func handleUSSDCapture(w http.ResponseWriter, r *http.Request) {
 		SyncStatus:    "pending",
 		RequestedTier: "tier1",
 		OCRRouting:    "none",
-		CreatedAt:     time.Now().Format(time.RFC3339),
 	}
-	forms = append(forms, form)
+	var createdAt time.Time
+	if err := db.QueryRowContext(r.Context(),
+		`INSERT INTO agent_kyc_forms
+		 (id, agent_id, customer_name, customer_phone, bvn, capture_mode, sync_status, requested_tier, ocr_routing)
+		 VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8)
+		 ON CONFLICT (id) DO NOTHING
+		 RETURNING created_at`,
+		form.ID, form.AgentID, form.CustomerName, form.CustomerPhone, form.BVN,
+		form.CaptureMode, form.RequestedTier, form.OCRRouting).Scan(&createdAt); err != nil {
+		log.Printf("[%s] handleUSSDCapture insert failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	form.CreatedAt = createdAt.Format(time.RFC3339)
 
 	respondJSON(w, 201, map[string]interface{}{
 		"created": true, "capture": form,
@@ -353,11 +462,34 @@ func handleUSSDCapture(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAgents(w http.ResponseWriter, r *http.Request) {
+	if !requireDB(w) {
+		return
+	}
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT id, name, phone, region, status, device_id, captures_total, captures_sync,
+		        captures_pending, last_active_at, gps_enabled, rating
+		 FROM agent_kyc_agents ORDER BY id ASC`)
+	if err != nil {
+		log.Printf("[%s] handleAgents query failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer rows.Close()
+	agents := []Agent{}
 	active := 0
-	for _, a := range agents {
+	for rows.Next() {
+		var a Agent
+		if err := rows.Scan(&a.ID, &a.Name, &a.Phone, &a.Region, &a.Status, &a.DeviceID,
+			&a.CapturesTotal, &a.CapturesSync, &a.CapturesPending, &a.LastActiveAt,
+			&a.GPSEnabled, &a.Rating); err != nil {
+			log.Printf("[%s] handleAgents scan failed: %v", serviceName, err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
 		if a.Status == "active" {
 			active++
 		}
+		agents = append(agents, a)
 	}
 	respondJSON(w, 200, map[string]interface{}{
 		"agents": agents, "total": len(agents), "active": active,
@@ -498,6 +630,10 @@ func initDB() {
 		return
 	}
 	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	// Boot-time schema + idempotent seeds: agent_kyc_forms / agent_kyc_agents
+	// are created idempotently; without them every business handler fails
+	// closed (503 persistence_unavailable).
+	initSchema()
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -1007,6 +1143,78 @@ func initSchema() {
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_status ON kyc_records(status)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_created ON kyc_records(created_at DESC)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
+
+	// ── Agent KYC capture store (C3-P2-B5-go-2: forms/agents register items) ─
+	// PII HANDLING: agent_kyc_forms.bvn / .nin are Nigerian national identity
+	// numbers (BVN = Bank Verification Number, NIN = National Identification
+	// Number) — highly sensitive PII. They are stored only here (authoritative
+	// copy), never logged, and access is restricted to JWT-authenticated
+	// agent-kyc routes. Any future export/sync MUST apply masking.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS agent_kyc_forms (
+		id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL DEFAULT '',
+		customer_name TEXT NOT NULL DEFAULT '',
+		customer_phone TEXT NOT NULL DEFAULT '',
+		bvn TEXT NOT NULL DEFAULT '',
+		nin TEXT NOT NULL DEFAULT '',
+		document_type TEXT NOT NULL DEFAULT '',
+		photo_captured BOOLEAN NOT NULL DEFAULT FALSE,
+		gps_lat DOUBLE PRECISION NOT NULL DEFAULT 0,
+		gps_lon DOUBLE PRECISION NOT NULL DEFAULT 0,
+		gps_accuracy DOUBLE PRECISION NOT NULL DEFAULT 0,
+		capture_mode TEXT NOT NULL DEFAULT 'online',
+		sync_status TEXT NOT NULL DEFAULT 'pending',
+		requested_tier TEXT NOT NULL DEFAULT 'tier1',
+		dob TEXT NOT NULL DEFAULT '',
+		gender TEXT NOT NULL DEFAULT '',
+		address TEXT NOT NULL DEFAULT '',
+		docs_submitted JSONB NOT NULL DEFAULT '[]'::jsonb,
+		ocr_routing TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		synced_at TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		log.Fatalf("schema init (agent_kyc_forms) failed: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS agent_kyc_agents (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		phone TEXT NOT NULL DEFAULT '',
+		region TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'active',
+		device_id TEXT NOT NULL DEFAULT '',
+		captures_total INTEGER NOT NULL DEFAULT 0,
+		captures_sync INTEGER NOT NULL DEFAULT 0,
+		captures_pending INTEGER NOT NULL DEFAULT 0,
+		last_active_at TEXT NOT NULL DEFAULT '',
+		gps_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+		rating DOUBLE PRECISION NOT NULL DEFAULT 0,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Fatalf("schema init (agent_kyc_agents) failed: %v", err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_agent_kyc_forms_sync ON agent_kyc_forms(sync_status)`)
+
+	// Idempotent seed of the original field-agent roster.
+	agentSeeds := []struct {
+		id, name, phone, region, status, deviceID, lastActive string
+		capturesTotal, capturesSync, capturesPending          int
+		gpsEnabled                                            bool
+		rating                                                float64
+	}{
+		{"AGT-001", "Ibrahim Musa", "08023456789", "North-West", "active", "DEV-TECNO-001", "2026-05-09T10:00:00Z", 245, 240, 5, true, 4.7},
+		{"AGT-002", "Fatima Bello", "08034567890", "North-East", "active", "DEV-ITEL-002", "2026-05-09T09:30:00Z", 189, 189, 0, true, 4.9},
+		{"AGT-003", "Emeka Obi", "07045678901", "South-East", "offline", "DEV-INFX-003", "2026-05-08T18:00:00Z", 312, 300, 12, false, 4.5},
+	}
+	for _, a := range agentSeeds {
+		if _, err := db.Exec(`INSERT INTO agent_kyc_agents
+			(id, name, phone, region, status, device_id, captures_total, captures_sync, captures_pending, last_active_at, gps_enabled, rating)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			ON CONFLICT (id) DO NOTHING`,
+			a.id, a.name, a.phone, a.region, a.status, a.deviceID,
+			a.capturesTotal, a.capturesSync, a.capturesPending, a.lastActive, a.gpsEnabled, a.rating); err != nil {
+			log.Printf("seed agent_kyc_agents %s (may already exist): %v", a.id, err)
+		}
+	}
 }
 
 func domainHandler(w http.ResponseWriter, r *http.Request) {
@@ -1089,8 +1297,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO kyc_records (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1098,10 +1313,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"kyc_records.created", id, string(payload))
+		"kyc_records.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1138,7 +1363,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1146,25 +1378,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"kyc_records.updated", id, string(payload))
+		"kyc_records.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"kyc_records.deleted", id, `{"id":"`+id+`"}`)
+		"kyc_records.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1457,19 +1718,19 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/agent-kyc/captures", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCaptures)))
-	mux.Handle("/v1/agent-kyc/capture", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreateCapture)))
-	mux.Handle("/v1/agent-kyc/sync", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleSyncCapture)))
-	mux.Handle("/v1/agent-kyc/batch-sync", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleBatchSync)))
-	mux.Handle("/v1/agent-kyc/ussd-capture", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUSSDCapture)))
-	mux.Handle("/v1/agent-kyc/agents", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAgents)))
-	mux.Handle("/v1/agent-kyc/sync-queue", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleSyncQueue)))
-	mux.Handle("/v1/agent-kyc/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/agent-kyc-capture/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(agent_kyc_captureScoreHandler)))
-	mux.Handle("/v1/agent-kyc-capture/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(agent_kyc_captureValidateRequestHandler)))
+	mux.Handle("/v1/agent-kyc/captures", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleCaptures))))
+	mux.Handle("/v1/agent-kyc/capture", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleCreateCapture))))
+	mux.Handle("/v1/agent-kyc/sync", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleSyncCapture))))
+	mux.Handle("/v1/agent-kyc/batch-sync", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleBatchSync))))
+	mux.Handle("/v1/agent-kyc/ussd-capture", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleUSSDCapture))))
+	mux.Handle("/v1/agent-kyc/agents", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleAgents))))
+	mux.Handle("/v1/agent-kyc/sync-queue", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleSyncQueue))))
+	mux.Handle("/v1/agent-kyc/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/agent-kyc-capture/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(agent_kyc_captureScoreHandler))))
+	mux.Handle("/v1/agent-kyc-capture/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("kyc_case", "review", http.HandlerFunc(agent_kyc_captureValidateRequestHandler))))
 	log.Printf("Agent KYC Capture v2.0 (Go) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1499,6 +1760,10 @@ func main() {
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+
+// listHandler is the historical handler name referenced by main_test.go; it
+// maps to the Postgres-backed captures list handler (C3-P2-B5-go-2).
+func listHandler(w http.ResponseWriter, r *http.Request) { handleCaptures(w, r) }
 
 // jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
 // scripts/fix-go-wire-jwt.py).

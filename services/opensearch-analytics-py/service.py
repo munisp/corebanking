@@ -20,11 +20,132 @@ from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
-indices: list[dict] = []
-documents: dict[str, list[dict]] = {}
-saved_queries: list[dict] = []
-dashboards: list[dict] = []
-alerts: list[dict] = []
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
+# W12-C3P2B5: index metadata, documents, saved queries, dashboards and alert
+# rules are PG-backed. documents live in os_documents (payload carries
+# "index"; record_id = document id) — list/search are PG reads.
+IDX_STORE = _W12Store("os_indices", key="name")
+DOC_STORE = _W12Store("os_documents")
+QUERY_STORE = _W12Store("saved_queries")
+DASH_STORE = _W12Store("dashboards")
+ALERT_STORE = _W12Store("alert_rules")
 
 DEFAULT_INDICES = [
     {"name": "transactions", "mappings": {"amount": "double", "type": "keyword", "status": "keyword", "timestamp": "date", "accountId": "keyword", "description": "text"}},
@@ -59,9 +180,11 @@ def now_iso() -> str:
 
 
 def init_data() -> None:
+    """W12-C3P2B5: seed default indices/dashboards into PG (idempotent upserts;
+    index natural key = name, so reseeding never duplicates)."""
     for idx_def in DEFAULT_INDICES:
         idx = {
-            "id": f"IDX-{uuid.uuid4().hex[:8]}",
+            "id": f"IDX-{idx_def['name']}",
             "name": idx_def["name"],
             "mappings": idx_def["mappings"],
             "settings": {"numberOfShards": 3, "numberOfReplicas": 1, "refreshInterval": "1s"},
@@ -70,12 +193,17 @@ def init_data() -> None:
             "status": "green",
             "createdAt": now_iso(),
         }
-        indices.append(idx)
-        documents[idx_def["name"]] = []
+        try:
+            IDX_STORE.put(idx["name"], idx)
+        except Exception as e:
+            print(f"W12-DEGRADED os_indices seed failed: {e}")
 
     for dash in DEFAULT_DASHBOARDS:
         dash["createdAt"] = now_iso()
-        dashboards.append(dash)
+        try:
+            DASH_STORE.put(dash["id"], dash)
+        except Exception as e:
+            print(f"W12-DEGRADED dashboards seed failed: {e}")
 
 
 init_data()
@@ -85,9 +213,11 @@ def create_index(body: dict) -> tuple[dict, int]:
     name = body.get("name", "")
     if not name or not re.match(r"^[a-z0-9\-]+$", name):
         return {"error": "name must be lowercase alphanumeric with hyphens"}, 400
-    for idx in indices:
-        if idx["name"] == name:
+    try:
+        if _w12_get_by(IDX_STORE, "name", name):
             return {"error": f"index '{name}' already exists"}, 409
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
 
     idx = {
         "id": f"IDX-{uuid.uuid4().hex[:8]}",
@@ -99,13 +229,19 @@ def create_index(body: dict) -> tuple[dict, int]:
         "status": "green",
         "createdAt": now_iso(),
     }
-    indices.append(idx)
-    documents[name] = []
+    try:
+        IDX_STORE.put(name, idx)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
     return idx, 201
 
 
 def ingest_document(index_name: str, body: dict) -> tuple[dict, int]:
-    if index_name not in documents:
+    try:
+        idx = _w12_get_by(IDX_STORE, "name", index_name)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
+    if not idx:
         return {"error": f"index '{index_name}' not found"}, 404
 
     doc = {
@@ -115,12 +251,13 @@ def ingest_document(index_name: str, body: dict) -> tuple[dict, int]:
         "timestamp": body.get("timestamp", now_iso()),
         "ingestedAt": now_iso(),
     }
-    documents[index_name].append(doc)
-    for idx in indices:
-        if idx["name"] == index_name:
-            idx["docCount"] += 1
-            idx["sizeBytes"] += len(json.dumps(doc))
-            break
+    try:
+        DOC_STORE.put(doc["id"], doc)
+        idx["docCount"] += 1
+        idx["sizeBytes"] += len(json.dumps(doc))
+        IDX_STORE.put(index_name, idx)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
     return {"id": doc["id"], "index": index_name, "result": "created"}, 201
 
 
@@ -129,8 +266,11 @@ def bulk_ingest(body: dict) -> tuple[dict, int]:
     docs = body.get("documents", [])
     if not index_name or not docs:
         return {"error": "index and documents array are required"}, 400
-    if index_name not in documents:
-        return {"error": f"index '{index_name}' not found"}, 404
+    try:
+        if not _w12_get_by(IDX_STORE, "name", index_name):
+            return {"error": f"index '{index_name}' not found"}, 404
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
 
     results = []
     for d in docs:
@@ -150,10 +290,13 @@ def search_documents(body: dict) -> tuple[dict, int]:
 
     if not index_name:
         return {"error": "index is required"}, 400
-    if index_name not in documents:
-        return {"error": f"index '{index_name}' not found"}, 404
+    try:
+        if not _w12_get_by(IDX_STORE, "name", index_name):
+            return {"error": f"index '{index_name}' not found"}, 404
+        all_docs = _w12_all_by(DOC_STORE, "index", index_name)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
 
-    all_docs = documents[index_name]
     matched = []
     for doc in all_docs:
         source = doc.get("source", {})
@@ -232,7 +375,10 @@ def create_alert(body: dict) -> tuple[dict, int]:
         "triggerCount": 0,
         "createdAt": now_iso(),
     }
-    alerts.append(alert)
+    try:
+        ALERT_STORE.put(alert["id"], alert)
+    except Exception as e:
+        return {"error": "persistence_unavailable", "detail": str(e)}, 503
     return alert, 201
 
 
@@ -434,15 +580,43 @@ class OpenSearchHandler(BaseHTTPRequestHandler):
                 "lakehouse": {"status": "connected", "table": "opensearch_analytics_iceberg"}
             }})
         elif path == "/v1/search/indices":
-            self._send({"items": indices, "total": len(indices)})
+            try:
+                _items = IDX_STORE.all()
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
+            self._send({"items": _items, "total": len(_items)})
         elif path == "/v1/search/dashboards":
-            self._send({"items": dashboards, "total": len(dashboards)})
+            try:
+                _items = DASH_STORE.all()
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
+            self._send({"items": _items, "total": len(_items)})
         elif path == "/v1/search/alerts":
-            self._send({"items": alerts, "total": len(alerts)})
+            try:
+                _items = ALERT_STORE.all()
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
+            self._send({"items": _items, "total": len(_items)})
         elif path == "/v1/search/saved-queries":
-            self._send({"items": saved_queries, "total": len(saved_queries)})
+            try:
+                _items = QUERY_STORE.all()
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
+            self._send({"items": _items, "total": len(_items)})
         elif path == "/v1/search/stats":
-            total_docs = sum(len(d) for d in documents.values())
+            try:
+                indices = IDX_STORE.all()
+                dashboards = DASH_STORE.all()
+                alerts = ALERT_STORE.all()
+                DOC_STORE.ensure()
+                total_docs = _w12_run("SELECT COUNT(*) AS n FROM os_documents", fetch="one")["n"]
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
             total_size = sum(idx["sizeBytes"] for idx in indices)
             self._send({
                 "totalIndices": len(indices), "totalDocuments": total_docs,
@@ -487,7 +661,11 @@ class OpenSearchHandler(BaseHTTPRequestHandler):
                 "query": body.get("query", {}),
                 "createdAt": now_iso(),
             }
-            saved_queries.append(sq)
+            try:
+                QUERY_STORE.put(sq["id"], sq)
+            except Exception as e:
+                self._send({"error": "persistence_unavailable", "detail": str(e)}, 503)
+                return
             self._send(sq, 201)
         else:
             self._send({"error": "not found"}, 404)

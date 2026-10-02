@@ -920,10 +920,10 @@ func main() {
 	mux.HandleFunc("/healthz", svc.healthz)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/salary/batches", svc.batchesHandler)
-	mux.HandleFunc("/v1/salary/batches/", svc.batchActionHandler) // MN-19: {id}/execute, {id}/retry
-	mux.HandleFunc("/v1/salary/instructions", svc.instructionsHandler)
-	mux.HandleFunc("/v1/salary/stats", svc.statsHandler)
+	mux.HandleFunc("/v1/salary/batches", permifyAuthzGuard("salary_processing", "manage", svc.batchesHandler))
+	mux.HandleFunc("/v1/salary/batches/", permifyAuthzGuard("salary_processing", "manage", svc.batchActionHandler)) // MN-19: {id}/execute, {id}/retry
+	mux.HandleFunc("/v1/salary/instructions", permifyAuthzGuard("salary_processing", "manage", svc.instructionsHandler))
+	mux.HandleFunc("/v1/salary/stats", permifyAuthzGuard("salary_processing", "view", svc.statsHandler))
 
 	addr := os.Getenv("ADDR")
 	if addr == "" {

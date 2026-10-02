@@ -20,6 +20,7 @@ from schemas import Context
 from utils.kafka_instance import kafka_client
 from utils.kafka_client import SavingsEventTypes
 from utils.coa_client import CoAClient
+from utils.permify_guard import require_permify
 
 load_dotenv()
 
@@ -319,7 +320,7 @@ async def health_check():
 
 
 # Savings goal creation endpoint remains unchanged
-@app.post("/api/v1/savings")
+@app.post("/api/v1/savings", dependencies=[Depends(require_permify("savings", "create"))])
 async def create_savings_goal(
     payload: SavingsGoal,
     db=Depends(lambda: db_pool),
@@ -360,7 +361,7 @@ async def create_savings_goal(
     return {"status": "created", "goal_id": goal_id, "goal_name": payload.name, "savings_account_id": account_id, "enable_auto_save": payload.enable_auto_save}
 
 # Deposit endpoint with fail-fast CoA journal entry
-@app.post("/api/v1/savings/deposit")
+@app.post("/api/v1/savings/deposit", dependencies=[Depends(require_permify("savings", "deposit"))])
 async def deposit(
     payload: DepositRequest,
     db=Depends(lambda: db_pool),
@@ -423,7 +424,7 @@ async def deposit(
         )
 
 # Withdrawal endpoint with fail-fast CoA journal entry
-@app.post("/api/v1/savings/withdrawal")
+@app.post("/api/v1/savings/withdrawal", dependencies=[Depends(require_permify("savings", "withdraw"))])
 async def withdrawal(
     payload: WithdrawalRequest,
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -483,7 +484,7 @@ async def get_tenant_savings(
         )
         return {"data": [dict(row) for row in rows], "total": total, "page": page, "limit": limit}
 
-@app.put("/api/v1/savings/{goal_id}")
+@app.put("/api/v1/savings/{goal_id}", dependencies=[Depends(require_permify("savings", "manage"))])
 async def update_savings_goal(
     goal_id: str,
     payload: UpdateSavingsGoal,
@@ -538,7 +539,7 @@ async def update_savings_goal(
         )
         return {"data": dict(updated_row)}
 
-@app.delete("/api/v1/savings/{goal_id}")
+@app.delete("/api/v1/savings/{goal_id}", dependencies=[Depends(require_permify("savings", "manage"))])
 async def delete_savings_goal(
     goal_id: str,
     db=Depends(lambda: db_pool),
@@ -555,7 +556,7 @@ async def delete_savings_goal(
             raise HTTPException(status_code=404, detail="Savings goal not found")
         return {"success": True, "message": "Savings goal deleted successfully"}
 
-@app.post("/api/v1/savings/{goal_id}/pause")
+@app.post("/api/v1/savings/{goal_id}/pause", dependencies=[Depends(require_permify("savings", "manage"))])
 async def pause_savings_goal(
     goal_id: str,
     db=Depends(lambda: db_pool),
@@ -580,7 +581,7 @@ async def pause_savings_goal(
         )
         return {"data": dict(updated_row)}
 
-@app.post("/api/v1/savings/{goal_id}/resume")
+@app.post("/api/v1/savings/{goal_id}/resume", dependencies=[Depends(require_permify("savings", "manage"))])
 async def resume_savings_goal(
     goal_id: str,
     db=Depends(lambda: db_pool),

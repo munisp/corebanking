@@ -1,5 +1,6 @@
 #![allow(unused)]
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -81,6 +82,7 @@ async fn load_rails_from_db(db: &tokio_postgres::Client) -> Vec<PaymentRail> {
 
 async fn find_route(req: actix_web::HttpRequest, body: web::Json<RouteRequest>, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "payment_order", "route").await { return resp; } // W12-B5D1
     let corridor = format!("{}-{}", body.from_currency, body.to_currency);
     let priority = body.priority.as_deref().unwrap_or("balanced");
 
@@ -381,3 +383,6 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/routing/find", web::post().to(find_route))
     }).bind(("0.0.0.0", port))?.run().await
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

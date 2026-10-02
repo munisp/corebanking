@@ -8,7 +8,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,6 +107,7 @@ type STKBankingService struct {
 	sessionTimeout time.Duration
 	smsProvider    SMSProvider
 	pinSecret      string
+	ledger         *tbLedger // TigerBeetle ledger of record; PG accounts rows are a read-model
 }
 
 // SMSProvider interface for sending SMS
@@ -120,6 +123,7 @@ func NewSTKBankingService(db *pgxpool.Pool, smsProvider SMSProvider, pinSecret s
 		sessionTimeout: 5 * time.Minute,
 		smsProvider:    smsProvider,
 		pinSecret:      pinSecret,
+		ledger:         newTBLedger(),
 	}
 
 	go service.cleanupExpiredSessions()
@@ -1019,36 +1023,66 @@ func (s *STKBankingService) executeTransfer(ctx context.Context, senderPhone, re
 		return "", fmt.Errorf("Insufficient balance")
 	}
 
+	// Resolve the recipient ledger account. Internal (54bank) transfers credit
+	// the recipient customer account; external transfers credit the platform
+	// outbound-settlement account.
+	isInternal := transferType == "54bank"
+	recipientLedgerAccount := settlementAccountID("outbound-transfer")
+	if isInternal {
+		var recipientAccountID string
+		err = s.db.QueryRow(ctx, `SELECT account_id FROM accounts WHERE account_number = $1`, recipient).Scan(&recipientAccountID)
+		if err != nil {
+			return "", fmt.Errorf("Recipient error")
+		}
+		recipientLedgerAccount = recipientAccountID
+	}
+
+	txnRef := fmt.Sprintf("STK%d", time.Now().UnixNano())
+
+	// AUTHORITATIVE LEDGER MOVEMENT (TigerBeetle). Fail-closed: unless the
+	// cluster confirms the transfer, no PostgreSQL read-model row is touched
+	// and the operation aborts. Transfer ID is derived from txnRef so a
+	// retried operation is idempotent at the cluster.
+	if err = s.ledger.move(ctx, senderAccountID, recipientLedgerAccount, true, isInternal, amount, txnRef, tbCodeP2PTransfer); err != nil {
+		if errors.Is(err, errLedgerInsufficientFunds) {
+			return "", fmt.Errorf("Insufficient balance")
+		}
+		log.Printf("[stk-service] transfer ledger posting FAILED ref=%s: %v", txnRef, err)
+		return "", fmt.Errorf("Transaction failed")
+	}
+
+	// READ-MODEL updates (PostgreSQL). The accounts rows mirror the TB ledger
+	// and are updated only after the cluster confirmed the movement, in the
+	// same transaction as the operation's own state row.
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
+		s.ledger.compensate(context.Background(), senderAccountID, recipientLedgerAccount, true, isInternal, amount, txnRef, tbCodeP2PTransfer)
 		return "", fmt.Errorf("Transaction failed")
 	}
 	defer tx.Rollback(ctx)
 
 	_, err = tx.Exec(ctx, `UPDATE accounts SET balance = balance - $1 WHERE account_id = $2`, amount, senderAccountID)
-	if err != nil {
-		return "", fmt.Errorf("Transaction failed")
-	}
 
-	if transferType == "54bank" {
+	if err == nil && isInternal {
 		_, err = tx.Exec(ctx, `UPDATE accounts SET balance = balance + $1 WHERE account_number = $2`, amount, recipient)
-		if err != nil {
-			return "", fmt.Errorf("Recipient error")
-		}
 	}
 
-	txnRef := fmt.Sprintf("STK%d", time.Now().UnixNano())
-	_, err = tx.Exec(ctx, `
-		INSERT INTO transactions (account_id, transaction_type, amount, reference, description, created_at)
-		VALUES ($1, 'transfer_out', $2, $3, $4, NOW())
-	`, senderAccountID, amount, txnRef, "STK Transfer")
-
-	if err != nil {
-		return "", fmt.Errorf("Transaction failed")
+	if err == nil {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO transactions (account_id, transaction_type, amount, reference, description, created_at)
+			VALUES ($1, 'transfer_out', $2, $3, $4, NOW())
+		`, senderAccountID, amount, txnRef, "STK Transfer")
 	}
 
-	err = tx.Commit(ctx)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+
 	if err != nil {
+		// The ledger moved the funds but the read-model/state row failed:
+		// compensate with a reverse TB transfer so the ledger and the
+		// read-model never diverge silently.
+		s.ledger.compensate(context.Background(), senderAccountID, recipientLedgerAccount, true, isInternal, amount, txnRef, tbCodeP2PTransfer)
 		return "", fmt.Errorf("Transaction failed")
 	}
 
@@ -1068,12 +1102,25 @@ func (s *STKBankingService) executeAirtime(ctx context.Context, senderPhone, tar
 		return "", fmt.Errorf("Insufficient balance")
 	}
 
-	_, err = s.db.Exec(ctx, `UPDATE accounts SET balance = balance - $1 WHERE account_id = $2`, amount, accountID)
-	if err != nil {
+	txnRef := fmt.Sprintf("AIR%d", time.Now().UnixNano())
+
+	// AUTHORITATIVE LEDGER MOVEMENT (TigerBeetle): debit the customer, credit
+	// the airtime settlement account. Fail-closed before any read-model write.
+	if err = s.ledger.move(ctx, accountID, settlementAccountID("airtime"), true, false, amount, txnRef, tbCodeAirtimePurchase); err != nil {
+		if errors.Is(err, errLedgerInsufficientFunds) {
+			return "", fmt.Errorf("Insufficient balance")
+		}
+		log.Printf("[stk-service] airtime ledger posting FAILED ref=%s: %v", txnRef, err)
 		return "", fmt.Errorf("Transaction failed")
 	}
 
-	txnRef := fmt.Sprintf("AIR%d", time.Now().UnixNano())
+	// READ-MODEL update (PostgreSQL) after TB confirmation.
+	_, err = s.db.Exec(ctx, `UPDATE accounts SET balance = balance - $1 WHERE account_id = $2`, amount, accountID)
+	if err != nil {
+		s.ledger.compensate(context.Background(), accountID, settlementAccountID("airtime"), true, false, amount, txnRef, tbCodeAirtimePurchase)
+		return "", fmt.Errorf("Transaction failed")
+	}
+
 	return fmt.Sprintf("N%.2f airtime\nTo: %s\nRef: %s", amount, targetPhone, txnRef), nil
 }
 
@@ -1090,12 +1137,27 @@ func (s *STKBankingService) executeBillPayment(ctx context.Context, senderPhone,
 		return "", fmt.Errorf("Insufficient balance")
 	}
 
-	_, err = s.db.Exec(ctx, `UPDATE accounts SET balance = balance - $1 WHERE account_id = $2`, amount, accountID)
-	if err != nil {
+	txnRef := fmt.Sprintf("BILL%d", time.Now().UnixNano())
+
+	// AUTHORITATIVE LEDGER MOVEMENT (TigerBeetle): debit the customer, credit
+	// the biller's settlement account (one per provider). Fail-closed before
+	// any read-model write.
+	billerSettlement := settlementAccountID("bills/" + provider)
+	if err = s.ledger.move(ctx, accountID, billerSettlement, true, false, amount, txnRef, tbCodeBillPayment); err != nil {
+		if errors.Is(err, errLedgerInsufficientFunds) {
+			return "", fmt.Errorf("Insufficient balance")
+		}
+		log.Printf("[stk-service] bill payment ledger posting FAILED ref=%s: %v", txnRef, err)
 		return "", fmt.Errorf("Transaction failed")
 	}
 
-	txnRef := fmt.Sprintf("BILL%d", time.Now().UnixNano())
+	// READ-MODEL update (PostgreSQL) after TB confirmation.
+	_, err = s.db.Exec(ctx, `UPDATE accounts SET balance = balance - $1 WHERE account_id = $2`, amount, accountID)
+	if err != nil {
+		s.ledger.compensate(context.Background(), accountID, billerSettlement, true, false, amount, txnRef, tbCodeBillPayment)
+		return "", fmt.Errorf("Transaction failed")
+	}
+
 	token := fmt.Sprintf("%012d", time.Now().UnixNano()%1000000000000)
 
 	return fmt.Sprintf("%s Payment\nN%.2f\nToken: %s\nRef: %s", provider, amount, token, txnRef), nil

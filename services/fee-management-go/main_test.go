@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -59,9 +60,37 @@ func TestRateLimiting(t *testing.T) {
 	}
 }
 
+// testStore is a test-local Store implementation (W12-C3-P2-B2: the
+// production in-memory memStore was removed; unit tests use this fake —
+// production paths are PostgreSQL-only).
+type testStore struct{ rules []FeeRule }
+
+func (s *testStore) List() ([]FeeRule, error) {
+	out := make([]FeeRule, len(s.rules))
+	copy(out, s.rules)
+	return out, nil
+}
+
+func (s *testStore) Create(r *FeeRule) error {
+	s.rules = append(s.rules, *r)
+	return nil
+}
+
+func (s *testStore) Update(id string, patch *FeeRule) (*FeeRule, error) {
+	for i, r := range s.rules {
+		if r.ID == id {
+			patch.ID = id
+			patch.CreatedAt = r.CreatedAt
+			s.rules[i] = *patch
+			return &s.rules[i], nil
+		}
+	}
+	return nil, fmt.Errorf("not found")
+}
+
 // MN-10: evaluate endpoint — deterministic, pure over the rule set.
 func TestEvaluateEndpoint(t *testing.T) {
-	store := newMemStore()
+	store := &testStore{}
 	bps := int64(50) // 0.50%
 	fixed := int64(1000)
 	feeAcct := "4201"

@@ -48,8 +48,10 @@ x-common-env: &common-env
   # ── Dapr ──────────────────────────────────────────────────────────────────────
   DAPR_URL: "http://localhost:3500"
   DAPR_HTTP_PORT: "3500"
-  DAPR_PUBSUB: pubsub
-  DAPR_PUBSUB_NAME: pubsub
+  # OR-09 (W12-B5-P1-G): 54link-dev redis component renamed pubsub -> pubsub-redis
+  # (infrastructure/manifests/dapr/pubsub.yaml); bare 'pubsub' is now kafka (ns 54bank).
+  DAPR_PUBSUB: pubsub-redis
+  DAPR_PUBSUB_NAME: pubsub-redis
   DAPR_PLACEMENT_ADDRESS: dapr-placement:50005
   # ── Identity & Auth ───────────────────────────────────────────────────────────
   KEYCLOAK_URL: https://keycloak.servers.upi.dev

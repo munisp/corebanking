@@ -132,6 +132,48 @@ export const bulkPaymentsApi = {
 
   cancel: (id: string, reason: string) =>
     apiClient.post(`${APISIX.BULK_PAYMENTS}/v1/bulk-payments/${id}/cancel`, { reason }).then((r) => r.data),
+
+  // ── W12 A4-P1-A: batch processing operations (bulk-payments-rs canonical routes) ──
+  process: (body: { batch_id?: string; source_account?: string; items?: BulkPaymentItem[] }) =>
+    apiClient.post(`${APISIX.BULK_PAYMENTS}/v1/process`, body).then((r) => r.data),
+
+  batchStatus: (body: { batch_id: string }) =>
+    apiClient.post(`${APISIX.BULK_PAYMENTS}/v1/status`, body).then((r) => r.data),
+
+  generateReturns: (body: { batch_id: string; format?: string }) =>
+    apiClient.post(`${APISIX.BULK_PAYMENTS}/v1/returns`, body).then((r) => r.data),
+
+  stats: () =>
+    apiClient.get(`${APISIX.BULK_PAYMENTS}/v1/stats`).then((r) => r.data),
+
+  batchStats: () =>
+    apiClient.get(`${APISIX.BULK_PAYMENTS}/v1/bulk-payments/stats`).then((r) => r.data),
+
+  retryFailed: (id: string) =>
+    apiClient.post(`${APISIX.BULK_PAYMENTS}/v1/bulk-payments/${id}/retry-failed`, {}).then((r) => r.data),
+};
+
+// ─── Bulk Payment Records (bulk-payments-rs /api/v1/payments CRUD) ───────────
+export interface BulkPaymentRecord {
+  id: string;
+  [key: string]: unknown;
+}
+
+export const bulkPaymentRecordsApi = {
+  list: (params?: { page?: number; limit?: number }) =>
+    apiClient.get<{ items: BulkPaymentRecord[]; total: number }>(`${APISIX.BULK_PAYMENTS}/api/v1/payments`, { params }).then((r) => r.data),
+
+  create: (body: Record<string, unknown>) =>
+    apiClient.post<BulkPaymentRecord>(`${APISIX.BULK_PAYMENTS}/api/v1/payments`, body).then((r) => r.data),
+
+  getById: (id: string) =>
+    apiClient.get<BulkPaymentRecord>(`${APISIX.BULK_PAYMENTS}/api/v1/payments/${id}`).then((r) => r.data),
+
+  update: (id: string, body: Record<string, unknown>) =>
+    apiClient.put<BulkPaymentRecord>(`${APISIX.BULK_PAYMENTS}/api/v1/payments/${id}`, body).then((r) => r.data),
+
+  remove: (id: string) =>
+    apiClient.delete(`${APISIX.BULK_PAYMENTS}/api/v1/payments/${id}`).then((r) => r.data),
 };
 
 // ─── QR Payments ─────────────────────────────────────────────────────────────
@@ -183,13 +225,13 @@ export interface UtilityPayment {
 
 export const utilityPaymentsApi = {
   getBillers: (params?: { category?: string }) =>
-    apiClient.get<{ items: Biller[]; total: number }>(`${APISIX.UTILITY_PAYMENTS}/v1/billers`, { params }).then((r) => r.data),
+    apiClient.get<{ items: Biller[]; total: number }>(`/mobile-bff/api/v1/billers`, { params }).then((r) => r.data),
 
   validateBill: (body: { billerId: string; customerId: string; amount?: number }) =>
-    apiClient.post(`${APISIX.UTILITY_PAYMENTS}/v1/bills/validate`, body).then((r) => r.data),
+    apiClient.post(`/mobile-bff/api/v1/bills/validate`, body).then((r) => r.data),
 
   pay: (body: { sourceAccount: string; billerId: string; customerId: string; amount: number; currency: string }) =>
-    apiClient.post<UtilityPayment>(`${APISIX.UTILITY_PAYMENTS}/v1/bills/pay`, body).then((r) => r.data),
+    apiClient.post<UtilityPayment>(`/mobile-bff/api/v1/bills/pay`, body).then((r) => r.data),
 
   list: (params?: { page?: number; limit?: number }) =>
     apiClient.get<{ items: UtilityPayment[]; total: number }>(`${APISIX.UTILITY_PAYMENTS}/v1/bills`, { params }).then((r) => r.data),
@@ -364,7 +406,7 @@ export const remittanceApi = {
     apiClient.post<RemittanceTransaction>(`${APISIX.REMITTANCE}/v1/remittances`, body).then((r) => r.data),
 
   getCorridors: () =>
-    apiClient.get(`${APISIX.REMITTANCE}/v1/corridors`).then((r) => r.data),
+    apiClient.get(`/diaspora/v1/diaspora/corridors`).then((r) => r.data),
 };
 
 // ─── WhatsApp Payment Integration ─────────────────────────────────────────────
@@ -388,5 +430,5 @@ export const whatsappPaymentApi = {
     apiClient.get(`${APISIX.WHATSAPP_PAYMENT}/v1/transactions`, { params }).then((r) => r.data),
 
   getStats: () =>
-    apiClient.get(`${APISIX.WHATSAPP_PAYMENT}/v1/stats`).then((r) => r.data),
+    apiClient.get(`${APISIX.WHATSAPP_PAYMENT}/v1/whatsapp-payment-integration/stats`).then((r) => r.data),
 };

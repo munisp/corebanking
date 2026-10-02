@@ -1,6 +1,8 @@
 """Business users API routes."""
 import logging
 from fastapi import APIRouter, Depends, Request, HTTPException
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from sqlalchemy.orm import Session
 
 from database import get_session
@@ -17,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/business/{business_id}/users", tags=["business-users"])
 
 
-@router.post("", response_model=BusinessUserResponse, status_code=201)
+@router.post("", response_model=BusinessUserResponse, status_code=201, dependencies=[Depends(require_permify("business_user", "create"))])
 def add_user_to_business(
     request: Request,
     business_id: str,
@@ -43,7 +45,7 @@ def add_user_to_business(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.get("", response_model=BusinessUsersListResponse)
+@router.get("", response_model=BusinessUsersListResponse, dependencies=[Depends(require_permify("business_user", "view"))])
 def list_business_users(
     request: Request,
     business_id: str,
@@ -71,7 +73,7 @@ def list_business_users(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.put("/{user_id}", response_model=BusinessUserResponse)
+@router.put("/{user_id}", response_model=BusinessUserResponse, dependencies=[Depends(require_permify("business_user", "update"))])
 def update_user_role(
     request: Request,
     business_id: str,
@@ -104,7 +106,7 @@ def update_user_role(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.delete("/{user_id}", response_model=BusinessUserResponse)
+@router.delete("/{user_id}", response_model=BusinessUserResponse, dependencies=[Depends(require_permify("business_user", "delete"))])
 def remove_user_from_business(
     request: Request,
     business_id: str,

@@ -2,8 +2,28 @@
  * Real-Time Notifications Engine — WebSocket push + multi-channel delivery.
  * SMS, email, push notifications, in-app alerts, and USSD callbacks
  * with delivery tracking, templates, and preference management.
+ *
+ * W12-C3-P2-MLIB (c3-0998): the notification delivery log was module process
+ * memory (a restart erased the delivery audit trail). Now
+ * Postgres-authoritative (table `notification_log`) via lib/pgJsonStore.ts;
+ * fail-closed 503 on PG outage, no degraded-memory fallback.
+ * (TEMPLATES/WS_CONNECTIONS are out of this batch's scope — WS connections
+ *  are inherently per-process runtime state, not business data.)
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeInsert, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const LOG_TABLE = "notification_log";
+
+async function ensureNotificationStores(): Promise<void> {
+  await ensureTables("realtimeNotifications", storeDDL(LOG_TABLE));
+  await storeSeed(LOG_TABLE, NOTIFICATION_LOG_SEED, (n) => n.tenantId ?? "");
+}
+
+async function loadNotificationLog(): Promise<NotificationLog[]> {
+  await ensureNotificationStores(); return storeList<NotificationLog>(LOG_TABLE);
+}
 
 interface NotificationTemplate {
   id: string;
@@ -54,7 +74,8 @@ const TEMPLATES: NotificationTemplate[] = [
   { id: "TPL-010", name: "WhatsApp Statement", channel: "whatsapp", body: "Hi {{customerName}}, your account statement for {{period}} is ready. Reply STMT to receive it.", variables: ["customerName", "period"], language: "en", status: "active" },
 ];
 
-const NOTIFICATION_LOG: NotificationLog[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const NOTIFICATION_LOG_SEED: NotificationLog[] = [
   { id: "NTF-001", tenantId: "TEN-GTBANK", recipientId: "USR-GT-001", channel: "sms", template: "TPL-001", body: "54Bank: ₦5,000,000 credit to 0012345678 from BUA Group. Bal: ₦8,500,000. Ref: TXN-2026050901. 09 May 2026 10:30", status: "delivered", sentAt: "2026-05-09T10:30:05Z", deliveredAt: "2026-05-09T10:30:08Z", metadata: { provider: "Termii", cost: 4.0 } },
   { id: "NTF-002", tenantId: "TEN-GTBANK", recipientId: "USR-GT-001", channel: "push", template: "TPL-001", body: "₦5,000,000 credited to your account", status: "read", sentAt: "2026-05-09T10:30:05Z", deliveredAt: "2026-05-09T10:30:06Z", readAt: "2026-05-09T10:31:00Z", metadata: { provider: "FCM", platform: "android" } },
   { id: "NTF-003", tenantId: "TEN-FIRSTBANK", recipientId: "USR-FB-001", channel: "email", template: "TPL-004", subject: "Loan Disbursed — PLN-2026-0045", body: "Dear Adewale Johnson, your loan of ₦2,500,000 has been disbursed...", status: "delivered", sentAt: "2026-05-09T11:00:10Z", deliveredAt: "2026-05-09T11:00:15Z", metadata: { provider: "SendGrid", emailId: "msg-abc123" } },
@@ -74,17 +95,20 @@ export function registerRealtimeNotifications(app: Express) {
   app.get("/api/notifications/v1/templates", (_req: Request, res: Response) => {
     res.json({ items: TEMPLATES, total: TEMPLATES.length });
   });
-  app.get("/api/notifications/v1/log", (req: Request, res: Response) => {
+  app.get("/api/notifications/v1/log", asyncRoute(async (req: Request, res: Response) => {
     const channel = req.query.channel as string;
-    const filtered = channel ? NOTIFICATION_LOG.filter((n) => n.channel === channel) : NOTIFICATION_LOG;
+    const log = await pgGuard(loadNotificationLog());
+    const filtered = channel ? log.filter((n) => n.channel === channel) : log;
     res.json({ items: filtered, total: filtered.length });
-  });
-  app.post("/api/notifications/v1/send", (req: Request, res: Response) => {
+  }));
+  app.post("/api/notifications/v1/send", asyncRoute(async (req: Request, res: Response) => {
     const { channel, recipientId, templateId, variables } = req.body ?? {};
     const tpl = TEMPLATES.find((t) => t.id === templateId);
+    const log = await pgGuard(loadNotificationLog());
+    const tenantId = (req.headers["x-tenant-id"] as string) ?? "TEN-PLATFORM-ADMIN";
     const entry: NotificationLog = {
-      id: `NTF-${String(NOTIFICATION_LOG.length + 1).padStart(3, "0")}`,
-      tenantId: (req.headers["x-tenant-id"] as string) ?? "TEN-PLATFORM-ADMIN",
+      id: `NTF-${String(log.length + 1).padStart(3, "0")}`,
+      tenantId,
       recipientId: recipientId ?? "USR-001",
       channel: channel ?? "in_app",
       template: templateId ?? "TPL-006",
@@ -94,19 +118,20 @@ export function registerRealtimeNotifications(app: Express) {
       deliveredAt: new Date().toISOString(),
       metadata: { variables },
     };
-    NOTIFICATION_LOG.push(entry);
+    await pgGuard(storeInsert(LOG_TABLE, tenantId, entry));
     res.status(201).json(entry);
-  });
+  }));
   app.get("/api/notifications/v1/websockets", (_req: Request, res: Response) => {
     res.json({ items: WS_CONNECTIONS, total: WS_CONNECTIONS.length, active: WS_CONNECTIONS.filter((w) => w.status === "active").length });
   });
-  app.get("/api/notifications/v1/stats", (_req: Request, res: Response) => {
+  app.get("/api/notifications/v1/stats", asyncRoute(async (_req: Request, res: Response) => {
+    const log = await pgGuard(loadNotificationLog());
     res.json({
-      totalSent: NOTIFICATION_LOG.length, delivered: NOTIFICATION_LOG.filter((n) => n.status === "delivered" || n.status === "read").length,
-      read: NOTIFICATION_LOG.filter((n) => n.status === "read").length, failed: NOTIFICATION_LOG.filter((n) => n.status === "failed").length,
+      totalSent: log.length, delivered: log.filter((n) => n.status === "delivered" || n.status === "read").length,
+      read: log.filter((n) => n.status === "read").length, failed: log.filter((n) => n.status === "failed").length,
       deliveryRate: 100, channels: { sms: 3, email: 1, push: 2, in_app: 0, ussd: 1, whatsapp: 0 },
       websocketConnections: WS_CONNECTIONS.length, activeConnections: WS_CONNECTIONS.filter((w) => w.status === "active").length,
       templates: TEMPLATES.length, avgDeliveryTimeMs: 3200,
     });
-  });
+  }));
 }

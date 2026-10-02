@@ -1,0 +1,566 @@
+// ============================================================================
+// Wave-12 B5-P1-D-F: analytics/reporting + notification + workflow schema
+// FRAGMENT (Permify wave 2, batch D-F). Merged into the canonical v2.perm by
+// the integrator; kept in a separate file so the canonical-schema owner
+// (B5-P0-D1), the kyc fragment owner (B5-P0-D2/D3) and the D-A..D-D batch
+// owners never share an edit surface with this batch. Syntax identical to
+// v2.perm; the `user` entity is declared in the canonical file and referenced
+// here by type only. ONLY genuinely new domain entities live here — every
+// entity name was collision-checked against v2.perm, v2-kyc-compliance,
+// v2-core-domain[/-py/-rs], v2-workflow and v2-money-wave2 fragments (see
+// codemods/p1d-f/forbidden-entities.json); canonical entities are REUSED,
+// never redefined.
+//
+// Convention: every mutating handler checks
+//   subject = verified JWT identity, resource = <entity>:<domain-id>,
+//   permission = <entity>.<action> as defined below. Checks fail closed
+//   (Permify unreachable -> 502, denied -> 403) via the batch guard modules.
+// User-facing "my notifications" reads stay ownership-filtered inside the
+// handlers (per D1/D-A precedent only mutating routes + admin template
+// management are Permify-enforced here).
+// ============================================================================
+
+entity alert_rule {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission settlements = admin or operator
+}
+
+entity analytics_job {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission reports = admin or operator
+}
+
+entity api_metric {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity assistant_session {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity batch_job {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission produce_batch = admin or operator
+  permission service_configs = admin or operator
+}
+
+entity billing_event {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity campaign {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity chat_session {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission accept = admin or operator
+  permission chat = admin or operator
+  permission end = admin or operator
+  permission handoff = admin or operator
+  permission intents = admin or operator
+  permission service_configs = admin or operator
+  permission train = admin or operator
+}
+
+entity dashboard {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission alerts = admin or operator
+  permission audit_events = admin or operator
+  permission customers = admin or operator
+  permission degradation = admin or operator
+  permission process = admin or operator
+  permission reports = admin or operator
+  permission validate = admin or operator
+}
+
+entity database_adapter {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission cards = admin or operator
+}
+
+entity dataset {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission embed = admin or operator
+  permission init = admin or operator
+  permission service_configs = admin or operator
+  permission upsert = admin or operator
+}
+
+entity document {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission batch = admin or operator
+  permission classify = admin or operator
+  permission extract = admin or operator
+  permission parse = admin or operator
+  permission upload = admin or operator
+}
+
+entity embedded_finance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity incident {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity insight {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission customers = admin or operator
+}
+
+entity kpi {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission acknowledge = admin or operator
+  permission alert_config = admin or operator
+  permission alerts = admin or operator
+  permission ask = admin or operator
+  permission evaluate = admin or operator
+  permission export = admin or operator
+  permission kpis = admin or operator
+  permission recompute = admin or operator
+  permission reports = admin or operator
+  permission resolve = admin or operator
+}
+
+entity ledger_entry {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission alerts = admin or operator
+  permission commit = admin or operator
+  permission convert_currency = admin or operator
+  permission degradation = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+  permission service_configs = admin or operator
+  permission tb_operation = admin or operator
+  permission throughput = admin or operator
+  permission transfers = admin or operator
+  permission void = admin or operator
+}
+
+entity lineage {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission audit_events = admin or operator
+}
+
+entity memoization {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity model {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission alerts = admin or operator
+  permission batch = admin or operator
+  permission categorize = admin or operator
+  permission check = admin or operator
+  permission config = admin or operator
+  permission degradation = admin or operator
+  permission label = admin or operator
+  permission override = admin or approver
+  permission process = admin or operator
+  permission promote = admin or operator
+  permission score = admin or operator
+  permission spending = admin or operator
+  permission train = admin or operator
+  permission v2 = admin or operator
+  permission validate = admin or operator
+}
+
+entity notification {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission alerts = admin or operator
+  permission broadcast = admin or operator
+  permission channel_sessions = admin or operator
+  permission config = admin or operator
+  permission conversation = admin or operator
+  permission conversations = admin or operator
+  permission degradation = admin or operator
+  permission delivery = admin or operator
+  permission events = admin or operator
+  permission messages = admin or operator
+  permission notifications = admin or operator
+  permission process = admin or operator
+  permission push = admin or operator
+  permission receive = admin or operator
+  permission recent = admin or operator
+  permission send = admin or operator
+  permission send_template = admin or operator
+  permission sessions = admin or operator
+  permission templates = admin or operator
+  permission tickets = admin or operator
+  permission validate = admin or operator
+}
+
+entity notification_template {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission messages = admin or operator
+  permission notifications = admin or operator
+  permission send_template = admin or operator
+  permission sessions = admin or operator
+  permission templates = admin or operator
+  permission tickets = admin or operator
+}
+
+entity onboarding_workflow {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission decommission = admin or operator
+}
+
+entity orchestration {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity pipeline {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity query_optimization {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission cards = admin or operator
+}
+
+entity ranking {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission alerts = admin or operator
+  permission degradation = admin or operator
+  permission process = admin or operator
+  permission validate = admin or operator
+}
+
+entity report {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission accounts = admin or operator
+  permission audit_events = admin or operator
+  permission reports = admin or operator
+  permission service_configs = admin or operator
+}
+
+entity saga {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity search_index {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission accounts = admin or operator
+  permission bulk = admin or operator
+  permission customers = admin or operator
+  permission disputes = admin or operator
+  permission documents = admin or operator
+  permission employees = admin or operator
+  permission index = admin or operator
+  permission loans = admin or operator
+  permission multi = admin or operator
+  permission notifications = admin or operator
+  permission products = admin or operator
+  permission service_configs = admin or operator
+  permission trade_finance = admin or operator
+  permission transaction_failed = admin or operator
+  permission transaction_initiated = admin or operator
+  permission transaction_success = admin or operator
+  permission transactions = admin or operator
+}
+
+entity telemetry_event {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}
+
+entity usage_record {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission alerts = admin or operator
+  permission degradation = admin or operator
+  permission process = admin or operator
+  permission validate = admin or operator
+}
+
+entity webhook_subscription {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission deliveries = admin or operator
+  permission endpoints = admin or operator
+}
+
+entity workflow_definition {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission service_configs = admin or operator
+}

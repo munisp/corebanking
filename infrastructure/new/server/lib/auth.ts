@@ -12,6 +12,7 @@ import { getDb } from "../db";
 import { users } from "../../drizzle/schema";
 import { eq } from "drizzle-orm";
 import { logger } from "./logger";
+import { kvGet, kvSetNX, kvDel, kvIncrWindow, tenantOf } from "./redisKv";
 import crypto from "crypto";
 
 // Pure-crypto JWT implementation (no external dependencies)
@@ -176,61 +177,73 @@ async function initDemoUsers() {
 
 initDemoUsers().catch((err) => logger.warn("Demo user seeding failed", { error: String(err) }));
 
-// Brute force protection
-const loginAttempts: Map<string, { count: number; lockedUntil: number }> = new Map();
+// Brute force protection — redis-backed (W12 C3-P1-B2, c3-1040).
+// Key: failed_login:{tenant}:{subject}, TTL = lockout window (900s, preserving
+// the previous 15-minute in-memory LOCKOUT_DURATION_MS). The failed-login count
+// now survives restarts and is shared across replicas; previously a restart
+// silently reset an attacker's lockout.
+// FAIL MODE: redis down => these helpers throw and the login route fails
+// closed (503) — the lockout check is never silently skipped.
 const MAX_LOGIN_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
+const LOCKOUT_WINDOW_SECONDS = 15 * 60; // 15 minutes (was LOCKOUT_DURATION_MS)
 
-function checkBruteForce(email: string): { blocked: boolean; remainingAttempts: number; lockedUntil?: string } {
-  const record = loginAttempts.get(email);
-  if (!record) return { blocked: false, remainingAttempts: MAX_LOGIN_ATTEMPTS };
-  if (record.lockedUntil > Date.now()) {
-    return { blocked: true, remainingAttempts: 0, lockedUntil: new Date(record.lockedUntil).toISOString() };
-  }
-  if (record.count >= MAX_LOGIN_ATTEMPTS) {
-    record.lockedUntil = Date.now() + LOCKOUT_DURATION_MS;
-    return { blocked: true, remainingAttempts: 0, lockedUntil: new Date(record.lockedUntil).toISOString() };
-  }
-  return { blocked: false, remainingAttempts: MAX_LOGIN_ATTEMPTS - record.count };
+function failedLoginKey(tenant: string, email: string): string {
+  return `failed_login:${tenant}:${email.toLowerCase()}`;
 }
 
-function recordLoginAttempt(email: string, success: boolean) {
+async function checkBruteForce(email: string, tenant = "platform"): Promise<{ blocked: boolean; remainingAttempts: number; lockedUntil?: string }> {
+  const raw = await kvGet(failedLoginKey(tenant, email));
+  const count = raw ? parseInt(raw, 10) : 0;
+  if (count >= MAX_LOGIN_ATTEMPTS) {
+    return { blocked: true, remainingAttempts: 0 };
+  }
+  return { blocked: false, remainingAttempts: MAX_LOGIN_ATTEMPTS - count };
+}
+
+async function recordLoginAttempt(email: string, success: boolean, tenant = "platform"): Promise<void> {
+  const key = failedLoginKey(tenant, email);
   if (success) {
-    loginAttempts.delete(email);
+    await kvDel(key);
     return;
   }
-  const record = loginAttempts.get(email) || { count: 0, lockedUntil: 0 };
-  record.count++;
-  loginAttempts.set(email, record);
+  await kvIncrWindow(key, LOCKOUT_WINDOW_SECONDS);
 }
 
-// Token blacklist for logout
-const tokenBlacklist: Set<string> = new Set();
-const TOKEN_CLEANUP_INTERVAL = 60 * 60 * 1000; // 1 hour
-
-function blacklistToken(token: string) {
-  tokenBlacklist.add(token);
-}
-
-function isTokenBlacklisted(token: string): boolean {
-  return tokenBlacklist.has(token);
-}
-
-// Cleanup expired tokens periodically
-setInterval(() => {
+// Token blacklist for logout — redis-backed (W12 C3-P1-B2, c3-1041).
+// Key: token_blacklist:{jti} (jti claim, or sha256 of the token when the JWT
+// has no jti), TTL = remaining JWT lifetime from the exp claim, so a revoked
+// token stays blocked exactly until it would have expired anyway — and a
+// process restart no longer un-revokes tokens (the previous in-memory Set was
+// wiped on restart, silently re-activating logged-out tokens).
+// FAIL MODE: redis down => isTokenBlacklisted throws and the auth middleware
+// fails closed (503) — a revocation check is never silently skipped.
+function tokenBlacklistKey(token: string): { key: string; ttlSeconds: number } {
   const now = Math.floor(Date.now() / 1000);
-  Array.from(tokenBlacklist).forEach((token) => {
-    try {
-      const parts = token.split(".");
-      const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
-      if (payload.exp && payload.exp < now) {
-        tokenBlacklist.delete(token);
-      }
-    } catch {
-      tokenBlacklist.delete(token);
-    }
-  });
-}, TOKEN_CLEANUP_INTERVAL);
+  let jti: string | null = null;
+  let ttlSeconds = 0;
+  try {
+    const parts = token.split(".");
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    jti = typeof payload.jti === "string" ? payload.jti : null;
+    if (payload.exp) ttlSeconds = Math.max(0, Math.floor(payload.exp - now));
+  } catch {
+    // Undecodable token — still blacklist by hash with a conservative TTL.
+  }
+  const id = jti || crypto.createHash("sha256").update(token).digest("hex");
+  return { key: `token_blacklist:${id}`, ttlSeconds };
+}
+
+async function blacklistToken(token: string): Promise<void> {
+  const { key, ttlSeconds } = tokenBlacklistKey(token);
+  // Already-expired tokens need no blacklist entry (verify() rejects them).
+  if (ttlSeconds <= 0) return;
+  await kvSetNX(key, "1", ttlSeconds);
+}
+
+async function isTokenBlacklisted(token: string): Promise<boolean> {
+  const { key } = tokenBlacklistKey(token);
+  return (await kvGet(key)) !== null;
+}
 
 // RBAC permission matrix
 const rolePermissions: Record<string, string[]> = {
@@ -252,7 +265,7 @@ function hasPermission(role: string, requiredPermission: string): boolean {
 
 // Auth middleware — validates JWT and attaches user to request
 export function createAuthMiddleware() {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     // Skip auth for login, health, and static routes
     const skipPaths = [
       "/api/auth/login",
@@ -270,8 +283,18 @@ export function createAuthMiddleware() {
     const cookieToken = req.cookies?.access_token;
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : cookieToken;
 
-    if (token && isTokenBlacklisted(token)) {
-      return res.status(401).json({ error: "Token has been revoked", code: "TOKEN_REVOKED" });
+    if (token) {
+      try {
+        if (await isTokenBlacklisted(token)) {
+          return res.status(401).json({ error: "Token has been revoked", code: "TOKEN_REVOKED" });
+        }
+      } catch (err) {
+        // FAIL CLOSED: revocation state lives in redis; if it is unreachable we
+        // cannot prove the token is not revoked, so the request is rejected
+        // rather than silently skipping the revocation check.
+        logger.error("[Auth] token blacklist check failed — failing closed", { error: String(err) });
+        return res.status(503).json({ error: "Authentication state unavailable", code: "AUTH_STATE_UNAVAILABLE" });
+      }
     }
 
     if (!token) {
@@ -353,8 +376,17 @@ export function registerAuthRoutes(app: Express) {
       return res.status(400).json({ error: "Email and password required" });
     }
 
-    // Brute force check
-    const bruteCheck = checkBruteForce(email);
+    // Brute force check (redis-backed). FAIL CLOSED: if redis is unreachable
+    // the lockout state cannot be verified, so login is refused with 503
+    // instead of silently skipping brute-force protection.
+    const loginTenant = tenantOf(req);
+    let bruteCheck: { blocked: boolean; remainingAttempts: number; lockedUntil?: string };
+    try {
+      bruteCheck = await checkBruteForce(email, loginTenant);
+    } catch (err) {
+      logger.error("[Auth] brute-force check failed — failing closed", { error: String(err) });
+      return res.status(503).json({ error: "Login protection unavailable", code: "LOCKOUT_STATE_UNAVAILABLE" });
+    }
     if (bruteCheck.blocked) {
       logAuthEvent("login_blocked", email, req.ip || "unknown", req.headers["user-agent"] || "unknown", false);
       return res.status(429).json({
@@ -413,7 +445,7 @@ export function registerAuthRoutes(app: Express) {
           sameSite: "lax",
           maxAge: 8 * 60 * 60 * 1000,
         });
-        recordLoginAttempt(email, true);
+        await recordLoginAttempt(email, true, loginTenant).catch((err) => logger.warn("[Auth] failed to clear login attempts", { error: String(err) }));
         logAuthEvent("login_success", email, req.ip || "unknown", req.headers["user-agent"] || "unknown", true, memUser.user.role);
         return res.json({
           user: {
@@ -427,12 +459,20 @@ export function registerAuthRoutes(app: Express) {
       }
     }
 
-    recordLoginAttempt(email, false);
+    let remainingAttempts = 0;
+    try {
+      await recordLoginAttempt(email, false, loginTenant);
+      remainingAttempts = (await checkBruteForce(email, loginTenant)).remainingAttempts;
+    } catch (err) {
+      // FAIL CLOSED on the failure-recording path too: an unrecorded failed
+      // login would let an attacker bypass the lockout during a redis outage.
+      logger.error("[Auth] failed to record login attempt — failing closed", { error: String(err) });
+      return res.status(503).json({ error: "Login protection unavailable", code: "LOCKOUT_STATE_UNAVAILABLE" });
+    }
     logAuthEvent("login_failed", email, req.ip || "unknown", req.headers["user-agent"] || "unknown", false);
-    const remaining = checkBruteForce(email);
     return res.status(401).json({
       error: "Invalid credentials",
-      remainingAttempts: remaining.remainingAttempts,
+      remainingAttempts,
     });
   });
 
@@ -500,12 +540,20 @@ export function registerAuthRoutes(app: Express) {
   });
 
   // POST /api/auth/logout
-  app.post("/api/auth/logout", (req: Request, res: Response) => {
+  app.post("/api/auth/logout", async (req: Request, res: Response) => {
     const authHeader = req.headers.authorization;
     const cookieToken = req.cookies?.access_token;
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : cookieToken;
     if (token) {
-      blacklistToken(token);
+      try {
+        await blacklistToken(token);
+      } catch (err) {
+        // FAIL CLOSED: a revocation that cannot be persisted would leave the
+        // token valid until natural expiry — report failure instead of
+        // pretending the logout succeeded.
+        logger.error("[Auth] token blacklist write failed", { error: String(err) });
+        return res.status(503).json({ error: "Logout could not be persisted", code: "REVOCATION_UNAVAILABLE" });
+      }
     }
     res.clearCookie("access_token");
     logAuthEvent("logout", (req as any).user?.email || "unknown", req.ip || "unknown", req.headers["user-agent"] || "unknown", true);

@@ -49,11 +49,6 @@ type SyndicatedLoan struct {
 	Status           string  `json:"status"`
 }
 
-var (
-	mu    sync.RWMutex
-	items = []SyndicatedLoan{}
-)
-
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -61,7 +56,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"syndication.facilities", "syndication.drawdowns", "syndication.participations"}, "usage": "event streaming"},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"syndicated-loans-go:cache"}},
-			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"syndicated_facilities", "loan_participants", "drawdown_schedules"}},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "connected": pgPing(), "tables": []string{"syndicated_facilities"}},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"syndicated-loans", "syndication-audit"}},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "syndicated-loans-go"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"syndicated-loans-go"}},
@@ -75,25 +70,6 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 			"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000"), "policy": "syndicated-loans-go-waf"},
 		},
 	})
-}
-
-func listItems(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items)})
-}
-
-func getStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	var total float64
-	for _, d := range items {
-		total += d.TotalAmount
-	}
-	stats := map[string]interface{}{"total_facilities": len(items), "total_committed": total}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
 }
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
@@ -271,13 +247,14 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	port := envOr("PORT", "8171")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/syndicated-loans/facilities", listItems)
-	http.HandleFunc("/v1/syndicated-loans/stats", getStats)
+	http.HandleFunc("/v1/syndicated-loans/facilities", permifyAuthzGuard("facility", "create", listItems))
+	http.HandleFunc("/v1/syndicated-loans/stats", permifyAuthzGuard("facility", "view", getStats))
 	fmt.Printf("Syndicated Loans Service running on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

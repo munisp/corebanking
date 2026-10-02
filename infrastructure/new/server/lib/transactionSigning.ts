@@ -22,6 +22,7 @@
 import crypto from "crypto";
 import type { Request, Response, NextFunction } from "express";
 import { logger } from "./logger";
+import { kvGetJson, kvSetJson, kvSetNX, kvDel, kvGet, kvIncrWindow } from "./redisKv";
 
 // Configurable thresholds
 const OTP_THRESHOLD = Number(process.env.OTP_THRESHOLD_NGN || "1000000"); // ₦1M
@@ -56,35 +57,46 @@ const MAX_ACTIVE_OTPS_PER_USER = 5;
 const RESEND_COOLDOWN_MS = 60_000; // 60s resend cooldown per user
 const MAX_VERIFY_ATTEMPTS = 5;
 
-// In-memory OTP store (production: Redis with TTL)
-const otpStore = new Map<string, { code: string; userId: string; expiresAt: number; attempts: number }>();
-// Per-user resend cooldown tracker
-const lastOtpRequestAt = new Map<string, number>();
-
-function countActiveOtpsForUser(userId: string, now: number): number {
-  let count = 0;
-  otpStore.forEach((entry, otpId) => {
-    if (entry.expiresAt <= now) {
-      otpStore.delete(otpId); // lazy cleanup of expired entries
-      return;
-    }
-    if (entry.userId === userId) count++;
-  });
-  return count;
+// OTP store — redis-backed (W12 C3-P1-B2, c3-1031/c3-1032).
+// Keys (register pattern otp:{tenant}:{phone}; this module has no tenant
+// context, so tenant="platform" and subject=userId/otpId):
+//   otp:platform:{otpId}            JSON {code,userId,expiresAt,attempts}, TTL 300s
+//   otp:cooldown:platform:{userId}  resend cooldown marker, TTL 60s (preserves
+//                                   the previous RESEND_COOLDOWN_MS lifetime)
+//   otp:active:platform:{userId}    counter of concurrently active OTPs, TTL 300s
+// OTP state now survives restarts and is consistent across replicas;
+// previously a restart silently invalidated outstanding OTPs (or, worse,
+// reset the resend-cooldown / active-count anti-abuse limits).
+// FAIL MODE: redis down => generate/verify THROW and callers fail closed —
+// an OTP check is never silently skipped.
+interface OtpEntry {
+  code: string;
+  userId: string;
+  expiresAt: number;
+  attempts: number;
 }
 
-export function generateOTP(userId: string): { otpId: string; expiresInSeconds: number } {
+const otpKey = (otpId: string) => `otp:platform:${otpId}`;
+const otpCooldownKey = (userId: string) => `otp:cooldown:platform:${userId}`;
+const otpActiveKey = (userId: string) => `otp:active:platform:${userId}`;
+
+async function countActiveOtpsForUser(userId: string): Promise<number> {
+  const raw = await kvGet(otpActiveKey(userId));
+  return raw ? parseInt(raw, 10) : 0;
+}
+
+export async function generateOTP(userId: string): Promise<{ otpId: string; expiresInSeconds: number }> {
   const now = Date.now();
 
   // Resend cooldown: reject rapid successive OTP requests for the same user.
-  const lastRequest = lastOtpRequestAt.get(userId);
-  if (lastRequest !== undefined && now - lastRequest < RESEND_COOLDOWN_MS) {
-    logger.warn("OTP resend cooldown triggered", { userId, retryAfterSeconds: Math.ceil((RESEND_COOLDOWN_MS - (now - lastRequest)) / 1000) });
-    throw new Error(`OTP resend cooldown active. Retry after ${Math.ceil((RESEND_COOLDOWN_MS - (now - lastRequest)) / 1000)} seconds.`);
+  const cooldownSet = await kvSetNX(otpCooldownKey(userId), String(now), RESEND_COOLDOWN_MS / 1000);
+  if (!cooldownSet) {
+    logger.warn("OTP resend cooldown triggered", { userId, retryAfterSeconds: Math.ceil(RESEND_COOLDOWN_MS / 1000) });
+    throw new Error(`OTP resend cooldown active. Retry after ${Math.ceil(RESEND_COOLDOWN_MS / 1000)} seconds.`);
   }
 
   // Rate limit: cap the number of concurrently active OTPs per user.
-  if (countActiveOtpsForUser(userId, now) >= MAX_ACTIVE_OTPS_PER_USER) {
+  if ((await countActiveOtpsForUser(userId)) >= MAX_ACTIVE_OTPS_PER_USER) {
     logger.warn("OTP active-limit reached for user", { userId, maxActive: MAX_ACTIVE_OTPS_PER_USER });
     throw new Error(`Too many active OTPs for user. Maximum ${MAX_ACTIVE_OTPS_PER_USER} concurrent OTPs allowed.`);
   }
@@ -92,13 +104,15 @@ export function generateOTP(userId: string): { otpId: string; expiresInSeconds: 
   // CSPRNG 6-digit code — never Math.random() for security tokens.
   const code = String(crypto.randomInt(100000, 1000000));
   const otpId = `otp-${userId}-${now.toString(36)}-${crypto.randomBytes(4).toString("hex")}`;
-  otpStore.set(otpId, {
+  const entry: OtpEntry = {
     code,
     userId,
     expiresAt: now + OTP_TTL_SECONDS * 1000,
     attempts: 0,
-  });
-  lastOtpRequestAt.set(userId, now);
+  };
+  await kvSetJson(otpKey(otpId), entry, OTP_TTL_SECONDS);
+  // Track the active-OTP count for this user (key expires with the OTP window).
+  await kvIncrWindow(otpActiveKey(userId), OTP_TTL_SECONDS);
 
   logger.info("OTP generated", { otpId, userId });
   // NOTE: the code is stored server-side only. Delivery to the user happens
@@ -107,24 +121,45 @@ export function generateOTP(userId: string): { otpId: string; expiresInSeconds: 
   return { otpId, expiresInSeconds: OTP_TTL_SECONDS };
 }
 
-export function verifyOTP(otpId: string, code: string): boolean {
-  const entry = otpStore.get(otpId);
+async function decrementActiveOtps(userId: string): Promise<void> {
+  const key = otpActiveKey(userId);
+  try {
+    const raw = await kvGet(key);
+    const n = raw ? parseInt(raw, 10) : 0;
+    if (n <= 1) await kvDel(key);
+    else await kvSetJson(key, n - 1, OTP_TTL_SECONDS);
+  } catch (err) {
+    logger.warn("OTP active-count decrement failed (non-fatal)", { error: String(err) });
+  }
+}
+
+export async function verifyOTP(otpId: string, code: string): Promise<boolean> {
+  const key = otpKey(otpId);
+  const entry = await kvGetJson<OtpEntry>(key);
   if (!entry) return false;
   if (Date.now() > entry.expiresAt) {
-    otpStore.delete(otpId);
+    await kvDel(key);
+    await decrementActiveOtps(entry.userId);
     return false;
   }
   entry.attempts++;
   if (entry.attempts > MAX_VERIFY_ATTEMPTS) {
-    otpStore.delete(otpId);
+    await kvDel(key);
+    await decrementActiveOtps(entry.userId);
     logger.warn("OTP invalidated after too many verify attempts", { otpId, attempts: entry.attempts });
     return false;
   }
   // Constant-time comparison to avoid timing attacks on the code.
   const provided = Buffer.from(code);
   const expected = Buffer.from(entry.code);
-  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) return false;
-  otpStore.delete(otpId);
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
+    // Persist the incremented attempt counter so attempts are enforced
+    // across replicas/restarts.
+    await kvSetJson(key, entry, Math.max(1, Math.floor((entry.expiresAt - Date.now()) / 1000)));
+    return false;
+  }
+  await kvDel(key);
+  await decrementActiveOtps(entry.userId);
   return true;
 }
 
@@ -146,7 +181,7 @@ export function verifyTransactionSignature(payload: Record<string, unknown>, sig
  * Checks x-otp-id and x-otp-code headers for amounts above threshold.
  */
 export function requireOTPForHighValue(amountField = "amount") {
-  return (req: Request, res: Response, next: NextFunction): void => {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     const amount = Number(req.body?.[amountField] || 0);
     if (amount <= OTP_THRESHOLD) {
       next();
@@ -166,7 +201,17 @@ export function requireOTPForHighValue(amountField = "amount") {
       return;
     }
 
-    if (!verifyOTP(otpId, otpCode)) {
+    let otpValid = false;
+    try {
+      otpValid = await verifyOTP(otpId, otpCode);
+    } catch (err) {
+      // FAIL CLOSED: OTP state lives in redis; if it is unreachable the OTP
+      // cannot be verified and the high-value transaction must not proceed.
+      logger.error("OTP verification state unavailable — failing closed", { error: String(err) });
+      res.status(503).json({ error: "OTP verification unavailable", code: "OTP_STATE_UNAVAILABLE" });
+      return;
+    }
+    if (!otpValid) {
       res.status(403).json({ error: "Invalid or expired OTP" });
       return;
     }

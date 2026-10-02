@@ -1,0 +1,1050 @@
+// ============================================================================
+// Wave-12 B5-P1-D-A: core-domain archetype schema FRAGMENT (Permify wave 2).
+// Merged into the canonical v2.perm by the integrator; kept in a separate
+// file so the canonical-schema owner (B5-P0-D1) and the kyc fragment owner
+// (B5-P0-D2) never share an edit surface with this batch. Syntax identical
+// to v2.perm; the `user` entity is declared in the canonical file and
+// referenced here by type only.
+//
+// Convention: every mutating handler in the core-domain fleet checks
+//   subject = verified JWT identity, resource = <entity>:<domain-id>,
+//   permission = <entity>.<action> as defined below. Checks fail closed
+//   (Permify unreachable -> 502, denied -> 403) via permify_guard.go.
+// ============================================================================
+
+entity avro_schema_registry {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity bank_guarantees {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity banking_domain_integration {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission dealing_gl = admin or operator
+  permission execution_gl = admin or operator
+  permission gl_posting = admin or operator
+  permission lifecycle_gl = admin or operator
+}
+
+entity beneficiary_management {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission favorite = admin or operator
+  permission verify = admin or operator
+}
+
+entity billing_ingestor {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity branch_operations {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity cac_realtime_api {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission verify = admin or operator
+}
+
+entity canary_token {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission check = admin or operator
+}
+
+entity cdn_edge_cache {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity cif_management {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity connectivity_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission apply = admin or operator
+  permission compress = admin or operator
+  permission decompress = admin or operator
+  permission generate = admin or operator
+  permission optimize = admin or operator
+  permission quality = admin or operator
+  permission setup = admin or operator
+  permission sync = admin or operator
+  permission verify = admin or operator
+}
+
+entity cooperative_management {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity cooperative_meetings {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity credit_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission compute_fsv = admin or operator
+  permission run = admin or operator
+  permission score = admin or operator
+  permission score_check = admin or operator
+}
+
+entity custody_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity custom_domain {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity dapr_sidecar {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity db_migration_manager {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity db_migrations {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission process = admin or operator
+}
+
+entity employee_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity esusu_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission join = admin or operator
+  permission management = admin or operator
+  permission payout = admin or operator
+  permission rotation = admin or operator
+  permission start = admin or operator
+}
+
+entity etherisc_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity event_bus {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity event_sourcing {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity event_streaming {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity expense_mgmt {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission expense_mgmt_go = admin or operator
+}
+
+entity feature_entitlement {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission check = admin or operator
+  permission provision = admin or operator
+  permission purchase_addon = admin or operator
+  permission tenant = admin or operator
+  permission upgrade = admin or operator
+  permission usage = admin or operator
+}
+
+entity fee_management {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission evaluate = admin or operator
+}
+
+entity gamification_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission award = admin or operator
+  permission join = admin or operator
+  permission progress = admin or operator
+  permission redeem = admin or operator
+}
+
+entity growth_features {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission bnpl = admin or operator
+  permission chatbot = admin or operator
+  permission gamification = admin or operator
+}
+
+entity grpc_hot_path {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity helm_validator {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity hpa_autoscaler {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity i18n_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity idempotency {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity identity_channels {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity image_scanner {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity incident_responder {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity kafka_broker {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity kafka_consumer_optimizer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity kafka_schema_registry {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity kafka_streaming {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity keda_scaler {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity loan_calculator {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission calculate = admin or operator
+  permission compute_emi = admin or operator
+  permission credit_check = admin or operator
+  permission process = admin or operator
+}
+
+entity locker {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity mandate_management {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity multi_entity {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity open_banking {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission api_catalog = admin or operator
+  permission funds_confirmation = admin or operator
+}
+
+entity open_banking_baas {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission credit_scoring = admin or operator
+  permission embedded_finance = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity optimistic_ui_engine {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity otel_collector {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity pgbouncer_manager {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity prepared_stmt_cache {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity privileged_access {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission approve = admin or approver
+  permission request = admin or operator
+  permission revoke = admin or operator
+  permission validate = admin or operator
+}
+
+entity project_finance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity quality_certification {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity request_coalescer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity safe_deposit {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission assign = admin or operator
+  permission process = admin or operator
+  permission vacate = admin or operator
+}
+
+entity session_recorder {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission end = admin or operator
+  permission record = admin or operator
+  permission start = admin or operator
+}
+
+entity stream_response {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity sw_api_cache {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+}
+
+entity tenant_billing {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission me = admin or operator
+  permission plan = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity tenant_export {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity tenant_isolation {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity tenant_provisioning {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity trade_finance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission guarantee = admin or operator
+  permission issue_lc = admin or operator
+}
+
+entity white_label_engine {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}

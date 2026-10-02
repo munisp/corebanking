@@ -11,7 +11,7 @@ import (
 // IndicatorService handles Key Risk Indicator operations
 type IndicatorService struct {
 	tenantID   string
-	indicators map[string]*RiskIndicator
+	indicators *repo[RiskIndicator]
 	mu         sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type IndicatorService struct {
 func NewIndicatorService(tenantID string) *IndicatorService {
 	svc := &IndicatorService{
 		tenantID:   tenantID,
-		indicators: make(map[string]*RiskIndicator),
+		indicators: newRepo[RiskIndicator](serviceDB, "risk_indicators"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewIndicatorService(tenantID string) *IndicatorService {
 
 func (s *IndicatorService) initializeDefaultData(tenantID string) {
 	// NPL Ratio
-	s.indicators["kri-001"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-001", &RiskIndicator{
 		IndicatorID:   "kri-001",
 		TenantID:      tenantID,
 		IndicatorName: "NPL Ratio",
@@ -42,10 +42,10 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Capital Adequacy Ratio
-	s.indicators["kri-002"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-002", &RiskIndicator{
 		IndicatorID:   "kri-002",
 		TenantID:      tenantID,
 		IndicatorName: "Capital Adequacy Ratio",
@@ -60,10 +60,10 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Liquidity Coverage Ratio
-	s.indicators["kri-003"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-003", &RiskIndicator{
 		IndicatorID:   "kri-003",
 		TenantID:      tenantID,
 		IndicatorName: "Liquidity Coverage Ratio",
@@ -78,10 +78,10 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// VaR Utilization
-	s.indicators["kri-004"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-004", &RiskIndicator{
 		IndicatorID:   "kri-004",
 		TenantID:      tenantID,
 		IndicatorName: "VaR Utilization",
@@ -96,10 +96,10 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Operational Loss Rate - warning
-	s.indicators["kri-005"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-005", &RiskIndicator{
 		IndicatorID:   "kri-005",
 		TenantID:      tenantID,
 		IndicatorName: "Operational Loss Rate",
@@ -114,10 +114,10 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Concentration Risk - warning
-	s.indicators["kri-006"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-006", &RiskIndicator{
 		IndicatorID:   "kri-006",
 		TenantID:      tenantID,
 		IndicatorName: "Top 20 Borrowers Concentration",
@@ -132,10 +132,10 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// System Availability
-	s.indicators["kri-007"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-007", &RiskIndicator{
 		IndicatorID:   "kri-007",
 		TenantID:      tenantID,
 		IndicatorName: "Core Banking System Availability",
@@ -150,10 +150,10 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Fraud Loss Rate
-	s.indicators["kri-008"] = &RiskIndicator{
+	s.indicators.seed(tenantID, "kri-008", &RiskIndicator{
 		IndicatorID:   "kri-008",
 		TenantID:      tenantID,
 		IndicatorName: "Fraud Loss Rate",
@@ -168,16 +168,18 @@ func (s *IndicatorService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 }
 
 // ListIndicators returns indicators based on filters
-func (s *IndicatorService) ListIndicators(tenantID, category string) []*RiskIndicator {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *IndicatorService) ListIndicators(tenantID, category string) ([]*RiskIndicator, error) {
 
 	var result []*RiskIndicator
-	for _, indicator := range s.indicators {
+	__ALL__, __ERR__ := s.indicators.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, indicator := range __ALL__ {
 		if indicator.TenantID != tenantID {
 			continue
 		}
@@ -186,16 +188,14 @@ func (s *IndicatorService) ListIndicators(tenantID, category string) []*RiskIndi
 		}
 		result = append(result, indicator)
 	}
-	return result
+	return result, nil
 }
 
 // GetIndicator retrieves an indicator by ID
 func (s *IndicatorService) GetIndicator(tenantID, indicatorID string) (*RiskIndicator, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	indicator, exists := s.indicators[indicatorID]
-	if !exists || indicator.TenantID != tenantID {
+	indicator, err := s.indicators.get(tenantID, indicatorID)
+	if err != nil {
 		return nil, errors.New("indicator not found")
 	}
 	return indicator, nil
@@ -203,8 +203,6 @@ func (s *IndicatorService) GetIndicator(tenantID, indicatorID string) (*RiskIndi
 
 // CreateIndicator creates a new indicator
 func (s *IndicatorService) CreateIndicator(tenantID string, indicator *RiskIndicator) (*RiskIndicator, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	indicator.IndicatorID = uuid.New().String()
 	indicator.TenantID = tenantID
@@ -215,17 +213,17 @@ func (s *IndicatorService) CreateIndicator(tenantID string, indicator *RiskIndic
 	// Calculate status
 	indicator.Status = s.calculateStatus(indicator)
 
-	s.indicators[indicator.IndicatorID] = indicator
+	if err := s.indicators.put(tenantID, indicator.IndicatorID, indicator); err != nil {
+		return nil, err
+	}
 	return indicator, nil
 }
 
 // UpdateIndicator updates an indicator
 func (s *IndicatorService) UpdateIndicator(indicator *RiskIndicator) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.indicators[indicator.IndicatorID]
-	if !exists || existing.TenantID != indicator.TenantID {
+	existing, err := s.indicators.get(indicator.TenantID, indicator.IndicatorID)
+	if err != nil {
 		return errors.New("indicator not found")
 	}
 
@@ -236,8 +234,7 @@ func (s *IndicatorService) UpdateIndicator(indicator *RiskIndicator) error {
 	// Calculate status
 	indicator.Status = s.calculateStatus(indicator)
 
-	s.indicators[indicator.IndicatorID] = indicator
-	return nil
+	return s.indicators.put(indicator.TenantID, indicator.IndicatorID, indicator)
 }
 
 func (s *IndicatorService) calculateStatus(indicator *RiskIndicator) string {
@@ -265,14 +262,16 @@ func (s *IndicatorService) calculateStatus(indicator *RiskIndicator) string {
 }
 
 // GetDashboard returns KRI dashboard summary
-func (s *IndicatorService) GetDashboard(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *IndicatorService) GetDashboard(tenantID string) (map[string]interface{}, error) {
 
 	var greenCount, amberCount, redCount int
 	byCategory := make(map[string][]map[string]interface{})
 
-	for _, indicator := range s.indicators {
+	__ALL__, __ERR__ := s.indicators.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, indicator := range __ALL__ {
 		if indicator.TenantID != tenantID {
 			continue
 		}
@@ -303,17 +302,19 @@ func (s *IndicatorService) GetDashboard(tenantID string) map[string]interface{} 
 		"redIndicators":   redCount,
 		"byCategory":      byCategory,
 		"timestamp":       time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetTrends returns KRI trends
-func (s *IndicatorService) GetTrends(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *IndicatorService) GetTrends(tenantID string) (map[string]interface{}, error) {
 
 	trends := make(map[string][]map[string]interface{})
 
-	for _, indicator := range s.indicators {
+	__ALL__, __ERR__ := s.indicators.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, indicator := range __ALL__ {
 		if indicator.TenantID != tenantID {
 			continue
 		}
@@ -336,5 +337,5 @@ func (s *IndicatorService) GetTrends(tenantID string) map[string]interface{} {
 	return map[string]interface{}{
 		"trends":    trends,
 		"timestamp": time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

@@ -137,19 +137,41 @@ const (
 	maxAuditEntries    = 2000
 )
 
-// appendRecord appends to the in-memory store, evicting the oldest entries
-// once the store exceeds maxInMemoryRecords (bounded store, GPT-06).
-func appendRecord(rec Record) {
+// appendRecord persists to Postgres FIRST (PG-authoritative, W12-C3P2B1) and
+// updates the bounded in-memory mirror only after a successful INSERT. When no
+// database is configured the service runs in documented degraded-memory mode
+// and the mirror is the only copy. An error means the record was NOT persisted
+// and NOT mirrored; callers must fail the request (503).
+func appendRecord(rec Record) error {
+	if db != nil {
+		dataBytes, merr := json.Marshal(rec.Data)
+		if merr != nil {
+			return merr
+		}
+		if err := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); err != nil {
+			return err
+		}
+	}
 	records = append(records, rec)
 	if len(records) > maxInMemoryRecords {
 		copy(records, records[len(records)-maxInMemoryRecords:])
 		records = records[:maxInMemoryRecords]
 	}
+	return nil
 }
 
-// appendAudit appends to the audit log, evicting the oldest entries once the
-// log exceeds maxAuditEntries (bounded store, GPT-06).
+// appendAudit persists to the audit_log table FIRST (PG-authoritative,
+// W12-C3P2B1) and updates the bounded in-memory mirror only after a successful
+// INSERT; on insert failure the entry is deliberately NOT mirrored so the
+// memory mirror never claims durability Postgres does not have. When no
+// database is configured the mirror is the only copy (degraded-memory mode).
 func appendAudit(e AuditEntry) {
+	if db != nil {
+		if err := dbAuditInsert(e); err != nil {
+			log.Printf("[%s] audit_log insert failed - entry NOT mirrored in memory: %v", serviceName, err)
+			return
+		}
+	}
 	auditLog = append(auditLog, e)
 	if len(auditLog) > maxAuditEntries {
 		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
@@ -250,10 +272,15 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("nirsal-credit-guarantee-go: DB query failed, falling back to in-memory: %v", err)
 	}
-	// In-memory fallback
+	// Degraded-mode fallback (W12-C3P2B1): Postgres is authoritative; the
+	// bounded in-memory mirror is served only when the database is unreachable
+	// or not configured, and the response is explicitly marked as degraded.
+	if db == nil {
+		log.Printf("[%s] no database configured - records served from degraded memory mirror", serviceName)
+	}
 	mu.RLock()
 	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "in-memory"})
+	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "degraded-memory"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -293,16 +320,13 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if rec.Type == "" {
 		rec.Type = "primary"
 	}
-	appendRecord(rec)
+	if err := appendRecord(rec); err != nil {
+		log.Printf("[%s] record INSERT failed - record NOT created: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not created"})
+		return
+	}
 	publishDomainEvent("nirsal-credit-guarantee.created", rec.TenantID, rec)
 	domainStats.TotalRecords = len(records)
-
-	// Persist to database
-	if dataBytes, err := json.Marshal(rec.Data); err == nil {
-		if dbErr := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); dbErr != nil {
-			log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-		}
-	}
 
 	appendAudit(AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
@@ -327,16 +351,49 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
+			// Build the updated record on a copy FIRST (W12-C3P2B1): the
+			// in-memory mirror is mutated only after Postgres accepts the
+			// write — PG is authoritative, memory is a mirror.
+			updated := records[i]
+			newData := make(map[string]interface{}, len(records[i].Data)+len(body))
+			for k, v := range records[i].Data {
+				newData[k] = v
+			}
+			updated.Data = newData
 			if s := getString(body, "status"); s != "" {
-				records[i].Status = s
+				updated.Status = s
 			}
 			for k, v := range body {
 				if k != "id" {
-					records[i].Data[k] = v
+					updated.Data[k] = v
 				}
 			}
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
+			updated.UpdatedAt = time.Now().Format(time.RFC3339)
+			updated.Version++
+			if db != nil {
+				dataBytes, merr := json.Marshal(updated.Data)
+				if merr != nil {
+					respondJSON(w, 500, map[string]string{"error": "record encode failed"})
+					return
+				}
+				res, uerr := db.Exec("UPDATE service_records SET status = $1, data = $2 WHERE id = $3 AND service = $4", updated.Status, string(dataBytes), id, serviceName)
+				if uerr != nil {
+					log.Printf("[%s] record UPDATE failed - record NOT updated: %v", serviceName, uerr)
+					respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not updated"})
+					return
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					// Row absent in PG (created before the flip or in degraded
+					// mode): backfill via INSERT so PG is authoritative from
+					// this write onward.
+					if ierr := dbInsert(updated.ID, serviceName, updated.Type, updated.Status, dataBytes); ierr != nil {
+						log.Printf("[%s] record UPDATE backfill INSERT failed - record NOT updated: %v", serviceName, ierr)
+						respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not updated"})
+						return
+					}
+				}
+			}
+			records[i] = updated
 			appendAudit(AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
@@ -358,9 +415,30 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
+	// PG-authoritative read (W12-C3P2B1): the audit log is served from
+	// Postgres. The bounded in-memory log is only a degraded-mode fallback
+	// mirror and is explicitly marked as such.
+	if db != nil {
+		rows, err := db.Query("SELECT id, action, record_id, actor, timestamp, details FROM audit_log WHERE service = $1 ORDER BY created_at DESC LIMIT 100", serviceName)
+		if err == nil {
+			defer rows.Close()
+			items := []map[string]interface{}{}
+			for rows.Next() {
+				var id, action, recordID, actor, ts, details string
+				if rows.Scan(&id, &action, &recordID, &actor, &ts, &details) == nil {
+					items = append(items, map[string]interface{}{"id": id, "action": action, "recordId": recordID, "actor": actor, "timestamp": ts, "details": details})
+				}
+			}
+			respondJSON(w, 200, map[string]interface{}{"auditLog": items, "total": len(items), "source": "database"})
+			return
+		}
+		log.Printf("[%s] audit_log query failed - degraded-memory fallback: %v", serviceName, err)
+	} else {
+		log.Printf("[%s] no database configured - audit log served from degraded memory mirror", serviceName)
+	}
 	mu.RLock()
 	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
+	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog), "source": "degraded-memory"})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +562,31 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 // --- Database Layer ---
 var db *sql.DB
+
+// ensureRecordsSchemaW12 creates the PG-authoritative record/audit stores
+// (W12-C3P2B1). Idempotent; no-op when the service runs without a database
+// (documented degraded-memory mode).
+func ensureRecordsSchemaW12() {
+	if db == nil {
+		return
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`); err != nil {
+		log.Printf("[%s] service_records schema init failed: %v", serviceName, err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS audit_log (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, action TEXT NOT NULL,
+		record_id TEXT DEFAULT '', actor TEXT DEFAULT '', timestamp TEXT DEFAULT '',
+		details TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[%s] audit_log schema init failed: %v", serviceName, err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_svc_created ON audit_log(service, created_at DESC)`)
+}
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -1091,8 +1194,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO loans (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1100,10 +1210,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"loans.created", id, string(payload))
+		"loans.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1140,7 +1260,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE loans SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1148,25 +1275,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"loans.updated", id, string(payload))
+		"loans.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE loans SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"loans.deleted", id, `{"id":"`+id+`"}`)
+		"loans.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1440,6 +1596,7 @@ func main() {
 		port = "9397"
 	}
 	initDB()
+	ensureRecordsSchemaW12()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
@@ -1447,17 +1604,17 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "view", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/nirsal-credit-guarantee/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
-	mux.Handle("/v1/nirsal-credit-guarantee/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
-	mux.Handle("/v1/nirsal-credit-guarantee/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
-	mux.Handle("/v1/nirsal-credit-guarantee/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
-	mux.Handle("/v1/nirsal-credit-guarantee/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
-	mux.Handle("/v1/nirsal-credit-guarantee/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/nirsal-credit-guarantee/compute-emi", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(nirsal_credit_guaranteeEMIHandler)))
-	mux.Handle("/v1/nirsal-credit-guarantee/credit-check", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(nirsal_credit_guaranteeCreditCheckHandler)))
+	mux.Handle("/v1/nirsal-credit-guarantee/list", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "view", http.HandlerFunc(handleList))))
+	mux.Handle("/v1/nirsal-credit-guarantee/create", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "create", http.HandlerFunc(handleCreate))))
+	mux.Handle("/v1/nirsal-credit-guarantee/update", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "update", http.HandlerFunc(handleUpdate))))
+	mux.Handle("/v1/nirsal-credit-guarantee/process", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "process", http.HandlerFunc(handleProcess))))
+	mux.Handle("/v1/nirsal-credit-guarantee/audit", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "view", http.HandlerFunc(handleAudit))))
+	mux.Handle("/v1/nirsal-credit-guarantee/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "view", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/nirsal-credit-guarantee/compute-emi", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "compute_emi", http.HandlerFunc(nirsal_credit_guaranteeEMIHandler))))
+	mux.Handle("/v1/nirsal-credit-guarantee/credit-check", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("nirsal_credit_guarantee", "credit_check", http.HandlerFunc(nirsal_credit_guaranteeCreditCheckHandler))))
 	log.Printf("Nirsal Credit Guarantee v2.0 (Agriculture) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1547,6 +1704,17 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+}
+
+// dbAuditInsert persists one audit entry to the shared audit_log table
+// (W12-C3P2B1).
+func dbAuditInsert(e AuditEntry) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO audit_log (id, service, action, record_id, actor, timestamp, details) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+		e.ID, serviceName, e.Action, e.RecordID, e.Actor, e.Timestamp, e.Details)
+	return err
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {

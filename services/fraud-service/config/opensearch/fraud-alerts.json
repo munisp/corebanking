@@ -1,0 +1,61 @@
+{
+  "_readme": "W12 B5-P1-F: OpenSearch index mapping for fraud alerts (replaces customer_id/description/alert_type ILIKE in fraud-service main.py list_fraud_alerts). Documents are dual-written with the INSERT INTO fraud_alerts flow and backfilled from Postgres (source of truth) on boot / via POST /api/v1/fraud/opensearch/reindex; natural _id = alert_id. Analyzer note: compose image opensearchproject/opensearch:2.19.0 has NO phonetic plugin; built-in edge_ngram + match fuzziness=AUTO are used instead. max_ngram_diff must be >= (max_gram - min_gram).",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "max_ngram_diff": 9,
+    "analysis": {
+      "tokenizer": {
+        "id_edge_tokenizer": {
+          "type": "edge_ngram",
+          "min_gram": 3,
+          "max_gram": 12,
+          "token_chars": ["letter", "digit"]
+        }
+      },
+      "analyzer": {
+        "id_index_analyzer": {
+          "type": "custom",
+          "tokenizer": "id_edge_tokenizer",
+          "filter": ["lowercase", "asciifolding"]
+        },
+        "id_search_analyzer": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "_meta": {
+      "owner": "fraud-service",
+      "source_table": "fraud_alerts",
+      "natural_id": "alert_id",
+      "wave": "W12-B5-P1-F"
+    },
+    "properties": {
+      "alert_id": {"type": "keyword"},
+      "tenant_id": {"type": "keyword"},
+      "customer_id": {
+        "type": "text",
+        "analyzer": "id_index_analyzer",
+        "search_analyzer": "id_search_analyzer",
+        "fields": {"raw": {"type": "keyword"}}
+      },
+      "alert_type": {
+        "type": "text",
+        "analyzer": "standard",
+        "fields": {"raw": {"type": "keyword"}}
+      },
+      "severity": {"type": "keyword"},
+      "status": {"type": "keyword"},
+      "description": {"type": "text", "analyzer": "standard"},
+      "related_entities": {"type": "text", "analyzer": "standard"},
+      "assigned_to": {"type": "keyword"},
+      "resolution_notes": {"type": "text", "analyzer": "standard"},
+      "created_at": {"type": "date"},
+      "resolved_at": {"type": "date"}
+    }
+  }
+}

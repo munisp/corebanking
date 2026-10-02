@@ -18,5 +18,31 @@ const config: CrudConfig = {
   ],
   idField: "id", statusField: "enabled", searchFields: ["name", "category", "scenarioCode"],
   apiBase: "/txn-monitoring-rules/api/rules",
+  // W12 A4-P1-A: wire previously-orphaned GET /api/alerts and GET /api/cases.
+  tabs: [
+    {
+      key: "alerts", label: "Alerts", apiBase: "/txn-monitoring-rules/api/alerts",
+      columns: [
+        { key: "id", label: "Alert ID", sortable: true },
+        { key: "rule_id", label: "Rule" },
+        { key: "customer_id", label: "Customer" },
+        { key: "transaction_id", label: "Transaction" },
+        { key: "severity", label: "Severity", sortable: true },
+        { key: "status", label: "Status", sortable: true },
+        { key: "created_at", label: "Raised", sortable: true },
+      ],
+    },
+    {
+      key: "cases", label: "Cases", apiBase: "/txn-monitoring-rules/api/cases",
+      columns: [
+        { key: "id", label: "Case ID", sortable: true },
+        { key: "customer_id", label: "Customer" },
+        { key: "status", label: "Status", sortable: true },
+        { key: "sar_filed", label: "SAR Filed" },
+        { key: "assigned_to", label: "Assigned To" },
+        { key: "created_at", label: "Opened", sortable: true },
+      ],
+    },
+  ],
 };
 export default function TxnMonitoringRulesWorkspace() { return <CrudWorkspace config={config} />; }

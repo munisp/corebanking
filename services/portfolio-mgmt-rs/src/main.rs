@@ -1,6 +1,7 @@
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpMessage, HttpResponse, HttpServer}; // Wave-12 drive-by: HttpMessage import required by actix-web resolved in the lockfile
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::types::Json;
+use sqlx::PgPool;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct MiddlewareConfig {
@@ -24,22 +25,31 @@ fn mw() -> MiddlewareConfig {
     MiddlewareConfig {
         kafka_broker: std::env::var("KAFKA_BROKER").unwrap_or_else(|_| "localhost:9092".into()),
         redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into()),
-        postgres_url: std::env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials"),
-        opensearch_url: std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into()),
-        keycloak_url: std::env::var("KEYCLOAK_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
-        permify_url: std::env::var("PERMIFY_URL").unwrap_or_else(|_| "http://localhost:3476".into()),
+        postgres_url: std::env::var("DATABASE_URL").expect(
+            "DATABASE_URL must be set - refusing to boot with default database credentials",
+        ),
+        opensearch_url: std::env::var("OPENSEARCH_URL")
+            .unwrap_or_else(|_| "http://localhost:9200".into()),
+        keycloak_url: std::env::var("KEYCLOAK_URL")
+            .unwrap_or_else(|_| "http://localhost:8080".into()),
+        permify_url: std::env::var("PERMIFY_URL")
+            .unwrap_or_else(|_| "http://localhost:3476".into()),
         dapr_url: std::env::var("DAPR_URL").unwrap_or_else(|_| "http://localhost:3500".into()),
         fluvio_url: std::env::var("FLUVIO_URL").unwrap_or_else(|_| "localhost:9003".into()),
         temporal_url: std::env::var("TEMPORAL_URL").unwrap_or_else(|_| "localhost:7233".into()),
-        mojaloop_url: std::env::var("MOJALOOP_URL").unwrap_or_else(|_| "http://localhost:3002".into()),
-        tigerbeetle_url: std::env::var("TIGERBEETLE_URL").unwrap_or_else(|_| "localhost:3000".into()),
-        lakehouse_url: std::env::var("LAKEHOUSE_URL").unwrap_or_else(|_| "http://localhost:8181".into()),
+        mojaloop_url: std::env::var("MOJALOOP_URL")
+            .unwrap_or_else(|_| "http://localhost:3002".into()),
+        tigerbeetle_url: std::env::var("TIGERBEETLE_URL")
+            .unwrap_or_else(|_| "localhost:3000".into()),
+        lakehouse_url: std::env::var("LAKEHOUSE_URL")
+            .unwrap_or_else(|_| "http://localhost:8181".into()),
         apisix_url: std::env::var("APISIX_URL").unwrap_or_else(|_| "http://localhost:9080".into()),
-        openappsec_url: std::env::var("OPENAPPSEC_URL").unwrap_or_else(|_| "http://localhost:4000".into()),
+        openappsec_url: std::env::var("OPENAPPSEC_URL")
+            .unwrap_or_else(|_| "http://localhost:4000".into()),
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct Portfolio {
     id: String,
     portfolio_name: String,
@@ -48,7 +58,9 @@ struct Portfolio {
     portfolio_type: String,
     currency: String,
     total_aum: f64,
-    asset_allocation: Vec<AssetAlloc>,
+    // Stored as JSONB; sqlx::types::Json is serde-transparent so the API
+    // payload shape is unchanged.
+    asset_allocation: Json<Vec<AssetAlloc>>,
     benchmark: String,
     ytd_return: f64,
     risk_score: f64,
@@ -64,33 +76,102 @@ struct AssetAlloc {
 }
 
 fn seed() -> Vec<Portfolio> {
-    vec![
-        Portfolio {
-            id: "PF-001".into(),
-            portfolio_name: "Conservative Income Fund".into(),
-            client_name: "Dangote Industries Ltd".into(),
-            client_id: "C-001".into(),
-            portfolio_type: "institutional".into(),
-            currency: "NGN".into(),
-            total_aum: 50_000_000_000.0,
-            asset_allocation: vec![
-                AssetAlloc { asset_class: "fgn_bonds".into(), weight: 45.0, value: 22_500_000_000.0 },
-                AssetAlloc { asset_class: "treasury_bills".into(), weight: 30.0, value: 15_000_000_000.0 },
-                AssetAlloc { asset_class: "money_market".into(), weight: 15.0, value: 7_500_000_000.0 },
-                AssetAlloc { asset_class: "equities".into(), weight: 10.0, value: 5_000_000_000.0 },
-            ],
-            benchmark: "S&P/FMDQ Nigerian Bond Index".into(),
-            ytd_return: 8.75,
-            risk_score: 3.2,
-            inception_date: "2023-01-15".into(),
-            status: "active".into(),
-        }
-    ]
+    vec![Portfolio {
+        id: "PF-001".into(),
+        portfolio_name: "Conservative Income Fund".into(),
+        client_name: "Dangote Industries Ltd".into(),
+        client_id: "C-001".into(),
+        portfolio_type: "institutional".into(),
+        currency: "NGN".into(),
+        total_aum: 50_000_000_000.0,
+        asset_allocation: Json(vec![
+            AssetAlloc {
+                asset_class: "fgn_bonds".into(),
+                weight: 45.0,
+                value: 22_500_000_000.0,
+            },
+            AssetAlloc {
+                asset_class: "treasury_bills".into(),
+                weight: 30.0,
+                value: 15_000_000_000.0,
+            },
+            AssetAlloc {
+                asset_class: "money_market".into(),
+                weight: 15.0,
+                value: 7_500_000_000.0,
+            },
+            AssetAlloc {
+                asset_class: "equities".into(),
+                weight: 10.0,
+                value: 5_000_000_000.0,
+            },
+        ]),
+        benchmark: "S&P/FMDQ Nigerian Bond Index".into(),
+        ytd_return: 8.75,
+        risk_score: 3.2,
+        inception_date: "2023-01-15".into(),
+        status: "active".into(),
+    }]
 }
 
+// Wave-12 (C3-P0-B5): Postgres is the sole portfolio store (was: in-memory
+// Mutex<Vec<Portfolio>> lost on every restart). Typed columns, with the nested
+// asset_allocation breakdown as JSONB; DDL at startup per repo convention.
 struct AppState {
-    portfolios: Mutex<Vec<Portfolio>>,
+    db: PgPool,
 }
+
+async fn init_db(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS portfolios (
+            id TEXT PRIMARY KEY,
+            portfolio_name TEXT NOT NULL,
+            client_name TEXT NOT NULL DEFAULT '',
+            client_id TEXT NOT NULL DEFAULT '',
+            portfolio_type TEXT NOT NULL DEFAULT '',
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            total_aum DOUBLE PRECISION NOT NULL DEFAULT 0,
+            asset_allocation JSONB NOT NULL DEFAULT '[]',
+            benchmark TEXT NOT NULL DEFAULT '',
+            ytd_return DOUBLE PRECISION NOT NULL DEFAULT 0,
+            risk_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+            inception_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("portfolio-mgmt-rs: portfolios DDL failed: {}", e);
+    }
+}
+
+/// Idempotent seed of the reference portfolio (was: in-memory seed on every
+/// boot). ON CONFLICT DO NOTHING so restarts never duplicate or overwrite.
+async fn seed_to_db(pool: &PgPool) {
+    for p in seed() {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO portfolios (id, portfolio_name, client_name, client_id, portfolio_type,
+                currency, total_aum, asset_allocation, benchmark, ytd_return, risk_score, inception_date, status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&p.id).bind(&p.portfolio_name).bind(&p.client_name).bind(&p.client_id)
+        .bind(&p.portfolio_type).bind(&p.currency).bind(p.total_aum).bind(&p.asset_allocation)
+        .bind(&p.benchmark).bind(p.ytd_return).bind(p.risk_score).bind(&p.inception_date).bind(&p.status)
+        .execute(pool)
+        .await
+        {
+            eprintln!("portfolio-mgmt-rs: seed portfolio {} failed: {}", p.id, e);
+        }
+    }
+}
+
+const PORTFOLIO_SELECT: &str =
+    "SELECT id, portfolio_name, client_name, client_id, portfolio_type, currency, total_aum,
+        asset_allocation, benchmark, ytd_return, risk_score, inception_date, status
+     FROM portfolios ORDER BY id";
 
 async fn healthz() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
@@ -101,30 +182,40 @@ async fn healthz() -> HttpResponse {
 }
 
 async fn list_portfolios(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let p = match data.portfolios.lock() {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    let p = match sqlx::query_as::<_, Portfolio>(PORTFOLIO_SELECT)
+        .fetch_all(&data.db)
+        .await
+    {
         Ok(v) => v,
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(
-                serde_json::json!({ "error": "failed to acquire lock" })
-            );
+        Err(e) => {
+            eprintln!("portfolio-mgmt-rs: list_portfolios query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({ "error": "portfolio_store_unavailable" }));
         }
     };
 
     HttpResponse::Ok().json(serde_json::json!({
-        "items": *p,
+        "items": p,
         "total": p.len()
     }))
 }
 
 async fn get_performance(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let p = match data.portfolios.lock() {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    let p = match sqlx::query_as::<_, Portfolio>(PORTFOLIO_SELECT)
+        .fetch_all(&data.db)
+        .await
+    {
         Ok(v) => v,
-        Err(_) => {
-            return HttpResponse::InternalServerError().json(
-                serde_json::json!({ "error": "failed to acquire lock" })
-            );
+        Err(e) => {
+            eprintln!("portfolio-mgmt-rs: get_performance query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({ "error": "portfolio_store_unavailable" }));
         }
     };
 
@@ -173,7 +264,8 @@ struct JwksCacheEntry {
     keys: jsonwebtoken::jwk::JwkSet,
 }
 
-static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> =
+    std::sync::OnceLock::new();
 
 fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
     JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
@@ -186,9 +278,10 @@ fn jwks_url() -> Option<String> {
         }
     }
     match std::env::var("KEYCLOAK_REALM_URL") {
-        Ok(realm) if !realm.is_empty() => {
-            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
-        }
+        Ok(realm) if !realm.is_empty() => Some(format!(
+            "{}/protocol/openid-connect/certs",
+            realm.trim_end_matches('/')
+        )),
         _ => None,
     }
 }
@@ -198,10 +291,12 @@ async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpRespon
     let url = match jwks_url() {
         Some(u) => u,
         None => {
-            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                "error": "jwt_validation_unavailable",
-                "detail": "no JWKS endpoint configured"
-            })))
+            return Err(
+                actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "error": "jwt_validation_unavailable",
+                    "detail": "no JWKS endpoint configured"
+                })),
+            )
         }
     };
     {
@@ -215,27 +310,38 @@ async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpRespon
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "client init failed"
-        })))?;
+        .map_err(|_| {
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "client init failed"
+            }))
+        })?;
     let resp = client.get(&url).send().await.map_err(|_| {
-        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+        actix_web::HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "jwks_unavailable"}))
     })?;
     if !resp.status().is_success() {
-        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "upstream returned error status"
-        })));
+        return Err(
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "upstream returned error status"
+            })),
+        );
     }
-    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
-        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "malformed JWKS payload"
-        }))
-    })?;
+    let keys = resp
+        .json::<jsonwebtoken::jwk::JwkSet>()
+        .await
+        .map_err(|_| {
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "malformed JWKS payload"
+            }))
+        })?;
     let mut cache = jwks_cache().lock().unwrap();
-    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    *cache = Some(JwksCacheEntry {
+        fetched_at: std::time::Instant::now(),
+        keys: keys.clone(),
+    });
     Ok(keys)
 }
 
@@ -253,13 +359,18 @@ fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
 }
 
 async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
-    let header = jsonwebtoken::decode_header(token)
-        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    let header = jsonwebtoken::decode_header(token).map_err(|_| {
+        actix_web::HttpResponse::Unauthorized()
+            .json(serde_json::json!({"error": "malformed token header"}))
+    })?;
     match header.alg {
         jsonwebtoken::Algorithm::RS256 => {
             let kid = match header.kid.clone() {
                 Some(k) if !k.is_empty() => k,
-                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+                _ => {
+                    return Err(actix_web::HttpResponse::Unauthorized()
+                        .json(serde_json::json!({"error": "missing kid"})))
+                }
             };
             // JWKS outage => 503 (fail closed). Unknown kid => force one cache
             // refresh (key rotation), then 401 if still unknown.
@@ -275,20 +386,24 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
                     match refreshed.find(&kid) {
                         Some(j) => j.clone(),
                         None => {
-                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                            return Err(actix_web::HttpResponse::Unauthorized()
+                                .json(serde_json::json!({"error": "unknown kid"})))
                         }
                     }
                 }
             };
-            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
-                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk).map_err(|_| {
+                actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid jwk"}))
+            })?;
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
             validation.validate_exp = true;
             validation.validate_nbf = true;
             apply_iss_aud(&mut validation);
             match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
                 Ok(data) => Ok(data.claims),
-                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid or expired token"}))),
             }
         }
         jsonwebtoken::Algorithm::HS256 => {
@@ -296,10 +411,12 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
             let secret = match std::env::var("JWT_SECRET") {
                 Ok(s) if !s.is_empty() => s,
                 _ => {
-                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                        "error": "jwt_validation_unavailable",
-                        "detail": "JWT_SECRET is not configured; refusing to validate"
-                    })))
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(
+                        serde_json::json!({
+                            "error": "jwt_validation_unavailable",
+                            "detail": "JWT_SECRET is not configured; refusing to validate"
+                        }),
+                    ))
                 }
             };
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -312,27 +429,47 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
                 &validation,
             ) {
                 Ok(data) => Ok(data.claims),
-                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid or expired token"}))),
             }
         }
-        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
-            "error": format!("unsupported alg {:?}", other)
-        }))),
+        other => Err(
+            actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+                "error": format!("unsupported alg {:?}", other)
+            })),
+        ),
     }
 }
 
-async fn check_jwt(req: &actix_web::HttpRequest) -> Result<serde_json::Value, actix_web::HttpResponse> {
+async fn check_jwt(
+    req: &actix_web::HttpRequest,
+) -> Result<serde_json::Value, actix_web::HttpResponse> {
     let path = req.path();
-    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
+    if path == "/healthz"
+        || path == "/readyz"
+        || path == "/livez"
+        || path == "/metrics"
+        || path == "/health"
+    {
         return Ok(serde_json::json!({}));
     }
-    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+    let header = match req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(h) => h,
-        None => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+        None => {
+            return Err(actix_web::HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "missing Authorization header"})))
+        }
     };
     let token = match header.strip_prefix("Bearer ") {
         Some(t) if !t.is_empty() => t,
-        _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+        _ => {
+            return Err(actix_web::HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "invalid auth header"})))
+        }
     };
     let claims = verify_jwt_token(token).await?;
     req.extensions_mut().insert(VerifiedClaims(claims.clone()));
@@ -360,9 +497,18 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .unwrap_or(8167);
 
-    let data = web::Data::new(AppState {
-        portfolios: Mutex::new(seed()),
-    });
+    // Wave-12 (C3-P0-B5): shared sqlx pool (max 25), aligned with the
+    // tigerbeetle-batch-engine-rs Wave-11 convention; DATABASE_URL is mandatory.
+    let db_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set - refusing to boot with default database credentials");
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_lazy(&db_url)
+        .expect("DATABASE_URL must parse");
+    init_db(&db).await;
+    seed_to_db(&db).await;
+    let data = web::Data::new(AppState { db });
 
     println!("Portfolio Management Service running on port {}", port);
 

@@ -1,7 +1,24 @@
 /**
  * B8: Credit risk scoring engine with PD/LGD/EAD models.
  * Basel III/IFRS 9 compliant expected credit loss (ECL) computation.
+ *
+ * W12-C3-P2-MLIB (c3-1004): the 'assessments' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `credit_assessments`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "credit_assessments";
+
+async function ensureAssessmentsStore(): Promise<void> {
+  await ensureTables("ensureAssessmentsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, ASSESSMENTS_SEED, () => "");
+}
+
 
 export interface CreditRiskAssessment {
   id: string;
@@ -24,7 +41,8 @@ export interface CreditRiskAssessment {
   factors: Array<{ factor: string; score: number; weight: number; contribution: number }>;
 }
 
-const assessments: CreditRiskAssessment[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const ASSESSMENTS_SEED: CreditRiskAssessment[]  = [
   {
     id: "CRA-001", customerId: "CUST-001", customerName: "Aisha Mohammed",
     customerType: "individual", creditScore: 750, creditGrade: "A",
@@ -83,7 +101,9 @@ const assessments: CreditRiskAssessment[] = [
   },
 ];
 
-export function getCreditAssessments() { return assessments; }
+export async function getCreditAssessments(): Promise<CreditRiskAssessment[]> {
+  return pgGuard((async () => { await ensureAssessmentsStore(); return storeList<CreditRiskAssessment>(TABLE); })());
+}
 
 export function computeECL(pd: number, lgd: number, ead: number): { ecl: number; stage: number } {
   const ecl12m = pd * lgd * ead;
@@ -92,7 +112,8 @@ export function computeECL(pd: number, lgd: number, ead: number): { ecl: number;
   return { ecl: Math.round(ecl12m * lifetimeMultiplier * 100) / 100, stage };
 }
 
-export function getPortfolioRiskSummary() {
+export async function getPortfolioRiskSummary() {
+  const assessments = await getCreditAssessments();
   const totalExposure = assessments.reduce((s, a) => s + a.totalExposure, 0);
   const totalECL = assessments.reduce((s, a) => s + a.ecl, 0);
   const byStage = { stage1: 0, stage2: 0, stage3: 0 };

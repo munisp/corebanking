@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"github.com/IBM/sarama"
 	pq "github.com/lib/pq"
@@ -90,6 +92,32 @@ var (
 		},
 	}
 )
+
+const (
+	maxInMemoryRecords = 5000
+	maxAuditEntries    = 2000
+)
+
+// appendRecord appends to the in-memory write-through cache, evicting the
+// oldest entries once the cache exceeds maxInMemoryRecords (bounded store,
+// W12-C3-P0). Postgres (service_records) is the authoritative store.
+func appendRecord(rec Record) {
+	records = append(records, rec)
+	if len(records) > maxInMemoryRecords {
+		copy(records, records[len(records)-maxInMemoryRecords:])
+		records = records[:maxInMemoryRecords]
+	}
+}
+
+// appendAudit appends to the bounded in-memory audit cache. The authoritative
+// audit trail is the audit_log table (W12-C3-P0).
+func appendAudit(e AuditEntry) {
+	auditLog = append(auditLog, e)
+	if len(auditLog) > maxAuditEntries {
+		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
+		auditLog = auditLog[:maxAuditEntries]
+	}
+}
 
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -186,7 +214,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if rec.Type == "" {
 		rec.Type = "primary"
 	}
-	records = append(records, rec)
+	appendRecord(rec) // write-through cache; authoritative row via dbInsert below
 	domainStats.TotalRecords = len(records)
 
 	// Persist to database
@@ -196,11 +224,15 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	auditLog = append(auditLog, AuditEntry{
+	createAudit := AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
-	})
+	}
+	appendAudit(createAudit)
+	if dbErr := dbAuditInsert(createAudit); dbErr != nil {
+		log.Printf("[%s] dbAuditInsert failed: %v", serviceName, dbErr)
+	}
 
 	respondJSON(w, 201, map[string]interface{}{"created": true, "record": rec})
 }
@@ -229,11 +261,21 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
-			auditLog = append(auditLog, AuditEntry{
+			updateAudit := AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
-			})
+			}
+			appendAudit(updateAudit)
+			// W12-C3-P0: updates must hit Postgres (previously memory-only).
+			if dataBytes, mErr := json.Marshal(records[i].Data); mErr == nil {
+				if dbErr := dbUpdate(records[i].ID, serviceName, records[i].Status, dataBytes); dbErr != nil {
+					log.Printf("[%s] dbUpdate failed: %v", serviceName, dbErr)
+				}
+			}
+			if dbErr := dbAuditInsert(updateAudit); dbErr != nil {
+				log.Printf("[%s] dbAuditInsert failed: %v", serviceName, dbErr)
+			}
 			respondJSON(w, 200, map[string]interface{}{"updated": true, "record": records[i]})
 			return
 		}
@@ -250,9 +292,20 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
+	// W12-C3-P0: audit trail is served from Postgres (authoritative); the
+	// bounded in-memory slice is a write-through cache used only when the
+	// database is unavailable (degraded mode).
+	if db != nil {
+		entries, err := dbAuditList(serviceName, 500)
+		if err == nil {
+			respondJSON(w, 200, map[string]interface{}{"auditLog": entries, "total": len(entries), "source": "database"})
+			return
+		}
+		log.Printf("[%s] audit DB query failed, falling back to in-memory cache: %v", serviceName, err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog)})
+	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog), "source": "in-memory-cache"})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -392,23 +445,22 @@ func initDB() {
 		db = nil
 		return
 	}
-	jwtCache.mu.Lock()
-	defer jwtCache.mu.Unlock()
-	for _, k := range jwks.Keys {
-		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
-		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 {
-			continue
-		}
-		var eInt int
-		for _, b := range eBytes {
-			eInt = eInt<<8 | int(b)
-		}
-		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
-		jwtCache.keys[k.Kid] = pub
-	}
-	jwtCache.updated = time.Now()
-	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
+	// W12-C3-P0: authoritative audit trail (was in-memory only).
+	db.Exec(`CREATE TABLE IF NOT EXISTS audit_log (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, action TEXT NOT NULL,
+		record_id TEXT DEFAULT '', actor TEXT DEFAULT '', details TEXT DEFAULT '',
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_svc ON audit_log(service, created_at DESC)`)
 }
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256) — fail-closed ────────────────
@@ -642,44 +694,20 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 				break
 			}
 		}
-		// Verify signature (RS256)
-		signingInput := parts[0] + "." + parts[1]
-		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
-		if err != nil {
-			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		hash := sha256.Sum256([]byte(signingInput))
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
-			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode claims
-		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
-		var claims map[string]interface{}
-		json.Unmarshal(claimsBytes, &claims)
-		// Check expiry
-		exp, ok := claims["exp"].(float64)
-		if !ok {
-			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
-			return
-		}
-		if time.Now().Unix() >= int64(exp) {
-			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
-			return
-		}
-		// Pass claims in context
-		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
-		// overwrite any caller-supplied tenant header and reject tokens that
-		// carry no tenant claim before any query runs.
-		tenant := tenantFromClaims(claims)
-		if tenant == "" {
-			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
-			return
-		}
-		r.Header.Set("X-Tenant-ID", tenant)
-		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -886,8 +914,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -895,10 +930,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
+		"service_configs.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -935,7 +980,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -943,25 +995,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
+		"service_configs.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+		"service_configs.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1279,18 +1360,18 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/alerts", alertsHandler)
-	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
+	mux.HandleFunc("/v1/alerts", permifyAuthzGuard("escrow", "view", alertsHandler))
+	mux.HandleFunc("/v1/degradation", permifyAuthzGuard("escrow", "view", degradationStatusHandler))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/v1/escrow/list", handleList)
-	mux.HandleFunc("/v1/escrow/create", handleCreate)
-	mux.HandleFunc("/v1/escrow/update", handleUpdate)
-	mux.HandleFunc("/v1/escrow/process", handleProcess)
-	mux.HandleFunc("/v1/escrow/audit", handleAudit)
-	mux.HandleFunc("/v1/escrow/stats", handleStats)
-	mux.HandleFunc("/v1/escrow/score", escrowScoreHandler)
-	mux.HandleFunc("/v1/escrow/validate", escrowValidateRequestHandler)
-	mux.HandleFunc("/v1/escrow/evaluate", handleEscrowEvaluate)
+	mux.HandleFunc("/v1/escrow/list", permifyAuthzGuard("escrow", "view", handleList))
+	mux.HandleFunc("/v1/escrow/create", permifyAuthzGuard("escrow", "create", handleCreate))
+	mux.HandleFunc("/v1/escrow/update", permifyAuthzGuard("escrow", "update", handleUpdate))
+	mux.HandleFunc("/v1/escrow/process", permifyAuthzGuard("escrow", "process", handleProcess))
+	mux.HandleFunc("/v1/escrow/audit", permifyAuthzGuard("escrow", "audit", handleAudit))
+	mux.HandleFunc("/v1/escrow/stats", permifyAuthzGuard("escrow", "view", handleStats))
+	mux.HandleFunc("/v1/escrow/score", permifyAuthzGuard("escrow", "score", escrowScoreHandler))
+	mux.HandleFunc("/v1/escrow/validate", permifyAuthzGuard("escrow", "validate", escrowValidateRequestHandler))
+	mux.HandleFunc("/v1/escrow/evaluate", permifyAuthzGuard("escrow", "evaluate", handleEscrowEvaluate))
 	log.Printf("Escrow v2.0 (Payments) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	if tlsEnabled {
@@ -1338,3 +1419,133 @@ func main() {
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+
+// ─── W12-C3-P0 repair: symbols referenced by main()/handlers but missing ───
+
+// jwtAuthMiddleware adapts the realm-aware jwtMiddleware to the single-arg
+// middleware shape used in main().
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return jwtMiddleware(jwtRealmURL(), next)
+}
+
+// traceMiddleware propagates/generates a trace id per request.
+func traceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-Id")
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Circuit-breaker state for callService (mirrors the wave-11 fleet pattern).
+var (
+	_cbOpen         atomic.Bool
+	_cbFailures     atomic.Int64
+	_cbLastFailUnix atomic.Int64
+)
+
+// callService invokes a peer service with bounded retry + circuit breaker.
+func callService(method, url string, body interface{}) (map[string]interface{}, error) {
+	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load())) < 30*time.Second {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	if _cbOpen.Load() {
+		_cbOpen.Store(false)
+		_cbFailures.Store(0)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
+		var req *http.Request
+		if body != nil {
+			j, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cbFailures.Add(1)
+			_cbLastFailUnix.Store(time.Now().UnixNano())
+			if _cbFailures.Load() >= 5 {
+				_cbOpen.Store(true)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			continue
+		}
+		return result, nil
+	}
+	return nil, lastErr
+}
+
+// dbInsert persists a new record to the authoritative service_records table.
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
+}
+
+// dbUpdate persists a record mutation to Postgres (W12-C3-P0: updates were
+// previously memory-only and silently lost on restart).
+func dbUpdate(id, service, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	res, err := db.Exec("UPDATE service_records SET status=$1, data=$2, updated_at=NOW() WHERE id=$3 AND service=$4", status, string(data), id, service)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Row absent (e.g. created before this wave, or cache/DB divergence):
+		// upsert so the authoritative store converges with the mutation.
+		_, err = db.Exec("INSERT INTO service_records (id, service, status, data) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET status=$3, data=$4, updated_at=NOW()", id, service, status, string(data))
+	}
+	return err
+}
+
+// dbAuditInsert appends an entry to the authoritative audit_log table.
+func dbAuditInsert(e AuditEntry) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO audit_log (id, service, action, record_id, actor, details, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+		e.ID, serviceName, e.Action, e.RecordID, e.Actor, e.Details, e.Timestamp)
+	return err
+}
+
+// dbAuditList serves the audit trail from Postgres (authoritative).
+func dbAuditList(service string, limit int) ([]map[string]interface{}, error) {
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
+	rows, err := db.Query("SELECT id, action, record_id, actor, details, created_at FROM audit_log WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []map[string]interface{}{}
+	for rows.Next() {
+		var id, action, recordID, actor, details, ts string
+		if rows.Scan(&id, &action, &recordID, &actor, &details, &ts) == nil {
+			items = append(items, map[string]interface{}{"id": id, "action": action, "recordId": recordID, "actor": actor, "details": details, "timestamp": ts})
+		}
+	}
+	return items, nil
+}

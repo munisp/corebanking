@@ -12,7 +12,7 @@ export default function GLEngineWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/gl-accounts/count")
+    fetch("/api/db/gl-accounts/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

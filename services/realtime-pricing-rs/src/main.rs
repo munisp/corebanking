@@ -1,5 +1,22 @@
 use actix_web::{web,App,HttpServer,HttpResponse,Responder};
+use actix_web::HttpMessage;
 use serde_json::json;
+
+// W12-RUSTFIX: AppState/CreateRequest were referenced by the wave-11 CRUD
+// handlers (update_record/delete_record) but never defined, and main() never
+// wired app_data or the CRUD routes (baseline did not compile). Fleet-canonical
+// shapes; pool initialised in main; update/delete routes registered.
+struct AppState { db: sqlx::PgPool }
+
+#[derive(Debug, serde::Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 use std::env;
 async fn healthz() -> impl Responder { HttpResponse::Ok().json(json!({"status":"healthy","service":"realtime-pricing-rs","port":8343})) }
 async fn config(req: actix_web::HttpRequest) -> impl Responder {
@@ -208,28 +225,58 @@ fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port:u16=env::var("PORT").unwrap_or_else(|_|"8343".into()).parse().unwrap_or(8343);
+    // W12-RUSTFIX: sqlx pool for the CRUD handlers (data.db). Fleet-canonical init.
+    let db: sqlx::PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("realtime-pricing-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[realtime-pricing-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[realtime-pricing-rs] DATABASE_URL not set — DB endpoints will fail");
+            sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+        }
+    };
+    let state = web::Data::new(AppState { db: db.clone() });
     println!("Real-Time Pricing on :{}",port);
-    HttpServer::new(||App::new().route("/healthz",web::get().to(healthz)).route("/api/realtime-pricing/config",web::get().to(config)).route("/api/realtime-pricing/middleware",web::get().to(mw))).bind(("0.0.0.0",port))?.run().await
+    HttpServer::new(move ||App::new().app_data(state.clone()).route("/healthz",web::get().to(healthz)).route("/api/realtime-pricing/config",web::get().to(config)).route("/api/realtime-pricing/middleware",web::get().to(mw)).route("/api/v1/realtime-pricing/records/{id}",web::put().to(update_record)).route("/api/v1/realtime-pricing/records/{id}",web::delete().to(delete_record))).bind(("0.0.0.0",port))?.run().await
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -238,18 +285,28 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }

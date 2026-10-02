@@ -4,6 +4,10 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use actix_web::HttpMessage;
+use actix_web::dev::Service as _;
+use chrono::{DateTime, Utc};
+use std::env;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -23,13 +27,254 @@ struct CreateRequest {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+// W12-RUSTFIX-2: domain types synthesized from constructor/usage sites
+// (generator emitted uses but never the definitions; E0425/E0422).
+// Field types inferred from default_configs()/default_profiles() literals
+// and the handler construction sites below.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SwipePattern {
+    direction: String,
+    avg_velocity: f64,
+    avg_pressure: f64,
+    avg_length_px: f64,
+    frequency: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrientationBaseline {
+    avg_tilt_x: f64,
+    avg_tilt_y: f64,
+    avg_tilt_z: f64,
+    variance_x: f64,
+    variance_y: f64,
+    variance_z: f64,
+    is_stable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BehavioralProfile {
+    customer_id: String,
+    typing_cadence_ms: Vec<f64>,
+    avg_typing_speed: f64,
+    typing_rhythm_signature: Vec<f64>,
+    swipe_patterns: Vec<SwipePattern>,
+    device_orientation_baseline: OrientationBaseline,
+    session_count: u32,
+    anomaly_score: f64,
+    last_updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StepUpConfig {
+    id: String,
+    trigger: String,
+    threshold: u64,
+    methods: Vec<String>,
+    frequency: String,
+    tenant_id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContinuousCheck {
+    id: String,
+    customer_id: String,
+    trigger: String,
+    transaction_amount: u64,
+    methods_applied: Vec<String>,
+    overall_score: f64,
+    passed: bool,
+    device_fingerprint: String,
+    behavioral_score: f64,
+    timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BehavioralCheck {
+    id: String,
+    customer_id: String,
+    typing_score: f64,
+    swipe_score: f64,
+    orientation_score: f64,
+    combined_score: f64,
+    anomalies: Vec<String>,
+    passed: bool,
+    device_info: String,
+    timestamp: String,
+}
+
 struct AppState {
     start_time: Instant,
-    configs: Mutex<Vec<StepUpConfig>>,
-    checks: Mutex<Vec<ContinuousCheck>>,
-    profiles: Mutex<Vec<BehavioralProfile>>,
-    behavioral_checks: Mutex<Vec<BehavioralCheck>>,
+    // W12-C3-PX (c3-0482/c3-0483/c3-0484/c3-0485): the four in-memory
+    // Mutex<Vec<...>> stores (configs/checks/profiles/behavioral_checks) were
+    // removed. Step-up configs, liveness checks, behavioral profiles and
+    // behavioral checks are business data and now live in the Postgres tables
+    // stepup_configs / liveness_checks / behavioral_profiles / behavioral_checks
+    // (DDL + idempotent seed in init_db). All create/list/stats paths read and
+    // write PG; no read-through cache is retained.
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+}
+
+// W12-C3-PX: fail-closed accessor for the shared PG client. Biometric/liveness
+// verification artifacts and step-up policy must never silently live only in
+// memory, so handlers 503 when no database is configured.
+fn pg_client(state: &web::Data<AppState>) -> Result<std::sync::Arc<tokio_postgres::Client>, HttpResponse> {
+    match &state.db_client {
+        Some(c) => Ok(c.clone()),
+        None => Err(HttpResponse::ServiceUnavailable().json(json!({
+            "error": "persistence_unavailable",
+            "detail": "DATABASE_URL is not configured; continuous-liveness data cannot be persisted"
+        }))),
+    }
+}
+
+// W12-C3-PX: default step-up configs as JSON payloads (identical field set to
+// the legacy StepUpConfig seeds). Seeded into stepup_configs at boot with
+// ON CONFLICT DO NOTHING (natural key = config id).
+fn default_stepup_configs_json() -> Vec<serde_json::Value> {
+    vec![
+        json!({"id": "SUC-001", "trigger": "high_value_transfer", "threshold": 5_000_000, "methods": ["passive_3d", "blink_challenge"], "frequency": "per_transaction", "tenant_id": "default", "enabled": true}),
+        json!({"id": "SUC-002", "trigger": "international_transfer", "threshold": 0, "methods": ["passive_3d", "face_match", "smile_challenge"], "frequency": "per_transaction", "tenant_id": "default", "enabled": true}),
+        json!({"id": "SUC-003", "trigger": "new_beneficiary_large", "threshold": 2_000_000, "methods": ["passive_3d"], "frequency": "per_beneficiary", "tenant_id": "default", "enabled": true}),
+        json!({"id": "SUC-004", "trigger": "periodic_tier3_quarterly", "threshold": 0, "methods": ["passive_3d", "face_match", "blink", "smile", "head_turn"], "frequency": "quarterly", "tenant_id": "default", "enabled": true}),
+        json!({"id": "SUC-005", "trigger": "device_change", "threshold": 0, "methods": ["passive_3d", "face_match", "blink_challenge"], "frequency": "per_event", "tenant_id": "default", "enabled": true}),
+        json!({"id": "SUC-006", "trigger": "suspicious_behavior", "threshold": 0, "methods": ["passive_3d", "face_match", "head_turn", "nod"], "frequency": "per_event", "tenant_id": "default", "enabled": true}),
+        json!({"id": "SUC-007", "trigger": "behavioral_anomaly", "threshold": 0, "methods": ["passive_3d", "typing_cadence", "swipe_pattern"], "frequency": "per_event", "tenant_id": "default", "enabled": true}),
+    ]
+}
+
+// W12-C3-PX: default behavioral profile as a JSON payload (identical field set
+// to the legacy BehavioralProfile seed). Natural key = customer_id.
+fn default_profiles_json() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "customer_id": "CUST-001",
+            "typing_cadence_ms": [120.0, 135.0, 110.0, 128.0, 145.0],
+            "avg_typing_speed": 127.6,
+            "typing_rhythm_signature": [0.85, 0.92, 0.78, 0.88, 0.91],
+            "swipe_patterns": [
+                {"direction": "right", "avg_velocity": 450.0, "avg_pressure": 0.65, "avg_length_px": 320.0, "frequency": 45},
+                {"direction": "up", "avg_velocity": 380.0, "avg_pressure": 0.58, "avg_length_px": 480.0, "frequency": 120},
+                {"direction": "down", "avg_velocity": 350.0, "avg_pressure": 0.52, "avg_length_px": 420.0, "frequency": 95},
+            ],
+            "device_orientation_baseline": {
+                "avg_tilt_x": 12.5, "avg_tilt_y": -3.2, "avg_tilt_z": 88.1,
+                "variance_x": 2.1, "variance_y": 1.8, "variance_z": 0.5, "is_stable": true,
+            },
+            "session_count": 245, "anomaly_score": 0.05, "last_updated": "2026-05-09T10:00:00Z",
+        }),
+    ]
+}
+
+// W12-C3-PX: JSON-valued twins of the legacy analysis functions (the legacy
+// typed versions above are retained for the RUSTFIX compile-repair layer).
+fn analyze_typing_j(submitted: &[f64], baseline: &serde_json::Value) -> (f64, Vec<String>) {
+    let cadence: Vec<f64> = baseline.get("typing_cadence_ms").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_f64()).collect()).unwrap_or_default();
+    let avg_speed = baseline.get("avg_typing_speed").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if submitted.is_empty() || cadence.is_empty() || avg_speed <= 0.0 {
+        return (0.5, vec!["insufficient_typing_data".into()]);
+    }
+    let sub_avg: f64 = submitted.iter().sum::<f64>() / submitted.len() as f64;
+    let diff = (sub_avg - avg_speed).abs();
+    let deviation_pct = diff / avg_speed;
+    let score = (1.0 - deviation_pct * 2.0).max(0.0).min(1.0);
+    let mut anomalies = vec![];
+    if deviation_pct > 0.3 {
+        anomalies.push(format!("typing_speed_deviation_{:.0}pct", deviation_pct * 100.0));
+    }
+    (score, anomalies)
+}
+
+fn analyze_swipe_j(velocity: f64, pressure: f64, baseline: &serde_json::Value) -> (f64, Vec<String>) {
+    let patterns: Vec<&serde_json::Value> = baseline.get("swipe_patterns").and_then(|v| v.as_array())
+        .map(|a| a.iter().collect()).unwrap_or_default();
+    if patterns.is_empty() {
+        return (0.5, vec!["no_swipe_baseline".into()]);
+    }
+    let n = patterns.len() as f64;
+    let avg_vel: f64 = patterns.iter().filter_map(|s| s.get("avg_velocity").and_then(|v| v.as_f64())).sum::<f64>() / n;
+    let avg_pres: f64 = patterns.iter().filter_map(|s| s.get("avg_pressure").and_then(|v| v.as_f64())).sum::<f64>() / n;
+    if avg_vel <= 0.0 || avg_pres <= 0.0 {
+        return (0.5, vec!["no_swipe_baseline".into()]);
+    }
+    let vel_diff = ((velocity - avg_vel) / avg_vel).abs();
+    let pres_diff = ((pressure - avg_pres) / avg_pres).abs();
+    let score = (1.0 - (vel_diff + pres_diff) / 2.0).max(0.0).min(1.0);
+    let mut anomalies = vec![];
+    if vel_diff > 0.4 {
+        anomalies.push("swipe_velocity_anomaly".into());
+    }
+    if pres_diff > 0.5 {
+        anomalies.push("swipe_pressure_anomaly".into());
+    }
+    (score, anomalies)
+}
+
+fn analyze_orientation_j(tilt_x: f64, tilt_y: f64, tilt_z: f64, baseline: &serde_json::Value) -> (f64, Vec<String>) {
+    let empty = json!({});
+    let ob = baseline.get("device_orientation_baseline").unwrap_or(&empty);
+    let f = |k: &str| ob.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let dx = (tilt_x - f("avg_tilt_x")).abs();
+    let dy = (tilt_y - f("avg_tilt_y")).abs();
+    let dz = (tilt_z - f("avg_tilt_z")).abs();
+    let score_x = (1.0 - dx / (f("variance_x") * 3.0 + 1.0)).max(0.0);
+    let score_y = (1.0 - dy / (f("variance_y") * 3.0 + 1.0)).max(0.0);
+    let score_z = (1.0 - dz / (f("variance_z") * 3.0 + 1.0)).max(0.0);
+    let score = (score_x + score_y + score_z) / 3.0;
+    let mut anomalies = vec![];
+    if dx > f("variance_x") * 4.0 {
+        anomalies.push("orientation_x_anomaly".into());
+    }
+    if dy > f("variance_y") * 4.0 {
+        anomalies.push("orientation_y_anomaly".into());
+    }
+    if dz > f("variance_z") * 4.0 {
+        anomalies.push("orientation_z_anomaly".into());
+    }
+    (score, anomalies)
+}
+
+// W12-C3-PX: PG read helpers (payload jsonb round-trips via ::text because the
+// tokio-postgres serde_json feature is not enabled in this crate).
+async fn pg_list_payloads(client: &tokio_postgres::Client, table: &str, tenant_id: &str, include_default: bool, limit: i64) -> Result<Vec<serde_json::Value>, tokio_postgres::Error> {
+    let rows = if include_default {
+        client.query(
+            &format!("SELECT payload::text AS payload FROM {} WHERE tenant_id = $1 OR tenant_id = 'default' ORDER BY created_at ASC LIMIT $2", table),
+            &[&tenant_id, &limit],
+        ).await?
+    } else {
+        client.query(
+            &format!("SELECT payload::text AS payload FROM {} WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2", table),
+            &[&tenant_id, &limit],
+        ).await?
+    };
+    Ok(rows.iter()
+        .filter_map(|r| serde_json::from_str::<serde_json::Value>(r.get::<&str, &str>("payload")).ok())
+        .collect())
+}
+
+async fn pg_count(client: &tokio_postgres::Client, table: &str, tenant_id: &str) -> Result<i64, tokio_postgres::Error> {
+    let row = client.query_one(&format!("SELECT count(*) AS n FROM {} WHERE tenant_id = $1", table), &[&tenant_id]).await?;
+    Ok(row.get("n"))
+}
+
+// W12-C3-PX: (total, passed) aggregate for a verification-artifact table.
+async fn pg_passed_agg(client: &tokio_postgres::Client, table: &str, tenant_id: &str) -> Result<(i64, i64), tokio_postgres::Error> {
+    let row = client.query_one(
+        &format!("SELECT count(*) AS n, count(*) FILTER (WHERE (payload->>'passed')::boolean) AS p FROM {} WHERE tenant_id = $1", table),
+        &[&tenant_id],
+    ).await?;
+    Ok((row.get("n"), row.get("p")))
+}
+
+async fn pg_insert_payload(client: &tokio_postgres::Client, table: &str, id: &str, tenant_id: &str, payload: &serde_json::Value) -> Result<(), tokio_postgres::Error> {
+    let payload_str = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+    client.execute(
+        &format!("INSERT INTO {} (id, tenant_id, payload) VALUES ($1, $2, $3::jsonb) ON CONFLICT (id) DO NOTHING", table),
+        &[&id, &tenant_id, &payload_str],
+    ).await?;
+    Ok(())
 }
 
 // ─── Seed Data ──────────────────────────────────────────────────────────────
@@ -153,7 +398,7 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests()
             .insert_header(("Retry-After", "1"))
             .json(serde_json::json!({"error": "rate_limit_exceeded"}));
@@ -207,40 +452,65 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
 
 async fn get_configs(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let configs = state.configs.lock().await;
+    // W12-C3-PX (c3-0482): list reads come from PG (tenant + seeded defaults).
+    let client = match pg_client(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let tenant_id = get_tenant_id(&req);
+    let configs = match pg_list_payloads(&client, "stepup_configs", &tenant_id, true, 500).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
     db_persist(&state, "get_configs", &json!({"action": "get_configs"})).await;
-    HttpResponse::Ok().json(json!({"configs": *configs, "total": configs.len()}))
+    HttpResponse::Ok().json(json!({"configs": &configs, "total": configs.len()}))
 }
 
 async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "liveness", "collection", "evaluate").await { return resp; }
     let _sanitized = sanitize_input("");
     let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
     let trigger = body.get("trigger").and_then(|v| v.as_str()).unwrap_or("high_value_transfer");
     let amount = body.get("transactionAmount").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let configs = state.configs.lock().await;
-    let matching_config = configs.iter().find(|c| c.trigger == trigger && c.enabled && amount >= c.threshold);
+    // W12-C3-PX (c3-0482/c3-0483): configs are evaluated from PG and the
+    // resulting check artifact is persisted to PG (idempotent on its id).
+    let client = match pg_client(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let tenant_id = get_tenant_id(&req);
+    let configs = match pg_list_payloads(&client, "stepup_configs", &tenant_id, true, 500).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
+    let matching_config = configs.into_iter().find(|c| {
+        c.get("trigger").and_then(|v| v.as_str()) == Some(trigger)
+            && c.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
+            && amount >= c.get("threshold").and_then(|v| v.as_u64()).unwrap_or(0)
+    });
 
     match matching_config {
         Some(config) => {
             let score = 0.85 + (rand_u32() % 14) as f64 / 100.0;
             let passed = score >= 0.75;
-            let check = ContinuousCheck {
-                id: format!("CLV-{:08X}", rand_u32()),
-                customer_id: customer_id.to_string(),
-                trigger: trigger.to_string(),
-                transaction_amount: amount,
-                methods_applied: config.methods.clone(),
-                overall_score: score,
-                passed,
-                device_fingerprint: format!("DEV-{:06X}", rand_u32() % 0xFFFFFF),
-                behavioral_score: 0.90 + (rand_u32() % 10) as f64 / 100.0,
-                timestamp: chrono_now(),
-            };
+            let check = json!({
+                "id": format!("CLV-{:08X}", rand_u32()),
+                "customer_id": customer_id,
+                "trigger": trigger,
+                "transaction_amount": amount,
+                "methods_applied": config.get("methods").cloned().unwrap_or(json!([])),
+                "overall_score": score,
+                "passed": passed,
+                "device_fingerprint": format!("DEV-{:06X}", rand_u32() % 0xFFFFFF),
+                "behavioral_score": 0.90 + (rand_u32() % 10) as f64 / 100.0,
+                "timestamp": chrono_now(),
+            });
 
-            let mut checks = state.checks.lock().await;
-            checks.push(check.clone());
+            if let Err(e) = pg_insert_payload(&client, "liveness_checks", check["id"].as_str().unwrap_or(""), &tenant_id, &check).await {
+                return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()}));
+            }
 
     db_persist(&state, "evaluate_step_up", &json!({"action": "evaluate_step_up"})).await;
             HttpResponse::Ok().json(json!({
@@ -263,12 +533,37 @@ async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<A
 
 async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "liveness", "collection", "analyze").await { return resp; }
     let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-    let profiles = state.profiles.lock().await;
-    let profile = profiles.iter().find(|p| p.customer_id == customer_id);
-    let default_profile = default_profiles().into_iter().next().unwrap();
-    let prof = profile.unwrap_or(&default_profile);
+    // W12-C3-PX (c3-0484/c3-0485): the behavioral profile is loaded from PG
+    // (falling back to the seeded CUST-001 default, then the inline seed), and
+    // the resulting check artifact is persisted to PG.
+    let client = match pg_client(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let tenant_id = get_tenant_id(&req);
+    let mut prof: Option<serde_json::Value> = match client.query_opt(
+        "SELECT payload::text AS payload FROM behavioral_profiles WHERE id = $1 LIMIT 1",
+        &[&customer_id],
+    ).await {
+        Ok(Some(row)) => serde_json::from_str::<serde_json::Value>(row.get("payload")).ok(),
+        Ok(None) => None,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
+    if prof.is_none() {
+        prof = match client.query_opt(
+            "SELECT payload::text AS payload FROM behavioral_profiles WHERE id = 'CUST-001' LIMIT 1",
+            &[],
+        ).await {
+            Ok(Some(row)) => serde_json::from_str::<serde_json::Value>(row.get("payload")).ok(),
+            Ok(None) => None,
+            Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+        };
+    }
+    let default_profile = default_profiles_json().into_iter().next().unwrap();
+    let prof = prof.as_ref().unwrap_or(&default_profile);
 
     // Extract typing cadence
     let typing: Vec<f64> = body.get("typingCadenceMs")
@@ -282,9 +577,9 @@ async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data
     let tilt_y = body.get("orientationY").and_then(|v| v.as_f64()).unwrap_or(-3.0);
     let tilt_z = body.get("orientationZ").and_then(|v| v.as_f64()).unwrap_or(88.0);
 
-    let (typing_score, mut anomalies) = analyze_typing(&typing, prof);
-    let (swipe_score, swipe_anomalies) = analyze_swipe(swipe_vel, swipe_pres, prof);
-    let (orient_score, orient_anomalies) = analyze_orientation(tilt_x, tilt_y, tilt_z, &prof.device_orientation_baseline);
+    let (typing_score, mut anomalies) = analyze_typing_j(&typing, prof);
+    let (swipe_score, swipe_anomalies) = analyze_swipe_j(swipe_vel, swipe_pres, prof);
+    let (orient_score, orient_anomalies) = analyze_orientation_j(tilt_x, tilt_y, tilt_z, prof);
 
     anomalies.extend(swipe_anomalies);
     anomalies.extend(orient_anomalies);
@@ -292,21 +587,22 @@ async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data
     let combined = typing_score * 0.35 + swipe_score * 0.30 + orient_score * 0.35;
     let passed = combined >= 0.60 && anomalies.len() < 3;
 
-    let check = BehavioralCheck {
-        id: format!("BHV-{:08X}", rand_u32()),
-        customer_id: customer_id.to_string(),
-        typing_score,
-        swipe_score,
-        orientation_score: orient_score,
-        combined_score: combined,
-        anomalies: anomalies.clone(),
-        passed,
-        device_info: body.get("deviceInfo").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-        timestamp: chrono_now(),
-    };
+    let check = json!({
+        "id": format!("BHV-{:08X}", rand_u32()),
+        "customer_id": customer_id,
+        "typing_score": typing_score,
+        "swipe_score": swipe_score,
+        "orientation_score": orient_score,
+        "combined_score": combined,
+        "anomalies": anomalies,
+        "passed": passed,
+        "device_info": body.get("deviceInfo").and_then(|v| v.as_str()).unwrap_or("unknown"),
+        "timestamp": chrono_now(),
+    });
 
-    let mut beh_checks = state.behavioral_checks.lock().await;
-    beh_checks.push(check.clone());
+    if let Err(e) = pg_insert_payload(&client, "behavioral_checks", check["id"].as_str().unwrap_or(""), &tenant_id, &check).await {
+        return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()}));
+    }
 
     db_persist(&state, "analyze_behavioral", &json!({"action": "analyze_behavioral"})).await;
     HttpResponse::Ok().json(json!({
@@ -318,46 +614,100 @@ async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data
 
 async fn get_profiles(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let profiles = state.profiles.lock().await;
+    // W12-C3-PX (c3-0484): list reads come from PG.
+    let client = match pg_client(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let tenant_id = get_tenant_id(&req);
+    let profiles = match pg_list_payloads(&client, "behavioral_profiles", &tenant_id, true, 500).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
     db_persist(&state, "get_profiles", &json!({"action": "get_profiles"})).await;
-    HttpResponse::Ok().json(json!({"profiles": *profiles, "total": profiles.len()}))
+    HttpResponse::Ok().json(json!({"profiles": &profiles, "total": profiles.len()}))
 }
 
 async fn get_checks(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let checks = state.checks.lock().await;
+    // W12-C3-PX (c3-0483): list reads come from PG.
+    let client = match pg_client(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let tenant_id = get_tenant_id(&req);
+    let checks = match pg_list_payloads(&client, "liveness_checks", &tenant_id, false, 500).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
     db_persist(&state, "get_checks", &json!({"action": "get_checks"})).await;
-    HttpResponse::Ok().json(json!({"checks": *checks, "total": checks.len()}))
+    HttpResponse::Ok().json(json!({"checks": &checks, "total": checks.len()}))
 }
 
 async fn get_behavioral_checks(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let checks = state.behavioral_checks.lock().await;
+    // W12-C3-PX (c3-0485): list reads come from PG.
+    let client = match pg_client(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let tenant_id = get_tenant_id(&req);
+    let checks = match pg_list_payloads(&client, "behavioral_checks", &tenant_id, false, 500).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
     db_persist(&state, "get_behavioral_checks", &json!({"action": "get_behavioral_checks"})).await;
-    HttpResponse::Ok().json(json!({"behavioral_checks": *checks, "total": checks.len()}))
+    HttpResponse::Ok().json(json!({"behavioral_checks": &checks, "total": checks.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let checks = state.checks.lock().await;
-    let beh = state.behavioral_checks.lock().await;
-    let total = checks.len() as f64;
-    let passed = checks.iter().filter(|c| c.passed).count() as f64;
-    let beh_passed = beh.iter().filter(|c| c.passed).count();
+    // W12-C3-PX (c3-0483/c3-0485): stats aggregate from PG (restart-safe).
+    let client = match pg_client(&state) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let tenant_id = get_tenant_id(&req);
+    let (total, passed) = match pg_passed_agg(&client, "liveness_checks", &tenant_id).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
+    let (beh_total, beh_passed) = match pg_passed_agg(&client, "behavioral_checks", &tenant_id).await {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
+    let beh_anomalies: i64 = match client.query_one(
+        "SELECT COALESCE(SUM(jsonb_array_length(COALESCE(payload->'anomalies', '[]'::jsonb))), 0) AS n FROM behavioral_checks WHERE tenant_id = $1",
+        &[&tenant_id],
+    ).await {
+        Ok(r) => r.get("n"),
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
+    let trigger_rows = match client.query(
+        "SELECT payload->>'trigger' AS t, count(*) AS n FROM liveness_checks WHERE tenant_id = $1 GROUP BY 1",
+        &[&tenant_id],
+    ).await {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": e.to_string()})),
+    };
+    let trig_count = |name: &str| trigger_rows.iter()
+        .filter(|r| r.get::<&str, Option<String>>("t").as_deref() == Some(name))
+        .map(|r| r.get::<&str, i64>("n"))
+        .sum::<i64>();
     db_persist(&state, "get_stats", &json!({"action": "get_stats"})).await;
     HttpResponse::Ok().json(json!({
-        "step_up_evaluations": checks.len(),
-        "step_up_passed": passed as u64,
-        "step_up_failed": (total - passed) as u64,
-        "step_up_pass_rate": if total > 0.0 { passed / total } else { 0.0 },
-        "behavioral_checks": beh.len(),
+        "step_up_evaluations": total,
+        "step_up_passed": passed,
+        "step_up_failed": total - passed,
+        "step_up_pass_rate": if total > 0 { passed as f64 / total as f64 } else { 0.0 },
+        "behavioral_checks": beh_total,
         "behavioral_passed": beh_passed,
-        "behavioral_anomalies": beh.iter().map(|c| c.anomalies.len()).sum::<usize>(),
+        "behavioral_anomalies": beh_anomalies,
         "triggers": {
-            "high_value_transfer": checks.iter().filter(|c| c.trigger == "high_value_transfer").count(),
-            "international_transfer": checks.iter().filter(|c| c.trigger == "international_transfer").count(),
-            "device_change": checks.iter().filter(|c| c.trigger == "device_change").count(),
-            "behavioral_anomaly": checks.iter().filter(|c| c.trigger == "behavioral_anomaly").count(),
+            "high_value_transfer": trig_count("high_value_transfer"),
+            "international_transfer": trig_count("international_transfer"),
+            "device_change": trig_count("device_change"),
+            "behavioral_anomaly": trig_count("behavioral_anomaly"),
         }
     }))
 }
@@ -382,8 +732,6 @@ fn chrono_now() -> String {
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -434,6 +782,68 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
                     created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
                 )", &[]).await;
             let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
+            // W12-C3-PX (c3-0482..0485): PG homes for step-up configs, liveness
+            // checks, behavioral profiles and behavioral checks (were: AppState
+            // Mutex<Vec> stores). ids are domain natural keys (SUC-/CLV-/BHV-
+            // codes, customer_id) giving idempotent upserts; tenant ids are
+            // non-UUID strings (get_tenant_id).
+            for ddl in [
+                "CREATE TABLE IF NOT EXISTS stepup_configs (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )",
+                "CREATE TABLE IF NOT EXISTS liveness_checks (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )",
+                "CREATE TABLE IF NOT EXISTS behavioral_profiles (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )",
+                "CREATE TABLE IF NOT EXISTS behavioral_checks (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )",
+                "CREATE INDEX IF NOT EXISTS idx_stepup_configs_tenant ON stepup_configs(tenant_id)",
+                "CREATE INDEX IF NOT EXISTS idx_liveness_checks_tenant ON liveness_checks(tenant_id)",
+                "CREATE INDEX IF NOT EXISTS idx_behavioral_profiles_tenant ON behavioral_profiles(tenant_id)",
+                "CREATE INDEX IF NOT EXISTS idx_behavioral_checks_tenant ON behavioral_checks(tenant_id)",
+            ] {
+                let _ = client.execute(ddl, &[]).await;
+            }
+            // W12-C3-PX: idempotent seed of the legacy default configs/profile
+            // (natural-key ON CONFLICT DO NOTHING) so first-boot behaviour is
+            // unchanged but the data survives restarts and is shared across
+            // replicas.
+            for cfg in default_stepup_configs_json() {
+                let id = cfg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tenant = cfg.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+                let payload = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
+                let _ = client.execute(
+                    "INSERT INTO stepup_configs (id, tenant_id, payload) VALUES ($1, $2, $3::jsonb) ON CONFLICT (id) DO NOTHING",
+                    &[&id, &tenant, &payload],
+                ).await;
+            }
+            for prof in default_profiles_json() {
+                let id = prof.get("customer_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let payload = serde_json::to_string(&prof).unwrap_or_else(|_| "{}".to_string());
+                let _ = client.execute(
+                    "INSERT INTO behavioral_profiles (id, tenant_id, payload) VALUES ($1, 'default', $2::jsonb) ON CONFLICT (id) DO NOTHING",
+                    &[&id, &payload],
+                ).await;
+            }
             Some(client)
         }
         Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
@@ -607,7 +1017,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -790,20 +1200,57 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:continuous-liveness-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:continuous-liveness-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -896,15 +1343,108 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = verified JWT tenant claim
+// (fallback: X-Tenant-Id header, PERMIFY_DEFAULT_TENANT, "bpmgd"), resource =
+// domain entity id, permission per action (schema: canonical v2.perm
+// service_config entity + services/auth-service/schemas/permify/
+// v2-core-domain-rs.fragment). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (services/risk-scoring-rs/src/main.rs).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    use actix_web::HttpMessage as _;
+    let (subject, claim_tenant) = {
+        let ext = req.extensions();
+        match ext.get::<VerifiedClaims>() {
+            Some(c) => (
+                c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ),
+            None => (None, None),
+        }
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8232".to_string());
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        configs: Mutex::new(default_configs()),
-        checks: Mutex::new(Vec::new()),
-        profiles: Mutex::new(default_profiles()),
-        behavioral_checks: Mutex::new(Vec::new()),
             db_client: {
             let db_url = std::env::var("DATABASE_URL").ok();
             if let Some(url) = db_url {
@@ -1028,44 +1568,8 @@ mod tests {
 
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("kyc_records.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("kyc_records.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
-}
+// W12-RUSTFIX-2: removed UNROUTED generator-template handlers `update_record`
+// and `delete_record` (E0609: referenced a non-existent `AppState.db` sqlx pool
+// field and a foreign `kyc_records` table in this liveness service; no route
+// registered either handler — same dead-code class as W12-B5D3's documented
+// removal in watchlist-manager-rs / wire-transfer-monitor-rs).

@@ -12,7 +12,7 @@ export default function BranchOperationsWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/agent-banking-agents/count")
+    fetch("/api/db/agent-banking-agents/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

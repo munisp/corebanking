@@ -132,19 +132,41 @@ const (
 	maxAuditEntries    = 2000
 )
 
-// appendRecord appends to the in-memory store, evicting the oldest entries
-// once the store exceeds maxInMemoryRecords (bounded store, GPT-06).
-func appendRecord(rec Record) {
+// appendRecord persists to Postgres FIRST (PG-authoritative, W12-C3P2B1) and
+// updates the bounded in-memory mirror only after a successful INSERT. When no
+// database is configured the service runs in documented degraded-memory mode
+// and the mirror is the only copy. An error means the record was NOT persisted
+// and NOT mirrored; callers must fail the request (503).
+func appendRecord(rec Record) error {
+	if db != nil {
+		dataBytes, merr := json.Marshal(rec.Data)
+		if merr != nil {
+			return merr
+		}
+		if err := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); err != nil {
+			return err
+		}
+	}
 	records = append(records, rec)
 	if len(records) > maxInMemoryRecords {
 		copy(records, records[len(records)-maxInMemoryRecords:])
 		records = records[:maxInMemoryRecords]
 	}
+	return nil
 }
 
-// appendAudit appends to the audit log, evicting the oldest entries once the
-// log exceeds maxAuditEntries (bounded store, GPT-06).
+// appendAudit persists to the audit_log table FIRST (PG-authoritative,
+// W12-C3P2B1) and updates the bounded in-memory mirror only after a successful
+// INSERT; on insert failure the entry is deliberately NOT mirrored so the
+// memory mirror never claims durability Postgres does not have. When no
+// database is configured the mirror is the only copy (degraded-memory mode).
 func appendAudit(e AuditEntry) {
+	if db != nil {
+		if err := dbAuditInsert(e); err != nil {
+			log.Printf("[%s] audit_log insert failed - entry NOT mirrored in memory: %v", serviceName, err)
+			return
+		}
+	}
 	auditLog = append(auditLog, e)
 	if len(auditLog) > maxAuditEntries {
 		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
@@ -245,10 +267,15 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("atm-management-go: DB query failed, falling back to in-memory: %v", err)
 	}
-	// In-memory fallback
+	// Degraded-mode fallback (W12-C3P2B1): Postgres is authoritative; the
+	// bounded in-memory mirror is served only when the database is unreachable
+	// or not configured, and the response is explicitly marked as degraded.
+	if db == nil {
+		log.Printf("[%s] no database configured - records served from degraded memory mirror", serviceName)
+	}
 	mu.RLock()
 	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "in-memory"})
+	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "degraded-memory"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -288,15 +315,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if rec.Type == "" {
 		rec.Type = "primary"
 	}
-	appendRecord(rec)
-	domainStats.TotalRecords = len(records)
-
-	// Persist to database
-	if dataBytes, err := json.Marshal(rec.Data); err == nil {
-		if dbErr := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); dbErr != nil {
-			log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-		}
+	if err := appendRecord(rec); err != nil {
+		log.Printf("[%s] record INSERT failed - record NOT created: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not created"})
+		return
 	}
+	domainStats.TotalRecords = len(records)
 
 	appendAudit(AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
@@ -321,16 +345,49 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
+			// Build the updated record on a copy FIRST (W12-C3P2B1): the
+			// in-memory mirror is mutated only after Postgres accepts the
+			// write — PG is authoritative, memory is a mirror.
+			updated := records[i]
+			newData := make(map[string]interface{}, len(records[i].Data)+len(body))
+			for k, v := range records[i].Data {
+				newData[k] = v
+			}
+			updated.Data = newData
 			if s := getString(body, "status"); s != "" {
-				records[i].Status = s
+				updated.Status = s
 			}
 			for k, v := range body {
 				if k != "id" {
-					records[i].Data[k] = v
+					updated.Data[k] = v
 				}
 			}
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
+			updated.UpdatedAt = time.Now().Format(time.RFC3339)
+			updated.Version++
+			if db != nil {
+				dataBytes, merr := json.Marshal(updated.Data)
+				if merr != nil {
+					respondJSON(w, 500, map[string]string{"error": "record encode failed"})
+					return
+				}
+				res, uerr := db.Exec("UPDATE service_records SET status = $1, data = $2 WHERE id = $3 AND service = $4", updated.Status, string(dataBytes), id, serviceName)
+				if uerr != nil {
+					log.Printf("[%s] record UPDATE failed - record NOT updated: %v", serviceName, uerr)
+					respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not updated"})
+					return
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					// Row absent in PG (created before the flip or in degraded
+					// mode): backfill via INSERT so PG is authoritative from
+					// this write onward.
+					if ierr := dbInsert(updated.ID, serviceName, updated.Type, updated.Status, dataBytes); ierr != nil {
+						log.Printf("[%s] record UPDATE backfill INSERT failed - record NOT updated: %v", serviceName, ierr)
+						respondJSON(w, 503, map[string]string{"error": "persistence unavailable: record not updated"})
+						return
+					}
+				}
+			}
+			records[i] = updated
 			appendAudit(AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
@@ -352,9 +409,30 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
+	// PG-authoritative read (W12-C3P2B1): the audit log is served from
+	// Postgres. The bounded in-memory log is only a degraded-mode fallback
+	// mirror and is explicitly marked as such.
+	if db != nil {
+		rows, err := db.Query("SELECT id, action, record_id, actor, timestamp, details FROM audit_log WHERE service = $1 ORDER BY created_at DESC LIMIT 100", serviceName)
+		if err == nil {
+			defer rows.Close()
+			items := []map[string]interface{}{}
+			for rows.Next() {
+				var id, action, recordID, actor, ts, details string
+				if rows.Scan(&id, &action, &recordID, &actor, &ts, &details) == nil {
+					items = append(items, map[string]interface{}{"id": id, "action": action, "recordId": recordID, "actor": actor, "timestamp": ts, "details": details})
+				}
+			}
+			respondJSON(w, 200, map[string]interface{}{"auditLog": items, "total": len(items), "source": "database"})
+			return
+		}
+		log.Printf("[%s] audit_log query failed - degraded-memory fallback: %v", serviceName, err)
+	} else {
+		log.Printf("[%s] no database configured - audit log served from degraded memory mirror", serviceName)
+	}
 	mu.RLock()
 	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
+	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog), "source": "degraded-memory"})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -472,6 +550,31 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 // --- Database Layer ---
 var db *sql.DB
+
+// ensureRecordsSchemaW12 creates the PG-authoritative record/audit stores
+// (W12-C3P2B1). Idempotent; no-op when the service runs without a database
+// (documented degraded-memory mode).
+func ensureRecordsSchemaW12() {
+	if db == nil {
+		return
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`); err != nil {
+		log.Printf("[%s] service_records schema init failed: %v", serviceName, err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS audit_log (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, action TEXT NOT NULL,
+		record_id TEXT DEFAULT '', actor TEXT DEFAULT '', timestamp TEXT DEFAULT '',
+		details TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[%s] audit_log schema init failed: %v", serviceName, err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_svc_created ON audit_log(service, created_at DESC)`)
+}
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -997,6 +1100,270 @@ func initSchema() {
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
 }
 
+// ─── W12-A4-P0-D: /v1/atms* REST handlers ────────────────────────────────────
+// Real PG persistence via the existing db pool (fail-closed 503 when the pool
+// is unavailable — no fabricated device lists). UI contract: tenant_admin
+// operationsApi.atmApi (items/total shapes, camelCase fields).
+
+func ensureATMTables() {
+	if db == nil {
+		return
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS atm_devices (
+		id VARCHAR(64) PRIMARY KEY,
+		tenant_id VARCHAR(128) NOT NULL,
+		terminal_id VARCHAR(64) NOT NULL,
+		location VARCHAR(255) NOT NULL DEFAULT '',
+		branch_id VARCHAR(64) NOT NULL DEFAULT '',
+		status VARCHAR(20) NOT NULL DEFAULT 'offline',
+		cash_level_kobo BIGINT NOT NULL DEFAULT 0,
+		currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+		model VARCHAR(64) NOT NULL DEFAULT '',
+		last_maintenance TIMESTAMPTZ,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[atm] atm_devices table creation: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS atm_cash_events (
+		id VARCHAR(64) PRIMARY KEY,
+		tenant_id VARCHAR(128) NOT NULL,
+		atm_id VARCHAR(64) NOT NULL,
+		event_type VARCHAR(20) NOT NULL,
+		amount_kobo BIGINT NOT NULL DEFAULT 0,
+		currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+		note VARCHAR(255) NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[atm] atm_cash_events table creation: %v", err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_atm_devices_tenant ON atm_devices(tenant_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_atm_cash_events_atm ON atm_cash_events(atm_id, created_at DESC)`)
+}
+
+func atmTenant(r *http.Request) string {
+	if t := r.Header.Get("x-tenant-id"); t != "" {
+		return t
+	}
+	return "default"
+}
+
+func atmDeviceRow(row *sql.Rows) (map[string]interface{}, error) {
+	var id, terminalID, location, branchID, status, currency, model string
+	var cashLevel int64
+	var lastMaint *time.Time
+	var createdAt time.Time
+	if err := row.Scan(&id, &terminalID, &location, &branchID, &status, &cashLevel, &currency, &model, &lastMaint, &createdAt); err != nil {
+		return nil, err
+	}
+	lm := ""
+	if lastMaint != nil {
+		lm = lastMaint.Format(time.RFC3339)
+	}
+	return map[string]interface{}{
+		"id": id, "terminalId": terminalID, "location": location,
+		"branchId": branchID, "status": status, "cashLevel": cashLevel,
+		"currency": currency, "model": model, "lastMaintenance": lm,
+		"createdAt": createdAt.Format(time.RFC3339),
+	}, nil
+}
+
+func atmListHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	tenant := atmTenant(r)
+	switch r.Method {
+	case "GET":
+		q := "SELECT id, terminal_id, location, branch_id, status, cash_level_kobo, currency, model, last_maintenance, created_at FROM atm_devices WHERE tenant_id = $1"
+		args := []interface{}{tenant}
+		if b := r.URL.Query().Get("branchId"); b != "" {
+			q += " AND branch_id = $2"
+			args = append(args, b)
+		}
+		if s := r.URL.Query().Get("status"); s != "" {
+			q += fmt.Sprintf(" AND status = $%d", len(args)+1)
+			args = append(args, s)
+		}
+		q += " ORDER BY created_at DESC LIMIT 200"
+		rows, err := db.Query(q, args...)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		items := []map[string]interface{}{}
+		for rows.Next() {
+			if m, err := atmDeviceRow(rows); err == nil {
+				items = append(items, m)
+			}
+		}
+		respondJSON(w, 200, map[string]interface{}{"items": items, "total": len(items)})
+	case "POST":
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+		terminalID := getString(body, "terminalId")
+		if terminalID == "" {
+			respondJSON(w, 422, map[string]string{"error": "terminalId is required"})
+			return
+		}
+		id := fmt.Sprintf("ATM-%08X", secureUint32())
+		status := getString(body, "status")
+		if status == "" {
+			status = "offline"
+		}
+		currency := getString(body, "currency")
+		if currency == "" {
+			currency = "NGN"
+		}
+		_, err := db.Exec(
+			"INSERT INTO atm_devices (id, tenant_id, terminal_id, location, branch_id, status, cash_level_kobo, currency, model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+			id, tenant, terminalID, getString(body, "location"), getString(body, "branchId"), status, int64(getFloat(body, "cashLevel")), currency, getString(body, "model"),
+		)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		respondJSON(w, 201, map[string]interface{}{"id": id, "terminalId": terminalID, "status": status})
+	default:
+		respondJSON(w, 405, map[string]string{"error": "method not allowed"})
+	}
+}
+
+func atmStatsHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	tenant := atmTenant(r)
+	var total, online, offline, lowCash, txnCount int64
+	_ = db.QueryRow("SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'online'), COUNT(*) FILTER (WHERE status = 'offline'), COUNT(*) FILTER (WHERE cash_level_kobo < 1000000) FROM atm_devices WHERE tenant_id = $1", tenant).
+		Scan(&total, &online, &offline, &lowCash)
+	_ = db.QueryRow("SELECT COUNT(*) FROM atm_cash_events WHERE tenant_id = $1", tenant).Scan(&txnCount)
+	respondJSON(w, 200, map[string]interface{}{
+		"totalAtms": total, "online": online, "offline": offline,
+		"lowCash": lowCash, "totalTransactions": txnCount,
+	})
+}
+
+func atmSubHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	tenant := atmTenant(r)
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/atms/")
+	if rest == "stats" {
+		atmStatsHandler(w, r)
+		return
+	}
+	parts := strings.SplitN(rest, "/", 2)
+	id := parts[0]
+	sub := ""
+	if len(parts) == 2 {
+		sub = parts[1]
+	}
+	if id == "" {
+		respondJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	switch {
+	case sub == "" && r.Method == "GET":
+		row := db.QueryRow("SELECT id, terminal_id, location, branch_id, status, cash_level_kobo, currency, model, last_maintenance, created_at FROM atm_devices WHERE tenant_id = $1 AND id = $2", tenant, id)
+		var devID, terminalID, location, branchID, status, currency, model string
+		var cashLevel int64
+		var lastMaint *time.Time
+		var createdAt time.Time
+		if err := row.Scan(&devID, &terminalID, &location, &branchID, &status, &cashLevel, &currency, &model, &lastMaint, &createdAt); err != nil {
+			respondJSON(w, 404, map[string]string{"error": "atm not found"})
+			return
+		}
+		lm := ""
+		if lastMaint != nil {
+			lm = lastMaint.Format(time.RFC3339)
+		}
+		respondJSON(w, 200, map[string]interface{}{
+			"id": devID, "terminalId": terminalID, "location": location,
+			"branchId": branchID, "status": status, "cashLevel": cashLevel,
+			"currency": currency, "model": model, "lastMaintenance": lm,
+			"createdAt": createdAt.Format(time.RFC3339),
+		})
+	case sub == "status" && r.Method == "PATCH":
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+		status := getString(body, "status")
+		if status == "" {
+			respondJSON(w, 422, map[string]string{"error": "status is required"})
+			return
+		}
+		res, err := db.Exec("UPDATE atm_devices SET status = $1 WHERE tenant_id = $2 AND id = $3", status, tenant, id)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			respondJSON(w, 404, map[string]string{"error": "atm not found"})
+			return
+		}
+		_, _ = db.Exec("INSERT INTO atm_cash_events (id, tenant_id, atm_id, event_type, note) VALUES ($1,$2,$3,'status',$4)",
+			fmt.Sprintf("EVT-%08X", secureUint32()), tenant, id, "status -> "+status)
+		respondJSON(w, 200, map[string]interface{}{"id": id, "status": status})
+	case sub == "replenish" && r.Method == "POST":
+		var body map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&body)
+		amount := int64(getFloat(body, "amount"))
+		if amount <= 0 {
+			respondJSON(w, 422, map[string]string{"error": "amount must be positive"})
+			return
+		}
+		currency := getString(body, "currency")
+		if currency == "" {
+			currency = "NGN"
+		}
+		res, err := db.Exec("UPDATE atm_devices SET cash_level_kobo = cash_level_kobo + $1 WHERE tenant_id = $2 AND id = $3", amount, tenant, id)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			respondJSON(w, 404, map[string]string{"error": "atm not found"})
+			return
+		}
+		_, _ = db.Exec("INSERT INTO atm_cash_events (id, tenant_id, atm_id, event_type, amount_kobo, currency, note) VALUES ($1,$2,$3,'replenish',$4,$5,'cash replenishment')",
+			fmt.Sprintf("EVT-%08X", secureUint32()), tenant, id, amount, currency)
+		respondJSON(w, 200, map[string]interface{}{"id": id, "replenished": amount, "currency": currency})
+	case sub == "transactions" && r.Method == "GET":
+		rows, err := db.Query("SELECT id, event_type, amount_kobo, currency, note, created_at FROM atm_cash_events WHERE tenant_id = $1 AND atm_id = $2 ORDER BY created_at DESC LIMIT 100", tenant, id)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		items := []map[string]interface{}{}
+		for rows.Next() {
+			var eid, etype, currency, note string
+			var amount int64
+			var createdAt time.Time
+			if rows.Scan(&eid, &etype, &amount, &currency, &note, &createdAt) == nil {
+				items = append(items, map[string]interface{}{
+					"id": eid, "type": etype, "amount": amount, "currency": currency,
+					"narration": note, "processedAt": createdAt.Format(time.RFC3339),
+				})
+			}
+		}
+		respondJSON(w, 200, map[string]interface{}{"items": items, "total": len(items)})
+	default:
+		respondJSON(w, 405, map[string]string{"error": "method not allowed"})
+	}
+}
+
+func getFloat(m map[string]interface{}, key string) float64 {
+	if v, ok := m[key].(float64); ok {
+		return v
+	}
+	return 0
+}
+
 func domainHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
@@ -1077,8 +1444,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO cards (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1086,10 +1460,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"cards.created", id, string(payload))
+		"cards.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1126,7 +1510,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE cards SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1134,25 +1525,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"cards.updated", id, string(payload))
+		"cards.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE cards SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"cards.deleted", id, `{"id":"`+id+`"}`)
+		"cards.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1437,6 +1857,7 @@ func main() {
 		port = "9317"
 	}
 	initDB()
+	ensureRecordsSchemaW12()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
@@ -1444,17 +1865,22 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "view", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/atm-management/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
-	mux.Handle("/v1/atm-management/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
-	mux.Handle("/v1/atm-management/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
-	mux.Handle("/v1/atm-management/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
-	mux.Handle("/v1/atm-management/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
-	mux.Handle("/v1/atm-management/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/atm-management/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(atm_managementScoreHandler)))
-	mux.Handle("/v1/atm-management/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(atm_managementValidateRequestHandler)))
+	mux.Handle("/v1/atm-management/list", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "view", http.HandlerFunc(handleList))))
+	mux.Handle("/v1/atm-management/create", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "manage", http.HandlerFunc(handleCreate))))
+	mux.Handle("/v1/atm-management/update", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "manage", http.HandlerFunc(handleUpdate))))
+	mux.Handle("/v1/atm-management/process", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "manage", http.HandlerFunc(handleProcess))))
+	mux.Handle("/v1/atm-management/audit", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "manage", http.HandlerFunc(handleAudit))))
+	mux.Handle("/v1/atm-management/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "view", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/atm-management/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "manage", http.HandlerFunc(atm_managementScoreHandler))))
+	mux.Handle("/v1/atm-management/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("terminal", "manage", http.HandlerFunc(atm_managementValidateRequestHandler))))
+	// W12-A4-P0-D: /v1/atms* REST API backing the tenant_admin ATM console
+	// (previously pointed at the unserved /account/v1/atms* namespace).
+	ensureATMTables()
+	mux.Handle("/v1/atms", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(atmListHandler)))
+	mux.Handle("/v1/atms/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(atmSubHandler)))
 	log.Printf("Atm Management v2.0 (Banking Ops) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1544,6 +1970,17 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+}
+
+// dbAuditInsert persists one audit entry to the shared audit_log table
+// (W12-C3P2B1).
+func dbAuditInsert(e AuditEntry) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO audit_log (id, service, action, record_id, actor, timestamp, details) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+		e.ID, serviceName, e.Action, e.RecordID, e.Actor, e.Timestamp, e.Details)
+	return err
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {

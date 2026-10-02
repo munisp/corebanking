@@ -103,7 +103,11 @@ class ApiService {
           await _primeAuthCache();
 
           final token = _cachedToken;
-          if (token != null) {
+          // W12-A4A: the token-refresh call carries the REFRESH token in its
+          // own Authorization header (auth-service token.py:102 contract) —
+          // never overwrite it with the (expired) access token.
+          final isRefreshCall = options.path.contains('/token/refresh');
+          if (token != null && !isRefreshCall) {
             options.headers['Authorization'] = 'Bearer $token';
           }
           options.headers['x-tenant-name'] = AppConfig.CURRENT_TENANT_ID;
@@ -144,10 +148,18 @@ class ApiService {
         onError: (error, handler) async {
           if (error.response?.statusCode == 401) {
             // Check if this is a login/auth endpoint - don't clear storage for failed login attempts
-            final isAuthEndpoint = error.requestOptions.path.contains('/auth/login') || 
+            final isAuthEndpoint = error.requestOptions.path.contains('/auth/login') ||
                                    error.requestOptions.path.contains('/auth/register') ||
                                    error.requestOptions.path.contains('/auth/verify-otp') ||
-                                   error.requestOptions.path.contains('/auth/verify-email');
+                                   error.requestOptions.path.contains('/auth/verify-email') ||
+                                   // W12-A4A: double-prefix gateway forms (gateway strips the
+                                   // first /auth segment; service serves /auth/<x>)
+                                   error.requestOptions.path.contains('/auth/auth/login') ||
+                                   error.requestOptions.path.contains('/auth/auth/register') ||
+                                   error.requestOptions.path.contains('/auth/auth/verify-otp') ||
+                                   error.requestOptions.path.contains('/auth/auth/verify-email') ||
+                                   // Never refresh-in-response-to-a-failed-refresh (recursion)
+                                   error.requestOptions.path.contains('/token/refresh');
             
             if (isAuthEndpoint) {
               // For auth endpoints, just pass the error through without clearing storage
@@ -344,8 +356,14 @@ class ApiService {
       throw Exception('No refresh token');
     }
 
+    // W12-A4A: was '/token/refresh/$refreshToken' — no apisix /token/* rule
+    // exists, so every refresh 404'd and every 401 forced a re-login.
+    // auth-service.yaml strips the first /auth segment → auth-service serves
+    // POST /token/refresh (api/v1/token.py:102) with the refresh token in the
+    // Authorization Bearer header (never in the URL — M-43).
     final response = await _dio.post(
-      '/token/refresh/$refreshToken',
+      '/auth/token/refresh',
+      options: Options(headers: {'Authorization': 'Bearer $refreshToken'}),
     );
 
     final data = response.data['data'] ?? response.data;
@@ -368,22 +386,26 @@ class ApiService {
 
   // ---------- HTTP METHODS ----------
   Future<Response> get(String path,
-          {Map<String, dynamic>? queryParameters}) =>
-      _dio.get(path, queryParameters: queryParameters);
+          {Map<String, dynamic>? queryParameters, Options? options}) =>
+      _dio.get(path, queryParameters: queryParameters, options: options);
 
   Future<Response> post(String path,
-          {dynamic data, Map<String, dynamic>? queryParameters}) =>
+          {dynamic data,
+          Map<String, dynamic>? queryParameters,
+          Options? options}) =>
       _dio.post(path,
-          data: data, queryParameters: queryParameters);
+          data: data, queryParameters: queryParameters, options: options);
 
   Future<Response> put(String path,
-          {dynamic data, Map<String, dynamic>? queryParameters}) =>
+          {dynamic data,
+          Map<String, dynamic>? queryParameters,
+          Options? options}) =>
       _dio.put(path,
-          data: data, queryParameters: queryParameters);
+          data: data, queryParameters: queryParameters, options: options);
 
   Future<Response> delete(String path,
-          {Map<String, dynamic>? queryParameters}) =>
-      _dio.delete(path, queryParameters: queryParameters);
+          {Map<String, dynamic>? queryParameters, Options? options}) =>
+      _dio.delete(path, queryParameters: queryParameters, options: options);
 
   // ---------- Get Transaction by ID ----------
   Future<Map<String, dynamic>> getTransactionById(String transactionId) async {

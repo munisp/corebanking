@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, responses, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from sqlalchemy.orm import Session
 from database import get_session
 from utils import create_logger
@@ -12,7 +14,7 @@ logger = create_logger(__name__)
 admin_router = APIRouter()
 
 
-@admin_router.post("")
+@admin_router.post("", dependencies=[Depends(require_permify("admin_account", "create"))])
 def create_admin(
     payload: CreateAdminSchema,
     db: Session = Depends(get_session),
@@ -64,7 +66,7 @@ def create_admin(
         raise HTTPException(status_code=500, detail="Create admin failed.")
 
 
-@admin_router.get("/{admin_id}")
+@admin_router.get("/{admin_id}", dependencies=[Depends(require_permify("admin_account", "view"))])
 def get_admin_by_id(
     admin_id: str,
     db: Session = Depends(get_session),
@@ -91,7 +93,7 @@ def get_admin_by_id(
         raise HTTPException(status_code=500, detail="Get admin failed.")
 
 
-@admin_router.get("/keycloak/{keycloak_id}")
+@admin_router.get("/keycloak/{keycloak_id}", dependencies=[Depends(require_permify("admin_account", "view"))])
 def get_admin_by_keycloak(
     keycloak_id: str,
     db: Session = Depends(get_session),
@@ -116,7 +118,7 @@ def get_admin_by_keycloak(
         raise HTTPException(status_code=500, detail="Get admin failed.")
 
 
-@admin_router.get("")
+@admin_router.get("", dependencies=[Depends(require_permify("admin_account", "view"))])
 def get_admins(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -149,7 +151,7 @@ def get_admins(
         raise HTTPException(status_code=500, detail="Get admins failed.")
 
 
-@admin_router.patch("/{admin_id}/suspend")
+@admin_router.patch("/{admin_id}/suspend", dependencies=[Depends(require_permify("admin_account", "manage"))])
 def suspend_admin(
     admin_id: str,
     db: Session = Depends(get_session),
@@ -186,7 +188,7 @@ def suspend_admin(
         raise HTTPException(status_code=500, detail="Suspend admin failed.")
 
 
-@admin_router.patch("/{admin_id}/unsuspend")
+@admin_router.patch("/{admin_id}/unsuspend", dependencies=[Depends(require_permify("admin_account", "manage"))])
 def unsuspend_admin(
     admin_id: str,
     db: Session = Depends(get_session),
@@ -223,7 +225,7 @@ def unsuspend_admin(
         raise HTTPException(status_code=500, detail="Unsuspend admin failed.")
 
 
-@admin_router.post("/kyc/save")
+@admin_router.post("/kyc/save", dependencies=[Depends(require_permify("admin_account", "create"))])
 def save_kyc_state(
     db: Session = Depends(get_session),
     payload: dict = Body(default=None),
@@ -267,7 +269,7 @@ def save_kyc_state(
         raise HTTPException(status_code=500, detail="Failed to save admin kyc state")
 
 
-@admin_router.post("/kyc/complete")
+@admin_router.post("/kyc/complete", dependencies=[Depends(require_permify("admin_account", "manage"))])
 def complete_kyc(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),

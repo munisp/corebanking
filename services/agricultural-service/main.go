@@ -2634,6 +2634,7 @@ func main() {
 
 	// Initialize and register merged agri services (consolidated from standalone microservices)
 	mergedAgriService := NewMergedAgriService(db)
+	mergedAgriService.initDomainStore() // W12 C3-P2-B5: domain_records DDL + idempotent seeds
 	mergedAgriService.RegisterRoutes(r)
 	log.Println("Registered: Merged Agri Services (evoucher, input-marketplace, logistics, reinsurance, savings-cycles, esg-impact, cbn-returns, ussd-agri, iot-sensor, agriculture-banking, crossborder-trade)")
 
@@ -2664,5 +2665,5 @@ func main() {
 
 	log.Printf("Agricultural Service starting on port %s", port)
 	log.Printf("Total endpoints registered: 350+ across 15 service modules")
-	log.Fatal((&http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(r), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(permifyAuthzMuxMiddleware(r)), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }

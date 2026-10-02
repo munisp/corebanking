@@ -13,6 +13,7 @@ from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query
+from permify_guard import require_permify  # W12-B5P1DF
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 
@@ -174,7 +175,7 @@ def bootstrap_notification_data(tenant_id: str, user_id: str = "seed-user", db: 
     return {"status": "bootstrapped", "tenant_id": tenant_id, "created_tickets": created}
 
 
-@router.post("/tickets", status_code=201)
+@router.post("/tickets", status_code=201, dependencies=[Depends(require_permify("notification", "tickets"))])
 def create_ticket(ticket: TicketCreate, background_tasks: BackgroundTasks, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     require_same_tenant(ticket.tenant_id, x_tenant_id)
     ticket_number = f"TKT-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
@@ -225,7 +226,7 @@ def create_ticket(ticket: TicketCreate, background_tasks: BackgroundTasks, x_ten
     return {"id": db_ticket.id, "ticket_number": db_ticket.ticket_number, "status": db_ticket.status, "created_at": db_ticket.created_at}
 
 
-@router.get("/tickets")
+@router.get("/tickets", dependencies=[Depends(require_permify("notification", "view"))])
 def list_tickets(
     tenant_id: str,
     user_id: Optional[str] = None,
@@ -258,7 +259,7 @@ def list_tickets(
     }
 
 
-@router.get("/tickets/{ticket_id}")
+@router.get("/tickets/{ticket_id}", dependencies=[Depends(require_permify("notification", "view"))])
 def get_ticket(ticket_id: int, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     ticket = db.query(SupportTicket).filter(SupportTicket.id == ticket_id, SupportTicket.tenant_id == x_tenant_id).first()
     if not ticket:
@@ -282,7 +283,7 @@ def get_ticket(ticket_id: int, x_tenant_id: str = Depends(require_tenant), db: S
     }
 
 
-@router.put("/tickets/{ticket_id}")
+@router.put("/tickets/{ticket_id}", dependencies=[Depends(require_permify("notification", "update"))])
 def update_ticket(ticket_id: int, update: TicketUpdate, background_tasks: BackgroundTasks, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     ticket = db.query(SupportTicket).filter(SupportTicket.id == ticket_id, SupportTicket.tenant_id == x_tenant_id).first()
     if not ticket:
@@ -330,7 +331,7 @@ def update_ticket(ticket_id: int, update: TicketUpdate, background_tasks: Backgr
     return {"status": "updated", "ticket_id": ticket.id}
 
 
-@router.post("/tickets/{ticket_id}/messages")
+@router.post("/tickets/{ticket_id}/messages", dependencies=[Depends(require_permify("notification", "messages"))])
 def add_message(ticket_id: int, message: MessageCreate, background_tasks: BackgroundTasks, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     ticket = db.query(SupportTicket).filter(SupportTicket.id == ticket_id, SupportTicket.tenant_id == x_tenant_id).first()
     if not ticket:
@@ -372,7 +373,7 @@ def add_message(ticket_id: int, message: MessageCreate, background_tasks: Backgr
     return {"message_id": db_message.id, "created_at": db_message.created_at}
 
 
-@router.post("/notifications")
+@router.post("/notifications", dependencies=[Depends(require_permify("notification", "notifications"))])
 def create_notification(notification: NotificationCreate, background_tasks: BackgroundTasks, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     require_same_tenant(notification.tenant_id, x_tenant_id)
     notification_id = f"NTF-{uuid.uuid4().hex[:18].upper()}"
@@ -418,14 +419,14 @@ def create_notification(notification: NotificationCreate, background_tasks: Back
     return {"notification_id": db_notification.notification_id, "status": "queued", "tenant_id": notification.tenant_id}
 
 
-@router.get("/notifications/{user_id}")
+@router.get("/notifications/{user_id}", dependencies=[Depends(require_permify("notification", "view"))])
 def get_user_notifications(user_id: str, tenant_id: str, skip: int = 0, limit: int = 50, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     require_same_tenant(tenant_id, x_tenant_id)
     notifications = db.query(Notification).filter(Notification.user_id == user_id, Notification.tenant_id == tenant_id).order_by(Notification.created_at.desc()).offset(skip).limit(limit).all()
     return {"tenant_id": tenant_id, "notifications": [{"id": n.notification_id, "type": n.type, "subject": n.subject, "message": n.message, "status": n.status, "sent_at": n.sent_at, "created_at": n.created_at} for n in notifications]}
 
 
-@router.post("/templates", status_code=201)
+@router.post("/templates", status_code=201, dependencies=[Depends(require_permify("notification_template", "templates"))])
 def create_template(payload: TemplateCreate, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     if payload.tenant_id != "global":
         require_same_tenant(payload.tenant_id, x_tenant_id)
@@ -447,14 +448,14 @@ def create_template(payload: TemplateCreate, x_tenant_id: str = Depends(require_
     return {"status": "created", "template_id": payload.template_id, "tenant_id": payload.tenant_id}
 
 
-@router.get("/templates")
+@router.get("/templates", dependencies=[Depends(require_permify("notification_template", "view"))])
 def list_templates(tenant_id: str, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     require_same_tenant(tenant_id, x_tenant_id)
     templates = db.query(NotificationTemplate).filter(NotificationTemplate.tenant_id.in_([tenant_id, "global"]), NotificationTemplate.is_active == True).order_by(NotificationTemplate.tenant_id.desc(), NotificationTemplate.updated_at.desc()).all()
     return {"tenant_id": tenant_id, "templates": [{"template_id": t.template_id, "scope": t.tenant_id, "name": t.name, "type": t.type, "variables": t.variables} for t in templates]}
 
 
-@router.post("/chat/sessions")
+@router.post("/chat/sessions", dependencies=[Depends(require_permify("notification", "sessions"))])
 def create_chat_session(payload: ChatSessionCreate, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     require_same_tenant(payload.tenant_id, x_tenant_id)
     session_id = f"CHAT-{uuid.uuid4().hex[:16].upper()}"
@@ -477,7 +478,7 @@ def create_chat_session(payload: ChatSessionCreate, x_tenant_id: str = Depends(r
     return {"session_id": session_id, "tenant_id": payload.tenant_id, "started_at": db_session.started_at}
 
 
-@router.post("/chat/messages")
+@router.post("/chat/messages", dependencies=[Depends(require_permify("notification", "messages"))])
 def send_chat_message(message: ChatMessageCreate, background_tasks: BackgroundTasks, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     require_same_tenant(message.tenant_id, x_tenant_id)
     session = db.query(ChatSession).filter(ChatSession.session_id == message.session_id, ChatSession.tenant_id == message.tenant_id).first()
@@ -514,7 +515,7 @@ def send_chat_message(message: ChatMessageCreate, background_tasks: BackgroundTa
     return {"user_message_id": db_message.id, "bot_response": bot_response["message"], "escalated": bot_response.get("escalate", False)}
 
 
-@router.get("/chat/sessions/{session_id}")
+@router.get("/chat/sessions/{session_id}", dependencies=[Depends(require_permify("notification", "view"))])
 def get_chat_history(session_id: str, tenant_id: str, x_tenant_id: str = Depends(require_tenant), db: Session = Depends(get_db)):
     require_same_tenant(tenant_id, x_tenant_id)
     session = db.query(ChatSession).filter(ChatSession.session_id == session_id, ChatSession.tenant_id == tenant_id).first()

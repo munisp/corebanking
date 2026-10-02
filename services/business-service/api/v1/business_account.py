@@ -1,6 +1,8 @@
 """Business accounts API routes."""
 import logging
 from fastapi import APIRouter, Depends, Request, HTTPException
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from sqlalchemy.orm import Session
 
 from database import get_session
@@ -17,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/business/{business_id}/accounts", tags=["business-accounts"])
 
 
-@router.post("", response_model=BusinessAccountResponse, status_code=201)
+@router.post("", response_model=BusinessAccountResponse, status_code=201, dependencies=[Depends(require_permify("business_account", "create"))])
 def associate_account(
     request: Request,
     business_id: str,
@@ -46,7 +48,7 @@ def associate_account(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.get("", response_model=BusinessAccountsListResponse)
+@router.get("", response_model=BusinessAccountsListResponse, dependencies=[Depends(require_permify("business_account", "view"))])
 def list_business_accounts(
     request: Request,
     business_id: str,
@@ -74,7 +76,7 @@ def list_business_accounts(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.delete("/{account_id}", response_model=BusinessAccountResponse)
+@router.delete("/{account_id}", response_model=BusinessAccountResponse, dependencies=[Depends(require_permify("business_account", "delete"))])
 def disassociate_account(
     request: Request,
     business_id: str,
@@ -101,7 +103,7 @@ def disassociate_account(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/{account_id}/primary")
+@router.post("/{account_id}/primary", dependencies=[Depends(require_permify("business_account", "manage"))])
 def set_primary_account(
     request: Request,
     business_id: str,

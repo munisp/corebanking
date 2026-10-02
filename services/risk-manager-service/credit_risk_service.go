@@ -11,7 +11,7 @@ import (
 // CreditRiskService handles credit risk operations
 type CreditRiskService struct {
 	tenantID string
-	risks    map[string]*CreditRisk
+	risks    *repo[CreditRisk]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type CreditRiskService struct {
 func NewCreditRiskService(tenantID string) *CreditRiskService {
 	svc := &CreditRiskService{
 		tenantID: tenantID,
-		risks:    make(map[string]*CreditRisk),
+		risks:    newRepo[CreditRisk](serviceDB, "credit_risks"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewCreditRiskService(tenantID string) *CreditRiskService {
 
 func (s *CreditRiskService) initializeDefaultData(tenantID string) {
 	// Corporate portfolio
-	s.risks["cr-001"] = &CreditRisk{
+	s.risks.seed(tenantID, "cr-001", &CreditRisk{
 		RiskID:             "cr-001",
 		TenantID:           tenantID,
 		EntityType:         "portfolio",
@@ -51,10 +51,10 @@ func (s *CreditRiskService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:          time.Now(),
-	}
+	})
 
 	// Retail portfolio
-	s.risks["cr-002"] = &CreditRisk{
+	s.risks.seed(tenantID, "cr-002", &CreditRisk{
 		RiskID:             "cr-002",
 		TenantID:           tenantID,
 		EntityType:         "portfolio",
@@ -78,10 +78,10 @@ func (s *CreditRiskService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:          time.Now(),
-	}
+	})
 
 	// SME portfolio
-	s.risks["cr-003"] = &CreditRisk{
+	s.risks.seed(tenantID, "cr-003", &CreditRisk{
 		RiskID:             "cr-003",
 		TenantID:           tenantID,
 		EntityType:         "portfolio",
@@ -105,10 +105,10 @@ func (s *CreditRiskService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:          time.Now(),
-	}
+	})
 
 	// Agriculture sector
-	s.risks["cr-004"] = &CreditRisk{
+	s.risks.seed(tenantID, "cr-004", &CreditRisk{
 		RiskID:             "cr-004",
 		TenantID:           tenantID,
 		EntityType:         "sector",
@@ -132,10 +132,10 @@ func (s *CreditRiskService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:          time.Now(),
-	}
+	})
 
 	// NPL customer
-	s.risks["cr-005"] = &CreditRisk{
+	s.risks.seed(tenantID, "cr-005", &CreditRisk{
 		RiskID:             "cr-005",
 		TenantID:           tenantID,
 		EntityType:         "customer",
@@ -159,16 +159,18 @@ func (s *CreditRiskService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(-2, 0, 0),
 		UpdatedAt:          time.Now(),
-	}
+	})
 }
 
 // ListRisks returns credit risks based on filters
-func (s *CreditRiskService) ListRisks(tenantID, rating, watchlist string) []*CreditRisk {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CreditRiskService) ListRisks(tenantID, rating, watchlist string) ([]*CreditRisk, error) {
 
 	var result []*CreditRisk
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -180,16 +182,14 @@ func (s *CreditRiskService) ListRisks(tenantID, rating, watchlist string) []*Cre
 		}
 		result = append(result, risk)
 	}
-	return result
+	return result, nil
 }
 
 // GetRisk retrieves a risk by ID
 func (s *CreditRiskService) GetRisk(tenantID, riskID string) (*CreditRisk, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	risk, exists := s.risks[riskID]
-	if !exists || risk.TenantID != tenantID {
+	risk, err := s.risks.get(tenantID, riskID)
+	if err != nil {
 		return nil, errors.New("risk not found")
 	}
 	return risk, nil
@@ -197,8 +197,6 @@ func (s *CreditRiskService) GetRisk(tenantID, riskID string) (*CreditRisk, error
 
 // CreateRisk creates a new credit risk
 func (s *CreditRiskService) CreateRisk(tenantID string, req *CreateCreditRiskRequest) (*CreditRisk, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	risk := &CreditRisk{
 		RiskID:          uuid.New().String(),
@@ -224,33 +222,30 @@ func (s *CreditRiskService) CreateRisk(tenantID string, req *CreateCreditRiskReq
 		risk.CollateralCoverage = float64(req.CollateralValue) / float64(req.ExposureAmount)
 	}
 
-	s.risks[risk.RiskID] = risk
+	if err := s.risks.put(tenantID, risk.RiskID, risk); err != nil {
+		return nil, err
+	}
 	return risk, nil
 }
 
 // UpdateRisk updates a credit risk
 func (s *CreditRiskService) UpdateRisk(risk *CreditRisk) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.risks[risk.RiskID]
-	if !exists || existing.TenantID != risk.TenantID {
+	existing, err := s.risks.get(risk.TenantID, risk.RiskID)
+	if err != nil {
 		return errors.New("risk not found")
 	}
 
 	risk.CreatedAt = existing.CreatedAt
 	risk.UpdatedAt = time.Now()
-	s.risks[risk.RiskID] = risk
-	return nil
+	return s.risks.put(risk.TenantID, risk.RiskID, risk)
 }
 
 // UpdateRating updates risk rating
 func (s *CreditRiskService) UpdateRating(tenantID, riskID, userID string, req *UpdateRiskRatingRequest) (*CreditRisk, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	risk, exists := s.risks[riskID]
-	if !exists || risk.TenantID != tenantID {
+	risk, err := s.risks.get(tenantID, riskID)
+	if err != nil {
 		return nil, errors.New("risk not found")
 	}
 
@@ -275,18 +270,23 @@ func (s *CreditRiskService) UpdateRating(tenantID, riskID, userID string, req *U
 
 	risk.ProvisionAmount = int64(float64(risk.ExposureAmount) * risk.ProvisionRate)
 
+	if err := s.risks.put(tenantID, risk.RiskID, risk); err != nil {
+		return nil, err
+	}
 	return risk, nil
 }
 
 // GetPortfolioRisk returns portfolio risk summary
-func (s *CreditRiskService) GetPortfolioRisk(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CreditRiskService) GetPortfolioRisk(tenantID string) (map[string]interface{}, error) {
 
 	var totalExposure, totalProvisions, totalNPL int64
 	var totalEL int64
 
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -316,18 +316,20 @@ func (s *CreditRiskService) GetPortfolioRisk(tenantID string) map[string]interfa
 		"nplRatio":          nplRatio,
 		"provisionCoverage": provisionCoverage,
 		"timestamp":         time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetConcentrationRisk returns concentration risk analysis
-func (s *CreditRiskService) GetConcentrationRisk(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CreditRiskService) GetConcentrationRisk(tenantID string) (map[string]interface{}, error) {
 
 	sectorExposure := make(map[string]int64)
 	var totalExposure int64
 
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -345,16 +347,18 @@ func (s *CreditRiskService) GetConcentrationRisk(tenantID string) map[string]int
 		"herfindahlIndex":     0.35,
 		"concentrationStatus": "moderate",
 		"timestamp":           time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetWatchlist returns watchlist items
-func (s *CreditRiskService) GetWatchlist(tenantID string) []*CreditRisk {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CreditRiskService) GetWatchlist(tenantID string) ([]*CreditRisk, error) {
 
 	var result []*CreditRisk
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -362,18 +366,20 @@ func (s *CreditRiskService) GetWatchlist(tenantID string) []*CreditRisk {
 			result = append(result, risk)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetProvisions returns provision summary
-func (s *CreditRiskService) GetProvisions(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CreditRiskService) GetProvisions(tenantID string) (map[string]interface{}, error) {
 
 	provisions := make(map[string]int64)
 	var totalProvisions int64
 
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -388,18 +394,20 @@ func (s *CreditRiskService) GetProvisions(tenantID string) map[string]interface{
 		"stage2":          provisions["watch"],
 		"stage3":          provisions["substandard"] + provisions["doubtful"] + provisions["loss"],
 		"timestamp":       time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetNPLAnalysis returns NPL analysis
-func (s *CreditRiskService) GetNPLAnalysis(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CreditRiskService) GetNPLAnalysis(tenantID string) (map[string]interface{}, error) {
 
 	var totalExposure, totalNPL int64
 	nplByCategory := make(map[string]int64)
 
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -426,5 +434,5 @@ func (s *CreditRiskService) GetNPLAnalysis(tenantID string) map[string]interface
 		"regulatoryLimit": 5.0,
 		"status":          "within_limit",
 		"timestamp":       time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

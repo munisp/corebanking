@@ -44,16 +44,16 @@ export interface TreasuryDashboard {
 
 export const treasuryApi = {
   getDashboard: () =>
-    apiClient.get<TreasuryDashboard>(`${APISIX.TREASURY}/v1/dashboard`).then((r) => r.data),
+    apiClient.get<TreasuryDashboard>(`${APISIX.TREASURY}/api/v1/dashboard`).then((r) => r.data),
 
   getPositions: (params?: { currency?: string; valueDate?: string }) =>
-    apiClient.get<{ items: TreasuryPosition[] }>(`${APISIX.TREASURY}/v1/positions`, { params }).then((r) => r.data),
+    apiClient.get<{ items: TreasuryPosition[] }>(`${APISIX.TREASURY}/api/v1/fx/positions`, { params }).then((r) => r.data),
 
   getPortfolio: (params?: { type?: string }) =>
-    apiClient.get(`${APISIX.TREASURY}/v1/portfolio`, { params }).then((r) => r.data),
+    apiClient.get(`${APISIX.TREASURY}/api/v1/investments/portfolio`, { params }).then((r) => r.data),
 
   getInvestments: (params?: { page?: number; limit?: number; status?: string }) =>
-    apiClient.get(`${APISIX.TREASURY}/v1/investments`, { params }).then((r) => r.data),
+    apiClient.get(`${APISIX.TREASURY}/api/v1/investments`, { params }).then((r) => r.data),
 };
 
 // ─── Treasury Liquidity ───────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ export const treasuryLiquidityApi = {
     apiClient.get(`${APISIX.TREASURY_LIQUIDITY}/v1/history`, { params }).then((r) => r.data),
 
   getLCRReport: () =>
-    apiClient.get(`${APISIX.TREASURY_LIQUIDITY}/v1/lcr`).then((r) => r.data),
+    apiClient.get(`/lcr-nsfr/v1/lcr`).then((r) => r.data),
 };
 
 // ─── FX Dealing Room ──────────────────────────────────────────────────────────
@@ -122,10 +122,10 @@ export const fxDealingRoomApi = {
     apiClient.post<FXDeal>(`${APISIX.FX}/v1/deals`, body).then((r) => r.data),
 
   getDealById: (id: string) =>
-    apiClient.get<FXDeal>(`${APISIX.FX}/v1/deals/${id}`).then((r) => r.data),
+    apiClient.get<FXDeal>(`/treasury/api/v1/fx/deals/${id}`).then((r) => r.data),
 
   getPositions: (params?: { currency?: string }) =>
-    apiClient.get<{ items: FXPosition[] }>(`${APISIX.FX}/v1/positions`, { params }).then((r) => r.data),
+    apiClient.get<{ items: FXPosition[] }>(`/treasury/api/v1/fx/positions`, { params }).then((r) => r.data),
 
   confirmDeal: (id: string) =>
     apiClient.post(`${APISIX.FX}/v1/deals/${id}/confirm`, {}).then((r) => r.data),
@@ -171,7 +171,7 @@ export const multicurrencyApi = {
     apiClient.post<RevaluationResult>(`${APISIX.MULTICURRENCY}/v1/revaluation/run`, body).then((r) => r.data),
 
   getRevaluations: (params?: { page?: number; limit?: number }) =>
-    apiClient.get<{ items: RevaluationResult[]; total: number }>(`${APISIX.MULTICURRENCY}/v1/revaluation`, { params }).then((r) => r.data),
+    apiClient.get<{ items: RevaluationResult[]; total: number }>(`/credit/v1/multicurrency/revaluation`, { params }).then((r) => r.data),
 
   getExposures: (params?: { currency?: string }) =>
     apiClient.get(`${APISIX.MULTICURRENCY}/v1/exposures`, { params }).then((r) => r.data),
@@ -331,7 +331,7 @@ export const securitiesTradingApi = {
     apiClient.post(`${APISIX.SECURITIES}/v1/orders/sell`, body).then((r) => r.data),
 
   getOrders: (params?: { page?: number; limit?: number; status?: string }) =>
-    apiClient.get(`${APISIX.SECURITIES}/v1/orders`, { params }).then((r) => r.data),
+    apiClient.get(`${APISIX.SECURITIES}/v1/trading/orders`, { params }).then((r) => r.data),
 
   getMarketData: (securityId: string) =>
     apiClient.get(`${APISIX.SECURITIES}/v1/market-data/${securityId}`).then((r) => r.data),

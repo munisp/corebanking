@@ -43,7 +43,8 @@ const AdminCards = lazy(() => import("./pages/admin/cards"));
 const AdminFeatureFlagsPage = lazy(() => import("./pages/AdminModulePages").then((m) => ({ default: m.AdminFeatureFlagsPage })));
 const AdminSecurityPage = lazy(() => import("./pages/AdminModulePages").then((m) => ({ default: m.AdminSecurityPage })));
 const AdminBankingOpsPage = lazy(() => import("./pages/AdminModulePages").then((m) => ({ default: m.AdminBankingOpsPage })));
-const AdminAnalyticsPage = lazy(() => import("./pages/AdminModulePages").then((m) => ({ default: m.AdminAnalyticsPage })));
+// W12-A4-P0-E: AdminAnalyticsPage declaration removed with its shadowed route
+// (/admin/analytics is served by AdminAnalytics, pages/admin/analytics).
 const AdminUsersPage = lazy(() => import("./pages/AdminModulePages").then((m) => ({ default: m.AdminUsersPage })));
 // Role-based dashboards
 const AuditorDashboard = lazy(() => import("./pages/dashboard/AuditorDashboard"));
@@ -67,6 +68,23 @@ const CbnAnchorBorrowersWorkspace = lazy(() => import("./pages/CbnAnchorBorrower
 const CBNReturnsWorkspace = lazy(() => import("./pages/CBNReturnsWorkspace"));
 const CbnAgriReturnsWorkspace = lazy(() => import("./pages/CbnAgriReturnsWorkspace"));
 const CBNComplianceCheckerWorkspace = lazy(() => import("./pages/CBNComplianceCheckerWorkspace"));
+// W12-A4P2WEB: previously-orphaned feature pages wired into router (P2-D WIRE batch)
+const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
+const AgentBankingWorkspace2 = lazy(() => import("./pages/AgentBankingWorkspace2"));
+const CardManagementWorkspace = lazy(() => import("./pages/CardManagementWorkspace"));
+const CardManagementWorkspace2 = lazy(() => import("./pages/CardManagementWorkspace2"));
+const FraudDetectionWorkspace = lazy(() => import("./pages/FraudDetectionWorkspace"));
+const InsuranceWorkspace = lazy(() => import("./pages/InsuranceWorkspace"));
+const LakehouseWorkspace = lazy(() => import("./pages/LakehouseWorkspace"));
+const LedgerWorkspace = lazy(() => import("./pages/LedgerWorkspace"));
+const OpenSearchWorkspace = lazy(() => import("./pages/OpenSearchWorkspace"));
+const OperationsCenter = lazy(() => import("./pages/OperationsCenter"));
+const PartnerOnboardingAdminPage = lazy(() => import("./pages/PartnerOnboardingAdminPage"));
+const PartnerOnboardingPortalPage = lazy(() => import("./pages/PartnerOnboardingPortalPage"));
+const RegulatoryReportingWorkspace = lazy(() => import("./pages/RegulatoryReportingWorkspace"));
+const ReportingWorkspace = lazy(() => import("./pages/ReportingWorkspace"));
+const AnalystDashboard = lazy(() => import("./pages/dashboard/AnalystDashboard"));
+const FinanceAdminDashboard = lazy(() => import("./pages/dashboard/FinanceAdminDashboard"));
 // Developer Platform
 import { useTemporalAccessPolling } from "./_core/hooks/useTemporalAccess";
 const Analytics = lazy(() => import("./pages/Analytics"));
@@ -222,7 +240,10 @@ function Router() {
           <Route path="/admin/feature-flags" component={AdminFeatureFlagsPage} />
           <Route path="/admin/security" component={AdminSecurityPage} />
           <Route path="/admin/banking-ops" component={AdminBankingOpsPage} />
-          <Route path="/admin/analytics" component={AdminAnalyticsPage} />
+          {/* W12-A4-P0-E: duplicate /admin/analytics removed — wouter first-match
+              means this entry (AdminAnalyticsPage, AdminModulePages.tsx) was
+              permanently shadowed by the canonical route above
+              (AdminAnalytics, pages/admin/analytics). */}
           <Route path="/admin/users" component={AdminUsersPage} />
 
           {/* KYC & Onboarding */}
@@ -239,6 +260,24 @@ function Router() {
           <Route path="/cbn-agri-returns" component={CbnAgriReturnsWorkspace} />
           <Route path="/cbn-agsmeis" component={CbnAgsmeisWorkspace} />
           <Route path="/cbn-anchor-borrowers" component={CbnAnchorBorrowersWorkspace} />
+
+          {/* W12-A4P2WEB: restored feature workspaces (P2-D WIRE batch) */}
+          <Route path="/admin/dashboard" component={AdminDashboard} />
+          <Route path="/agent-banking/workspace" component={AgentBankingWorkspace2} />
+          <Route path="/card-management" component={CardManagementWorkspace} />
+          <Route path="/card-management-extended" component={CardManagementWorkspace2} />
+          <Route path="/fraud-detection" component={FraudDetectionWorkspace} />
+          <Route path="/insurance" component={InsuranceWorkspace} />
+          <Route path="/lakehouse" component={LakehouseWorkspace} />
+          <Route path="/ledger" component={LedgerWorkspace} />
+          <Route path="/opensearch" component={OpenSearchWorkspace} />
+          <Route path="/operations-center" component={OperationsCenter} />
+          <Route path="/partner-onboarding/admin" component={PartnerOnboardingAdminPage} />
+          <Route path="/partner-onboarding" component={PartnerOnboardingPortalPage} />
+          <Route path="/regulatory-reporting/workspace" component={RegulatoryReportingWorkspace} />
+          <Route path="/reporting" component={ReportingWorkspace} />
+          <Route path="/dashboard/analyst" component={AnalystDashboard} />
+          <Route path="/dashboard/finance-admin" component={FinanceAdminDashboard} />
 
           {/* Developer Platform */}
           <Route path="/developer-platform" component={DeveloperPlatform} />

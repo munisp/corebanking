@@ -9,7 +9,8 @@ use uuid::Uuid;
 use chrono::{Utc, DateTime};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use tokio::sync::Mutex;
+use std::time::Instant;
+use actix_web::HttpMessage;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -29,14 +30,16 @@ struct CreateRequest {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+// Wave-12 (C3-P2-RSVEC): the accounting posting rules are served from Postgres
+// (was: in-memory Mutex<Vec<AccountingRule>> lost on every restart). Typed
+// columns matching AccountingRule; rule_id is the natural/unique key.
 struct AppState {
     db: Option<PgPool>,
-    rules: Mutex<Vec<AccountingRule>>,
     db_url: Option<String>,
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct AccountingRule {
     rule_id: String,
     event_type: String,
@@ -112,10 +115,25 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
 async fn evaluate_rules(req: actix_web::HttpRequest, body: web::Json<RuleEvalRequest>, state: web::Data<AppState>) -> HttpResponse {
     let _sanitized = sanitize_input("");
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    let rules = state.rules.lock().await;
+    if let Err(resp) = permify::require_permify(&req, "ledger", "evaluate").await { return resp; } // W12-B5D1
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(json!({"error": "rules_store_unavailable", "detail": "DATABASE_URL not configured; accounting rules cannot be loaded"})),
+    };
+    let rules = match sqlx::query_as::<_, AccountingRule>(
+        "SELECT rule_id, event_type, debit_account, credit_account, amount_formula, active FROM accounting_rules WHERE event_type = $1")
+        .bind(&body.event_type)
+        .fetch_all(pool)
+        .await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[accounting-rules-rs] evaluate_rules query failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(json!({"error": "rules_store_unavailable"}));
+        }
+    };
     let matching: Vec<serde_json::Value> = rules.iter()
-        .filter(|r| r.event_type == body.event_type && r.active.unwrap_or(true))
+        .filter(|r| r.active.unwrap_or(true))
         .map(|r| {
             let computed = evaluate_formula(&r.amount_formula, body.amount);
             json!({"rule_id": r.rule_id, "debit": r.debit_account, "credit": r.credit_account, "amount": computed, "formula": r.amount_formula})
@@ -134,17 +152,31 @@ async fn evaluate_rules(req: actix_web::HttpRequest, body: web::Json<RuleEvalReq
 
 async fn validate_rule_handler(req: actix_web::HttpRequest, body: web::Json<AccountingRule>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if let Err(resp) = permify::require_permify(&req, "journal_entry", "validate").await { return resp; } // W12-B5D1
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let errors = validate_rule(&body);
     HttpResponse::Ok().json(json!({"valid": errors.is_empty(), "errors": errors}))
 }
 
 async fn rules_by_event(req: actix_web::HttpRequest, path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let event_type = path.into_inner();
-    let rules = state.rules.lock().await;
-    let matching: Vec<&AccountingRule> = rules.iter().filter(|r| r.event_type == event_type).collect();
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(json!({"error": "rules_store_unavailable", "detail": "DATABASE_URL not configured; accounting rules cannot be loaded"})),
+    };
+    let matching = match sqlx::query_as::<_, AccountingRule>(
+        "SELECT rule_id, event_type, debit_account, credit_account, amount_formula, active FROM accounting_rules WHERE event_type = $1")
+        .bind(&event_type)
+        .fetch_all(pool)
+        .await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[accounting-rules-rs] rules_by_event query failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(json!({"error": "rules_store_unavailable"}));
+        }
+    };
     db_persist(&state, "rules_by_event", &json!({"action": "rules_by_event"})).await;
     HttpResponse::Ok().json(json!({"event_type": event_type, "rules": matching, "count": matching.len()}))
 }
@@ -153,8 +185,6 @@ async fn rules_by_event(req: actix_web::HttpRequest, path: web::Path<String>, st
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -392,7 +422,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -501,8 +531,6 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 
 
@@ -583,17 +611,56 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     }
 }
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:accounting-rules-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:accounting-rules-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -698,7 +765,6 @@ async fn main() -> std::io::Result<()> {
     };
     let state = web::Data::new(AppState {
             db: db_pool,
-            rules: Mutex::new(Vec::new()),
             db_url: std::env::var("DATABASE_URL").ok(),
             db_client: {
             let db_url = std::env::var("DATABASE_URL").ok();
@@ -792,6 +858,21 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create accounts table");
+    // Wave-12 (C3-P2-RSVEC): durable accounting posting rules (was in-memory Vec).
+    if let Err(e) = sqlx::query(r#"CREATE TABLE IF NOT EXISTS accounting_rules (
+    rule_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    debit_account TEXT NOT NULL,
+    credit_account TEXT NOT NULL,
+    amount_formula TEXT NOT NULL,
+    active BOOLEAN,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await {
+        eprintln!("[accounting-rules-rs] accounting_rules DDL failed: {}", e);
+    }
 }
 
 #[cfg(test)]
@@ -859,6 +940,7 @@ async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
 
 async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "account", "create").await { return resp; } // W12-B5D1
     let tenant_id = match claims_tenant(&req) {
         Some(t) if !t.is_empty() => t,
         _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
@@ -870,22 +952,31 @@ async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>
         None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
     };
 
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO accounts (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
     )
     .bind(&tenant_id)
     .bind(&status)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
         Ok(id) => {
             let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("accounts.created")
                 .bind(id.to_string())
                 .bind(&payload)
-                .execute(pool).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -917,6 +1008,7 @@ async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: act
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "account", "update").await { return resp; } // W12-B5D1
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
     let pool = match data.db.as_ref() {
@@ -924,20 +1016,29 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
         None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
     };
 
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE accounts SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("accounts.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(pool).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -946,23 +1047,37 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "account", "delete").await { return resp; } // W12-B5D1
     let id = path.into_inner();
     let pool = match data.db.as_ref() {
         Some(p) => p,
         None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
     };
-    sqlx::query("UPDATE accounts SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE accounts SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(pool)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("accounts.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(pool).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

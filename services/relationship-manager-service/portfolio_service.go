@@ -8,7 +8,7 @@ import (
 // PortfolioService handles portfolio operations
 type PortfolioService struct {
 	tenantID   string
-	portfolios map[string]*Portfolio
+	portfolios *repo[Portfolio]
 	mu         sync.RWMutex
 }
 
@@ -16,14 +16,14 @@ type PortfolioService struct {
 func NewPortfolioService(tenantID string) *PortfolioService {
 	svc := &PortfolioService{
 		tenantID:   tenantID,
-		portfolios: make(map[string]*Portfolio),
+		portfolios: newRepo[Portfolio](serviceDB, "portfolios"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
 }
 
 func (s *PortfolioService) initializeDefaultData(tenantID string) {
-	s.portfolios["rm-001"] = &Portfolio{
+	s.portfolios.seed(tenantID, "rm-001", &Portfolio{
 		PortfolioID:    "port-001",
 		TenantID:       tenantID,
 		RMID:           "rm-001",
@@ -39,9 +39,9 @@ func (s *PortfolioService) initializeDefaultData(tenantID string) {
 		Achievement:    92.5,
 		CreatedAt:      time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
-	s.portfolios["rm-002"] = &Portfolio{
+	s.portfolios.seed(tenantID, "rm-002", &Portfolio{
 		PortfolioID:    "port-002",
 		TenantID:       tenantID,
 		RMID:           "rm-002",
@@ -57,16 +57,14 @@ func (s *PortfolioService) initializeDefaultData(tenantID string) {
 		Achievement:    80.0,
 		CreatedAt:      time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 }
 
 // GetPortfolio returns portfolio for an RM
 func (s *PortfolioService) GetPortfolio(tenantID, rmID string) *Portfolio {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	portfolio, exists := s.portfolios[rmID]
-	if !exists || portfolio.TenantID != tenantID {
+	portfolio, err := s.portfolios.get(tenantID, rmID)
+	if err != nil {
 		return &Portfolio{
 			TenantID:       tenantID,
 			RMID:           rmID,

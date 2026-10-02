@@ -581,7 +581,17 @@ func (app *App) periodClose(w http.ResponseWriter, r *http.Request) {
 			"closing_balance_kobo" = EXCLUDED."closing_balance_kobo",
 			"status" = 'closed'`
 
-	result, err := app.db.Exec(query, req.TenantID, req.PeriodStart, req.PeriodEnd)
+	// Period close + outbox event in ONE transaction: either the close and
+	// its event are both recorded or neither is (fail closed on any error).
+	tx, err := app.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("[gl-engine-go] period close tx begin failed: %v", err)
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable"})
+		return
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(query, req.TenantID, req.PeriodStart, req.PeriodEnd)
 	if err != nil {
 		log.Printf("[gl-engine-go] period close failed (journal history unavailable): %v", err)
 		writeJSON(w, 503, map[string]string{"error": "journal_history_unavailable", "detail": "period NOT closed — cannot derive balances from journal history; refusing to report live balances as period figures"})
@@ -589,17 +599,25 @@ func (app *App) periodClose(w http.ResponseWriter, r *http.Request) {
 	}
 	affected, _ := result.RowsAffected()
 
-	// Queue a real outbox event; the relay publishes it to Kafka.
+	// Queue a real outbox event in the SAME transaction; the relay publishes
+	// it to Kafka. An outbox error aborts the period close (fail closed).
 	outboxPayload, _ := json.Marshal(map[string]interface{}{
 		"event": "gl.trial_balance.closed", "tenantId": req.TenantID,
 		"periodStart": req.PeriodStart, "periodEnd": req.PeriodEnd,
 		"accountsClosed": affected, "timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 	outboxID := fmt.Sprintf("OBX-PC-%s-%d", req.TenantID, time.Now().UnixNano())
-	if _, err := app.db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
+	if _, err := tx.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
 		VALUES ($1, $2, $3, $4, $5, $6, 'pending') ON CONFLICT (id) DO NOTHING`,
 		outboxID, "gl.trial_balance.closed", req.TenantID, outboxPayload, outboxID, time.Now()); err != nil {
 		log.Printf("[gl-engine-go] period-close outbox insert failed: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "period_close_failed", "detail": "outbox insert failed; period close rolled back"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[gl-engine-go] period close commit failed: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "period_close_failed", "detail": "commit failed; period close rolled back"})
+		return
 	}
 
 	writeJSON(w, 200, map[string]interface{}{
@@ -1330,12 +1348,12 @@ func main() {
 	})
 	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/v1/gl/accounts", app.listGLAccounts)
-	mux.HandleFunc("/v1/gl/journal", app.postJournal)
+	mux.HandleFunc("/v1/gl/journal", permifyAuthzGuard("journal_entry", "create", app.postJournal))
 	mux.HandleFunc("/v1/gl/trial-balance", app.listTrialBalance)
-	mux.HandleFunc("/v1/gl/period-close", app.periodClose)
-	mux.HandleFunc("/v1/gl/efass/generate", app.generateEFASS)
-	mux.HandleFunc("/v1/gl/efass/mapping", app.efassMapping)
-	mux.HandleFunc("/v1/gl/cbn-returns", app.cbnReturns)
+	mux.HandleFunc("/v1/gl/period-close", permifyAuthzGuard("fiscal_period", "close", app.periodClose))
+	mux.HandleFunc("/v1/gl/efass/generate", permifyAuthzGuard("ledger", "report", app.generateEFASS))
+	mux.HandleFunc("/v1/gl/efass/mapping", permifyAuthzGuard("coa_mapping", "upsert", app.efassMapping))
+	mux.HandleFunc("/v1/gl/cbn-returns", permifyAuthzGuard("ledger", "report", app.cbnReturns))
 
 	port := getEnv("PORT", "8090")
 

@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // USSD Escrow Service for Offline/Low-Connectivity Access
@@ -43,14 +48,36 @@ type USSDResponse struct {
 // USSDEscrowService handles USSD escrow operations
 type USSDEscrowService struct {
 	escrowService *EscrowService
-	sessions      map[string]*USSDSession
+	// W12 C3-P1-B2 (c3-0519): the per-process sessions map is gone — USSD
+	// session state lives in redis (ussd:session:{session_id}, 900s sliding)
+	// via the previously declared-but-uninitialized go-redis/v9 dependency,
+	// so PIN-confirmation and release-approval state is consistent across
+	// replicas and survives restarts.
+	redis *redis.Client
+}
+
+// ussdSessionTTL is the sliding session lifetime — refreshed on every touch.
+const ussdSessionTTL = 900 * time.Second
+
+func ussdSessionKey(sessionID string) string {
+	return "ussd:session:" + sessionID
 }
 
 // NewUSSDEscrowService creates a new USSD escrow service
 func NewUSSDEscrowService(escrowSvc *EscrowService) *USSDEscrowService {
+	addr := os.Getenv("REDIS_URL")
+	if addr == "" {
+		addr = "localhost:6379"
+	}
 	return &USSDEscrowService{
 		escrowService: escrowSvc,
-		sessions:      make(map[string]*USSDSession),
+		redis: redis.NewClient(&redis.Options{
+			Addr:         addr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		}),
 	}
 }
 
@@ -71,11 +98,44 @@ const (
 	MenuEnterDescription = "enter_description"
 )
 
+// loadSession fetches the session from redis; nil session means "no such
+// session" (or a corrupt entry, treated as absent). Redis outages return an
+// error so callers can FAIL CLOSED.
+func (s *USSDEscrowService) loadSession(ctx context.Context, sessionID string) (*USSDSession, error) {
+	raw, err := s.redis.Get(ctx, ussdSessionKey(sessionID)).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var session USSDSession
+	if err := json.Unmarshal(raw, &session); err != nil {
+		log.Printf("[escrow-ussd] corrupt session entry %s, starting fresh: %v", sessionID, err)
+		return nil, nil
+	}
+	return &session, nil
+}
+
+// saveSession writes the session with the sliding 900s TTL.
+func (s *USSDEscrowService) saveSession(ctx context.Context, session *USSDSession) error {
+	data, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("session encode: %w", err)
+	}
+	return s.redis.Set(ctx, ussdSessionKey(session.SessionID), data, ussdSessionTTL).Err()
+}
+
 // ProcessUSSD handles USSD requests
 func (s *USSDEscrowService) ProcessUSSD(ctx context.Context, req USSDRequest) (*USSDResponse, error) {
-	// Get or create session
-	session, exists := s.sessions[req.SessionID]
-	if !exists {
+	// W12 C3-P1-B2 (c3-0519): FAIL CLOSED — a USSD escrow session carries
+	// PIN-entry and release-approval state; if redis is unreachable the
+	// request errors rather than continuing with untracked state.
+	session, err := s.loadSession(ctx, req.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("session state unavailable: %w", err)
+	}
+	if session == nil {
 		// New session - authenticate user by phone
 		user, err := s.authenticateByPhone(ctx, req.PhoneNumber)
 		if err != nil {
@@ -97,20 +157,37 @@ func (s *USSDEscrowService) ProcessUSSD(ctx context.Context, req USSDRequest) (*
 			CreatedAt:    time.Now(),
 			LastActivity: time.Now(),
 		}
-		s.sessions[req.SessionID] = session
 	}
 
 	session.LastActivity = time.Now()
 
-	// Handle back navigation
+	var resp *USSDResponse
 	if req.Input == "0" && len(session.MenuStack) > 0 {
+		// Handle back navigation
 		session.CurrentMenu = session.MenuStack[len(session.MenuStack)-1]
 		session.MenuStack = session.MenuStack[:len(session.MenuStack)-1]
-		return s.renderMenu(ctx, session)
+		resp, err = s.renderMenu(ctx, session)
+	} else {
+		// Process input based on current menu
+		resp, err = s.processMenuInput(ctx, session, req.Input)
+	}
+	if err != nil {
+		return resp, err
 	}
 
-	// Process input based on current menu
-	return s.processMenuInput(ctx, session, req.Input)
+	// Persist the mutated session (sliding 900s TTL); on session end the key
+	// is deleted so ended sessions cannot be resumed (previously ended
+	// sessions leaked in the map forever). FAIL CLOSED on persistence
+	// failure for the same reason as above.
+	if resp != nil && resp.EndSession {
+		if derr := s.redis.Del(ctx, ussdSessionKey(req.SessionID)).Err(); derr != nil {
+			return nil, fmt.Errorf("session state unavailable: %w", derr)
+		}
+	} else if serr := s.saveSession(ctx, session); serr != nil {
+		return nil, fmt.Errorf("session state unavailable: %w", serr)
+	}
+
+	return resp, nil
 }
 
 func (s *USSDEscrowService) processMenuInput(ctx context.Context, session *USSDSession, input string) (*USSDResponse, error) {

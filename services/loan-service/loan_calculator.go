@@ -1,12 +1,16 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
+	"log"
 	"math"
 	"net/http"
-	"sync"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	_ "github.com/lib/pq"
 )
 
 type LoanCalcResult struct {
@@ -34,9 +38,57 @@ type Installment struct {
 	ClosingBalanceKobo int64 `json:"closing_balance_kobo"` // kobo integer
 }
 
+// ── Postgres persistence (W12 C3-P2-B5) ─────────────────────────────────────
+// The in-memory lcCalcs slice was removed. loan_calculations is authoritative
+// (kobo columns stay BIGINT — never float); creates are real PG INSERTs
+// (idempotent on the id natural key) and the list endpoint reads from PG.
+// When DATABASE_URL is unset/unreachable the endpoints fail closed (503).
+// Pool mirrors the fx/treasury per-package pattern (same DATABASE_URL).
+
+var calcDB *sql.DB
+
+func init() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[loan-service] DATABASE_URL unset — loan calculation endpoints fail closed (503)")
+		return
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil || db.Ping() != nil {
+		log.Printf("[loan-service] DATABASE_URL unreachable — loan calculation endpoints fail closed (503)")
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS loan_calculations (
+		id TEXT PRIMARY KEY,
+		customer_name TEXT NOT NULL DEFAULT '',
+		loan_type TEXT NOT NULL DEFAULT '',
+		principal_kobo BIGINT NOT NULL DEFAULT 0,
+		annual_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+		tenor_months INT NOT NULL DEFAULT 0,
+		repayment_type TEXT NOT NULL DEFAULT '',
+		monthly_payment_kobo BIGINT NOT NULL DEFAULT 0,
+		total_interest_kobo BIGINT NOT NULL DEFAULT 0,
+		total_repayment_kobo BIGINT NOT NULL DEFAULT 0,
+		effective_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+		schedule JSONB,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[loan-service] loan_calculations DDL failed: %v — endpoints fail closed (503)", err)
+		return
+	}
+	calcDB = db
+	log.Printf("[loan-service] loan_calculations store ready")
+}
+
+func calcStoreUnavailable(c *gin.Context) {
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "loan calculation store unavailable (postgres down)"})
+}
+
 var (
-	lcMu            sync.RWMutex
-	lcCalcs         []LoanCalcResult
+
 	lcCounter       int64
 	validLoanTypes  = map[string]bool{"mortgage": true, "education": true, "agriculture": true, "personal": true, "auto": true, "murabaha": true, "ijara": true, "general": true}
 	validRepayTypes = map[string]bool{"equal_installment": true, "reducing_balance": true, "bullet": true, "balloon": true}
@@ -181,9 +233,34 @@ func registerCalculatorRoutes(api *gin.RouterGroup) {
 }
 
 func listCalculations(c *gin.Context) {
-	lcMu.RLock()
-	defer lcMu.RUnlock()
-	c.JSON(http.StatusOK, gin.H{"items": lcCalcs, "total": len(lcCalcs)})
+	if calcDB == nil {
+		calcStoreUnavailable(c)
+		return
+	}
+	rows, err := calcDB.Query(`SELECT id, customer_name, loan_type, principal_kobo, annual_rate, tenor_months, repayment_type,
+		monthly_payment_kobo, total_interest_kobo, total_repayment_kobo, effective_rate, schedule, created_at
+		FROM loan_calculations ORDER BY created_at, id`)
+	if err != nil {
+		log.Printf("[loan-service] calculation list failed: %v", err)
+		calcStoreUnavailable(c)
+		return
+	}
+	defer rows.Close()
+	items := []LoanCalcResult{}
+	for rows.Next() {
+		var lc LoanCalcResult
+		var sched []byte
+		if err := rows.Scan(&lc.ID, &lc.CustomerName, &lc.LoanType, &lc.PrincipalKobo, &lc.AnnualRate, &lc.TenorMonths, &lc.RepaymentType,
+			&lc.MonthlyPaymentKobo, &lc.TotalInterestKobo, &lc.TotalRepaymentKobo, &lc.EffectiveRate, &sched, &lc.CreatedAt); err != nil {
+			calcStoreUnavailable(c)
+			return
+		}
+		if len(sched) > 0 {
+			_ = json.Unmarshal(sched, &lc.Schedule)
+		}
+		items = append(items, lc)
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
 }
 
 func createCalculation(c *gin.Context) {
@@ -220,7 +297,10 @@ func createCalculation(c *gin.Context) {
 	if req.PrincipalKobo > 0 {
 		effectiveRate = math.Round(float64(ti)/float64(req.PrincipalKobo)*10000) / 100
 	}
-	lcMu.Lock()
+	if calcDB == nil {
+		calcStoreUnavailable(c)
+		return
+	}
 	lcCounter++
 	calc := LoanCalcResult{
 		ID: generateID("LC"), CustomerName: req.CustomerName,
@@ -229,8 +309,17 @@ func createCalculation(c *gin.Context) {
 		MonthlyPaymentKobo: mp, TotalInterestKobo: ti, TotalRepaymentKobo: tr,
 		EffectiveRate: effectiveRate, CreatedAt: time.Now().UTC(),
 	}
-	lcCalcs = append(lcCalcs, calc)
-	lcMu.Unlock()
+	schedJSON, _ := json.Marshal(calc.Schedule)
+	if _, err := calcDB.Exec(`INSERT INTO loan_calculations
+		(id, customer_name, loan_type, principal_kobo, annual_rate, tenor_months, repayment_type, monthly_payment_kobo, total_interest_kobo, total_repayment_kobo, effective_rate, schedule, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING`,
+		calc.ID, calc.CustomerName, calc.LoanType, calc.PrincipalKobo, calc.AnnualRate, calc.TenorMonths, calc.RepaymentType,
+		calc.MonthlyPaymentKobo, calc.TotalInterestKobo, calc.TotalRepaymentKobo, calc.EffectiveRate, schedJSON, calc.CreatedAt); err != nil {
+		log.Printf("[loan-service] calculation insert failed: %v", err)
+		calcStoreUnavailable(c)
+		return
+	}
+	
 	c.JSON(http.StatusCreated, calc)
 }
 

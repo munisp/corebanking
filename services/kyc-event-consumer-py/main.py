@@ -13,7 +13,9 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -24,9 +26,28 @@ import signal
 import socket as _socket
 import urllib.request
 
+import redis as _redis_lib
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("kyc-event-consumer-py")
 SERVICE_NAME = "kyc-event-consumer-py"
+
+# Redis client for the KYC trigger cooldown store (c3-0945, ADD-CLIENT:
+# redis==5.2.1 added to requirements.txt). The previous in-process
+# `cooldown_tracker` dict lost cooldown state on restart and was
+# per-replica, allowing duplicate KYC triggers across replicas.
+_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_redis_pool = None
+
+
+def _get_redis():
+    """Lazy sync redis client backed by a shared ConnectionPool."""
+    global _redis_pool
+    if _redis_pool is None:
+        _redis_pool = _redis_lib.ConnectionPool.from_url(
+            _REDIS_URL, decode_responses=True, max_connections=20
+        )
+    return _redis_lib.Redis(connection_pool=_redis_pool)
 
 # Configuration
 def _require_env(name):
@@ -214,6 +235,19 @@ def init_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+        # W12-C3-P2-AMB (c3-0946): durable store for fired KYC/KYB triggers
+        # (replaces the in-memory `processed_events` ring). Fleet pattern:
+        # id uuid pk, record_id text UNIQUE (natural key = trigger id),
+        # tenant_id text (none in this flow -> NULL), payload jsonb,
+        # created_at timestamptz.
+        cur.execute("""CREATE TABLE IF NOT EXISTS kyc_trigger_events (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            record_id TEXT NOT NULL UNIQUE,
+            tenant_id TEXT,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_trigger_events_created ON kyc_trigger_events(created_at DESC)")
         conn.commit()
         logger.info("Schema initialized")
     except Exception as e:
@@ -344,7 +378,7 @@ def metrics():
         return {"service": "kyc-event-consumer-py", "total_records": 0}
 
 
-@app.get("/api/v1/kyc_records")
+@app.get("/api/v1/kyc_records", dependencies=[Depends(require_permify("kyc_record", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
@@ -422,8 +456,42 @@ TRIGGER_RULES = [
 ]
 trigger_stats = {"total_events_received": 0, "triggers_by_topic": {}, "events_skipped": 0,
                  "total_triggers_fired": 0, "triggers_by_level": {}}
-cooldown_tracker = {}
-processed_events = []
+# Cooldown state now lives in redis (c3-0945):
+# `SET kyc:cooldown:{topic}:{customer|company} 1 NX PX <cooldown_ms>`
+# (12/24/72h windows preserved exactly; remaining time read back via PTTL).
+# ADJUDICATION NOTE: the remediation memo mentioned a kyc:processed:{event_id}
+# dedup key, but the source has no event_id dedup — only this cooldown
+# tracker (register line 425) — so only the cooldown store was converted.
+_COOLDOWN_KEY = "kyc:cooldown:{topic}:{subject}"
+
+
+# W12-C3-P2-AMB (c3-0946): removed the in-memory `processed_events` ring
+# (bounded 10k, 5k trim-on-overflow, NEVER read anywhere, lost on restart)
+# and persist fired triggers to postgres:kyc_trigger_events instead
+# (DDL in init_schema). INSERT is idempotent: ON CONFLICT (record_id)
+# DO NOTHING. NOTE (event_id dedup interplay, per C3-P1-B2D adjudication in
+# fix-dispositions/c3-fixes.md): the source has NO kyc:processed:{event_id}
+# dedup — only the cooldown tracker existed — so no dedup logic is added
+# here; record_id uniqueness only makes a retried insert of the SAME
+# trigger id a no-op. Reachability note: process_event is currently not
+# invoked by any route/loop in this service (kafka_consumer_loop is never
+# started); the conversion keeps the designated trigger trail durable for
+# when the consumer is wired, without restructuring handlers.
+def _persist_trigger_event(trigger):
+    """INSERT one fired trigger into kyc_trigger_events (autocommit
+    connection => single-statement transaction). Raises on PG failure so
+    the caller can fail closed."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO kyc_trigger_events (record_id, tenant_id, payload)
+                VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                (trigger["id"], None, json.dumps(trigger, default=str)))
+    finally:
+        release_db(conn)
+
+
 def process_event(topic, event_data):
     trigger_stats["total_events_received"] += 1
     trigger_stats["triggers_by_topic"].setdefault(topic, 0)
@@ -437,14 +505,21 @@ def process_event(topic, event_data):
     customer_id = event_data.get("customerId", "")
     company_id = event_data.get("companyId", "")
 
-    # Cooldown check
-    cooldown_key = f"{topic}:{customer_id or company_id}"
-    if cooldown_key in cooldown_tracker:
-        last_fired = cooldown_tracker[cooldown_key]
-        elapsed_hours = (time.time() - last_fired) / 3600
-        if elapsed_hours < rule["cooldown_hours"]:
-            trigger_stats["events_skipped"] += 1
-            return {"processed": False, "reason": f"Cooldown active ({elapsed_hours:.1f}h / {rule['cooldown_hours']}h)"}
+    # Cooldown check (redis-backed, fail-closed: an outage must NOT let
+    # duplicate KYC triggers fire, so we report the event as unprocessed).
+    cooldown_key = _COOLDOWN_KEY.format(topic=topic, subject=customer_id or company_id)
+    cooldown_ms = int(rule["cooldown_hours"] * 3600 * 1000)
+    try:
+        r = _get_redis()
+        remaining_ms = r.pttl(cooldown_key)
+    except _redis_lib.RedisError as e:
+        logger.error("cooldown state store unavailable (redis): %s", e)
+        trigger_stats["events_skipped"] += 1
+        return {"processed": False, "reason": "Cooldown state store unavailable"}
+    if remaining_ms is not None and remaining_ms > 0:
+        elapsed_hours = (cooldown_ms - remaining_ms) / 3600000
+        trigger_stats["events_skipped"] += 1
+        return {"processed": False, "reason": f"Cooldown active ({elapsed_hours:.1f}h / {rule['cooldown_hours']}h)"}
 
     # Fire KYC/KYB trigger
     trigger_id = f"EVT-{uuid.uuid4().hex[:8].upper()}"
@@ -470,11 +545,28 @@ def process_event(topic, event_data):
             {"topic": "kyb.verification.required", "companyId": company_id, "level": rule["kyc_level"]}
         )
 
-    processed_events.append(trigger)
-    if len(processed_events) > 10000:
-        del processed_events[:5000]
+    # W12-C3-P2-AMB (c3-0946): INSERT-before-response, fail-closed — if the
+    # trigger event store is down we report the event unprocessed (mirrors
+    # the c3-0945 cooldown fail-closed posture: an outage must not let a
+    # KYC trigger fire without a durable audit record).
+    try:
+        _persist_trigger_event(trigger)
+    except Exception as e:
+        logger.error("trigger event store unavailable (postgres): %s", e)
+        trigger_stats["events_skipped"] += 1
+        return {"processed": False, "reason": "Trigger event store unavailable"}
 
-    cooldown_tracker[cooldown_key] = time.time()
+    try:
+        # Atomic cooldown arm: NX PX makes the window race-safe across replicas.
+        armed = r.set(cooldown_key, "1", nx=True, px=cooldown_ms)
+    except _redis_lib.RedisError as e:
+        logger.error("cooldown state store unavailable (redis): %s", e)
+        trigger_stats["events_skipped"] += 1
+        return {"processed": False, "reason": "Cooldown state store unavailable"}
+    if not armed:
+        # Lost a race with another replica: the cooldown was armed concurrently.
+        trigger_stats["events_skipped"] += 1
+        return {"processed": False, "reason": f"Cooldown active (0.0h / {rule['cooldown_hours']}h)"}
     trigger_stats["total_triggers_fired"] += 1
     trigger_stats["triggers_by_level"][rule["kyc_level"]] += 1
 

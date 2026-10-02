@@ -2,14 +2,15 @@
 use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicI64, AtomicI32, Ordering as AtomicOrdering};
 use std::env;
 use chrono::Utc;
+use std::time::Instant;
+use actix_web::HttpMessage;
 
 // ── Domain Types ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct DormantAccount {
     id: String,
     account_number: String,
@@ -19,11 +20,11 @@ struct DormantAccount {
     branch: String,
     balance: f64,
     currency: String,
-    days_inactive: u32,
+    days_inactive: i32, // C3-P2-RSVEC: u32 -> i32 (sqlx-postgres has no u32 codec); JSON identical
     last_transaction_date: String,
     dormancy_stage: String,     // "active" | "inactive" | "dormant" | "unclaimed"
     restriction_level: String,  // "none" | "alert_only" | "debit_restricted" | "fully_restricted"
-    notifications_sent: u32,
+    notifications_sent: i32, // C3-P2-RSVEC: u32 -> i32 (sqlx-postgres has no u32 codec)
     reactivation_eligible: bool,
     flagged_for_cbn_sweep: bool,
     created_at: String,
@@ -60,9 +61,72 @@ struct NotifyRequest {
     channel: Option<String>,
 }
 
+// Wave-12 (C3-P2-RSVEC): dormant accounts are persisted in Postgres (was:
+// in-memory Mutex<Vec<DormantAccount>> lost on every restart). Typed columns
+// matching the all-scalar struct; id is the natural/unique key. Handlers fail
+// closed (503) on PG error — no silent memory fallback.
 struct AppState {
-    accounts: Mutex<Vec<DormantAccount>>,
+    db: sqlx::PgPool,
 }
+
+const DORMANT_COLS: &str = "id, account_number, account_name, customer_id, account_type, branch, \
+     balance, currency, days_inactive, last_transaction_date, dormancy_stage, restriction_level, \
+     notifications_sent, reactivation_eligible, flagged_for_cbn_sweep, created_at, updated_at";
+
+async fn init_dormancy_db(pool: &sqlx::PgPool) {
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS dormant_accounts (
+            id TEXT PRIMARY KEY,
+            account_number TEXT NOT NULL DEFAULT '',
+            account_name TEXT NOT NULL DEFAULT '',
+            customer_id TEXT NOT NULL DEFAULT '',
+            account_type TEXT NOT NULL DEFAULT '',
+            branch TEXT NOT NULL DEFAULT '',
+            balance DOUBLE PRECISION NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            days_inactive INTEGER NOT NULL DEFAULT 0,
+            last_transaction_date TEXT NOT NULL DEFAULT '',
+            dormancy_stage TEXT NOT NULL DEFAULT 'active',
+            restriction_level TEXT NOT NULL DEFAULT 'none',
+            notifications_sent INTEGER NOT NULL DEFAULT 0,
+            reactivation_eligible BOOLEAN NOT NULL DEFAULT false,
+            flagged_for_cbn_sweep BOOLEAN NOT NULL DEFAULT false,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("[dormancy-management-rs] dormant_accounts DDL failed: {}", e);
+    }
+}
+
+async fn fetch_dormant_by_id(
+    pool: &sqlx::PgPool,
+    id: &str,
+) -> Result<Option<DormantAccount>, sqlx::Error> {
+    sqlx::query_as::<_, DormantAccount>(&format!(
+        "SELECT {} FROM dormant_accounts WHERE id = $1",
+        DORMANT_COLS
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+// W12-RUSTFIX: CreateRequest was referenced by the wave-11 CRUD handlers but
+// never defined (baseline did not compile). Fleet-canonical shape.
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
 
 // ── Domain Logic ──────────────────────────────────────────────────────────────
 
@@ -153,24 +217,48 @@ async fn reactivate(
     body: web::Json<ReactivateRequest>,
 ) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "dormancy", "collection", "reactivate").await { return resp; }
 
-    let mut accounts = state.accounts.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(account) = accounts.iter_mut().find(|a| a.id == body.id) {
-        if !account.reactivation_eligible {
-            return HttpResponse::Conflict().json(json!({
-                "error": "account is not eligible for reactivation",
-                "stage": account.dormancy_stage,
-            }));
+    let mut account = match fetch_dormant_by_id(&state.db, &body.id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return HttpResponse::NotFound()
+                .json(json!({"error": format!("account not found: {}", body.id)}));
         }
-        account.dormancy_stage = "active".into();
-        account.restriction_level = "none".into();
-        account.days_inactive = 0;
-        account.reactivation_eligible = false;
-        account.updated_at = Utc::now().to_rfc3339();
-        let snapshot = account.clone();
-        return HttpResponse::Ok().json(json!({ "reactivated": true, "account": snapshot }));
+        Err(e) => {
+            eprintln!("[dormancy-management-rs] reactivate fetch failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "account_store_unavailable"}));
+        }
+    };
+    if !account.reactivation_eligible {
+        return HttpResponse::Conflict().json(json!({
+            "error": "account is not eligible for reactivation",
+            "stage": account.dormancy_stage,
+        }));
     }
-    HttpResponse::NotFound().json(json!({"error": format!("account not found: {}", body.id)}))
+    account.dormancy_stage = "active".into();
+    account.restriction_level = "none".into();
+    account.days_inactive = 0;
+    account.reactivation_eligible = false;
+    account.updated_at = Utc::now().to_rfc3339();
+    if let Err(e) = sqlx::query(
+        "UPDATE dormant_accounts SET dormancy_stage=$1, restriction_level=$2, days_inactive=$3, reactivation_eligible=$4, updated_at=$5 WHERE id=$6",
+    )
+    .bind(&account.dormancy_stage)
+    .bind(&account.restriction_level)
+    .bind(account.days_inactive)
+    .bind(account.reactivation_eligible)
+    .bind(&account.updated_at)
+    .bind(&account.id)
+    .execute(&state.db)
+    .await
+    {
+        eprintln!("[dormancy-management-rs] reactivate update failed: {}", e);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "account_store_unavailable"}));
+    }
+    return HttpResponse::Ok().json(json!({ "reactivated": true, "account": account }));
 }
 
 async fn notify(
@@ -179,46 +267,103 @@ async fn notify(
     body: web::Json<NotifyRequest>,
 ) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "dormancy", "collection", "notify").await { return resp; }
 
-    let mut accounts = state.accounts.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(account) = accounts.iter_mut().find(|a| a.id == body.id) {
-        account.notifications_sent += 1;
-        account.updated_at = Utc::now().to_rfc3339();
-        let channel = body.channel.as_deref().unwrap_or("sms");
-        let snapshot = account.clone();
-        return HttpResponse::Ok().json(json!({
-            "notified": true,
-            "channel": channel,
-            "notifications_sent": snapshot.notifications_sent,
-            "account": snapshot,
-        }));
+    let mut account = match fetch_dormant_by_id(&state.db, &body.id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return HttpResponse::NotFound()
+                .json(json!({"error": format!("account not found: {}", body.id)}));
+        }
+        Err(e) => {
+            eprintln!("[dormancy-management-rs] notify fetch failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "account_store_unavailable"}));
+        }
+    };
+    account.notifications_sent += 1;
+    account.updated_at = Utc::now().to_rfc3339();
+    let channel = body.channel.as_deref().unwrap_or("sms");
+    if let Err(e) = sqlx::query(
+        "UPDATE dormant_accounts SET notifications_sent=$1, updated_at=$2 WHERE id=$3",
+    )
+    .bind(account.notifications_sent)
+    .bind(&account.updated_at)
+    .bind(&account.id)
+    .execute(&state.db)
+    .await
+    {
+        eprintln!("[dormancy-management-rs] notify update failed: {}", e);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "account_store_unavailable"}));
     }
-    HttpResponse::NotFound().json(json!({"error": format!("account not found: {}", body.id)}))
+    return HttpResponse::Ok().json(json!({
+        "notified": true,
+        "channel": channel,
+        "notifications_sent": account.notifications_sent,
+        "account": account,
+    }));
 }
 
 // ── Production Hardening ──────────────────────────────────────────────────────
 
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RL_TOKENS: AtomicI64 = AtomicI64::new(100);
-static _RL_LAST:   AtomicI64 = AtomicI64::new(0);
 static CB_FAILURES: AtomicI32 = AtomicI32::new(0);
 static CB_LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
 const  CB_THRESHOLD: i32 = 5;
 const  CB_RESET_SECS: i64 = 30;
 
-fn rl_allow() -> bool {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(AtomicOrdering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, AtomicOrdering::Relaxed);
-        _RL_LAST.store(now, AtomicOrdering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:dormancy-management-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:dormancy-management-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, AtomicOrdering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, AtomicOrdering::Relaxed);
-        return false;
-    }
-    true
 }
 
 fn cb_allow() -> bool {
@@ -532,11 +677,130 @@ fn compute_provisioning_rate(days_past_due: u32) -> f64 {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = verified JWT tenant claim
+// (fallback: X-Tenant-Id header, PERMIFY_DEFAULT_TENANT, "bpmgd"), resource =
+// domain entity id, permission per action (schema: canonical v2.perm
+// service_config entity + services/auth-service/schemas/permify/
+// v2-core-domain-rs.fragment). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (services/risk-scoring-rs/src/main.rs).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    use actix_web::HttpMessage as _;
+    let (subject, claim_tenant) = {
+        let ext = req.extensions();
+        match ext.get::<VerifiedClaims>() {
+            Some(c) => (
+                c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ),
+            None => (None, None),
+        }
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8166);
+    // W12-RUSTFIX: sqlx pool for the wave-11 CRUD handlers (data.db) — never
+    // initialised by the generator (baseline did not compile). Fleet-canonical init.
+    let db: sqlx::PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("dormancy-management-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[dormancy-management-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[dormancy-management-rs] DATABASE_URL not set — DB endpoints will fail");
+            sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+        }
+    };
+    init_dormancy_db(&db).await;
     let state = web::Data::new(AppState {
-        accounts: Mutex::new(vec![]),
+        db: db.clone(),
     });
 
     println!("dormancy-management-rs v2.0 listening on :{}", port);
@@ -635,20 +899,29 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -657,18 +930,28 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }

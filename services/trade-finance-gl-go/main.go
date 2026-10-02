@@ -1184,15 +1184,15 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "view", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", healthz)
-	mux.Handle("/v1/trade-finance/lc-gl", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(lcLifecycleGL)))
-	mux.Handle("/v1/trade-finance/collections-gl", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(docCollectionsGL)))
-	mux.Handle("/v1/islamic/murabaha-gl", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(murabahaGL)))
-	mux.Handle("/v1/disputes/chargeback-gl", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(disputeChargebackGL)))
-	mux.Handle("/v1/trade-finance-gl/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(trade_finance_glScoreHandler)))
-	mux.Handle("/v1/trade-finance-gl/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(trade_finance_glValidateRequestHandler)))
+	mux.Handle("/v1/trade-finance/lc-gl", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "create", http.HandlerFunc(lcLifecycleGL))))
+	mux.Handle("/v1/trade-finance/collections-gl", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "create", http.HandlerFunc(docCollectionsGL))))
+	mux.Handle("/v1/islamic/murabaha-gl", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "create", http.HandlerFunc(murabahaGL))))
+	mux.Handle("/v1/disputes/chargeback-gl", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "create", http.HandlerFunc(disputeChargebackGL))))
+	mux.Handle("/v1/trade-finance-gl/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "create", http.HandlerFunc(trade_finance_glScoreHandler))))
+	mux.Handle("/v1/trade-finance-gl/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("journal_entry", "validate", http.HandlerFunc(trade_finance_glValidateRequestHandler))))
 	log.Printf("Trade Finance & Specialized Banking GL (Go) on :%s — Gaps 17-20", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

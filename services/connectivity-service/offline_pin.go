@@ -12,14 +12,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/scrypt"
 )
 
 // Prometheus metrics
@@ -100,12 +99,16 @@ type OfflinePINVerificationResult struct {
 }
 
 // OfflinePINService handles offline PIN verification
+//
+// W12-C3-P0-B6: key material is NO LONGER held in this struct. The master key
+// is sourced fail-closed from KMS_MASTER_KEY (see kms_envelope.go) and cached
+// only inside the envelope helper; per-device data keys are random 32-byte
+// DEKs envelope-encrypted (AES-256-GCM) under the master key and persisted as
+// wrapped blobs in the device_keys table. No plaintext key material is kept
+// in long-lived process state, and none is ever stored in PG/redis.
 type OfflinePINService struct {
 	db          *pgxpool.Pool
 	config      OfflinePINConfig
-	masterKey   []byte
-	deviceKeys  map[string][]byte
-	mutex       sync.RWMutex
 	smsProvider SMSProvider
 }
 
@@ -114,26 +117,40 @@ type SMSProvider interface {
 	SendSMS(ctx context.Context, phone string, message string) error
 }
 
-// NewOfflinePINService creates a new offline PIN service
-func NewOfflinePINService(db *pgxpool.Pool, masterKey []byte, smsProvider SMSProvider) *OfflinePINService {
+// NewOfflinePINService creates a new offline PIN service.
+//
+// FAIL-CLOSED startup: returns an error when the master-key source
+// (KMS_MASTER_KEY env, or its future KMS/Vault-transit replacement — see
+// kms_envelope.go) is unavailable, and when the DDL cannot be applied.
+// The service refuses to start rather than handle PIN key material
+// unprotected.
+func NewOfflinePINService(ctx context.Context, db *pgxpool.Pool, smsProvider SMSProvider) (*OfflinePINService, error) {
+	// Fail-closed: master key must be loadable before we accept traffic.
+	if _, err := loadMasterKey(); err != nil {
+		return nil, fmt.Errorf("offline PIN service startup refused: %w", err)
+	}
+
+	// DDL at startup per repo convention (CREATE TABLE IF NOT EXISTS).
+	if _, err := db.Exec(ctx, OfflinePINSchema); err != nil {
+		return nil, fmt.Errorf("failed to ensure offline PIN schema: %w", err)
+	}
+
 	return &OfflinePINService{
 		db:          db,
 		config:      DefaultOfflinePINConfig,
-		masterKey:   masterKey,
-		deviceKeys:  make(map[string][]byte),
 		smsProvider: smsProvider,
-	}
+	}, nil
 }
 
 // GenerateOfflinePINData generates encrypted PIN data for offline storage
-func (s *OfflinePINService) GenerateOfflinePINData(ctx context.Context, userID, deviceID, pin string) (*OfflinePINData, error) {
+func (s *OfflinePINService) GenerateOfflinePINData(ctx context.Context, tenantID, userID, deviceID, pin string) (*OfflinePINData, error) {
 	start := time.Now()
 	defer func() {
 		offlinePINSyncTime.WithLabelValues("generate").Observe(time.Since(start).Seconds())
 	}()
 
-	// Generate device-specific key
-	deviceKey, err := s.getOrCreateDeviceKey(deviceID)
+	// Unwrap (or create) the device-specific data key from device_keys
+	deviceKey, err := s.getOrCreateDeviceKey(ctx, tenantID, deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get device key: %w", err)
 	}
@@ -170,7 +187,11 @@ func (s *OfflinePINService) GenerateOfflinePINData(ctx context.Context, userID, 
 	}
 
 	// Generate checksum for integrity verification
-	data.Checksum = s.generateChecksum(data)
+	checksum, err := s.generateChecksum(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate checksum: %w", err)
+	}
+	data.Checksum = checksum
 
 	// Store in database for sync tracking
 	_, err = s.db.Exec(ctx, `
@@ -192,9 +213,13 @@ func (s *OfflinePINService) GenerateOfflinePINData(ctx context.Context, userID, 
 }
 
 // VerifyOfflinePIN verifies PIN offline using stored encrypted data
-func (s *OfflinePINService) VerifyOfflinePIN(ctx context.Context, data *OfflinePINData, pin string) (*OfflinePINVerificationResult, error) {
+func (s *OfflinePINService) VerifyOfflinePIN(ctx context.Context, tenantID string, data *OfflinePINData, pin string) (*OfflinePINVerificationResult, error) {
 	// Verify checksum
-	if s.generateChecksum(data) != data.Checksum {
+	expectedChecksum, err := s.generateChecksum(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute checksum: %w", err)
+	}
+	if expectedChecksum != data.Checksum {
 		offlinePINVerifications.WithLabelValues("failed", "checksum").Inc()
 		return &OfflinePINVerificationResult{
 			Valid:              false,
@@ -234,8 +259,8 @@ func (s *OfflinePINService) VerifyOfflinePIN(ctx context.Context, data *OfflineP
 		}, nil
 	}
 
-	// Get device key
-	deviceKey, err := s.getOrCreateDeviceKey(data.DeviceID)
+	// Unwrap device key
+	deviceKey, err := s.getOrCreateDeviceKey(ctx, tenantID, data.DeviceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get device key: %w", err)
 	}
@@ -325,10 +350,15 @@ func (s *OfflinePINService) CanPerformOfflineTransaction(data *OfflinePINData, a
 }
 
 // RecordOfflineTransaction records an offline transaction
-func (s *OfflinePINService) RecordOfflineTransaction(data *OfflinePINData, amount float64) {
+func (s *OfflinePINService) RecordOfflineTransaction(data *OfflinePINData, amount float64) error {
 	data.OfflineTransactions++
 	data.OfflineAmount += amount
-	data.Checksum = s.generateChecksum(data)
+	checksum, err := s.generateChecksum(data)
+	if err != nil {
+		return fmt.Errorf("failed to generate checksum: %w", err)
+	}
+	data.Checksum = checksum
+	return nil
 }
 
 // SyncOfflineData syncs offline PIN data with server
@@ -347,10 +377,14 @@ func (s *OfflinePINService) SyncOfflineData(ctx context.Context, data *OfflinePI
 	data.OfflineAmount = 0
 
 	// Update checksum
-	data.Checksum = s.generateChecksum(data)
+	checksum, err := s.generateChecksum(data)
+	if err != nil {
+		return fmt.Errorf("failed to generate checksum: %w", err)
+	}
+	data.Checksum = checksum
 
 	// Update database
-	_, err := s.db.Exec(ctx, `
+	_, err = s.db.Exec(ctx, `
 		UPDATE offline_pin_data SET
 			last_sync_at = $1,
 			version = $2,
@@ -365,22 +399,99 @@ func (s *OfflinePINService) SyncOfflineData(ctx context.Context, data *OfflinePI
 
 // Helper methods
 
-func (s *OfflinePINService) getOrCreateDeviceKey(deviceID string) ([]byte, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+// getOrCreateDeviceKey returns the plaintext data-encryption key (DEK) for a
+// device. The DEK is a random 32-byte key, envelope-encrypted (AES-256-GCM)
+// under the master key (kms_envelope.go) and persisted as a wrapped blob in
+// the device_keys table — plaintext DEKs are never stored and never kept in
+// an in-process map. The returned plaintext is used for a single crypto
+// operation and then discarded by the caller.
+func (s *OfflinePINService) getOrCreateDeviceKey(ctx context.Context, tenantID, deviceID string) ([]byte, error) {
+	var wrapped []byte
+	err := s.db.QueryRow(ctx, `
+		SELECT wrapped_key FROM device_keys
+		WHERE tenant_id = $1 AND device_id = $2 AND status = 'active'
+	`, tenantID, deviceID).Scan(&wrapped)
 
-	if key, exists := s.deviceKeys[deviceID]; exists {
+	if err == nil {
+		key, derr := envelopeDecrypt(string(wrapped))
+		if derr != nil {
+			return nil, fmt.Errorf("failed to unwrap device key for device %s: %w", deviceID, derr)
+		}
 		return key, nil
 	}
-
-	// Derive device-specific key from master key and device ID
-	key, err := scrypt.Key(s.masterKey, []byte(deviceID), 32768, 8, 1, 32)
-	if err != nil {
-		return nil, err
+	if err != pgx.ErrNoRows {
+		return nil, fmt.Errorf("failed to read device key: %w", err)
 	}
 
-	s.deviceKeys[deviceID] = key
-	return key, nil
+	// No key yet: generate a random DEK, wrap it, persist the wrapped blob.
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("failed to generate device key: %w", err)
+	}
+	wrappedStr, err := envelopeEncrypt(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to wrap device key: %w", err)
+	}
+
+	// ON CONFLICT: a concurrent replica may have created the key first; in
+	// that case re-read and unwrap the winning row so all replicas agree.
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO device_keys (tenant_id, device_id, wrapped_key, status)
+		VALUES ($1, $2, $3, 'active')
+		ON CONFLICT (tenant_id, device_id) DO NOTHING
+	`, tenantID, deviceID, []byte(wrappedStr))
+	if err != nil {
+		return nil, fmt.Errorf("failed to persist wrapped device key: %w", err)
+	}
+
+	var stored []byte
+	err = s.db.QueryRow(ctx, `
+		SELECT wrapped_key FROM device_keys
+		WHERE tenant_id = $1 AND device_id = $2 AND status = 'active'
+	`, tenantID, deviceID).Scan(&stored)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-read device key: %w", err)
+	}
+	return envelopeDecrypt(string(stored))
+}
+
+// rotateDeviceKey generates a fresh DEK for the device, wraps it under the
+// current master key, and atomically replaces the active row. Rotation path
+// (documented per W12-C3-P0-B6):
+//  1. Master-key rotation: provision new KMS_MASTER_KEY/_ID, then call
+//     rotateDeviceKey for every active row (re-wraps under the new master
+//     key) before retiring the old key. Wrapped blobs carry their kid, so
+//     rows still wrapped under the old key fail closed (envelopeDecrypt
+//     rejects unknown kid) rather than silently mis-decrypting.
+//  2. Device-key rotation (e.g. suspected device compromise): call
+//     rotateDeviceKey for that device only, then re-encrypt payloads
+//     protected by the old DEK (offline_pin_data rows) on next sync.
+//
+// rotated_at records the last rotation for audit.
+func (s *OfflinePINService) rotateDeviceKey(ctx context.Context, tenantID, deviceID string) error {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return fmt.Errorf("failed to generate replacement device key: %w", err)
+	}
+	wrappedStr, err := envelopeEncrypt(key)
+	if err != nil {
+		return fmt.Errorf("failed to wrap replacement device key: %w", err)
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE device_keys
+		SET wrapped_key = $3, rotated_at = NOW(), status = 'active'
+		WHERE tenant_id = $1 AND device_id = $2
+	`, tenantID, deviceID, []byte(wrappedStr)); err != nil {
+		return fmt.Errorf("failed to rotate device key: %w", err)
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *OfflinePINService) encryptData(data, key []byte) ([]byte, []byte, error) {
@@ -417,16 +528,23 @@ func (s *OfflinePINService) decryptData(data, key, iv []byte) ([]byte, error) {
 	return gcm.Open(nil, iv, data, nil)
 }
 
-func (s *OfflinePINService) generateChecksum(data *OfflinePINData) string {
+// generateChecksum computes an HMAC-SHA256 over the PIN data using the
+// envelope master key (kms_envelope.go). Fail-closed: returns an error when
+// the master-key source is unavailable.
+func (s *OfflinePINService) generateChecksum(data *OfflinePINData) (string, error) {
 	// Create a copy without checksum for hashing
 	dataCopy := *data
 	dataCopy.Checksum = ""
 
 	jsonData, _ := json.Marshal(dataCopy)
 
-	h := hmac.New(sha256.New, s.masterKey)
+	masterKey, err := loadMasterKey()
+	if err != nil {
+		return "", err
+	}
+	h := hmac.New(sha256.New, masterKey)
 	h.Write(jsonData)
-	return hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // BiometricOfflinePIN handles biometric-based offline authentication
@@ -454,8 +572,8 @@ func NewBiometricOfflinePINService(pinService *OfflinePINService) *BiometricOffl
 }
 
 // RegisterBiometric registers biometric data for offline use
-func (s *BiometricOfflinePINService) RegisterBiometric(ctx context.Context, userID, deviceID, biometricType string, template []byte) (*BiometricData, error) {
-	deviceKey, err := s.pinService.getOrCreateDeviceKey(deviceID)
+func (s *BiometricOfflinePINService) RegisterBiometric(ctx context.Context, tenantID, userID, deviceID, biometricType string, template []byte) (*BiometricData, error) {
+	deviceKey, err := s.pinService.getOrCreateDeviceKey(ctx, tenantID, deviceID)
 	if err != nil {
 		return nil, err
 	}
@@ -476,9 +594,13 @@ func (s *BiometricOfflinePINService) RegisterBiometric(ctx context.Context, user
 		ExpiresAt:         now.Add(90 * 24 * time.Hour), // 90 days
 	}
 
-	// Generate checksum
+	// Generate checksum (HMAC under envelope master key, fail-closed)
+	masterKey, err := loadMasterKey()
+	if err != nil {
+		return nil, err
+	}
 	jsonData, _ := json.Marshal(data)
-	h := hmac.New(sha256.New, s.pinService.masterKey)
+	h := hmac.New(sha256.New, masterKey)
 	h.Write(jsonData)
 	data.Checksum = hex.EncodeToString(h.Sum(nil))
 
@@ -486,13 +608,13 @@ func (s *BiometricOfflinePINService) RegisterBiometric(ctx context.Context, user
 }
 
 // VerifyBiometric verifies biometric data offline
-func (s *BiometricOfflinePINService) VerifyBiometric(ctx context.Context, data *BiometricData, template []byte) (bool, error) {
+func (s *BiometricOfflinePINService) VerifyBiometric(ctx context.Context, tenantID string, data *BiometricData, template []byte) (bool, error) {
 	// Check expiry
 	if time.Now().After(data.ExpiresAt) {
 		return false, fmt.Errorf("biometric data expired")
 	}
 
-	deviceKey, err := s.pinService.getOrCreateDeviceKey(data.DeviceID)
+	deviceKey, err := s.pinService.getOrCreateDeviceKey(ctx, tenantID, data.DeviceID)
 	if err != nil {
 		return false, err
 	}
@@ -531,130 +653,314 @@ type OfflineTransaction struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	PINVerifiedAt   time.Time  `json:"pin_verified_at"`
 	Signature       string     `json:"signature"`
-	SyncStatus      string     `json:"sync_status"` // pending, synced, failed
+	SyncStatus      string     `json:"sync_status"` // pending, synced, rejected
 	SyncAttempts    int        `json:"sync_attempts"`
 	LastSyncAttempt *time.Time `json:"last_sync_attempt,omitempty"`
+	LastError       string     `json:"last_error,omitempty"`
 }
 
-// OfflineTransactionQueue manages offline transactions
+// OfflineTransactionQueue manages offline transactions.
+//
+// W12-C3-P0-B6: the queue is backed by the offline_transactions PG table with
+// a real state machine (pending -> synced | rejected); there is NO in-process
+// queue state, so a restart (or a different replica) sees exactly the same
+// pending set. Enqueue/flush/reject run inside PG transactions, and state
+// transitions are guarded by the current status (a synced row cannot be
+// re-rejected and vice versa).
 type OfflineTransactionQueue struct {
-	transactions map[string]*OfflineTransaction
-	mutex        sync.RWMutex
-	pinService   *OfflinePINService
+	db         *pgxpool.Pool
+	pinService *OfflinePINService
 }
 
-// NewOfflineTransactionQueue creates a new offline transaction queue
+// NewOfflineTransactionQueue creates a new offline transaction queue backed
+// by the service's PG pool.
 func NewOfflineTransactionQueue(pinService *OfflinePINService) *OfflineTransactionQueue {
 	return &OfflineTransactionQueue{
-		transactions: make(map[string]*OfflineTransaction),
-		pinService:   pinService,
+		db:         pinService.db,
+		pinService: pinService,
 	}
 }
 
-// QueueTransaction queues a transaction for later sync
+// QueueTransaction enqueues a transaction for later sync (transactional,
+// idempotent on transaction_id).
 func (q *OfflineTransactionQueue) QueueTransaction(ctx context.Context, txn *OfflineTransaction) error {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
 	// Generate signature for integrity
-	txn.Signature = q.generateTransactionSignature(txn)
+	sig, err := q.generateTransactionSignature(txn)
+	if err != nil {
+		return fmt.Errorf("failed to sign offline transaction: %w", err)
+	}
+	txn.Signature = sig
 	txn.SyncStatus = "pending"
 	txn.SyncAttempts = 0
 
-	q.transactions[txn.TransactionID] = txn
+	tx, err := q.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// ON CONFLICT DO NOTHING: re-enqueue of the same transaction_id (client
+	// retry) is a no-op, keeping enqueue idempotent.
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO offline_transactions (
+			transaction_id, user_id, device_id, type, amount, recipient,
+			description, created_at, pin_verified_at, signature,
+			sync_status, sync_attempts
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', 0)
+		ON CONFLICT (transaction_id) DO NOTHING
+	`, txn.TransactionID, txn.UserID, txn.DeviceID, txn.Type, txn.Amount,
+		nullableString(txn.Recipient), txn.Description, txn.CreatedAt,
+		txn.PINVerifiedAt, txn.Signature)
+	if err != nil {
+		return fmt.Errorf("failed to enqueue offline transaction: %w", err)
+	}
+	_ = tag
+
+	return tx.Commit(ctx)
+}
+
+// GetPendingTransactions returns all transactions in pending state.
+func (q *OfflineTransactionQueue) GetPendingTransactions(ctx context.Context) ([]*OfflineTransaction, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT transaction_id, user_id, device_id, type, amount,
+		       COALESCE(recipient, ''), description, created_at, pin_verified_at,
+		       signature, sync_status, sync_attempts, last_sync_attempt,
+		       COALESCE(last_error, '')
+		FROM offline_transactions
+		WHERE sync_status = 'pending'
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read pending offline transactions: %w", err)
+	}
+	defer rows.Close()
+
+	var pending []*OfflineTransaction
+	for rows.Next() {
+		var txn OfflineTransaction
+		if err := rows.Scan(
+			&txn.TransactionID, &txn.UserID, &txn.DeviceID, &txn.Type,
+			&txn.Amount, &txn.Recipient, &txn.Description, &txn.CreatedAt,
+			&txn.PINVerifiedAt, &txn.Signature, &txn.SyncStatus,
+			&txn.SyncAttempts, &txn.LastSyncAttempt, &txn.LastError,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan offline transaction: %w", err)
+		}
+		pending = append(pending, &txn)
+	}
+	return pending, rows.Err()
+}
+
+// MarkSynced transitions a pending transaction to synced. Guarded by the
+// current state: only pending rows transition (state machine).
+func (q *OfflineTransactionQueue) MarkSynced(ctx context.Context, transactionID string) error {
+	tag, err := q.db.Exec(ctx, `
+		UPDATE offline_transactions
+		SET sync_status = 'synced', synced_at = NOW(), updated_at = NOW(),
+		    last_error = NULL
+		WHERE transaction_id = $1 AND sync_status = 'pending'
+	`, transactionID)
+	if err != nil {
+		return fmt.Errorf("failed to mark offline transaction synced: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("offline transaction %s is not pending (state machine guard)", transactionID)
+	}
 	return nil
 }
 
-// GetPendingTransactions returns all pending transactions
-func (q *OfflineTransactionQueue) GetPendingTransactions() []*OfflineTransaction {
-	q.mutex.RLock()
-	defer q.mutex.RUnlock()
+// MarkRejected transitions a pending transaction to rejected, recording the
+// attempt and the error. Transactional and state-guarded like MarkSynced.
+func (q *OfflineTransactionQueue) MarkRejected(ctx context.Context, transactionID string, lastError string) error {
+	tx, err := q.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 
-	var pending []*OfflineTransaction
-	for _, txn := range q.transactions {
-		if txn.SyncStatus == "pending" {
-			pending = append(pending, txn)
+	tag, err := tx.Exec(ctx, `
+		UPDATE offline_transactions
+		SET sync_status = 'rejected',
+		    sync_attempts = sync_attempts + 1,
+		    last_sync_attempt = NOW(),
+		    last_error = $2,
+		    updated_at = NOW()
+		WHERE transaction_id = $1 AND sync_status = 'pending'
+	`, transactionID, lastError)
+	if err != nil {
+		return fmt.Errorf("failed to mark offline transaction rejected: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("offline transaction %s is not pending (state machine guard)", transactionID)
+	}
+	return tx.Commit(ctx)
+}
+
+// FlushPending drains pending transactions through syncFn, marking each
+// synced or rejected based on the outcome. Claiming (SELECT ... FOR UPDATE),
+// the sync attempt, and the state transition run inside one PG transaction so
+// a crash mid-flush leaves no transaction in an indeterminate state and no
+// other replica flushes the same rows concurrently.
+func (q *OfflineTransactionQueue) FlushPending(ctx context.Context, syncFn func(ctx context.Context, txn *OfflineTransaction) error) (synced, rejected int, err error) {
+	tx, err := q.db.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rows, err := tx.Query(ctx, `
+		SELECT transaction_id, user_id, device_id, type, amount,
+		       COALESCE(recipient, ''), description, created_at, pin_verified_at,
+		       signature, sync_status, sync_attempts
+		FROM offline_transactions
+		WHERE sync_status = 'pending'
+		ORDER BY created_at ASC
+		FOR UPDATE
+	`)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to claim pending offline transactions: %w", err)
+	}
+
+	var claimed []*OfflineTransaction
+	for rows.Next() {
+		var txn OfflineTransaction
+		if err := rows.Scan(
+			&txn.TransactionID, &txn.UserID, &txn.DeviceID, &txn.Type,
+			&txn.Amount, &txn.Recipient, &txn.Description, &txn.CreatedAt,
+			&txn.PINVerifiedAt, &txn.Signature, &txn.SyncStatus,
+			&txn.SyncAttempts,
+		); err != nil {
+			rows.Close()
+			return 0, 0, fmt.Errorf("failed to scan claimed offline transaction: %w", err)
 		}
+		claimed = append(claimed, &txn)
 	}
-	return pending
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	for _, txn := range claimed {
+		if !q.VerifyTransactionSignature(txn) {
+			// Tampered record: reject without invoking the sync handler.
+			if err := q.markRejectedTx(ctx, tx, txn.TransactionID, "signature verification failed"); err != nil {
+				return synced, rejected, err
+			}
+			rejected++
+			continue
+		}
+		if syncErr := syncFn(ctx, txn); syncErr != nil {
+			if err := q.markRejectedTx(ctx, tx, txn.TransactionID, syncErr.Error()); err != nil {
+				return synced, rejected, err
+			}
+			rejected++
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE offline_transactions
+			SET sync_status = 'synced', synced_at = NOW(), updated_at = NOW(),
+			    last_error = NULL
+			WHERE transaction_id = $1 AND sync_status = 'pending'
+		`, txn.TransactionID); err != nil {
+			return synced, rejected, fmt.Errorf("failed to mark flushed transaction synced: %w", err)
+		}
+		synced++
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, err
+	}
+	return synced, rejected, nil
 }
 
-// MarkSynced marks a transaction as synced
-func (q *OfflineTransactionQueue) MarkSynced(transactionID string) {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	if txn, exists := q.transactions[transactionID]; exists {
-		txn.SyncStatus = "synced"
+// markRejectedTx is the in-transaction variant of MarkRejected used by Flush.
+func (q *OfflineTransactionQueue) markRejectedTx(ctx context.Context, tx pgx.Tx, transactionID, lastError string) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE offline_transactions
+		SET sync_status = 'rejected',
+		    sync_attempts = sync_attempts + 1,
+		    last_sync_attempt = NOW(),
+		    last_error = $2,
+		    updated_at = NOW()
+		WHERE transaction_id = $1 AND sync_status = 'pending'
+	`, transactionID, lastError)
+	if err != nil {
+		return fmt.Errorf("failed to mark offline transaction rejected: %w", err)
 	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("offline transaction %s is not pending (state machine guard)", transactionID)
+	}
+	return nil
 }
 
-// MarkFailed marks a transaction as failed
-func (q *OfflineTransactionQueue) MarkFailed(transactionID string) {
-	q.mutex.Lock()
-	defer q.mutex.Unlock()
-
-	if txn, exists := q.transactions[transactionID]; exists {
-		txn.SyncStatus = "failed"
-		txn.SyncAttempts++
-		now := time.Now()
-		txn.LastSyncAttempt = &now
-	}
-}
-
-func (q *OfflineTransactionQueue) generateTransactionSignature(txn *OfflineTransaction) string {
+// generateTransactionSignature signs a transaction with HMAC-SHA256 under the
+// envelope master key (kms_envelope.go). Fail-closed on key-source failure.
+func (q *OfflineTransactionQueue) generateTransactionSignature(txn *OfflineTransaction) (string, error) {
 	data := fmt.Sprintf("%s|%s|%s|%.2f|%s|%d",
 		txn.TransactionID, txn.UserID, txn.Type, txn.Amount,
 		txn.CreatedAt.Format(time.RFC3339), txn.PINVerifiedAt.Unix())
 
-	h := hmac.New(sha256.New, q.pinService.masterKey)
+	masterKey, err := loadMasterKey()
+	if err != nil {
+		return "", err
+	}
+	h := hmac.New(sha256.New, masterKey)
 	h.Write([]byte(data))
-	return hex.EncodeToString(h.Sum(nil))
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// VerifyTransactionSignature verifies transaction integrity
+// VerifyTransactionSignature verifies transaction integrity. Returns false
+// when the signature mismatches OR the key source is unavailable (fail-closed).
 func (q *OfflineTransactionQueue) VerifyTransactionSignature(txn *OfflineTransaction) bool {
-	expectedSig := q.generateTransactionSignature(txn)
+	expectedSig, err := q.generateTransactionSignature(txn)
+	if err != nil {
+		return false
+	}
 	return hmac.Equal([]byte(txn.Signature), []byte(expectedSig))
+}
+
+// nullableString maps an empty string to SQL NULL for nullable columns.
+func nullableString(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // SecureOfflineStorage provides encrypted local storage
 
-// SecureStorage handles encrypted local storage for offline data
+// SecureStorage handles encrypted local storage for offline data.
+//
+// W12-C3-P0-B6: no encryption key is held in this struct any more. Data is
+// envelope-encrypted under the master key sourced fail-closed from
+// KMS_MASTER_KEY (kms_envelope.go); ciphertext is self-describing
+// (v1:<kid>:...) so the KMS swap path does not change stored data.
 type SecureStorage struct {
-	encryptionKey []byte
-	storageDir    string
+	storageDir string
 }
 
-// NewSecureStorage creates a new secure storage instance
-func NewSecureStorage(encryptionKey []byte, storageDir string) *SecureStorage {
+// NewSecureStorage creates a new secure storage instance. Fail-closed:
+// returns an error when the master-key source is unavailable rather than
+// storing data unprotected.
+func NewSecureStorage(storageDir string) (*SecureStorage, error) {
+	if _, err := loadMasterKey(); err != nil {
+		return nil, fmt.Errorf("secure storage startup refused: %w", err)
+	}
 	return &SecureStorage{
-		encryptionKey: encryptionKey,
-		storageDir:    storageDir,
-	}
+		storageDir: storageDir,
+	}, nil
 }
 
-// Store stores data securely
+// Store stores data securely (envelope-encrypted, AES-256-GCM under the
+// master key).
 func (s *SecureStorage) Store(key string, data []byte) error {
-	block, err := aes.NewCipher(s.encryptionKey)
+	encrypted, err := envelopeEncrypt(data)
 	if err != nil {
 		return err
 	}
 
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return err
-	}
-
-	encrypted := gcm.Seal(nonce, nonce, data, nil)
-
-	// In production, write to secure file storage
-	// For now, just return success
+	// In production, write `encrypted` to secure file storage under
+	// s.storageDir. For now, just return success.
 	_ = encrypted
 	return nil
 }
@@ -782,7 +1088,8 @@ CREATE TABLE IF NOT EXISTS pin_migration_tokens (
     used BOOLEAN DEFAULT FALSE
 );
 
--- Offline transactions pending sync
+-- Offline transactions pending sync (W12-C3-P0-B6: PG-backed state machine,
+-- sync_status IN pending/synced/rejected; no in-process queue state)
 CREATE TABLE IF NOT EXISTS offline_transactions (
     id SERIAL PRIMARY KEY,
     transaction_id VARCHAR(36) NOT NULL UNIQUE,
@@ -798,7 +1105,31 @@ CREATE TABLE IF NOT EXISTS offline_transactions (
     sync_status VARCHAR(16) DEFAULT 'pending',
     sync_attempts INT DEFAULT 0,
     last_sync_attempt TIMESTAMP,
-    synced_at TIMESTAMP
+    last_error TEXT,
+    synced_at TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- Upgrades for deployments that already have the pre-B6 table shape
+-- (CREATE TABLE IF NOT EXISTS does not add columns to existing tables).
+ALTER TABLE offline_transactions ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE offline_transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW();
+
+-- W12-C3-P0-B6: per-device data-encryption keys, envelope-encrypted
+-- (AES-256-GCM) under the master key (KMS_MASTER_KEY / kms_envelope.go).
+-- wrapped_key holds the versioned ciphertext 'v1:<kid>:<iv>:<tag>:<ct>';
+-- plaintext DEKs are NEVER stored. Rotation: see rotateDeviceKey — re-wrap in
+-- place, rotated_at records the last rotation; status allows
+-- active/retired lifecycle.
+CREATE TABLE IF NOT EXISTS device_keys (
+    id SERIAL PRIMARY KEY,
+    tenant_id VARCHAR(36) NOT NULL,
+    device_id VARCHAR(64) NOT NULL,
+    wrapped_key BYTEA NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    rotated_at TIMESTAMP,
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
+    UNIQUE(tenant_id, device_id)
 );
 
 -- Indexes
@@ -807,4 +1138,5 @@ CREATE INDEX IF NOT EXISTS idx_offline_pin_expires ON offline_pin_data(expires_a
 CREATE INDEX IF NOT EXISTS idx_migration_tokens_expires ON pin_migration_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_offline_txn_sync_status ON offline_transactions(sync_status);
 CREATE INDEX IF NOT EXISTS idx_offline_txn_user ON offline_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_device_keys_device ON device_keys(tenant_id, device_id);
 `

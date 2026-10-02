@@ -58,7 +58,10 @@ class AccountService {
    */
   async createAccount(params: CreateAccountParams): Promise<{ success: boolean; message: string; data?: Account }> {
     try {
-      const response = await apiService.post(`${AppConfig.accountEndpoint}/account`, {
+      // W12-A4-P0-D: accountEndpoint already resolves to the service create
+      // route (/account/account -> gateway rewrite -> service POST /account);
+      // appending another /account produced /account/account/account (404).
+      const response = await apiService.post(`${AppConfig.accountEndpoint}`, {
         user_id: params.userId,
         account_name: params.accountName,
         account_type: params.accountType,
@@ -191,7 +194,9 @@ class AccountService {
   async getAccountByKeycloakId(): Promise<Account | null> {
     try {
       const keycloak_id = localStorage.getItem('keycloak_id');
-      const response = await apiService.get(`${AppConfig.accountEndpoint}/account/keycloak/${keycloak_id}`);
+      // W12-A4-P0-D: drop the extra /account segment — service route is
+      // GET /account/keycloak/{id} (UI path /account/account/keycloak/{id}).
+      const response = await apiService.get(`${AppConfig.accountEndpoint}/keycloak/${keycloak_id}`);
       
       const data = response.data as { success?: boolean; account?: any };
       if (data.success && data.account) {

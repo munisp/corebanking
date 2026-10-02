@@ -11,7 +11,7 @@ import (
 // AuditorService handles auditor operations
 type AuditorService struct {
 	tenantID string
-	auditors map[string]*Auditor
+	auditors *repo[Auditor]
 	mu       sync.RWMutex
 }
 
@@ -19,14 +19,14 @@ type AuditorService struct {
 func NewAuditorService(tenantID string) *AuditorService {
 	svc := &AuditorService{
 		tenantID: tenantID,
-		auditors: make(map[string]*Auditor),
+		auditors: newRepo[Auditor](serviceDB, "auditors"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
 }
 
 func (s *AuditorService) initializeDefaultData(tenantID string) {
-	s.auditors["auditor-001"] = &Auditor{
+	s.auditors.seed(tenantID, "auditor-001", &Auditor{
 		AuditorID:      "auditor-001",
 		TenantID:       tenantID,
 		EmployeeID:     "emp-001",
@@ -40,9 +40,9 @@ func (s *AuditorService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-3, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
-	s.auditors["auditor-002"] = &Auditor{
+	s.auditors.seed(tenantID, "auditor-002", &Auditor{
 		AuditorID:      "auditor-002",
 		TenantID:       tenantID,
 		EmployeeID:     "emp-002",
@@ -56,9 +56,9 @@ func (s *AuditorService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-2, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
-	s.auditors["auditor-003"] = &Auditor{
+	s.auditors.seed(tenantID, "auditor-003", &Auditor{
 		AuditorID:      "auditor-003",
 		TenantID:       tenantID,
 		EmployeeID:     "emp-003",
@@ -72,9 +72,9 @@ func (s *AuditorService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
-	s.auditors["auditor-004"] = &Auditor{
+	s.auditors.seed(tenantID, "auditor-004", &Auditor{
 		AuditorID:      "auditor-004",
 		TenantID:       tenantID,
 		EmployeeID:     "emp-004",
@@ -88,9 +88,9 @@ func (s *AuditorService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-4, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
-	s.auditors["auditor-005"] = &Auditor{
+	s.auditors.seed(tenantID, "auditor-005", &Auditor{
 		AuditorID:      "auditor-005",
 		TenantID:       tenantID,
 		EmployeeID:     "emp-005",
@@ -104,16 +104,18 @@ func (s *AuditorService) initializeDefaultData(tenantID string) {
 		Status:         "active",
 		CreatedAt:      time.Now().AddDate(-5, 0, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 }
 
 // ListAuditors returns auditors based on filters
-func (s *AuditorService) ListAuditors(tenantID, specialization string) []*Auditor {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *AuditorService) ListAuditors(tenantID, specialization string) ([]*Auditor, error) {
 
 	var result []*Auditor
-	for _, auditor := range s.auditors {
+	__ALL__, __ERR__ := s.auditors.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, auditor := range __ALL__ {
 		if auditor.TenantID != tenantID {
 			continue
 		}
@@ -122,16 +124,14 @@ func (s *AuditorService) ListAuditors(tenantID, specialization string) []*Audito
 		}
 		result = append(result, auditor)
 	}
-	return result
+	return result, nil
 }
 
 // GetAuditor retrieves an auditor by ID
 func (s *AuditorService) GetAuditor(tenantID, auditorID string) (*Auditor, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	auditor, exists := s.auditors[auditorID]
-	if !exists || auditor.TenantID != tenantID {
+	auditor, err := s.auditors.get(tenantID, auditorID)
+	if err != nil {
 		return nil, errors.New("auditor not found")
 	}
 	return auditor, nil
@@ -139,8 +139,6 @@ func (s *AuditorService) GetAuditor(tenantID, auditorID string) (*Auditor, error
 
 // RegisterAuditor registers a new auditor
 func (s *AuditorService) RegisterAuditor(tenantID string, auditor *Auditor) (*Auditor, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	auditor.AuditorID = uuid.New().String()
 	auditor.TenantID = tenantID
@@ -148,33 +146,30 @@ func (s *AuditorService) RegisterAuditor(tenantID string, auditor *Auditor) (*Au
 	auditor.CreatedAt = time.Now()
 	auditor.UpdatedAt = time.Now()
 
-	s.auditors[auditor.AuditorID] = auditor
+	if err := s.auditors.put(tenantID, auditor.AuditorID, auditor); err != nil {
+		return nil, err
+	}
 	return auditor, nil
 }
 
 // UpdateAuditor updates an auditor
 func (s *AuditorService) UpdateAuditor(auditor *Auditor) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.auditors[auditor.AuditorID]
-	if !exists || existing.TenantID != auditor.TenantID {
+	existing, err := s.auditors.get(auditor.TenantID, auditor.AuditorID)
+	if err != nil {
 		return errors.New("auditor not found")
 	}
 
 	auditor.CreatedAt = existing.CreatedAt
 	auditor.UpdatedAt = time.Now()
-	s.auditors[auditor.AuditorID] = auditor
-	return nil
+	return s.auditors.put(auditor.TenantID, auditor.AuditorID, auditor)
 }
 
 // GetWorkload returns auditor workload
 func (s *AuditorService) GetWorkload(tenantID, auditorID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	auditor, exists := s.auditors[auditorID]
-	if !exists || auditor.TenantID != tenantID {
+	auditor, err := s.auditors.get(tenantID, auditorID)
+	if err != nil {
 		return map[string]interface{}{
 			"error": "auditor not found",
 		}

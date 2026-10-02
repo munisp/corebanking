@@ -10,12 +10,21 @@
  */
 
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // PRICING TIERS (mirrored from Go service for frontend consumption)
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// W12-C3-P2-MLIB (c3-0994): the tenant entitlement tier registry was module
+// process memory (lost on restart, divergent across replicas — tier/price
+// divergence between replicas mis-bills tenants). Now Postgres-authoritative
+// (table `tenant_entitlements`) via lib/pgJsonStore.ts; fail-closed 503 on PG
+// outage, no degraded-memory fallback. (WHITE_LABEL_TIERS is out of this
+// batch's scope.)
 
-const TENANT_TIERS = [
+const TENANT_TIERS_SEED = [
   {
     id: "TIER-ENTERPRISE", name: "Enterprise", type: "tenant",
     monthlyFeeNGN: 25_000_000, annualFeeNGN: 250_000_000, setupFeeNGN: 50_000_000,
@@ -101,26 +110,41 @@ const WHITE_LABEL_TIERS = [
 // ROUTE REGISTRATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
+type TenantTier = (typeof TENANT_TIERS_SEED)[number];
+
+const TENANT_TIERS_TABLE = "tenant_entitlements";
+
+async function loadTenantTiers(): Promise<TenantTier[]> {
+  return pgGuard((async () => {
+    await ensureTables("featureEntitlementGateway", storeDDL(TENANT_TIERS_TABLE));
+    await storeSeed(TENANT_TIERS_TABLE, TENANT_TIERS_SEED, () => "");
+    return storeList<TenantTier>(TENANT_TIERS_TABLE);
+  })());
+}
+
 export function registerFeatureEntitlementRoutes(app: Express) {
   // --- Pricing Tiers ---
-  app.get("/api/entitlements/tiers", (_req: Request, res: Response) => {
-    res.json({ tenantTiers: TENANT_TIERS, whiteLabelTiers: WHITE_LABEL_TIERS, total: TENANT_TIERS.length + WHITE_LABEL_TIERS.length });
-  });
+  app.get("/api/entitlements/tiers", asyncRoute(async (_req: Request, res: Response) => {
+    const tenantTiers = await loadTenantTiers();
+    res.json({ tenantTiers, whiteLabelTiers: WHITE_LABEL_TIERS, total: tenantTiers.length + WHITE_LABEL_TIERS.length });
+  }));
 
-  app.get("/api/entitlements/tiers/tenant", (_req: Request, res: Response) => {
-    res.json({ items: TENANT_TIERS, total: TENANT_TIERS.length });
-  });
+  app.get("/api/entitlements/tiers/tenant", asyncRoute(async (_req: Request, res: Response) => {
+    const tenantTiers = await loadTenantTiers();
+    res.json({ items: tenantTiers, total: tenantTiers.length });
+  }));
 
   app.get("/api/entitlements/tiers/white-label", (_req: Request, res: Response) => {
     res.json({ items: WHITE_LABEL_TIERS, total: WHITE_LABEL_TIERS.length });
   });
 
   // --- Feature Access Check ---
-  app.get("/api/entitlements/check", (req: Request, res: Response) => {
+  app.get("/api/entitlements/check", asyncRoute(async (req: Request, res: Response) => {
     const { tenantId, feature } = req.query as { tenantId: string; feature: string };
     // In production, this calls feature-entitlement-go:8107/v1/entitlements/check
     // For now, return entitlement check based on tier
-    const tier = [...TENANT_TIERS, ...WHITE_LABEL_TIERS].find((t) =>
+    const tenantTiers = await loadTenantTiers();
+    const tier = [...tenantTiers, ...WHITE_LABEL_TIERS].find((t) =>
       t.growthFeatures.includes(feature) || t.features.includes(feature),
     );
     res.json({
@@ -131,7 +155,7 @@ export function registerFeatureEntitlementRoutes(app: Express) {
       message: tier ? "Feature entitled for this tier" : "Feature not available — upgrade required",
       services: { entitlementEngine: "feature-entitlement-go:8107", billingEnforcement: "billing-enforcement-rs:8108" },
     });
-  });
+  }));
 
   // --- Billing & Invoices ---
   app.get("/api/entitlements/billing/invoices", (_req: Request, res: Response) => {
@@ -169,9 +193,10 @@ export function registerFeatureEntitlementRoutes(app: Express) {
   });
 
   // --- Provisioning ---
-  app.post("/api/entitlements/provision", (req: Request, res: Response) => {
+  app.post("/api/entitlements/provision", asyncRoute(async (req: Request, res: Response) => {
     const { tenantId, tenantName, tierId, type, addOns, operatorEmail } = req.body;
-    const tier = [...TENANT_TIERS, ...WHITE_LABEL_TIERS].find((t) => t.id === tierId);
+    const tenantTiers = await loadTenantTiers();
+    const tier = [...tenantTiers, ...WHITE_LABEL_TIERS].find((t) => t.id === tierId);
     if (!tier) { res.status(400).json({ error: "Invalid tier ID" }); return; }
 
     const allFeatures = [...tier.features, ...tier.growthFeatures, ...(addOns ?? [])];
@@ -188,7 +213,7 @@ export function registerFeatureEntitlementRoutes(app: Express) {
       estimatedDuration: "35 minutes",
       services: { entitlement: "feature-entitlement-go:8107", billing: "billing-enforcement-rs:8108", provisioning: "tenant-provisioning-py:8109" },
     });
-  });
+  }));
 
   // --- Add-On Purchase ---
   app.post("/api/entitlements/purchase-addon", (req: Request, res: Response) => {
@@ -201,16 +226,17 @@ export function registerFeatureEntitlementRoutes(app: Express) {
   });
 
   // --- Tier Upgrade ---
-  app.post("/api/entitlements/upgrade", (req: Request, res: Response) => {
+  app.post("/api/entitlements/upgrade", asyncRoute(async (req: Request, res: Response) => {
     const { tenantId, newTierId, operatorEmail } = req.body;
-    const newTier = [...TENANT_TIERS, ...WHITE_LABEL_TIERS].find((t) => t.id === newTierId);
+    const tenantTiers = await loadTenantTiers();
+    const newTier = [...tenantTiers, ...WHITE_LABEL_TIERS].find((t) => t.id === newTierId);
     if (!newTier) { res.status(400).json({ error: "Invalid tier" }); return; }
     res.json({
       success: true, tenantId, newTier: newTier.name, newMonthlyBill: newTier.monthlyFeeNGN,
       newFeatures: [...newTier.features, ...newTier.growthFeatures],
       upgradedBy: operatorEmail, effectiveDate: "immediate",
     });
-  });
+  }));
 
   // --- All Services Summary ---
   app.get("/api/entitlements/services", (_req: Request, res: Response) => {

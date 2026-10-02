@@ -12,26 +12,19 @@
 
 import { Express, Request, Response, NextFunction } from "express";
 import { logger } from "./logger";
+import { kvGet, kvDel, kvIncrWindow, tenantOf } from "./redisKv";
 import crypto from "crypto";
 
-// Rate limiting store (in-memory, use Redis in production)
-const loginAttempts = new Map<string, { count: number; lastAttempt: number; lockedUntil?: number }>();
+// Brute-force login protection — redis-backed (W12 C3-P1-B2, c3-1027).
+// Key (register pattern): failed_login:{tenant}:{subject}, TTL 900s = the
+// lockout window (preserves the previous 15-minute LOCKOUT_DURATION).
+// subject = client IP (this middleware keys on IP, not email). The counter now
+// survives restarts and is shared across replicas; previously a restart
+// silently reset an attacker's lockout.
+// FAIL MODE: redis down => bruteForceProtection fails closed (503) — the
+// lockout check on the login path is never silently skipped.
 const MAX_LOGIN_ATTEMPTS = 5;
-const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
-const ATTEMPT_WINDOW = 5 * 60 * 1000; // 5 minutes
-
-// TS-19: periodically sweep stale per-IP entries so the map stays bounded even
-// when attackers never revisit from the same IP.
-const loginAttemptsSweep = setInterval(() => {
-  const now = Date.now();
-  for (const [ip, record] of loginAttempts) {
-    const locked = record.lockedUntil !== undefined && record.lockedUntil > now;
-    if (!locked && now - record.lastAttempt > ATTEMPT_WINDOW) {
-      loginAttempts.delete(ip);
-    }
-  }
-}, ATTEMPT_WINDOW);
-loginAttemptsSweep.unref();
+const LOCKOUT_WINDOW_SECONDS = 15 * 60; // 15 minutes (was LOCKOUT_DURATION)
 
 // TS-09: derive the PII encryption key once — scryptSync is a ~50-100ms
 // event-loop block and the inputs are static per process.
@@ -83,50 +76,44 @@ function sanitizeObject(obj: Record<string, any>) {
 }
 
 // Brute force protection for login
-function bruteForceProtection(req: Request, res: Response, next: NextFunction) {
+async function bruteForceProtection(req: Request, res: Response, next: NextFunction) {
   if (req.path !== "/api/auth/login" || req.method !== "POST") {
     return next();
   }
 
   const ip = req.ip || req.socket.remoteAddress || "unknown";
-  const now = Date.now();
-  const record = loginAttempts.get(ip);
-
-  if (record) {
-    if (record.lockedUntil && record.lockedUntil > now) {
-      const remaining = Math.ceil((record.lockedUntil - now) / 1000);
+  const tenant = tenantOf(req);
+  try {
+    const raw = await kvGet(`failed_login:${tenant}:${ip}`);
+    const count = raw ? parseInt(raw, 10) : 0;
+    if (count >= MAX_LOGIN_ATTEMPTS) {
       res.status(429).json({
         error: "Account locked due to too many failed attempts",
-        retryAfter: remaining,
+        retryAfter: LOCKOUT_WINDOW_SECONDS,
         code: "BRUTE_FORCE_LOCKED",
       });
       return;
     }
-
-    if (now - record.lastAttempt > ATTEMPT_WINDOW) {
-      loginAttempts.delete(ip);
-    }
+  } catch (err) {
+    // FAIL CLOSED: cannot verify the lockout state on the login path.
+    logger.error("[Security] brute-force check failed — failing closed", { error: String(err) });
+    res.status(503).json({ error: "Login protection unavailable", code: "LOCKOUT_STATE_UNAVAILABLE" });
+    return;
   }
 
   next();
 }
 
-function recordLoginAttempt(ip: string, success: boolean) {
+async function recordLoginAttempt(ip: string, success: boolean, tenant = "platform"): Promise<void> {
+  const key = `failed_login:${tenant}:${ip}`;
   if (success) {
-    loginAttempts.delete(ip);
+    await kvDel(key);
     return;
   }
-
-  const record = loginAttempts.get(ip) || { count: 0, lastAttempt: 0 };
-  record.count++;
-  record.lastAttempt = Date.now();
-
-  if (record.count >= MAX_LOGIN_ATTEMPTS) {
-    record.lockedUntil = Date.now() + LOCKOUT_DURATION;
-    logger.warn(`Brute force lockout: IP=${ip} attempts=${record.count}`);
+  const count = await kvIncrWindow(key, LOCKOUT_WINDOW_SECONDS);
+  if (count >= MAX_LOGIN_ATTEMPTS) {
+    logger.warn(`Brute force lockout: IP=${ip} attempts=${count}`);
   }
-
-  loginAttempts.set(ip, record);
 }
 
 // Data encryption utilities

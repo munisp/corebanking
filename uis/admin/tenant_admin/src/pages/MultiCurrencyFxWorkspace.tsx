@@ -12,7 +12,7 @@ export default function MultiCurrencyFxWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/fx-trades/count")
+    fetch("/api/db/fx-trades/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

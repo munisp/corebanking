@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sync"
@@ -12,6 +11,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+// C3-P2-B5-go-2 drive-by: removed the unused "encoding/json" import — a
+// pre-existing compile break (present in the pristine error multiset,
+// previously masked by the duplicate type declarations resolved in main.go).
 
 // Gamification Service for 54Bank
 // Implements savings goals, achievements, streaks, and rewards

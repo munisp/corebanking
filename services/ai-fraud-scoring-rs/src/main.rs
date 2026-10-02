@@ -7,6 +7,15 @@ use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::Instant;
+use actix_web::HttpMessage;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use sqlx::Row;
+use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use std::env;
+use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -26,9 +35,12 @@ struct CreateRequest {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+// W12-RUSTFIX-2: stale tokio_postgres `db_client` field replaced by the shared
+// sqlx pool that main() already constructs (`AppState { db: pool }`; E0560);
+// unused `records` field dropped (no reader in this crate). tokio-postgres is
+// not a declared dependency of this crate.
 struct AppState {
-    records: Mutex<Vec<serde_json::Value>>,
-    db_client: Option<Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 // Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
@@ -37,48 +49,46 @@ static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(S
 static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        let id = format!("{}_{}_{}", "ai_fraud_scoring_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let svc_name = String::from("ai-fraud-scoring-rs");
-        let status = String::from("active");
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let client = client.clone();
-            let buf = buf.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-                loop {
-                    tick.tick().await;
-                    let rows: Vec<(String, String, String, String, String)> = {
-                        let mut b = buf.lock().unwrap();
-                        if b.is_empty() { continue; }
-                        std::mem::take(&mut *b)
-                    };
-                    for (id, svc, ep, st, d) in rows {
-                        let _ = client.execute(
-                            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-                            &[&id, &svc, &ep, &st, &d],
-                        ).await;
-                    }
-                }
-            });
-        }
-        let mut b = buf.lock().unwrap();
-        b.push((id, svc_name, endpoint.to_string(), status, data_str));
-        if b.len() >= 100 {
-            let rows = std::mem::take(&mut *b);
-            drop(b);
-            let client = client.clone();
-            tokio::spawn(async move {
+    // W12-RUSTFIX-2: flush via shared sqlx pool (fleet canonical; was stale
+    // tokio_postgres db_client field — same shape as W12-RUSTFIX's aml-engine-rs).
+    let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let id = format!("{}_{}_{}", "ai_fraud_scoring_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let svc_name = String::from("ai-fraud-scoring-rs");
+    let status = String::from("active");
+    let data_str = serde_json::to_string(data).unwrap_or_default();
+    if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let pool = state.db.clone();
+        let buf = buf.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                let rows: Vec<(String, String, String, String, String)> = {
+                    let mut b = buf.lock().unwrap();
+                    if b.is_empty() { continue; }
+                    std::mem::take(&mut *b)
+                };
                 for (id, svc, ep, st, d) in rows {
-                    let _ = client.execute(
+                    let _ = sqlx::query(
                         "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-                        &[&id, &svc, &ep, &st, &d],
-                    ).await;
+                    ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
                 }
-            });
-        }
+            }
+        });
+    }
+    let mut b = buf.lock().unwrap();
+    b.push((id, svc_name, endpoint.to_string(), status, data_str));
+    if b.len() >= 100 {
+        let rows = std::mem::take(&mut *b);
+        drop(b);
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            for (id, svc, ep, st, d) in rows {
+                let _ = sqlx::query(
+                    "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+            }
+        });
     }
 }
 
@@ -86,7 +96,8 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 async fn enaira_cbdc(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     let _ = sanitize_input("");
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if let Err(resp) = permify::require_permify(&req, "fraud_case", "score").await { return resp; } // W12-B5P1DD
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let result = json!({
         "enhancementId": 3,
         "name": "eNaira / CBDC Integration",
@@ -147,7 +158,8 @@ async fn enaira_cbdc(req: actix_web::HttpRequest, state: web::Data<AppState>) ->
 
 async fn fraud_detection_ml(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if let Err(resp) = permify::require_permify(&req, "fraud_case", "score").await { return resp; } // W12-B5P1DD
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let result = json!({
         "enhancementId": 4,
         "name": "Real-Time Fraud Detection (ML Engine)",
@@ -247,6 +259,7 @@ fn degradation_mode() -> &'static str {
 
 async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "fraud_case", "score").await { return resp; } // W12-B5P1DD
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -256,7 +269,7 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 
 async fn healthz(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "status": "healthy", "service": "ai-fraud-scoring-rs", "version": "1.0.0",
         "enhancements": ["3: eNaira/CBDC", "4: Real-Time Fraud ML"]
@@ -267,8 +280,6 @@ async fn healthz(req: actix_web::HttpRequest) -> HttpResponse {
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -276,6 +287,7 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 // --- Alerting ---
 async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "fraud_case", "score").await { return resp; } // W12-B5P1DD
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -305,25 +317,9 @@ async fn prom_metrics() -> HttpResponse {
 }
 
 
-// --- Database Connection ---
-use tokio_postgres::NoTls;
-
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS service_records (
-                    id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-                    status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
-    }
-}
+// W12-RUSTFIX-2: removed dead tokio_postgres init_db/NoTls block — tokio-postgres
+// is not a declared dependency of this crate and nothing calls init_db after the
+// AppState.db (sqlx PgPool) wiring; schema is created by init_schema(&pool) below.
 
 
 // --- JWT Auth Check ---
@@ -492,7 +488,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -512,7 +508,7 @@ async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
@@ -555,8 +551,6 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 
 
@@ -637,17 +631,56 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     }
 }
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:ai-fraud-scoring-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:ai-fraud-scoring-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -908,23 +941,33 @@ mod tests {
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "fraud_case", "create").await { return resp; } // W12-B5P1DD
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE fraud_alerts SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("fraud_alerts.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -933,19 +976,132 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "fraud_case", "create").await { return resp; } // W12-B5P1DD
     let id = path.into_inner();
-    sqlx::query("UPDATE fraud_alerts SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE fraud_alerts SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("fraud_alerts.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }
+
+// W12-RUSTFIX-2: synthesized canonical handlers — route registrations in main()
+// referenced metrics/list_records/create_record/get_record but the generator
+// never emitted them (baseline did not compile). Real implementations against
+// this service's own service_records table + outbox, fleet-canonical shape
+// (same pattern as W12-RUSTFIX's synthesized handlers, e.g. fx-rates-engine-rs,
+// minus permify wiring which is not part of this crate's baseline).
+async fn metrics() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "service": "ai-fraud-scoring-rs",
+        "requests_total": _REQ_COUNT.load(AtomicOrdering::Relaxed),
+        "errors_total": _ERR_COUNT.load(AtomicOrdering::Relaxed),
+    }))
+}
+
+async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
+    let offset = (page - 1) * limit;
+    match sqlx::query(
+        "SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+    )
+    .bind("ai_fraud_scoring_rs")
+    .bind(limit as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.db)
+    .await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+                json!({
+                    "id": r.get::<String, _>(0),
+                    "service": r.get::<String, _>(1),
+                    "type": r.get::<String, _>(2),
+                    "status": r.get::<String, _>(3),
+                    "data": r.get::<serde_json::Value, _>(4),
+                })
+            }).collect();
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_records WHERE service = $1")
+                .bind("ai_fraud_scoring_rs").fetch_one(&state.db).await.unwrap_or(0);
+            HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "database"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let tenant_id = body.tenant_id.clone().unwrap_or_else(|| "platform".to_string());
+    let id = Uuid::new_v4().to_string();
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    let result = sqlx::query("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)")
+        .bind(&id)
+        .bind("ai_fraud_scoring_rs")
+        .bind("record")
+        .bind(&status)
+        .bind(serde_json::json!({"tenant_id": &tenant_id}))
+        .execute(&mut *tx)
+        .await;
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status, "tenant_id": &tenant_id});
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_records.created")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
+            HttpResponse::Created().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_records WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<String, _>("id"),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+// Wave-12 B5-P1-D-D: Permify authorization guard module.
+mod permify;

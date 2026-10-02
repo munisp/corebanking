@@ -1,0 +1,68 @@
+{
+  "_readme": "W12 B5-P1-F: OpenSearch index mapping for PEP names. SHARED INDEX CONTRACT: this exact mapping body is deployed by BOTH kyc-aml-screening-py (watchlist rows, natural _id 'wl-{id}') and pep-enhanced-dd-py (curated pep_entries rows, natural _id 'entry-{uuid}'), so a single consolidated pep-names index serves both services; the field set is the union of both source schemas and both services MUST ship byte-identical mapping JSON (indices.create is only attempted when the index does not exist). Analyzer note: the compose image is opensearchproject/opensearch:2.19.0 (docker-compose.yml:58-66) with NO external plugins — the phonetic plugin is NOT available; fuzzy matching uses built-in edge_ngram + match fuzziness=AUTO. max_ngram_diff must be >= (max_gram - min_gram).",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "max_ngram_diff": 9,
+    "analysis": {
+      "tokenizer": {
+        "name_edge_tokenizer": {
+          "type": "edge_ngram",
+          "min_gram": 3,
+          "max_gram": 12,
+          "token_chars": ["letter", "digit"]
+        }
+      },
+      "analyzer": {
+        "name_index_analyzer": {
+          "type": "custom",
+          "tokenizer": "name_edge_tokenizer",
+          "filter": ["lowercase", "asciifolding"]
+        },
+        "name_search_analyzer": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "_meta": {
+      "owners": ["kyc-aml-screening-py", "pep-enhanced-dd-py"],
+      "source_tables": ["screening_watchlist (list_type='pep')", "pep_entries"],
+      "natural_ids": ["wl-{screening_watchlist.id}", "entry-{pep_entries.id}"],
+      "wave": "W12-B5-P1-F"
+    },
+    "properties": {
+      "watchlist_id": {"type": "long"},
+      "entry_id": {"type": "keyword"},
+      "list_type": {"type": "keyword"},
+      "name": {
+        "type": "text",
+        "analyzer": "name_index_analyzer",
+        "search_analyzer": "name_search_analyzer",
+        "fields": {
+          "raw": {"type": "keyword"},
+          "std": {"type": "text", "analyzer": "standard"}
+        }
+      },
+      "name_normalized": {"type": "keyword"},
+      "category": {"type": "keyword"},
+      "position": {
+        "type": "text",
+        "analyzer": "standard",
+        "fields": {"raw": {"type": "keyword"}}
+      },
+      "tier": {"type": "keyword"},
+      "active": {"type": "boolean"},
+      "country": {"type": "keyword"},
+      "reason": {"type": "text", "analyzer": "standard"},
+      "risk": {"type": "keyword"},
+      "list_name": {"type": "keyword"},
+      "source": {"type": "keyword"},
+      "loaded_at": {"type": "date"},
+      "created_at": {"type": "date"}
+    }
+  }
+}

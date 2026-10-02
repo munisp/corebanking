@@ -12,7 +12,7 @@ export default function RegulatoryAutomationWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/regulatory-reports/count")
+    fetch("/api/db/regulatory-reports/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

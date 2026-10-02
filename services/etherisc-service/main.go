@@ -324,11 +324,11 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", handleHealth)
-	mux.HandleFunc("/api/v1/etherisc/policies/all", handlePoliciesAll)
-	mux.HandleFunc("/api/v1/etherisc/policies", handlePolicies)
-	mux.HandleFunc("/api/v1/etherisc/claims/all", handleClaimsAll)
-	mux.HandleFunc("/api/v1/etherisc/claims", handleClaims)
-	mux.HandleFunc("/api/v1/etherisc/stats", handleStats)
+	mux.HandleFunc("/api/v1/etherisc/policies/all", permifyAuthzGuard("etherisc_service", "view", handlePoliciesAll))
+	mux.HandleFunc("/api/v1/etherisc/policies", permifyAuthzGuard("etherisc_service", "manage", handlePolicies))
+	mux.HandleFunc("/api/v1/etherisc/claims/all", permifyAuthzGuard("etherisc_service", "view", handleClaimsAll))
+	mux.HandleFunc("/api/v1/etherisc/claims", permifyAuthzGuard("etherisc_service", "manage", handleClaims))
+	mux.HandleFunc("/api/v1/etherisc/stats", permifyAuthzGuard("etherisc_service", "view", handleStats))
 
 	log.Printf("[etherisc-service] Parametric crop insurance on :%s", port)
 	log.Fatal((&http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())

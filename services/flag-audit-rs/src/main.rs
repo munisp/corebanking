@@ -8,6 +8,9 @@ use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use actix_web::HttpMessage;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -38,6 +41,7 @@ fn change_type(old: bool, new: bool) -> &'static str { match (old, new) { (false
 
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
@@ -61,7 +65,7 @@ async fn health() -> HttpResponse {
 
 async fn audit_change(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     let _sanitized = sanitize_input("");
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
@@ -116,8 +120,6 @@ async fn stats(state: web::Data<AppState>) -> HttpResponse {
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -332,7 +334,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -352,7 +354,7 @@ async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
@@ -444,8 +446,6 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 
 
@@ -526,17 +526,56 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     }
 }
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:flag-audit-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:flag-audit-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -629,6 +668,72 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+
+// --- Permify authorization (W12-B5-P0-D2) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = X-Tenant-Id header or
+// PERMIFY_DEFAULT_TENANT, resource = domain entity id, permission per action
+// (schema: services/auth-service/schemas/permify/v2-kyc-compliance.fragment).
+// FAIL-CLOSED: Permify unreachable/non-200 => 503; denied => 403.
+// Canonical pattern: services/permify-authz-go/main.go:428 (REST check) and
+// services/auth-service/adapters/permify.py check_permission.
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    let subject = {
+        let ext = req.extensions();
+        ext.get::<VerifiedClaims>()
+            .and_then(|c| c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = req.headers().get("X-Tenant-Id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8216);
@@ -709,7 +814,7 @@ async fn main() -> std::io::Result<()> {
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
+            .route("/metrics", web::get().to(prom_metrics))
             .route("/api/v1/audit_events", web::get().to(list_records))
             .service(web::resource("/api/v1/audit_events").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::post().to(create_record)))
             .service(web::resource("/api/v1/audit_events/{id}").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::get().to(get_record)))
@@ -771,25 +876,96 @@ mod tests {
 
 }
 
+
+// W12-B5-P0-D2: synthesized canonical CRUD handlers — the route registrations
+// in main() referenced create_record/get_record but the generator never
+// emitted them (baseline did not compile). Real implementations against this
+// service's own service_records table + outbox, same pattern as the fleet
+// canonical (services/accounting-rules-rs create_record/get_record).
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let tenant_id = body.tenant_id.clone().unwrap_or_else(|| "platform".to_string());
+    let id = Uuid::new_v4().to_string();
+    if let Err(resp) = permify_check(&req, "compliance_alert", &id, "flag").await { return resp; }
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    let result = sqlx::query("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)")
+        .bind(&id)
+        .bind("flag_audit_rs")
+        .bind("record")
+        .bind(&status)
+        .bind(serde_json::json!({"tenant_id": &tenant_id}))
+        .execute(&mut *tx)
+        .await;
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status, "tenant_id": &tenant_id});
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_records.created")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
+            HttpResponse::Created().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_records WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<String, _>("id"),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
+    if let Err(resp) = permify_check(&req, "compliance_alert", &id, "flag").await { return resp; }
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE audit_events SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("audit_events.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -799,18 +975,29 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
-    sqlx::query("UPDATE audit_events SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    if let Err(resp) = permify_check(&req, "compliance_alert", &id, "clear").await { return resp; }
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE audit_events SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("audit_events.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }

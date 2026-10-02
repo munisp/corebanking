@@ -248,3 +248,76 @@ class KeycloakAdapter(ExternalAPIClient):
             data=urlencode(data),
             headers=headers,
         )
+
+    def logout_user(self, user_id: str) -> None:
+        """Revoke all Keycloak sessions for a user (admin logout).
+
+        Real server-side session invalidation backing POST /auth/logout —
+        every refresh token for the user stops working after this call."""
+
+        self.__initialize()
+
+        response = self._post(
+            endpoint=f"/admin/realms/{self.__realm}/users/{user_id}/logout",
+            data={},
+            headers=self.headers,
+            get_response=False,
+        )
+
+        status_code = response.get("status_code") if isinstance(response, dict) else None
+        logger.info(f"logout_user_status_code: {status_code} for keycloak user id: {user_id}")
+
+        if status_code not in (204, 200):
+            raise ApiError(
+                message=f"Failed to log out user (status {status_code}).",
+                status_code=500,
+                code="AUTH-KEYCLOAK-INT-5004",
+            )
+
+    def update_user_profile(
+        self,
+        user_id: str,
+        first_name: str = None,
+        last_name: str = None,
+        email: str = None,
+        phone_number: str = None,
+        email_verified: bool = None,
+    ) -> None:
+        """Update mutable profile attributes on a Keycloak user.
+
+        Backs PUT /auth/user and the email-verified flag flip on
+        POST /auth/verify-email. Only supplied fields are sent."""
+
+        self.__initialize()
+
+        payload = {}
+        if first_name is not None:
+            payload["firstName"] = first_name
+        if last_name is not None:
+            payload["lastName"] = last_name
+        if email is not None:
+            payload["email"] = email
+        if email_verified is not None:
+            payload["emailVerified"] = email_verified
+        if phone_number is not None:
+            payload["attributes"] = {"phone_number": [phone_number]}
+
+        if not payload:
+            return
+
+        response = self._put(
+            endpoint=f"/admin/realms/{self.__realm}/users/{user_id}",
+            data=payload,
+            headers=self.headers,
+            get_response=False,
+        )
+
+        status_code = response.get("status_code") if isinstance(response, dict) else None
+        logger.info(f"update_user_profile_status_code: {status_code} for keycloak user id: {user_id}")
+
+        if status_code != 204:
+            raise ApiError(
+                message=f"Failed to update user profile (status {status_code}).",
+                status_code=500,
+                code="AUTH-KEYCLOAK-INT-5005",
+            )

@@ -1016,16 +1016,16 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/alerts", alertsHandler)
+	mux.HandleFunc("/v1/alerts", permifyAuthzGuard("trade_finance", "manage", alertsHandler))
 	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/api/list", listHandler)
-	mux.HandleFunc("/api/stats", statsHandler)
-	mux.HandleFunc("/api/get", getByIdHandler)
-	mux.HandleFunc("/api/create", createHandler)
+	mux.HandleFunc("/api/list", permifyAuthzGuard("trade_finance", "view", listHandler))
+	mux.HandleFunc("/api/stats", permifyAuthzGuard("trade_finance", "view", statsHandler))
+	mux.HandleFunc("/api/get", permifyAuthzGuard("trade_finance", "view", getByIdHandler))
+	mux.HandleFunc("/api/create", permifyAuthzGuard("trade_finance", "create", createHandler))
 
-	mux.HandleFunc("/v1/trade/issue-lc", issueLCHandler)
-	mux.HandleFunc("/v1/trade/present-documents", presentDocHandler)
-	mux.HandleFunc("/v1/trade/guarantee", guaranteeHandler)
+	mux.HandleFunc("/v1/trade/issue-lc", permifyAuthzGuard("trade_finance", "issue_lc", issueLCHandler))
+	mux.HandleFunc("/v1/trade/present-documents", permifyAuthzGuard("trade_finance", "manage", presentDocHandler))
+	mux.HandleFunc("/v1/trade/guarantee", permifyAuthzGuard("trade_finance", "guarantee", guaranteeHandler))
 
 	log.Printf("trade-finance-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

@@ -119,6 +119,25 @@ class InitiateDepositWithAccountNumberSchema(BaseModel):
         return _validate_kobo(v)
 
 
+class InitiateWithdrawalSchema(BaseModel):
+    # W12-A4B: customer withdrawal (debit account -> mint). Mirrors
+    # InitiateDepositSchema; the UI called /payment-processing/withdraw but no
+    # route existed anywhere (/transfers/withdraw is the Mojaloop switch shape).
+    recipient: int
+    amount_kobo: int
+    note: str = "Withdrawal"
+    reference: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _promote_amount(cls, data):
+        return _promote_major_amount(cls, data)
+
+    @validator("amount_kobo")
+    def validate_amount_kobo(cls, v):
+        return _validate_kobo(v)
+
+
 class InitiateLoanPaymentSchema(BaseModel):
     loan_id: str
     payer: int

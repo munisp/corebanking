@@ -96,7 +96,7 @@ export const smsAlertApi = {
     apiClient.post<SMSAlert>(`${APISIX.SMS_ALERT_NOTIFICATION}/api/v1/alerts`, body).then((r) => r.data),
 
   getDeliveryStats: () =>
-    apiClient.get(`${APISIX.SMS_ALERT_NOTIFICATION}/api/v1/stats`).then((r) => r.data),
+    apiClient.get(`/sms-service/api/v1/sms/stats`).then((r) => r.data),
 
   getProviderConfig: () =>
     apiClient.get(`${APISIX.SMS_ALERT_NOTIFICATION}/api/v1/config`).then((r) => r.data),
@@ -148,7 +148,7 @@ export const webhookEngineApi = {
     apiClient.delete(`${APISIX.WEBHOOKS}/api/v1/subscriptions/${id}`).then((r) => r.data),
 
   listDeliveries: (params?: { page?: number; limit?: number; subscriptionId?: string; status?: string; event?: string }) =>
-    apiClient.get<{ items: WebhookDelivery[]; total: number }>(`${APISIX.WEBHOOKS}/api/v1/deliveries`, { params }).then((r) => r.data),
+    apiClient.get<{ items: WebhookDelivery[]; total: number }>(`${APISIX.WEBHOOKS}/v1/deliveries`, { params }).then((r) => r.data),
 
   getDeliveryById: (id: string) =>
     apiClient.get<WebhookDelivery>(`${APISIX.WEBHOOKS}/api/v1/deliveries/${id}`).then((r) => r.data),
@@ -183,13 +183,13 @@ export const approvalWorkflowApi = {
     apiClient.get<{ items: ApprovalRequest[]; total: number }>(`${APISIX.APPROVAL_WORKFLOW}/v1/approvals`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<ApprovalRequest>(`${APISIX.APPROVAL_WORKFLOW}/v1/approvals/${id}`).then((r) => r.data),
+    apiClient.get<ApprovalRequest>(`/branch-manager/api/v1/approvals/${id}`).then((r) => r.data),
 
   approve: (id: string, body: { comments?: string }) =>
-    apiClient.post(`${APISIX.APPROVAL_WORKFLOW}/v1/approvals/${id}/approve`, body).then((r) => r.data),
+    apiClient.post(`/branch-manager/api/v1/approvals/${id}/approve`, body).then((r) => r.data),
 
   reject: (id: string, body: { reason: string }) =>
-    apiClient.post(`${APISIX.APPROVAL_WORKFLOW}/v1/approvals/${id}/reject`, body).then((r) => r.data),
+    apiClient.post(`/branch-manager/api/v1/approvals/${id}/reject`, body).then((r) => r.data),
 
   cancel: (id: string, reason: string) =>
     apiClient.post(`${APISIX.APPROVAL_WORKFLOW}/v1/approvals/${id}/cancel`, { reason }).then((r) => r.data),
@@ -272,13 +272,13 @@ export const makerCheckerApi = {
     apiClient.get<{ items: MakerCheckerEntry[]; total: number }>(`${APISIX.MAKER_CHECKER}/v1/approvals`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<MakerCheckerEntry>(`${APISIX.MAKER_CHECKER}/v1/approvals/${id}`).then((r) => r.data),
+    apiClient.get<MakerCheckerEntry>(`/branch-manager/api/v1/approvals/${id}`).then((r) => r.data),
 
   approve: (id: string, comments?: string) =>
-    apiClient.post(`${APISIX.MAKER_CHECKER}/v1/approvals/${id}/approve`, { comments }).then((r) => r.data),
+    apiClient.post(`/branch-manager/api/v1/approvals/${id}/approve`, { comments }).then((r) => r.data),
 
   reject: (id: string, comments: string) =>
-    apiClient.post(`${APISIX.MAKER_CHECKER}/v1/approvals/${id}/reject`, { comments }).then((r) => r.data),
+    apiClient.post(`/branch-manager/api/v1/approvals/${id}/reject`, { comments }).then((r) => r.data),
 
   getPendingCount: () =>
     apiClient.get(`${APISIX.MAKER_CHECKER}/v1/stats`).then((r) => r.data),

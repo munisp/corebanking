@@ -9,6 +9,8 @@ use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use std::sync::atomic::{AtomicU64, AtomicI64, AtomicI32, AtomicBool, Ordering as AtomicOrdering};
+use std::time::Instant;
+use actix_web::HttpMessage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct COANode {
@@ -36,11 +38,57 @@ struct TransactionFlow {
     amount: f64,
     currency: String,
     narration: String,
+    // Optional caller-supplied idempotency key (natural dedup key for the
+    // money flow); UNIQUE in coa_transaction_flows when present.
+    flow_ref: Option<String>,
 }
 
+// W12-B5P1H: the edges_mem in-memory shadow (runtime transaction-flow edges
+// lost on restart) was removed; flows are persisted transactionally to the
+// coa_transaction_flows Postgres metadata table and merged into the graph on
+// read. This service holds no balance/ledger state (balances are read live
+// from glAccounts) — graph metadata only, so PG is the correct target.
 struct AppState {
     db: Option<PgPool>,
-    edges_mem: std::sync::Mutex<Vec<COAEdge>>,
+}
+
+async fn init_flow_schema(db: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS coa_transaction_flows (
+            flow_id BIGSERIAL PRIMARY KEY,
+            debit_account TEXT NOT NULL,
+            credit_account TEXT NOT NULL,
+            amount DOUBLE PRECISION NOT NULL CHECK (amount >= 0),
+            currency TEXT NOT NULL,
+            narration TEXT NOT NULL,
+            flow_ref TEXT UNIQUE,
+            recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+// Runtime-recorded flows as graph edges, read back from Postgres.
+async fn fetch_flow_edges(db: &PgPool) -> Result<Vec<COAEdge>, String> {
+    let rows = sqlx::query(
+        r#"SELECT debit_account, credit_account, amount::float8, currency, narration
+           FROM coa_transaction_flows ORDER BY flow_id"#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("coa_transaction_flows query failed: {}", e))?;
+    Ok(rows
+        .iter()
+        .map(|r| COAEdge {
+            from_code: r.get("debit_account"),
+            to_code: r.get("credit_account"),
+            relation_type: "TRANSACTION".into(),
+            weight: r.get(2),
+            metadata: json!({"narration": r.get::<String, _>("narration"), "currency": r.get::<String, _>("currency")}),
+        })
+        .collect())
 }
 
 fn source_unavailable(detail: &str) -> HttpResponse {
@@ -149,16 +197,57 @@ fn sanitize_input(s: &str) -> String {
     s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect()
 }
 
-static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
-static RL_LAST: AtomicI64 = AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    if now > RL_LAST.load(AtomicOrdering::Relaxed) {
-        RL_TOKENS.store(100, AtomicOrdering::Relaxed);
-        RL_LAST.store(now, AtomicOrdering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:neo4j-coa-graph-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:neo4j-coa-graph-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    RL_TOKENS.fetch_sub(1, AtomicOrdering::Relaxed) > 0
 }
 
 // --- JWT Auth Check (fail-closed; R4-V1 remediation) ---
@@ -399,19 +488,23 @@ async fn load_graph(state: &web::Data<AppState>) -> Result<(Vec<COANode>, Vec<CO
             return Err(source_unavailable(&e));
         }
     };
-    // Edges: DB table, merged with any edges recorded at runtime via transaction-flow.
+    // Edges: coaEdges table, merged with transaction flows recorded at
+    // runtime via transaction-flow (persisted in coa_transaction_flows).
     let db_edges = fetch_edges(db).await.unwrap_or_else(|e| {
-        eprintln!("[neo4j-coa-graph-rs] edge load failed (continuing with runtime edges): {}", e);
+        eprintln!("[neo4j-coa-graph-rs] edge load failed (continuing with flow edges): {}", e);
         Vec::new()
     });
     let mut edges = db_edges;
-    edges.extend(state.edges_mem.lock().unwrap().iter().cloned());
+    match fetch_flow_edges(db).await {
+        Ok(flow_edges) => edges.extend(flow_edges),
+        Err(e) => eprintln!("[neo4j-coa-graph-rs] flow edge load failed: {}", e),
+    }
     Ok((nodes, edges))
 }
 
 async fn coa_graph(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
     match load_graph(&state).await {
         Ok((nodes, edges)) => HttpResponse::Ok().json(json!({"nodes": nodes, "edges": edges, "total_nodes": nodes.len(), "total_edges": edges.len()})),
@@ -421,7 +514,7 @@ async fn coa_graph(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn coa_pagerank(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
     match load_graph(&state).await {
         Ok((nodes, edges)) => {
@@ -438,7 +531,7 @@ async fn coa_pagerank(req: actix_web::HttpRequest, state: web::Data<AppState>) -
 
 async fn coa_basel(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
     match load_graph(&state).await {
         Ok((nodes, _)) => HttpResponse::Ok().json(compute_basel_iii(&nodes)),
@@ -449,8 +542,9 @@ async fn coa_basel(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 async fn coa_traverse(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let _ = sanitize_input("");
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger", "view").await { return resp; } // W12-B5D1
     let from = body.get("from").and_then(|v| v.as_str()).unwrap_or("");
     let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("");
     let edges = match load_graph(&state).await {
@@ -482,15 +576,66 @@ async fn coa_traverse(req: actix_web::HttpRequest, state: web::Data<AppState>, b
 async fn transaction_flow(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<TransactionFlow>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let _ = sanitize_input("");
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger", "view").await { return resp; } // W12-B5D1
     let txn = body.into_inner();
-    state.edges_mem.lock().unwrap().push(COAEdge {
-        from_code: txn.debit_account.clone(), to_code: txn.credit_account.clone(),
-        relation_type: "TRANSACTION".into(), weight: txn.amount,
-        metadata: json!({"narration": txn.narration, "currency": txn.currency}),
-    });
-    HttpResponse::Created().json(json!({"recorded": true, "debit": txn.debit_account, "credit": txn.credit_account, "amount": txn.amount}))
+    let db = match &state.db {
+        Some(d) => d,
+        None => {
+            ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            return source_unavailable("DATABASE_URL not configured; refusing to record an unpersisted transaction flow");
+        }
+    };
+    // Transactional, idempotent on the natural key flow_ref (when supplied):
+    // a replayed POST returns the already-stored flow instead of duplicating it.
+    let inserted = match sqlx::query(
+        r#"INSERT INTO coa_transaction_flows (debit_account, credit_account, amount, currency, narration, flow_ref)
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (flow_ref) DO NOTHING RETURNING flow_id"#,
+    )
+    .bind(&txn.debit_account)
+    .bind(&txn.credit_account)
+    .bind(txn.amount)
+    .bind(&txn.currency)
+    .bind(&txn.narration)
+    .bind(&txn.flow_ref)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            eprintln!("[neo4j-coa-graph-rs] flow insert failed: {}", e);
+            ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            return source_unavailable(&format!("flow persist failed: {}", e));
+        }
+    };
+    match inserted {
+        Some(row) => HttpResponse::Created().json(json!({
+            "recorded": true, "flow_id": row.get::<i64, _>("flow_id"),
+            "debit": txn.debit_account, "credit": txn.credit_account, "amount": txn.amount,
+            "source": "postgres",
+        })),
+        None => {
+            // ON CONFLICT fired: fetch the stored row and report the replay.
+            let stored = sqlx::query(
+                r#"SELECT flow_id FROM coa_transaction_flows WHERE flow_ref = $1"#,
+            )
+            .bind(&txn.flow_ref)
+            .fetch_one(db)
+            .await;
+            match stored {
+                Ok(row) => HttpResponse::Ok().json(json!({
+                    "recorded": true, "idempotent_replayed": true, "flow_id": row.get::<i64, _>("flow_id"),
+                    "debit": txn.debit_account, "credit": txn.credit_account, "amount": txn.amount,
+                    "source": "postgres",
+                })),
+                Err(e) => {
+                    ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                    source_unavailable(&format!("flow replay lookup failed: {}", e))
+                }
+            }
+        }
+    }
 }
 
 #[actix_web::main]
@@ -507,7 +652,14 @@ async fn main() -> std::io::Result<()> {
                 .connect(&url)
                 .await
             {
-                Ok(p) => Some(p),
+                Ok(p) => {
+                    if let Err(e) = init_flow_schema(&p).await {
+                        log::error!("[neo4j-coa-graph-rs] flow schema init failed: {} — CoA endpoints will 503", e);
+                        None
+                    } else {
+                        Some(p)
+                    }
+                }
                 Err(e) => {
                     log::error!("[neo4j-coa-graph-rs] DB connect failed: {} — CoA endpoints will 503", e);
                     None
@@ -521,7 +673,7 @@ async fn main() -> std::io::Result<()> {
     };
 
     let port: u16 = env::var("PORT").unwrap_or_else(|_| "8112".to_string()).parse().unwrap_or(8112);
-    let state = web::Data::new(AppState { db, edges_mem: std::sync::Mutex::new(Vec::new()) });
+    let state = web::Data::new(AppState { db });
 
     println!("neo4j-coa-graph-rs listening on port {}", port);
     start_grpc_server("neo4j-coa-graph-rs", 10386);
@@ -597,8 +749,7 @@ mod tests {
         assert_eq!("neo4j-coa-graph-rs", "neo4j-coa-graph-rs");
     }
 
-    #[test]
-    fn test_rate_limiter() {
-        assert!(rl_allow());
-    }
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

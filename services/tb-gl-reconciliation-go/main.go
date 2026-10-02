@@ -480,7 +480,7 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/api/v1/reconciliation/run", reconcile)
+	mux.HandleFunc("/api/v1/reconciliation/run", permifyAuthzGuard("reconciliation", "run", reconcile))
 	mux.HandleFunc("/api/v1/reconciliation/history", getHistory)
 	srv := &http.Server{
 		Addr: ":" + port, Handler: jwtAuthMiddleware(mux),

@@ -1,12 +1,13 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::PgPool;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct Derivative {
     id: String,
     instrument_type: String, // irs, ccs, fra, cap, floor, collar, fx_option, swaption
@@ -58,7 +59,86 @@ struct PricingRequest {
 }
 
 struct AppState {
-    derivatives: Mutex<Vec<Derivative>>,
+    // Wave-12 (C3-P2-RSVEC): derivatives are persisted in Postgres (was:
+    // in-memory Mutex<Vec<Derivative>> re-seeded on every boot). Typed columns;
+    // id is the natural/unique key. None => 503 (no silent memory fallback).
+    db: Option<PgPool>,
+}
+
+const DERIV_COLS: &str = "id, instrument_type, trade_id, counterparty, counterparty_id, notional, \
+     currency, secondary_currency, fixed_rate, floating_index, floating_spread, strike_price, \
+     option_type, start_date, maturity_date, payment_frequency, day_count, mtm_value, \
+     collateral_posted, collateral_received, hedge_designation, status";
+
+async fn init_db(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS derivatives (
+            id TEXT PRIMARY KEY,
+            instrument_type TEXT NOT NULL DEFAULT '',
+            trade_id TEXT NOT NULL DEFAULT '',
+            counterparty TEXT NOT NULL DEFAULT '',
+            counterparty_id TEXT NOT NULL DEFAULT '',
+            notional DOUBLE PRECISION NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            secondary_currency TEXT,
+            fixed_rate DOUBLE PRECISION,
+            floating_index TEXT,
+            floating_spread DOUBLE PRECISION,
+            strike_price DOUBLE PRECISION,
+            option_type TEXT,
+            start_date TEXT NOT NULL DEFAULT '',
+            maturity_date TEXT NOT NULL DEFAULT '',
+            payment_frequency TEXT NOT NULL DEFAULT '',
+            day_count TEXT NOT NULL DEFAULT '',
+            mtm_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+            collateral_posted DOUBLE PRECISION NOT NULL DEFAULT 0,
+            collateral_received DOUBLE PRECISION NOT NULL DEFAULT 0,
+            hedge_designation TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("otc-derivatives-rs: derivatives DDL failed: {}", e);
+    }
+}
+
+/// Idempotent seed of the reference derivatives (was: in-memory seed on every
+/// boot). ON CONFLICT DO NOTHING so restarts never duplicate or overwrite.
+async fn seed_to_db(pool: &PgPool) {
+    for d in seed() {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO derivatives (id, instrument_type, trade_id, counterparty, counterparty_id,
+                notional, currency, secondary_currency, fixed_rate, floating_index, floating_spread,
+                strike_price, option_type, start_date, maturity_date, payment_frequency, day_count,
+                mtm_value, collateral_posted, collateral_received, hedge_designation, status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&d.id).bind(&d.instrument_type).bind(&d.trade_id).bind(&d.counterparty)
+        .bind(&d.counterparty_id).bind(d.notional).bind(&d.currency).bind(&d.secondary_currency)
+        .bind(d.fixed_rate).bind(&d.floating_index).bind(d.floating_spread).bind(d.strike_price)
+        .bind(&d.option_type).bind(&d.start_date).bind(&d.maturity_date).bind(&d.payment_frequency)
+        .bind(&d.day_count).bind(d.mtm_value).bind(d.collateral_posted).bind(d.collateral_received)
+        .bind(&d.hedge_designation).bind(&d.status)
+        .execute(pool)
+        .await
+        {
+            eprintln!("otc-derivatives-rs: seed {} failed: {}", d.id, e);
+        }
+    }
+}
+
+async fn fetch_derivatives(pool: &PgPool) -> Result<Vec<Derivative>, sqlx::Error> {
+    sqlx::query_as::<_, Derivative>(&format!(
+        "SELECT {} FROM derivatives ORDER BY id",
+        DERIV_COLS
+    ))
+    .fetch_all(pool)
+    .await
 }
 
 fn seed() -> Vec<Derivative> {
@@ -138,12 +218,28 @@ async fn healthz() -> HttpResponse {
 
 async fn list_derivatives(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let d = data.derivatives.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({ "items": *d, "total": d.len() }))
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => {
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "derivative_store_unavailable"}));
+        }
+    };
+    let d = match fetch_derivatives(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("otc-derivatives-rs: list_derivatives query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "derivative_store_unavailable"}));
+        }
+    };
+    let total = d.len();
+    HttpResponse::Ok().json(serde_json::json!({ "items": d, "total": total }))
 }
 
 async fn price_derivative(req: actix_web::HttpRequest, body: web::Json<PricingRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "derivative", "price").await { return resp; } // W12-B5D1
     let req = body.into_inner();
     if req.notional <= 0.0 {
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "notional must be positive"}));
@@ -194,7 +290,21 @@ async fn price_derivative(req: actix_web::HttpRequest, body: web::Json<PricingRe
 
 async fn portfolio_risk(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let d = data.derivatives.lock().unwrap();
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => {
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "derivative_store_unavailable"}));
+        }
+    };
+    let d = match fetch_derivatives(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("otc-derivatives-rs: portfolio_risk query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "derivative_store_unavailable"}));
+        }
+    };
     let total_notional: f64 = d.iter().filter(|x| x.status == "active").map(|x| x.notional).sum();
     let total_mtm: f64 = d.iter().filter(|x| x.status == "active").map(|x| x.mtm_value).sum();
     let total_collateral_posted: f64 = d.iter().map(|x| x.collateral_posted).sum();
@@ -411,7 +521,31 @@ fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = env_or("PORT", "8080");
-    let state = web::Data::new(AppState { derivatives: Mutex::new(seed()) });
+    // Wave-12 (C3-P2-RSVEC): Postgres is the derivative store (was in-memory
+    // Vec). DATABASE_URL optional: when unset the pool is None and reads fail
+    // closed (503) rather than falling back to memory.
+    let db: Option<PgPool> = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("otc-derivatives-rs: invalid DATABASE_URL: {} — reads will return 503", e);
+                None
+            }
+        },
+        Err(_) => {
+            eprintln!("otc-derivatives-rs: DATABASE_URL not set — reads will return 503");
+            None
+        }
+    };
+    if let Some(pool) = db.as_ref() {
+        init_db(pool).await;
+        seed_to_db(pool).await;
+    }
+    let state = web::Data::new(AppState { db });
     eprintln!("OTC Derivatives service on :{}", port);
     HttpServer::new(move || {
         App::new()
@@ -425,3 +559,6 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

@@ -180,3 +180,94 @@ export const batchProcessingApi = {
   getScheduledJobs: () =>
     apiClient.get(`${APISIX.BATCH_PROCESSING}/v1/eod/runs`).then((r) => r.data),
 };
+
+// ─── Banking Clearing Ops RS (W12 A4-P1-A: /banking-clearing-ops/*) ─────────
+// GL position views, ops alerts and settlement instruction records served by
+// banking-clearing-ops-rs (services/banking-clearing-ops-rs/src/main.rs).
+
+export interface ClearingGlPosition {
+  gl_code?: string;
+  balance?: number;
+  currency?: string;
+  [key: string]: unknown;
+}
+
+export interface ClearingOpsAlert {
+  id?: string;
+  severity?: string;
+  message?: string;
+  [key: string]: unknown;
+}
+
+export interface ClearingSettlementRecord {
+  id: string;
+  [key: string]: unknown;
+}
+
+export const clearingOpsRsApi = {
+  chequeClearingGl: () =>
+    apiClient.get<ClearingGlPosition>(`${APISIX.CLEARING_OPS}/v1/cheque/clearing-gl`).then((r) => r.data),
+
+  collateralGl: () =>
+    apiClient.get<ClearingGlPosition>(`${APISIX.CLEARING_OPS}/v1/collateral/gl`).then((r) => r.data),
+
+  cashManagementGl: () =>
+    apiClient.get<ClearingGlPosition>(`${APISIX.CLEARING_OPS}/v1/cash/management-gl`).then((r) => r.data),
+
+  swiftCorrespondentGl: () =>
+    apiClient.get<ClearingGlPosition>(`${APISIX.CLEARING_OPS}/v1/swift/correspondent-gl`).then((r) => r.data),
+
+  alerts: () =>
+    apiClient.get<ClearingOpsAlert[] | { items: ClearingOpsAlert[] }>(`${APISIX.CLEARING_OPS}/v1/alerts`).then((r) => r.data),
+
+  listSettlements: (params?: { page?: number; limit?: number }) =>
+    apiClient.get<{ items: ClearingSettlementRecord[]; total: number }>(`${APISIX.CLEARING_OPS}/api/v1/settlements`, { params }).then((r) => r.data),
+
+  createSettlement: (body: Record<string, unknown>) =>
+    apiClient.post<ClearingSettlementRecord>(`${APISIX.CLEARING_OPS}/api/v1/settlements`, body).then((r) => r.data),
+
+  getSettlement: (id: string) =>
+    apiClient.get<ClearingSettlementRecord>(`${APISIX.CLEARING_OPS}/api/v1/settlements/${id}`).then((r) => r.data),
+
+  updateSettlement: (id: string, body: Record<string, unknown>) =>
+    apiClient.put<ClearingSettlementRecord>(`${APISIX.CLEARING_OPS}/api/v1/settlements/${id}`, body).then((r) => r.data),
+
+  deleteSettlement: (id: string) =>
+    apiClient.delete(`${APISIX.CLEARING_OPS}/api/v1/settlements/${id}`).then((r) => r.data),
+};
+
+// ─── Banking Operations Pipeline (W12 A4-P1-A: /banking-operations-pipeline/*) ─
+export interface OpsPipelineEodResult {
+  batch_id: string;
+  business_date: string;
+  [key: string]: unknown;
+}
+
+export const opsPipelineApi = {
+  list: () =>
+    apiClient.get<{ records: Record<string, unknown>[]; source: string }>(`${APISIX.BANKING_OPS_PIPELINE}/v1/list`).then((r) => r.data),
+
+  create: (body: Record<string, unknown>) =>
+    apiClient.post(`${APISIX.BANKING_OPS_PIPELINE}/v1/create`, body).then((r) => r.data),
+
+  eodReconciliation: (date?: string) =>
+    apiClient.get(`${APISIX.BANKING_OPS_PIPELINE}/v1/eod/reconciliation`, { params: date ? { date } : undefined }).then((r) => r.data),
+
+  feesRevenue: (date?: string) =>
+    apiClient.get(`${APISIX.BANKING_OPS_PIPELINE}/v1/fees/revenue`, { params: date ? { date } : undefined }).then((r) => r.data),
+
+  treasuryMtm: (date?: string) =>
+    apiClient.get(`${APISIX.BANKING_OPS_PIPELINE}/v1/treasury/mtm`, { params: date ? { date } : undefined }).then((r) => r.data),
+
+  settlementPositions: (date?: string) =>
+    apiClient.get(`${APISIX.BANKING_OPS_PIPELINE}/v1/settlement/positions`, { params: date ? { date } : undefined }).then((r) => r.data),
+
+  dormancyEscheatment: (date?: string) =>
+    apiClient.get(`${APISIX.BANKING_OPS_PIPELINE}/v1/dormancy/escheatment`, { params: date ? { date } : undefined }).then((r) => r.data),
+
+  middlewareConfig: () =>
+    apiClient.get(`${APISIX.BANKING_OPS_PIPELINE}/v1/middleware`).then((r) => r.data),
+
+  runAllEod: (businessDate?: string) =>
+    apiClient.post<OpsPipelineEodResult>(`${APISIX.BANKING_OPS_PIPELINE}/v1/eod/run-all`, businessDate ? { businessDate } : {}).then((r) => r.data),
+};

@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -51,13 +54,111 @@ type SWIFTMessage struct {
 	Timestamp   string  `json:"timestamp"`
 }
 
-var (
-	mu       sync.RWMutex
-	messages []SWIFTMessage
-)
+// ── Persistence (wave-12 C3-P0-B7) ─────────────────────────────────────────
+// SWIFT messages are Postgres-authoritative (table swift_messages, typed
+// columns — the domain shape is fully known). The previous package-level
+// in-memory slice was removed entirely: create/list/stats ALL hit PG, and
+// mutations run inside a transaction. Fail-closed: without DATABASE_URL the
+// message endpoints return 503 rather than silently losing financial messages.
+var db *sql.DB
 
-func init() {
-	messages = []SWIFTMessage{}
+const swiftDDL = `
+CREATE SEQUENCE IF NOT EXISTS swift_message_id_seq START 1;
+CREATE TABLE IF NOT EXISTS swift_messages (
+    id           text PRIMARY KEY,
+    tenant_id    text NOT NULL DEFAULT '',
+    message_type text NOT NULL,
+    direction    text NOT NULL,
+    sender_bic   text NOT NULL DEFAULT '',
+    receiver_bic text NOT NULL DEFAULT '',
+    amount       double precision NOT NULL DEFAULT 0,
+    currency     text NOT NULL DEFAULT '',
+    reference    text NOT NULL DEFAULT '',
+    status       text NOT NULL DEFAULT 'pending',
+    iso20022     boolean NOT NULL DEFAULT false,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_swift_messages_tenant ON swift_messages (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_swift_messages_status ON swift_messages (status);
+`
+
+func initDB() {
+	dsn := envOr("DATABASE_URL", "")
+	if dsn == "" {
+		log.Printf("[swift-messaging-go] DATABASE_URL not set — message endpoints fail-closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[swift-messaging-go] pg open failed: %v — message endpoints fail-closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[swift-messaging-go] pg ping failed: %v — message endpoints fail-closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(swiftDDL); err != nil {
+		log.Fatalf("[swift-messaging-go] swift_messages DDL failed: %v", err)
+	}
+	log.Printf("[swift-messaging-go] postgres authoritative store ready (swift_messages)")
+}
+
+// dbInsertMessage persists one SWIFT message transactionally, allocating its
+// id from a PG sequence (restart-safe, unlike the old len(slice)+1 scheme).
+func dbInsertMessage(m *SWIFTMessage, tenantID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var seq int64
+	if err = tx.QueryRow(`SELECT nextval('swift_message_id_seq')`).Scan(&seq); err != nil {
+		return err
+	}
+	m.ID = fmt.Sprintf("SW-%03d", seq)
+	m.Status = "pending"
+	m.Timestamp = now()
+	_, err = tx.Exec(
+		`INSERT INTO swift_messages (id, tenant_id, message_type, direction, sender_bic, receiver_bic, amount, currency, reference, status, iso20022, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now())`,
+		m.ID, tenantID, m.MessageType, m.Direction, m.SenderBIC, m.ReceiverBIC, m.Amount, m.Currency, m.Reference, m.Status, m.ISO20022)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func dbListMessages(tenantID string) ([]SWIFTMessage, error) {
+	q := `SELECT id, message_type, direction, sender_bic, receiver_bic, amount, currency, reference, status, iso20022, created_at FROM swift_messages`
+	args := []interface{}{}
+	if tenantID != "" {
+		q += ` WHERE tenant_id = $1`
+		args = append(args, tenantID)
+	}
+	q += ` ORDER BY created_at, id`
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SWIFTMessage{}
+	for rows.Next() {
+		var m SWIFTMessage
+		var ts time.Time
+		if err := rows.Scan(&m.ID, &m.MessageType, &m.Direction, &m.SenderBIC, &m.ReceiverBIC, &m.Amount, &m.Currency, &m.Reference, &m.Status, &m.ISO20022, &ts); err != nil {
+			return nil, err
+		}
+		m.Timestamp = ts.UTC().Format(time.RFC3339)
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 func respond(w http.ResponseWriter, code int, data interface{}) {
@@ -89,44 +190,75 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func handleMessages(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	if db == nil {
+		respond(w, 503, map[string]string{"error": "postgres unavailable — message store fail-closed"})
+		return
+	}
+	tenantID := r.Header.Get("X-Tenant-ID")
 	if r.Method == http.MethodPost {
 		var m SWIFTMessage
 		json.NewDecoder(r.Body).Decode(&m)
-		m.ID = fmt.Sprintf("SW-%03d", len(messages)+1)
-		m.Status = "pending"
-		m.Timestamp = now()
-		messages = append(messages, m)
+		if err := dbInsertMessage(&m, tenantID); err != nil {
+			respond(w, 500, map[string]string{"error": "persist failed: " + err.Error()})
+			return
+		}
 		respond(w, 201, m)
 		return
 	}
-	respond(w, 200, map[string]interface{}{"items": messages, "total": len(messages)})
+	items, err := dbListMessages(tenantID)
+	if err != nil {
+		respond(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+		return
+	}
+	respond(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
 }
 
-func handleStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		respond(w, 503, map[string]string{"error": "postgres unavailable — stats fail-closed"})
+		return
+	}
+	tenantID := r.Header.Get("X-Tenant-ID")
+	where := ""
+	args := []interface{}{}
+	if tenantID != "" {
+		where = " WHERE tenant_id = $1"
+		args = append(args, tenantID)
+	}
 	outgoing := 0
 	incoming := 0
 	iso20022 := 0
+	total := 0
 	var totalAmount float64
+	err := db.QueryRow(
+		`SELECT count(*),
+		        count(*) FILTER (WHERE direction = 'outgoing'),
+		        count(*) FILTER (WHERE direction <> 'outgoing'),
+		        count(*) FILTER (WHERE iso20022),
+		        COALESCE(sum(amount), 0)
+		 FROM swift_messages`+where, args...).
+		Scan(&total, &outgoing, &incoming, &iso20022, &totalAmount)
+	if err != nil {
+		respond(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+		return
+	}
 	byType := map[string]int{}
-	for _, m := range messages {
-		if m.Direction == "outgoing" {
-			outgoing++
-		} else {
-			incoming++
+	rows, err := db.Query(`SELECT message_type, count(*) FROM swift_messages`+where+` GROUP BY message_type`, args...)
+	if err != nil {
+		respond(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t string
+		var c int
+		if err := rows.Scan(&t, &c); err == nil {
+			byType[t] = c
 		}
-		if m.ISO20022 {
-			iso20022++
-		}
-		totalAmount += m.Amount
-		byType[m.MessageType]++
 	}
 	respond(w, 200, map[string]interface{}{
-		"totalMessages": len(messages), "outgoing": outgoing, "incoming": incoming,
-		"iso20022Count": iso20022, "legacyMTCount": len(messages) - iso20022,
+		"totalMessages": total, "outgoing": outgoing, "incoming": incoming,
+		"iso20022Count": iso20022, "legacyMTCount": total - iso20022,
 		"totalAmount": totalAmount, "byType": byType,
 		"supportedTypes": []string{"MT103", "MT202", "MT700", "MT760", "MT940", "MT199", "pacs.008", "pacs.009", "camt.053", "camt.054"},
 	})
@@ -306,14 +438,15 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	initDB()
 	startJWKSRefresh()
 
 	port := envOr("PORT", "8248")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/swift/messages", handleMessages)
-	http.HandleFunc("/v1/swift/stats", handleStats)
+	http.HandleFunc("/v1/swift/messages", permifyAuthzGuard("swift_message", "manage", handleMessages))
+	http.HandleFunc("/v1/swift/stats", permifyAuthzGuard("swift_message", "view", handleStats))
 	fmt.Printf("SWIFT Messaging Service on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

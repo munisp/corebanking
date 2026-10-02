@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "github.com/lib/pq"
 	"shared/otel/go/otelkit"
 )
 
@@ -64,14 +66,78 @@ type POSTransaction struct {
 }
 
 var (
-	mu           sync.Mutex
-	terminals    []POSTerminal
-	transactions []POSTransaction
+	mu        sync.Mutex
+	terminals []POSTerminal
 )
 
 func init() {
 	terminals = []POSTerminal{}
-	transactions = []POSTransaction{}
+}
+
+// ── Persistence (wave-12 C3-P0-B7) ─────────────────────────────────────────
+// POS transactions are Postgres-authoritative (typed table pos_transactions).
+// The in-memory transactions slice was removed (NOTE: the terminals slice is
+// a different register item owned by another batch and is intentionally
+// untouched here). Creates are idempotent on the natural key rrn (partial
+// UNIQUE index where rrn is present): a replayed POST returns the stored row
+// with X-Idempotent-Replayed. Fail-closed 503 when DATABASE_URL is unset/down.
+var db *sql.DB
+
+const posDDL = `
+CREATE SEQUENCE IF NOT EXISTS pos_txn_id_seq START 1;
+CREATE TABLE IF NOT EXISTS pos_transactions (
+    id            text PRIMARY KEY,
+    tenant_id     text NOT NULL DEFAULT '',
+    terminal_id   text NOT NULL,
+    merchant_name text NOT NULL DEFAULT '',
+    type          text NOT NULL,
+    amount        double precision NOT NULL CHECK (amount > 0),
+    currency      text NOT NULL DEFAULT 'NGN',
+    card_scheme   text NOT NULL DEFAULT '',
+    response_code text NOT NULL DEFAULT '',
+    rrn           text NOT NULL DEFAULT '',
+    txn_timestamp text NOT NULL DEFAULT '',
+    status        text NOT NULL DEFAULT 'pending',
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pos_txn_rrn ON pos_transactions (rrn) WHERE rrn <> '';
+CREATE INDEX IF NOT EXISTS idx_pos_txn_terminal ON pos_transactions (terminal_id);
+`
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[pos-terminal-go] DATABASE_URL not set — transaction endpoints fail-closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[pos-terminal-go] pg open failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[pos-terminal-go] pg ping failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(posDDL); err != nil {
+		log.Fatalf("[pos-terminal-go] DDL failed: %v", err)
+	}
+	log.Printf("[pos-terminal-go] postgres authoritative store ready (pos_transactions)")
+}
+
+const posTxnCols = `id, terminal_id, merchant_name, type, amount, currency, card_scheme, response_code, rrn, txn_timestamp, status`
+
+func scanPOSTxn(row interface{ Scan(...interface{}) error }) (POSTransaction, error) {
+	var t POSTransaction
+	err := row.Scan(&t.ID, &t.TerminalID, &t.MerchantName, &t.Type, &t.Amount, &t.Currency, &t.CardScheme, &t.ResponseCode, &t.RRN, &t.Timestamp, &t.Status)
+	return t, err
 }
 
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -310,6 +376,7 @@ func main() {
 			log.Printf("otelkit shutdown: %v", serr)
 		}
 	}()
+	initDB()
 	startJWKSRefresh()
 
 	mux := http.NewServeMux()
@@ -320,7 +387,7 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	// Terminals — GET list / POST create
-	mux.HandleFunc("/v1/pos/terminals", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/pos/terminals", permifyAuthzGuard("terminal", "manage", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			mu.Lock()
@@ -352,17 +419,35 @@ func main() {
 		default:
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		}
-	})
+	}))
 
-	// Transactions — GET list / POST create
-	mux.HandleFunc("/v1/pos/transactions", func(w http.ResponseWriter, r *http.Request) {
+	// Transactions — GET list / POST create (Postgres-authoritative)
+	mux.HandleFunc("/v1/pos/transactions", permifyAuthzGuard("payment_order", "create", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			respondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "postgres unavailable — fail-closed"})
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
-			mu.Lock()
-			defer mu.Unlock()
+			rows, err := db.Query(`SELECT ` + posTxnCols + ` FROM pos_transactions ORDER BY created_at, id`)
+			if err != nil {
+				respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "list failed: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+			items := []POSTransaction{}
+			for rows.Next() {
+				t, err := scanPOSTxn(rows)
+				if err != nil {
+					respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "list failed: " + err.Error()})
+					return
+				}
+				items = append(items, t)
+			}
 			respondJSON(w, http.StatusOK, map[string]interface{}{
-				"items": transactions,
-				"total": len(transactions),
+				"items":  items,
+				"total":  len(items),
+				"source": "postgres",
 			})
 
 		case http.MethodPost:
@@ -381,16 +466,36 @@ func main() {
 			if tx.Status == "" {
 				tx.Status = "pending"
 			}
-			tx.ID = fmt.Sprintf("PTX-%04d", len(transactions)+1)
-			mu.Lock()
-			transactions = append(transactions, tx)
-			mu.Unlock()
+			// Idempotent create on the natural key rrn (when provided): a
+			// replayed POST returns the stored row instead of double-recording
+			// a card transaction.
+			err := db.QueryRow(
+				`INSERT INTO pos_transactions (id, terminal_id, merchant_name, type, amount, currency, card_scheme, response_code, rrn, txn_timestamp, status)
+				 VALUES ('PTX-' || lpad(nextval('pos_txn_id_seq')::text, 4, '0'), $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+				 ON CONFLICT (rrn) WHERE rrn <> '' DO NOTHING
+				 RETURNING id`,
+				tx.TerminalID, tx.MerchantName, tx.Type, tx.Amount, tx.Currency, tx.CardScheme, tx.ResponseCode, tx.RRN, tx.Timestamp, tx.Status).
+				Scan(&tx.ID)
+			if err == sql.ErrNoRows {
+				stored, serr := scanPOSTxn(db.QueryRow(`SELECT `+posTxnCols+` FROM pos_transactions WHERE rrn = $1`, tx.RRN))
+				if serr != nil {
+					respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "replay fetch failed: " + serr.Error()})
+					return
+				}
+				w.Header().Set("X-Idempotent-Replayed", "true")
+				respondJSON(w, http.StatusOK, stored)
+				return
+			}
+			if err != nil {
+				respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist failed: " + err.Error()})
+				return
+			}
 			respondJSON(w, http.StatusCreated, tx)
 
 		default:
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		}
-	})
+	}))
 
 	// Stats endpoint
 	mux.HandleFunc("/v1/pos/stats", func(w http.ResponseWriter, _ *http.Request) {
@@ -411,12 +516,10 @@ func main() {
 		approvedTxns := 0
 		declinedTxns := 0
 
-		for _, tx := range transactions {
-			if tx.Status == "approved" {
-				approvedTxns++
-			} else {
-				declinedTxns++
-			}
+		if db != nil {
+			_ = db.QueryRow(`SELECT count(*) FILTER (WHERE status = 'approved'),
+			        count(*) FILTER (WHERE status <> 'approved') FROM pos_transactions`).
+				Scan(&approvedTxns, &declinedTxns)
 		}
 
 		mu.Unlock()

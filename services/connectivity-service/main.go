@@ -99,10 +99,17 @@ type SyncQueueResponse struct {
 }
 
 func NewConnectivityServer() *ConnectivityServer {
+	// W12-C3-P0-B6: use the real PayloadCompressor from payload_compression.go.
+	// The previous stub redeclared the type and returned hardcoded responses,
+	// which also made the package fail to compile.
+	compressor, err := NewPayloadCompressor()
+	if err != nil {
+		log.Fatalf("connectivity-service: failed to initialise payload compressor: %v", err)
+	}
 	server := &ConnectivityServer{
 		router:            mux.NewRouter(),
 		imageOptimizer:    NewAdaptiveImageOptimizer(),
-		payloadCompressor: NewPayloadCompressor(),
+		payloadCompressor: compressor,
 		offlinePIN:        NewOfflinePINVerifier(),
 	}
 	server.setupRoutes()
@@ -117,29 +124,29 @@ func (s *ConnectivityServer) setupRoutes() {
 	api := s.router.PathPrefix("/api/v1").Subrouter()
 
 	// Image optimization for low bandwidth
-	api.HandleFunc("/connectivity/image/optimize", s.optimizeImageHandler).Methods("POST")
-	api.HandleFunc("/connectivity/image/quality", s.detectQualityHandler).Methods("POST")
+	api.HandleFunc("/connectivity/image/optimize", permifyAuthzGuard("connectivity_service", "optimize", s.optimizeImageHandler)).Methods("POST")
+	api.HandleFunc("/connectivity/image/quality", permifyAuthzGuard("connectivity_service", "quality", s.detectQualityHandler)).Methods("POST")
 
 	// Payload compression
-	api.HandleFunc("/connectivity/compress", s.compressPayloadHandler).Methods("POST")
-	api.HandleFunc("/connectivity/decompress", s.decompressPayloadHandler).Methods("POST")
+	api.HandleFunc("/connectivity/compress", permifyAuthzGuard("connectivity_service", "compress", s.compressPayloadHandler)).Methods("POST")
+	api.HandleFunc("/connectivity/decompress", permifyAuthzGuard("connectivity_service", "decompress", s.decompressPayloadHandler)).Methods("POST")
 
 	// Offline PIN verification
-	api.HandleFunc("/connectivity/offline/pin/setup", s.setupOfflinePINHandler).Methods("POST")
-	api.HandleFunc("/connectivity/offline/pin/verify", s.verifyOfflinePINHandler).Methods("POST")
-	api.HandleFunc("/connectivity/offline/pin/sync", s.syncOfflinePINHandler).Methods("POST")
+	api.HandleFunc("/connectivity/offline/pin/setup", permifyAuthzGuard("connectivity_service", "setup", s.setupOfflinePINHandler)).Methods("POST")
+	api.HandleFunc("/connectivity/offline/pin/verify", permifyAuthzGuard("connectivity_service", "verify", s.verifyOfflinePINHandler)).Methods("POST")
+	api.HandleFunc("/connectivity/offline/pin/sync", permifyAuthzGuard("connectivity_service", "sync", s.syncOfflinePINHandler)).Methods("POST")
 
 	// Offline transaction queue
-	api.HandleFunc("/connectivity/offline/queue", s.getOfflineQueueHandler).Methods("GET")
-	api.HandleFunc("/connectivity/offline/queue/sync", s.syncOfflineQueueHandler).Methods("POST")
+	api.HandleFunc("/connectivity/offline/queue", permifyAuthzGuard("connectivity_service", "view", s.getOfflineQueueHandler)).Methods("GET")
+	api.HandleFunc("/connectivity/offline/queue/sync", permifyAuthzGuard("connectivity_service", "sync", s.syncOfflineQueueHandler)).Methods("POST")
 
 	// Network quality detection
-	api.HandleFunc("/connectivity/network/quality", s.detectNetworkQualityHandler).Methods("GET")
-	api.HandleFunc("/connectivity/network/optimize", s.getOptimalSettingsHandler).Methods("GET")
+	api.HandleFunc("/connectivity/network/quality", permifyAuthzGuard("connectivity_service", "view", s.detectNetworkQualityHandler)).Methods("GET")
+	api.HandleFunc("/connectivity/network/optimize", permifyAuthzGuard("connectivity_service", "view", s.getOptimalSettingsHandler)).Methods("GET")
 
 	// Delta sync for minimal data transfer
-	api.HandleFunc("/connectivity/delta/generate", s.generateDeltaHandler).Methods("POST")
-	api.HandleFunc("/connectivity/delta/apply", s.applyDeltaHandler).Methods("POST")
+	api.HandleFunc("/connectivity/delta/generate", permifyAuthzGuard("connectivity_service", "generate", s.generateDeltaHandler)).Methods("POST")
+	api.HandleFunc("/connectivity/delta/apply", permifyAuthzGuard("connectivity_service", "apply", s.applyDeltaHandler)).Methods("POST")
 }
 
 func (s *ConnectivityServer) healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -187,13 +194,33 @@ func (s *ConnectivityServer) compressPayloadHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	result, err := s.payloadCompressor.Compress(req)
+	// W12-C3-P0-B6: real compression path (payload_compression.go).
+	raw, err := json.Marshal(req.Data)
+	if err != nil {
+		http.Error(w, "failed to encode payload data: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	level := CompressionLevel(req.Level)
+	if level <= 0 {
+		level = LevelDefault
+	}
+	result, err := s.payloadCompressor.Compress(raw, CompressionAlgorithm(req.Algorithm), level)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	json.NewEncoder(w).Encode(result)
+	ratio := 0.0
+	if result.OriginalSize > 0 {
+		ratio = float64(result.CompressedSize) / float64(result.OriginalSize)
+	}
+	json.NewEncoder(w).Encode(CompressPayloadResponse{
+		CompressedData:   result.Data,
+		OriginalSize:     result.OriginalSize,
+		CompressedSize:   result.CompressedSize,
+		CompressionRatio: ratio,
+		Algorithm:        string(result.Algorithm),
+	})
 }
 
 func (s *ConnectivityServer) decompressPayloadHandler(w http.ResponseWriter, r *http.Request) {
@@ -206,13 +233,28 @@ func (s *ConnectivityServer) decompressPayloadHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	data, err := s.payloadCompressor.Decompress(req.CompressedData, req.Algorithm)
+	// W12-C3-P0-B6: real decompression path (payload_compression.go).
+	compressedBytes, err := base64.StdEncoding.DecodeString(req.CompressedData)
+	if err != nil {
+		http.Error(w, "invalid base64 compressed_data: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	payload := &CompressedPayload{
+		Algorithm: CompressionAlgorithm(req.Algorithm),
+		Data:      req.CompressedData,
+		Checksum:  calculateChecksum(compressedBytes),
+	}
+	data, err := s.payloadCompressor.Decompress(payload)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": data})
+	var out interface{}
+	if err := json.Unmarshal(data, &out); err != nil {
+		out = base64.StdEncoding.EncodeToString(data)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"data": out})
 }
 
 func (s *ConnectivityServer) setupOfflinePINHandler(w http.ResponseWriter, r *http.Request) {
@@ -656,25 +698,10 @@ func (o *AdaptiveImageOptimizer) DetectOptimalQuality(bandwidth, latency int) st
 	return "high"
 }
 
-type PayloadCompressor struct{}
-
-func NewPayloadCompressor() *PayloadCompressor {
-	return &PayloadCompressor{}
-}
-
-func (c *PayloadCompressor) Compress(req CompressPayloadRequest) (*CompressPayloadResponse, error) {
-	return &CompressPayloadResponse{
-		CompressedData:   "compressed_base64",
-		OriginalSize:     1000,
-		CompressedSize:   200,
-		CompressionRatio: 0.80,
-		Algorithm:        req.Algorithm,
-	}, nil
-}
-
-func (c *PayloadCompressor) Decompress(data, algorithm string) (interface{}, error) {
-	return map[string]interface{}{"decompressed": true}, nil
-}
+// W12-C3-P0-B6: the stub PayloadCompressor that used to live here was removed —
+// it redeclared the real type in payload_compression.go (package did not
+// compile) and returned hardcoded responses. Handlers now use the real
+// implementation.
 
 type OfflinePINVerifier struct{}
 

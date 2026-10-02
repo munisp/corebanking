@@ -89,9 +89,11 @@ type ConsentRequest struct {
 }
 
 var (
-	tpps      []TPP
-	endpoints []APIEndpoint
-	mu        sync.Mutex
+	// W12 C3-P2-B5: seedTPPs/seedEndpoints are boot seed data ONLY — upserted
+	// into Postgres (tpps / api_endpoints) by initConsentStore. All reads are
+	// served from PG; the in-memory registry was removed.
+	seedTPPs      []TPP
+	seedEndpoints []APIEndpoint
 	// CP-09: Postgres consent store (durable, shared across replicas).
 	consentDB *sql.DB
 )
@@ -135,11 +137,123 @@ func initConsentStore() {
 	_, _ = consentDB.Exec(`CREATE INDEX IF NOT EXISTS idx_ob_consents_tpp ON ob_consents(tpp_id, status)`)
 	// Lazily expire consents past their expiry on boot.
 	_, _ = consentDB.Exec(`UPDATE ob_consents SET status='expired' WHERE status='authorized' AND expires_at < NOW()`)
+
+	// W12 C3-P2-B5: TPP accreditation registry + API catalog → PG (were
+	// in-memory slices seeded by init()).
+	if _, err := consentDB.Exec(`CREATE TABLE IF NOT EXISTS tpps (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		registration_no TEXT NOT NULL DEFAULT '',
+		role TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT '',
+		cert_issuer TEXT NOT NULL DEFAULT '',
+		cert_expiry TEXT NOT NULL DEFAULT '',
+		redirect_uris JSONB NOT NULL DEFAULT '[]',
+		contact_email TEXT NOT NULL DEFAULT '',
+		api_versions JSONB NOT NULL DEFAULT '[]',
+		consent_count INT NOT NULL DEFAULT 0,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[open-banking-go] tpps schema init failed: %v", err)
+	}
+	if _, err := consentDB.Exec(`CREATE TABLE IF NOT EXISTS api_endpoints (
+		id TEXT PRIMARY KEY,
+		path TEXT NOT NULL DEFAULT '',
+		method TEXT NOT NULL DEFAULT '',
+		category TEXT NOT NULL DEFAULT '',
+		version TEXT NOT NULL DEFAULT '',
+		description TEXT NOT NULL DEFAULT '',
+		rate_limit INT NOT NULL DEFAULT 0,
+		auth_type TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[open-banking-go] api_endpoints schema init failed: %v", err)
+	}
+	// Idempotent boot seeds (previously the in-memory fixtures).
+	for _, t := range seedTPPs {
+		uris, _ := json.Marshal(t.RedirectURIs)
+		vers, _ := json.Marshal(t.APIVersions)
+		if _, err := consentDB.Exec(`INSERT INTO tpps
+			(id, name, registration_no, role, status, cert_issuer, cert_expiry, redirect_uris, contact_email, api_versions, consent_count)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+			t.ID, t.Name, t.RegistrationNo, t.Role, t.Status, t.CertIssuer, t.CertExpiry, uris, t.ContactEmail, vers, t.ConsentCount); err != nil {
+			log.Printf("[open-banking-go] tpp seed failed: %v", err)
+		}
+	}
+	for _, e := range seedEndpoints {
+		if _, err := consentDB.Exec(`INSERT INTO api_endpoints
+			(id, path, method, category, version, description, rate_limit, auth_type)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+			e.ID, e.Path, e.Method, e.Category, e.Version, e.Description, e.RateLimit, e.AuthType); err != nil {
+			log.Printf("[open-banking-go] endpoint seed failed: %v", err)
+		}
+	}
 	log.Printf("[open-banking-go] consent store ready")
 }
 
+// listTPPs serves the TPP accreditation registry from Postgres.
+func listTPPs() ([]TPP, error) {
+	rows, err := consentDB.Query(`SELECT id, name, registration_no, role, status, cert_issuer, cert_expiry, redirect_uris, contact_email, api_versions, consent_count
+		FROM tpps ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TPP{}
+	for rows.Next() {
+		var t TPP
+		var uris, vers []byte
+		if err := rows.Scan(&t.ID, &t.Name, &t.RegistrationNo, &t.Role, &t.Status, &t.CertIssuer, &t.CertExpiry, &uris, &t.ContactEmail, &vers, &t.ConsentCount); err != nil {
+			return nil, err
+		}
+		t.RedirectURIs = []string{}
+		t.APIVersions = []string{}
+		_ = json.Unmarshal(uris, &t.RedirectURIs)
+		_ = json.Unmarshal(vers, &t.APIVersions)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// getActiveTPP looks up one ACTIVE TPP by id (consent-creation validation).
+func getActiveTPP(id string) (*TPP, error) {
+	var t TPP
+	var uris, vers []byte
+	err := consentDB.QueryRow(`SELECT id, name, registration_no, role, status, cert_issuer, cert_expiry, redirect_uris, contact_email, api_versions, consent_count
+		FROM tpps WHERE id = $1 AND status = 'active'`, id).
+		Scan(&t.ID, &t.Name, &t.RegistrationNo, &t.Role, &t.Status, &t.CertIssuer, &t.CertExpiry, &uris, &t.ContactEmail, &vers, &t.ConsentCount)
+	if err != nil {
+		return nil, err
+	}
+	t.RedirectURIs = []string{}
+	t.APIVersions = []string{}
+	_ = json.Unmarshal(uris, &t.RedirectURIs)
+	_ = json.Unmarshal(vers, &t.APIVersions)
+	return &t, nil
+}
+
+// listAPIEndpoints serves the API catalog from Postgres.
+func listAPIEndpoints() ([]APIEndpoint, error) {
+	rows, err := consentDB.Query(`SELECT id, path, method, category, version, description, rate_limit, auth_type
+		FROM api_endpoints ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []APIEndpoint{}
+	for rows.Next() {
+		var e APIEndpoint
+		if err := rows.Scan(&e.ID, &e.Path, &e.Method, &e.Category, &e.Version, &e.Description, &e.RateLimit, &e.AuthType); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func init() {
-	tpps = []TPP{
+	seedTPPs = []TPP{
 		{"TPP-001", "Paystack (Stripe)", "CBN/TPP/2025/001", "pisp", "active", "CBN Certificate Authority", "2027-12-31", []string{"https://paystack.com/callback"}, "api@paystack.com", []string{"v3.1", "v3.2"}, 12500},
 		{"TPP-002", "Flutterwave", "CBN/TPP/2025/002", "pisp", "active", "CBN Certificate Authority", "2027-06-30", []string{"https://flutterwave.com/callback"}, "api@flutterwave.com", []string{"v3.1"}, 8200},
 		{"TPP-003", "Mono (YC)", "CBN/TPP/2025/003", "aisp", "active", "CBN Certificate Authority", "2027-09-30", []string{"https://mono.co/callback"}, "api@mono.co", []string{"v3.1", "v3.2"}, 5600},
@@ -153,7 +267,7 @@ func init() {
 	// Consents now live in Postgres (ob_consents) and are enforced on data
 	// endpoints. The TPP registry seed above is retained as the static
 	// accreditation list used for consent-creation validation.
-	endpoints = []APIEndpoint{
+	seedEndpoints = []APIEndpoint{
 		{"API-001", "/open-banking/v3.1/accounts", "GET", "accounts", "v3.1", "Get list of accounts", 1000, "oauth2_ais"},
 		{"API-002", "/open-banking/v3.1/accounts/{accountId}", "GET", "accounts", "v3.1", "Get account details", 1000, "oauth2_ais"},
 		{"API-003", "/open-banking/v3.1/accounts/{accountId}/balances", "GET", "accounts", "v3.1", "Get account balances", 2000, "oauth2_ais"},
@@ -356,28 +470,46 @@ func main() {
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/open-banking/consents", handleConsents)
+	mux.HandleFunc("/v1/open-banking/consents", permifyAuthzGuard("open_banking", "manage", handleConsents))
 	// CP-09: consent lifecycle sub-actions (authorize / revoke).
-	mux.HandleFunc("/v1/open-banking/consents/", handleConsentAction)
+	mux.HandleFunc("/v1/open-banking/consents/", permifyAuthzGuard("open_banking", "manage", handleConsentAction))
 
 	// CP-09: AIS/PIS data endpoints behind real consent enforcement. The
 	// account/payment DATA source is not implemented in this service, so
 	// these honestly return 501 AFTER the consent check — an unauthenticated
 	// or out-of-scope request is rejected (403), never served.
-	mux.HandleFunc("/open-banking/v3.1/accounts", consentEnforcement("ais", "ReadAccountsBasic", notImplementedData))
-	mux.HandleFunc("/open-banking/v3.1/accounts/", consentEnforcement("ais", "ReadAccountsDetail", notImplementedData))
-	mux.HandleFunc("/open-banking/v3.1/payments/domestic-payments", consentEnforcement("pis", "CreatePayment", notImplementedData))
-	mux.HandleFunc("/open-banking/v3.1/funds-confirmation", consentEnforcement("cbpii", "ConfirmFunds", notImplementedData))
+	mux.HandleFunc("/open-banking/v3.1/accounts", permifyAuthzGuard("open_banking", "manage", consentEnforcement("ais", "ReadAccountsBasic", notImplementedData)))
+	mux.HandleFunc("/open-banking/v3.1/accounts/", permifyAuthzGuard("open_banking", "manage", consentEnforcement("ais", "ReadAccountsDetail", notImplementedData)))
+	mux.HandleFunc("/open-banking/v3.1/payments/domestic-payments", permifyAuthzGuard("open_banking", "manage", consentEnforcement("pis", "CreatePayment", notImplementedData)))
+	mux.HandleFunc("/open-banking/v3.1/funds-confirmation", permifyAuthzGuard("open_banking", "funds_confirmation", consentEnforcement("cbpii", "ConfirmFunds", notImplementedData)))
 
-	mux.HandleFunc("/v1/open-banking/tpps", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/v1/open-banking/tpps", permifyAuthzGuard("open_banking", "manage", func(w http.ResponseWriter, _ *http.Request) {
+		if consentDBOr503(w) {
+			return
+		}
+		tpps, err := listTPPs()
+		if err != nil {
+			log.Printf("[open-banking-go] tpps list failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "tpp registry unavailable (postgres down)"})
+			return
+		}
 		respondJSON(w, 200, map[string]interface{}{"items": tpps, "total": len(tpps)})
-	})
+	}))
 
-	mux.HandleFunc("/v1/open-banking/api-catalog", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/v1/open-banking/api-catalog", permifyAuthzGuard("open_banking", "api_catalog", func(w http.ResponseWriter, _ *http.Request) {
+		if consentDBOr503(w) {
+			return
+		}
+		endpoints, err := listAPIEndpoints()
+		if err != nil {
+			log.Printf("[open-banking-go] api catalog list failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "api catalog unavailable (postgres down)"})
+			return
+		}
 		respondJSON(w, 200, map[string]interface{}{"items": endpoints, "total": len(endpoints)})
-	})
+	}))
 
-	mux.HandleFunc("/v1/open-banking/stats", handleConsentStats)
+	mux.HandleFunc("/v1/open-banking/stats", permifyAuthzGuard("open_banking", "view", handleConsentStats))
 
 	fmt.Println("Open Banking service on :8165")
 	(&http.Server{Addr: ":8165", Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
@@ -452,16 +584,11 @@ func handleConsents(w http.ResponseWriter, r *http.Request) {
 			respondJSON(w, 400, map[string]string{"error": "customerId and tppId required"})
 			return
 		}
-		tppActive := false
 		tppName := ""
-		for _, t := range tpps {
-			if t.ID == req.TPPID && t.Status == "active" {
-				tppActive = true
-				tppName = t.Name
-				break
-			}
+		if tpp, err := getActiveTPP(req.TPPID); err == nil && tpp != nil {
+			tppName = tpp.Name
 		}
-		if !tppActive {
+		if tppName == "" {
 			respondJSON(w, 403, map[string]string{"error": "TPP is not active or not found"})
 			return
 		}
@@ -629,19 +756,24 @@ func handleConsentStats(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	activeTPPs := 0
-	for _, t := range tpps {
-		if t.Status == "active" {
-			activeTPPs++
-		}
+	totalTPPs := 0
+	totalEndpoints := 0
+	if err := consentDB.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM tpps),
+		(SELECT COUNT(*) FROM tpps WHERE status = 'active'),
+		(SELECT COUNT(*) FROM api_endpoints)`).Scan(&totalTPPs, &activeTPPs, &totalEndpoints); err != nil {
+		log.Printf("[open-banking-go] stats tpp/endpoint counts failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "stats store unavailable (postgres down)"})
+		return
 	}
 	stats["byStatus"] = byStatus
 	stats["byConsentType"] = byType
 	stats["totalConsents"] = total
 	stats["activeConsents"] = active
-	stats["totalTPPs"] = len(tpps)
+	stats["totalTPPs"] = totalTPPs
 	stats["activeTPPs"] = activeTPPs
 	stats["totalAPIAccesses"] = totalAccess
-	stats["apiEndpoints"] = len(endpoints)
+	stats["apiEndpoints"] = totalEndpoints
 	respondJSON(w, 200, stats)
 }
 

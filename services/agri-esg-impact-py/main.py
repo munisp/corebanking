@@ -11,7 +11,8 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Depends
+from permify_guard import require_permify
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -404,7 +405,7 @@ def metrics():
         return {"service": "agri-esg-impact-py", "total_records": 0}
 
 
-@app.get("/api/v1/service_configs")
+@app.get("/api/v1/service_configs", dependencies=[Depends(require_permify("agri_esg_impact", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:

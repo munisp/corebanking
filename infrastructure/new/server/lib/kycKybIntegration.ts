@@ -15,12 +15,23 @@
  * (kyc_enforcement_verifications) and FAILS CLOSED: when no record exists, the
  * database is unavailable, or the record is not verified/expired, the operation
  * is blocked. A verified verdict is never synthesized.
+ *
+ * W12-C3-P2-MLIB (c3-0972/0973/0974): the 'kycTriggers', 'kybTriggers' and
+ * 'kycOverrides' stores were module process memory (lost on restart, divergent
+ * across replicas). They are now Postgres-authoritative (tables `kyc_triggers`,
+ * `kyb_triggers`, `kyc_overrides`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT
+ * EXISTS at first use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage
+ * fails the request (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
+ * NOTE: 'eventTriggerRules' and 'serviceKYCGates' remain static config maps
+ * (toggle state is operator-session-scoped); they are NOT part of c3-0972/0973/0974.
  */
 import type { Express, Request, Response } from "express";
 import { desc, eq } from "drizzle-orm";
 import { getDb } from "../db";
 import { kycEnforcementVerifications } from "../../drizzle/schema";
 import { logger } from "./logger";
+import { ensureTables, storeDDL, storeInsert, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
 
 // ── Types ──
 
@@ -135,7 +146,8 @@ function makePipelineSteps(status: "completed" | "in_progress" | "pending"): Pip
   }));
 }
 
-const kycTriggers: KYCTrigger[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const KYC_TRIGGERS_SEED: KYCTrigger[] = [
   {
     id: "KYCT-001", customerId: "CUS-1045", customerName: "Amina Yusuf",
     triggerType: "event_auto", triggerSource: "account-opening-go",
@@ -184,7 +196,7 @@ const kycTriggers: KYCTrigger[] = [
   },
 ];
 
-const kybTriggers: KYBTrigger[] = [
+const KYB_TRIGGERS_SEED: KYBTrigger[] = [
   {
     id: "KYBT-001", companyId: "COMP-001", companyName: "Dangote Industries Limited",
     rcNumber: "RC-71242", triggerType: "event_auto", triggerSource: "trade-finance-go",
@@ -334,7 +346,7 @@ const serviceKYCGates: ServiceKYCGate[] = [
   { serviceId: "microfinance-py", serviceName: "Microfinance", port: 8182, kycRequired: true, kybRequired: false, minimumKYCLevel: "basic", bypassConditions: ["group_lending_verified"], enforcedEndpoints: ["/v1/loans", "/v1/clients"], blockOnFailure: false, gateStatus: "enforcing" },
 ];
 
-const kycOverrides: KYCOverride[] = [
+const KYC_OVERRIDES_SEED: KYCOverride[] = [
   {
     id: "OVR-001", customerId: "CUS-9001", customerName: "VIP Corporate Client",
     overrideType: "waive_liveness", reason: "Physically disabled — unable to complete video liveness check per CBN accommodation circular",
@@ -356,6 +368,42 @@ const kycOverrides: KYCOverride[] = [
     createdAt: "2026-05-09T14:00:00Z", status: "active",
   },
 ];
+
+// ── Postgres-backed stores (fail-closed via pgJsonStore) ──
+
+const KYC_TRIGGERS_TABLE = "kyc_triggers";
+const KYB_TRIGGERS_TABLE = "kyb_triggers";
+const KYC_OVERRIDES_TABLE = "kyc_overrides";
+
+async function ensureKycTriggersStore(): Promise<void> {
+  await ensureTables("kycKybIntegration.kycTriggers", storeDDL(KYC_TRIGGERS_TABLE));
+  await storeSeed(KYC_TRIGGERS_TABLE, KYC_TRIGGERS_SEED, () => "");
+}
+
+async function ensureKybTriggersStore(): Promise<void> {
+  await ensureTables("kycKybIntegration.kybTriggers", storeDDL(KYB_TRIGGERS_TABLE));
+  await storeSeed(KYB_TRIGGERS_TABLE, KYB_TRIGGERS_SEED, () => "");
+}
+
+async function ensureKycOverridesStore(): Promise<void> {
+  await ensureTables("kycKybIntegration.kycOverrides", storeDDL(KYC_OVERRIDES_TABLE));
+  await storeSeed(KYC_OVERRIDES_TABLE, KYC_OVERRIDES_SEED, () => "");
+}
+
+export async function loadKycTriggers(): Promise<KYCTrigger[]> {
+  await ensureKycTriggersStore();
+  return storeList<KYCTrigger>(KYC_TRIGGERS_TABLE);
+}
+
+export async function loadKybTriggers(): Promise<KYBTrigger[]> {
+  await ensureKybTriggersStore();
+  return storeList<KYBTrigger>(KYB_TRIGGERS_TABLE);
+}
+
+export async function loadKycOverrides(): Promise<KYCOverride[]> {
+  await ensureKycOverridesStore();
+  return storeList<KYCOverride>(KYC_OVERRIDES_TABLE);
+}
 
 // ── Real KYC status lookup (fail closed) ─────────────────────────────────────
 
@@ -409,21 +457,24 @@ export function registerKYCKYBIntegration(app: Express) {
 
   // ─── 1. Admin KYC Triggers ───
 
-  app.get("/api/platform/kyc-triggers", (_: Request, res: Response) => {
+  app.get("/api/platform/kyc-triggers", asyncRoute(async (_: Request, res: Response) => {
+    const kycTriggers = await pgGuard(loadKycTriggers());
     res.json({ items: kycTriggers, total: kycTriggers.length });
-  });
+  }));
 
-  app.get("/api/platform/kyc-triggers/:id", (req: Request, res: Response) => {
+  app.get("/api/platform/kyc-triggers/:id", asyncRoute(async (req: Request, res: Response) => {
+    const kycTriggers = await pgGuard(loadKycTriggers());
     const t = kycTriggers.find(x => x.id === req.params.id);
     if (!t) return res.status(404).json({ error: "KYC trigger not found" });
     res.json(t);
-  });
+  }));
 
-  app.post("/api/platform/kyc-triggers/initiate", (req: Request, res: Response) => {
+  app.post("/api/platform/kyc-triggers/initiate", asyncRoute(async (req: Request, res: Response) => {
     const { customerId, customerName, documentType, priority, notes, requestedBy } = req.body || {};
     if (!customerId || !customerName) {
       return res.status(400).json({ error: "customerId and customerName are required" });
     }
+    const kycTriggers = await pgGuard(loadKycTriggers());
     const trigger: KYCTrigger = {
       id: `KYCT-${String(kycTriggers.length + 1).padStart(3, "0")}`,
       customerId, customerName,
@@ -433,17 +484,18 @@ export function registerKYCKYBIntegration(app: Express) {
       requestedAt: now(), notes,
       pipelineSteps: makePipelineSteps("pending"),
     };
-    kycTriggers.push(trigger);
+    await pgGuard(storeInsert(KYC_TRIGGERS_TABLE, "", trigger));
     res.status(201).json({
       ...trigger,
       message: `KYC verification initiated for ${customerName}`,
       kafkaEvent: { topic: "kyc.admin.triggered", payload: { triggerId: trigger.id, customerId, documentType } },
     });
-  });
+  }));
 
-  app.post("/api/platform/kyc-triggers/re-verify", (req: Request, res: Response) => {
+  app.post("/api/platform/kyc-triggers/re-verify", asyncRoute(async (req: Request, res: Response) => {
     const { customerId, customerName, reason, requestedBy } = req.body || {};
     if (!customerId) return res.status(400).json({ error: "customerId required" });
+    const kycTriggers = await pgGuard(loadKycTriggers());
     const trigger: KYCTrigger = {
       id: `KYCT-${String(kycTriggers.length + 1).padStart(3, "0")}`,
       customerId, customerName: customerName || customerId,
@@ -453,7 +505,7 @@ export function registerKYCKYBIntegration(app: Express) {
       requestedAt: now(), notes: `Re-verification: ${reason || "Admin requested"}`,
       pipelineSteps: makePipelineSteps("pending"),
     };
-    kycTriggers.push(trigger);
+    await pgGuard(storeInsert(KYC_TRIGGERS_TABLE, "", trigger));
     res.status(201).json({
       ...trigger,
       message: `KYC re-verification initiated for ${trigger.customerName}`,
@@ -462,16 +514,20 @@ export function registerKYCKYBIntegration(app: Express) {
         { topic: "kyc.customer.status_changed", payload: { customerId, newStatus: "reverification_pending" } },
       ],
     });
-  });
+  }));
 
-  app.post("/api/platform/kyc-triggers/batch", (req: Request, res: Response) => {
+  app.post("/api/platform/kyc-triggers/batch", asyncRoute(async (req: Request, res: Response) => {
     const { customerIds, reason, priority, requestedBy } = req.body || {};
     if (!customerIds || !Array.isArray(customerIds) || customerIds.length === 0) {
       return res.status(400).json({ error: "customerIds array required (non-empty)" });
     }
-    const created = customerIds.map((c: { id: string; name: string }) => {
+    const kycTriggers = await pgGuard(loadKycTriggers());
+    let nextSeq = kycTriggers.length;
+    const created: KYCTrigger[] = [];
+    for (const c of customerIds as { id: string; name: string }[]) {
+      nextSeq += 1;
       const trigger: KYCTrigger = {
-        id: `KYCT-${String(kycTriggers.length + 1).padStart(3, "0")}`,
+        id: `KYCT-${String(nextSeq).padStart(3, "0")}`,
         customerId: c.id, customerName: c.name || c.id,
         triggerType: "admin_manual", triggerSource: "admin-batch",
         status: "pending", priority: priority || "normal",
@@ -479,28 +535,31 @@ export function registerKYCKYBIntegration(app: Express) {
         requestedAt: now(), notes: `Batch: ${reason || "Admin batch KYC"}`,
         pipelineSteps: makePipelineSteps("pending"),
       };
-      kycTriggers.push(trigger);
-      return trigger;
-    });
+      // Fail-closed: each row is persisted BEFORE it is included in the 201 body.
+      await pgGuard(storeInsert(KYC_TRIGGERS_TABLE, "", trigger));
+      created.push(trigger);
+    }
     res.status(201).json({
       batchId: `BATCH-${Date.now()}`,
       total: created.length,
       triggers: created,
       kafkaEvent: { topic: "kyc.batch.triggered", payload: { batchSize: created.length, customerIds: customerIds.map((c: { id: string }) => c.id) } },
     });
-  });
+  }));
 
   // ─── 2. Admin KYC Overrides ───
 
-  app.get("/api/platform/kyc-overrides", (_: Request, res: Response) => {
+  app.get("/api/platform/kyc-overrides", asyncRoute(async (_: Request, res: Response) => {
+    const kycOverrides = await pgGuard(loadKycOverrides());
     res.json({ items: kycOverrides, total: kycOverrides.length });
-  });
+  }));
 
-  app.post("/api/platform/kyc-overrides", (req: Request, res: Response) => {
+  app.post("/api/platform/kyc-overrides", asyncRoute(async (req: Request, res: Response) => {
     const { customerId, customerName, overrideType, reason, approvedBy } = req.body || {};
     if (!customerId || !overrideType || !reason || !approvedBy) {
       return res.status(400).json({ error: "customerId, overrideType, reason, and approvedBy required" });
     }
+    const kycOverrides = await pgGuard(loadKycOverrides());
     const override: KYCOverride = {
       id: `OVR-${String(kycOverrides.length + 1).padStart(3, "0")}`,
       customerId, customerName: customerName || customerId,
@@ -508,24 +567,26 @@ export function registerKYCKYBIntegration(app: Express) {
       approvalChain: [approvedBy],
       createdAt: now(), status: "active",
     };
-    kycOverrides.push(override);
+    await pgGuard(storeInsert(KYC_OVERRIDES_TABLE, "", override));
     res.status(201).json({
       ...override,
       kafkaEvent: { topic: "kyc.override.created", payload: { overrideId: override.id, customerId, overrideType } },
     });
-  });
+  }));
 
   // ─── 3. Admin KYB Triggers ───
 
-  app.get("/api/platform/kyb-triggers", (_: Request, res: Response) => {
+  app.get("/api/platform/kyb-triggers", asyncRoute(async (_: Request, res: Response) => {
+    const kybTriggers = await pgGuard(loadKybTriggers());
     res.json({ items: kybTriggers, total: kybTriggers.length });
-  });
+  }));
 
-  app.post("/api/platform/kyb-triggers/initiate", (req: Request, res: Response) => {
+  app.post("/api/platform/kyb-triggers/initiate", asyncRoute(async (req: Request, res: Response) => {
     const { companyId, companyName, rcNumber, priority, notes, requestedBy } = req.body || {};
     if (!companyName || !rcNumber) {
       return res.status(400).json({ error: "companyName and rcNumber are required" });
     }
+    const kybTriggers = await pgGuard(loadKybTriggers());
     const trigger: KYBTrigger = {
       id: `KYBT-${String(kybTriggers.length + 1).padStart(3, "0")}`,
       companyId: companyId || `COMP-${Date.now()}`, companyName, rcNumber,
@@ -534,13 +595,13 @@ export function registerKYCKYBIntegration(app: Express) {
       requestedBy: requestedBy || "admin/unknown",
       requestedAt: now(), notes,
     };
-    kybTriggers.push(trigger);
+    await pgGuard(storeInsert(KYB_TRIGGERS_TABLE, "", trigger));
     res.status(201).json({
       ...trigger,
       message: `KYB verification initiated for ${companyName} (${rcNumber})`,
       kafkaEvent: { topic: "kyb.admin.triggered", payload: { triggerId: trigger.id, companyName, rcNumber } },
     });
-  });
+  }));
 
   // ─── 4. Event Trigger Rules ───
 
@@ -618,7 +679,10 @@ export function registerKYCKYBIntegration(app: Express) {
 
   // ─── 6. Integration Dashboard ───
 
-  app.get("/api/platform/kyc-integration/dashboard", (_: Request, res: Response) => {
+  app.get("/api/platform/kyc-integration/dashboard", asyncRoute(async (_: Request, res: Response) => {
+    const kycTriggers = await pgGuard(loadKycTriggers());
+    const kybTriggers = await pgGuard(loadKybTriggers());
+    const kycOverrides = await pgGuard(loadKycOverrides());
     const totalKYCTriggers = kycTriggers.length;
     const completedKYC = kycTriggers.filter(t => t.status === "completed").length;
     const pendingKYC = kycTriggers.filter(t => t.status === "pending" || t.status === "in_progress").length;
@@ -640,9 +704,12 @@ export function registerKYCKYBIntegration(app: Express) {
       integratedServices: Array.from(new Set(eventTriggerRules.flatMap(r => r.integratedServices))).sort(),
       kafkaTopics: Array.from(new Set(eventTriggerRules.map(r => r.kafkaTopic))).sort(),
     });
-  });
+  }));
 
-  app.get("/api/platform/kyc-integration/stats", (_: Request, res: Response) => {
+  app.get("/api/platform/kyc-integration/stats", asyncRoute(async (_: Request, res: Response) => {
+    const kycTriggers = await pgGuard(loadKycTriggers());
+    const kybTriggers = await pgGuard(loadKybTriggers());
+    const kycOverrides = await pgGuard(loadKycOverrides());
     res.json({
       total_kyc_triggers: kycTriggers.length,
       total_kyb_triggers: kybTriggers.length,
@@ -655,5 +722,5 @@ export function registerKYCKYBIntegration(app: Express) {
       integrated_services_count: Array.from(new Set(eventTriggerRules.flatMap(r => r.integratedServices))).length,
       kafka_topics_count: Array.from(new Set(eventTriggerRules.map(r => r.kafkaTopic))).length,
     });
-  });
+  }));
 }

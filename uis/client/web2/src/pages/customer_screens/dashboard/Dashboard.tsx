@@ -80,7 +80,9 @@ const Dashboard: React.FC = () => {
       
       console.log('[Dashboard] Calling account endpoint with keycloak_id:', keycloakId);
       
-      const response = await apiService.get(`${AppConfig.accountEndpoint}/account/keycloak/${keycloakId}`);
+      // W12-A4-P0-D: drop the extra /account segment — service route is
+      // GET /account/keycloak/{id} (UI path /account/account/keycloak/{id}).
+      const response = await apiService.get(`${AppConfig.accountEndpoint}/keycloak/${keycloakId}`);
       console.log('[Dashboard] Account endpoint response:', response.data);
       
       const data = response.data as any;

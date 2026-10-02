@@ -1,9 +1,8 @@
-# OR-09 NAME-COLLISION WARNING: this component is named 'pubsub' (pubsub.kafka,
-# namespace 54bank). A DIFFERENT component also named 'pubsub' (pubsub.redis,
-# namespace 54link-dev) exists at infrastructure/manifests/dapr/pubsub.yaml.
-# Same name, different backing store, different deploy plane. Do NOT apply both
-# to the same namespace; Dapr component names are namespace-scoped and the last
-# applied wins silently.
+# OR-09 RESOLVED (W12-B5-P1-G): this component keeps the name 'pubsub'
+# (pubsub.kafka, namespace 54bank). The colliding redis component in ns 54link-dev
+# was RENAMED to 'pubsub-redis' (infrastructure/manifests/dapr/pubsub.yaml), so the
+# bare name 'pubsub' now unambiguously means THIS kafka-backed component fleet-wide.
+# All in-code bare-'pubsub' references were audited and intend this kafka component.
 apiVersion: dapr.io/v1alpha1
 kind: Component
 metadata:

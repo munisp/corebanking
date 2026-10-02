@@ -66,43 +66,10 @@ type Store interface {
 	Update(id string, r *FeeRule) (*FeeRule, error)
 }
 
-// In-memory fallback
-
-type memStore struct {
-	mu    sync.RWMutex
-	rules []FeeRule
-}
-
-func newMemStore() *memStore { return &memStore{} }
-
-func (s *memStore) List() ([]FeeRule, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]FeeRule, len(s.rules))
-	copy(out, s.rules)
-	return out, nil
-}
-
-func (s *memStore) Create(r *FeeRule) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rules = append(s.rules, *r)
-	return nil
-}
-
-func (s *memStore) Update(id string, patch *FeeRule) (*FeeRule, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, r := range s.rules {
-		if r.ID == id {
-			patch.ID = id
-			patch.CreatedAt = r.CreatedAt
-			s.rules[i] = *patch
-			return &s.rules[i], nil
-		}
-	}
-	return nil, fmt.Errorf("not found")
-}
+// W12-C3-P2-B2 (GO-SVC-FIELD-MAPS): the in-memory memStore fallback was
+// removed. Fee rules are money-adjacent configuration and must never be
+// served from process memory: PostgreSQL (fee_rules) is the only store and
+// the service fails closed at boot when it is unavailable (see main).
 
 // PostgreSQL store
 
@@ -179,11 +146,22 @@ func (s *pgStore) List() ([]FeeRule, error) {
 	return out, rows.Err()
 }
 
+// Create is idempotent (W12-C3-P2-B2): ON CONFLICT (id) DO NOTHING and the
+// stored row is read back so a retried create returns the persisted state
+// instead of a duplicate-key error.
 func (s *pgStore) Create(r *FeeRule) error {
-	_, err := s.db.Exec(`INSERT INTO fee_rules(`+feeRuleCols+`) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+	if _, err := s.db.Exec(`INSERT INTO fee_rules(`+feeRuleCols+`) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+		ON CONFLICT (id) DO NOTHING`,
 		r.ID, r.Name, r.FeeType, r.Amount, r.Rate, r.ProductCode, r.Service, r.Currency, r.Status, r.EffectiveFrom, r.CreatedAt,
-		r.TenantID, r.TransactionType, r.Channel, r.FeeAccountID, r.AmountKobo, r.RateBps, r.MinFeeKobo, r.MaxFeeKobo)
-	return err
+		r.TenantID, r.TransactionType, r.Channel, r.FeeAccountID, r.AmountKobo, r.RateBps, r.MinFeeKobo, r.MaxFeeKobo); err != nil {
+		return err
+	}
+	stored, err := scanFeeRule(s.db.QueryRow(`SELECT `+feeRuleCols+` FROM fee_rules WHERE id=$1`, r.ID).Scan)
+	if err != nil {
+		return err
+	}
+	*r = stored
+	return nil
 }
 
 func (s *pgStore) Update(id string, patch *FeeRule) (*FeeRule, error) {
@@ -670,20 +648,19 @@ func main() {
 		port = "8080"
 	}
 
-	var store Store
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		pg, err := newPGStore(dsn)
-		if err != nil {
-			log.Printf("[fee-management-go] postgres unavailable (%v) — using in-memory store", err)
-			store = newMemStore()
-		} else {
-			log.Printf("[fee-management-go] connected to postgres")
-			store = pg
-		}
-	} else {
-		log.Printf("[fee-management-go] no DATABASE_URL — using in-memory store")
-		store = newMemStore()
+	// W12-C3-P2-B2: fail closed — PostgreSQL is the only store. The previous
+	// in-memory fallback silently lost fee rules on restart and diverged
+	// across replicas; the process now refuses to start without PG so the
+	// deploy/readiness check surfaces the misconfiguration instead.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatal("[fee-management-go] DATABASE_URL not set — cannot start without PostgreSQL (in-memory fallback removed)")
 	}
+	store, err := newPGStore(dsn)
+	if err != nil {
+		log.Fatalf("[fee-management-go] postgres unavailable (%v) — cannot start (in-memory fallback removed)", err)
+	}
+	log.Printf("[fee-management-go] connected to postgres")
 
 	mux := http.NewServeMux()
 
@@ -692,18 +669,18 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	rulesHandler := handleRules(store)
-	mux.HandleFunc("/v1/fee-rules/evaluate", handleEvaluate(store)) // MN-10 — registered before the /v1/fee-rules/ subtree; ServeMux picks the longest pattern
-	mux.HandleFunc("/v1/fee-rules/", rulesHandler)
-	mux.HandleFunc("/v1/fee-rules", rulesHandler)
+	mux.HandleFunc("/v1/fee-rules/evaluate", permifyAuthzGuard("fee_management", "evaluate", handleEvaluate(store))) // MN-10 — registered before the /v1/fee-rules/ subtree; ServeMux picks the longest pattern
+	mux.HandleFunc("/v1/fee-rules/", permifyAuthzGuard("fee_management", "manage", rulesHandler))
+	mux.HandleFunc("/v1/fee-rules", permifyAuthzGuard("fee_management", "manage", rulesHandler))
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", permifyAuthzGuard("fee_management", "manage", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"service":"fee-management-go","status":"running"}`)
-	})
+	}))
 
 	log.Printf("[fee-management-go] listening on :%s", port)
 	if err := (&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe(); err != nil {

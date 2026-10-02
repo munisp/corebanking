@@ -29,6 +29,7 @@ from merchant_kyb import (
     create_kyb_tables,
 )
 from docling_kyb_integration import DoclingKYBProcessor
+from permify_guard import require_permify
 from kyb_document_endpoints import (
     router as kyb_documents_router,
     init_kyb_endpoints,
@@ -615,7 +616,7 @@ def _scrub_api_key(record: dict) -> dict:
 
 
 # Merchant Management Endpoints
-@app.post("/api/v1/merchants", response_model=MerchantCreatedResponse, status_code=201)
+@app.post("/api/v1/merchants", response_model=MerchantCreatedResponse, status_code=201, dependencies=[Depends(require_permify("merchant", "create"))])
 async def create_merchant(
     merchant: MerchantCreate,
     x_tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -677,7 +678,7 @@ async def create_merchant(
     return merchant_payload
 
 
-@app.post("/api/v1/merchants/{merchant_id}/issue-api-key", response_model=MerchantCreatedResponse)
+@app.post("/api/v1/merchants/{merchant_id}/issue-api-key", response_model=MerchantCreatedResponse, dependencies=[Depends(require_permify("merchant", "manage"))])
 async def issue_merchant_api_key(
     merchant_id: str,
     x_tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -769,7 +770,7 @@ async def get_merchant(merchant_id: str, db=Depends(get_db)):
             raise HTTPException(status_code=404, detail="Merchant not found")
         return _scrub_api_key(dict(row))
 
-@app.put("/api/v1/merchants/{merchant_id}")
+@app.put("/api/v1/merchants/{merchant_id}", dependencies=[Depends(require_permify("merchant", "update"))])
 async def update_merchant(
     merchant_id: str,
     merchant: MerchantUpdate,
@@ -814,7 +815,7 @@ async def update_merchant(
     )
     return {"status": "updated", "merchant": updated}
 
-@app.post("/api/v1/merchants/{merchant_id}/suspend")
+@app.post("/api/v1/merchants/{merchant_id}/suspend", dependencies=[Depends(require_permify("merchant", "manage"))])
 async def suspend_merchant(merchant_id: str, reason: str, db=Depends(get_db)):
     """Suspend a merchant account"""
     async with db.acquire() as conn:
@@ -836,7 +837,7 @@ async def suspend_merchant(merchant_id: str, reason: str, db=Depends(get_db)):
     )
     return {"status": "suspended", "merchant_id": merchant_id, "reason": reason}
 
-@app.post("/api/v1/merchants/{merchant_id}/activate")
+@app.post("/api/v1/merchants/{merchant_id}/activate", dependencies=[Depends(require_permify("merchant", "manage"))])
 async def activate_merchant(merchant_id: str, db=Depends(get_db)):
     """Activate a merchant account"""
     async with db.acquire() as conn:

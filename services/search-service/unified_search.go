@@ -139,33 +139,33 @@ func (s *UnifiedSearchService) RegisterRoutes(router *mux.Router) {
 
 	// Unified search
 	api.HandleFunc("/", s.unifiedSearch).Methods("POST")
-	api.HandleFunc("/multi", s.multiIndexSearch).Methods("POST")
+	api.HandleFunc("/multi", permifyAuthzGuard("search_index", "multi", s.multiIndexSearch)).Methods("POST")
 
 	// Domain-specific search endpoints
-	api.HandleFunc("/customers", s.searchCustomers).Methods("POST")
-	api.HandleFunc("/accounts", s.searchAccounts).Methods("POST")
-	api.HandleFunc("/transactions", s.searchTransactions).Methods("POST")
-	api.HandleFunc("/loans", s.searchLoans).Methods("POST")
-	api.HandleFunc("/disputes", s.searchDisputes).Methods("POST")
-	api.HandleFunc("/documents", s.searchDocuments).Methods("POST")
-	api.HandleFunc("/employees", s.searchEmployees).Methods("POST")
-	api.HandleFunc("/products", s.searchProducts).Methods("POST")
-	api.HandleFunc("/notifications", s.searchNotifications).Methods("POST")
-	api.HandleFunc("/trade-finance", s.searchTradeFinance).Methods("POST")
+	api.HandleFunc("/customers", permifyAuthzGuard("search_index", "customers", s.searchCustomers)).Methods("POST")
+	api.HandleFunc("/accounts", permifyAuthzGuard("search_index", "accounts", s.searchAccounts)).Methods("POST")
+	api.HandleFunc("/transactions", permifyAuthzGuard("search_index", "transactions", s.searchTransactions)).Methods("POST")
+	api.HandleFunc("/loans", permifyAuthzGuard("search_index", "loans", s.searchLoans)).Methods("POST")
+	api.HandleFunc("/disputes", permifyAuthzGuard("search_index", "disputes", s.searchDisputes)).Methods("POST")
+	api.HandleFunc("/documents", permifyAuthzGuard("search_index", "documents", s.searchDocuments)).Methods("POST")
+	api.HandleFunc("/employees", permifyAuthzGuard("search_index", "employees", s.searchEmployees)).Methods("POST")
+	api.HandleFunc("/products", permifyAuthzGuard("search_index", "products", s.searchProducts)).Methods("POST")
+	api.HandleFunc("/notifications", permifyAuthzGuard("search_index", "notifications", s.searchNotifications)).Methods("POST")
+	api.HandleFunc("/trade-finance", permifyAuthzGuard("search_index", "trade_finance", s.searchTradeFinance)).Methods("POST")
 
 	// Indexing endpoints (for internal use)
-	api.HandleFunc("/index", s.indexDocument).Methods("POST")
-	api.HandleFunc("/index/bulk", s.bulkIndex).Methods("POST")
-	api.HandleFunc("/index/{index}/{id}", s.deleteDocument).Methods("DELETE")
+	api.HandleFunc("/index", permifyAuthzGuard("search_index", "index", s.indexDocument)).Methods("POST")
+	api.HandleFunc("/index/bulk", permifyAuthzGuard("search_index", "bulk", s.bulkIndex)).Methods("POST")
+	api.HandleFunc("/index/{index}/{id}", permifyAuthzGuard("search_index", "delete", s.deleteDocument)).Methods("DELETE")
 
 	// Suggestions/autocomplete
-	api.HandleFunc("/suggest/customers", s.suggestCustomers).Methods("GET")
-	api.HandleFunc("/suggest/accounts", s.suggestAccounts).Methods("GET")
-	api.HandleFunc("/suggest/products", s.suggestProducts).Methods("GET")
+	api.HandleFunc("/suggest/customers", permifyAuthzGuard("search_index", "view", s.suggestCustomers)).Methods("GET")
+	api.HandleFunc("/suggest/accounts", permifyAuthzGuard("search_index", "view", s.suggestAccounts)).Methods("GET")
+	api.HandleFunc("/suggest/products", permifyAuthzGuard("search_index", "view", s.suggestProducts)).Methods("GET")
 
 	// Admin endpoints
-	api.HandleFunc("/admin/reindex/{index}", s.reindexIndex).Methods("POST")
-	api.HandleFunc("/admin/stats", s.getStats).Methods("GET")
+	api.HandleFunc("/admin/reindex/{index}", permifyAuthzGuard("search_index", "create", s.reindexIndex)).Methods("POST")
+	api.HandleFunc("/admin/stats", permifyAuthzGuard("search_index", "view", s.getStats)).Methods("GET")
 }
 
 // initializeIndices creates all required indices with mappings

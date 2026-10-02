@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -62,6 +63,7 @@ fn source_unavailable(detail: &str) -> HttpResponse {
 // Never fabricate filings: if the DB is unreachable or the query fails, fail fast (503).
 async fn list_items(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "tax_report", "view").await { return resp; } // W12-B5P1DD
     let pool = match &data.db {
         Some(p) => p,
         None => return source_unavailable("DATABASE_URL not configured; refusing to serve fabricated FATCA/CRS reports"),
@@ -327,3 +329,6 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/fatca-crs-rs/list", web::get().to(list_items))
     }).bind(("0.0.0.0", port))?.run().await
 }
+
+// Wave-12 B5-P1-D-D: Permify authorization guard module.
+mod permify;

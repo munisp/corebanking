@@ -6,8 +6,24 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
 use hmac::{Hmac, Mac};
-use rand::rngs::OsRng;
-use rand::RngCore;
+// W12-RUSTFIX-2: rand_core 0.6 compatibility shim. aes-gcm 0.10 / argon2 0.4
+// (password-hash 0.5) require rand_core 0.6 CryptoRng+RngCore, but the pinned
+// rand 0.9.1 implements the rand_core 0.9 traits (E0277/E0599 trait-version
+// mismatch). Delegates to rand 0.9's ThreadRng (ChaCha CSPRNG, OS-seeded) via
+// the rand::Rng trait; no dependency changes, still cryptographically secure.
+#[derive(Debug, Default, Clone, Copy)]
+struct OsRngCompat;
+
+impl aes_gcm::aead::rand_core::RngCore for OsRngCompat {
+    fn next_u32(&mut self) -> u32 { rand::Rng::random(&mut rand::rng()) }
+    fn next_u64(&mut self) -> u64 { rand::Rng::random(&mut rand::rng()) }
+    fn fill_bytes(&mut self, dest: &mut [u8]) { rand::Rng::fill(&mut rand::rng(), dest) }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), aes_gcm::aead::rand_core::Error> {
+        rand::Rng::fill(&mut rand::rng(), dest);
+        Ok(())
+    }
+}
+impl aes_gcm::aead::rand_core::CryptoRng for OsRngCompat {}
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::fs;
@@ -276,7 +292,7 @@ fn emit_verification_result(result: VerificationResult, output: Option<&PathBuf>
 }
 
 fn hash_pin(pin: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut OsRng);
+    let salt = SaltString::generate(&mut OsRngCompat);
     Argon2::default()
         .hash_password(pin.as_bytes(), &salt)
         .map(|hash| hash.to_string())
@@ -306,7 +322,7 @@ struct EncryptedPayload {
 fn encrypt_pin_hash(device_key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedPayload, String> {
     let cipher = Aes256Gcm::new_from_slice(device_key).map_err(|e| format!("failed to initialize cipher: {e}"))?;
     let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
+    aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut OsRngCompat, &mut nonce);
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|e| format!("failed to encrypt pin hash: {e}"))?;

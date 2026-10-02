@@ -1,7 +1,24 @@
 /**
  * Customer segmentation engine — retail/SME/corporate/HNW classification,
  * behavioral scoring, cross-sell propensity, churn risk.
+ *
+ * W12-C3-P2-MLIB (c3-1008): the 'segments' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `customer_segments`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "customer_segments";
+
+async function ensureSegmentsStore(): Promise<void> {
+  await ensureTables("ensureSegmentsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, SEGMENTS_SEED, () => "");
+}
+
 
 export interface CustomerSegment {
   id: string;
@@ -24,7 +41,8 @@ export interface CustomerSegment {
   onboardedDate: string;
 }
 
-const segments: CustomerSegment[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const SEGMENTS_SEED: CustomerSegment[]  = [
   { id: "SEG-001", customerId: "CUST-001", customerName: "Aisha Mohammed", segment: "premium_retail", totalRelationshipValue: 18_500_000, totalDeposits: 15_000_000, totalLoans: 3_500_000, productCount: 5, monthlyTransactions: 45, avgTransactionValue: 125_000, currency: "NGN", profitabilityScore: 72, churnRisk: "low", crossSellOpportunities: ["Platinum Visa card", "T-Bill investment", "Life insurance"], lastInteraction: "2026-05-09", relationshipManager: "Adebayo Ogundimu", npsScore: 8, onboardedDate: "2022-06-15" },
   { id: "SEG-002", customerId: "CUST-002", customerName: "Ibrahim Musa", segment: "premium_retail", totalRelationshipValue: 75_000_000, totalDeposits: 50_000_000, totalLoans: 25_000_000, productCount: 7, monthlyTransactions: 30, avgTransactionValue: 800_000, currency: "NGN", profitabilityScore: 88, churnRisk: "low", crossSellOpportunities: ["Wealth management", "Offshore investment"], lastInteraction: "2026-05-08", relationshipManager: "Adebayo Ogundimu", npsScore: 9, onboardedDate: "2020-03-01" },
   { id: "SEG-003", customerId: "CUST-010", customerName: "Pinnacle Holdings Ltd", segment: "large_corporate", totalRelationshipValue: 2_500_000_000, totalDeposits: 1_800_000_000, totalLoans: 700_000_000, productCount: 12, monthlyTransactions: 8_500, avgTransactionValue: 5_200_000, currency: "NGN", profitabilityScore: 95, churnRisk: "low", crossSellOpportunities: ["Trade finance LC", "FX hedging", "Cash management"], lastInteraction: "2026-05-09", relationshipManager: "Oluwafemi Adeleke", npsScore: 7, onboardedDate: "2018-11-20" },
@@ -35,9 +53,12 @@ const segments: CustomerSegment[] = [
   { id: "SEG-008", customerId: "CUST-020", customerName: "Olusegun Bakare", segment: "diaspora", totalRelationshipValue: 45_000_000, totalDeposits: 40_000_000, totalLoans: 5_000_000, productCount: 4, monthlyTransactions: 8, avgTransactionValue: 2_000_000, currency: "NGN", profitabilityScore: 62, churnRisk: "medium", crossSellOpportunities: ["Property investment", "Dom account top-up", "Remittance plan"], lastInteraction: "2026-04-28", onboardedDate: "2022-09-01" },
 ];
 
-export function getCustomerSegments() { return segments; }
+export async function getCustomerSegments(): Promise<CustomerSegment[]> {
+  return pgGuard((async () => { await ensureSegmentsStore(); return storeList<CustomerSegment>(TABLE); })());
+}
 
-export function getSegmentStats() {
+export async function getSegmentStats() {
+  const segments = await getCustomerSegments();
   const bySegment: Record<string, { count: number; totalValue: number }> = {};
   const byChurnRisk: Record<string, number> = {};
   let totalValue = 0;

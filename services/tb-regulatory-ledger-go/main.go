@@ -64,12 +64,94 @@ type AuditQuery struct {
 }
 
 var (
-	db        *sql.DB
-	tbClient  *tbclient.Client
-	entriesMu sync.RWMutex
-	entries   []RegLedgerEntry
-	lastHash  string
+	db       *sql.DB
+	tbClient *tbclient.Client
 )
+
+// TigerBeetle ledger id for the regulatory mirror cluster.
+// All regulatory GL entries are mirrored as real TB transfers on this ledger
+// between deterministic accounts (GL control account ↔ entry account), with
+// transfer ids derived from entry_id so replication is idempotent.
+const tbRegulatoryLedgerID uint32 = 900
+
+// detID derives a deterministic TB Uint128 from a human-meaningful key
+// (SHA-256, first 128 bits) ⇒ idempotent retries (C3-P0-B1).
+func detID(key string) tbclient.Uint128 {
+	sum := sha256.Sum256([]byte(key))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	return tbclient.BytesToUint128(b)
+}
+
+// ensureRegAccount idempotently creates a TB account on the regulatory
+// ledger (AccountExists tolerated).
+func ensureRegAccount(ctx context.Context, tbID tbclient.Uint128) error {
+	results, err := tbClient.CreateAccounts(ctx, []tbclient.Account{{ID: tbID, Ledger: tbRegulatoryLedgerID, Code: 1}})
+	if err != nil {
+		return fmt.Errorf("tigerbeetle create account: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tbclient.AccountCreated && r.Status != tbclient.AccountExists {
+			return fmt.Errorf("tigerbeetle account rejected: status=%d", uint32(r.Status))
+		}
+	}
+	return nil
+}
+
+// mirrorEntryToTB posts the regulatory mirror transfer. Debit/credit legs are
+// deterministic: the GL control account (per gl_code) and the entry account.
+// Transfer id = detID(entry key) so a retried replication yields
+// TransferExists instead of a duplicate mirror posting.
+func mirrorEntryToTB(ctx context.Context, glCode, accountID, entryType string, amountKobo int64, idemKey string) error {
+	if amountKobo <= 0 {
+		return fmt.Errorf("amount_kobo must be positive")
+	}
+	glAcct := detID("tb-regulatory-ledger-go/gl/" + glCode)
+	entryAcct := detID("tb-regulatory-ledger-go/account/" + accountID)
+	debit, credit := glAcct, entryAcct
+	if entryType == "credit" {
+		debit, credit = entryAcct, glAcct
+	}
+	if err := ensureRegAccount(ctx, debit); err != nil {
+		return err
+	}
+	if err := ensureRegAccount(ctx, credit); err != nil {
+		return err
+	}
+	results, err := tbClient.CreateTransfers(ctx, []tbclient.Transfer{{
+		ID:              detID("tb-regulatory-ledger-go/entry/" + idemKey),
+		DebitAccountID:  debit,
+		CreditAccountID: credit,
+		Amount:          tbclient.ToUint128(uint64(amountKobo)),
+		Ledger:          tbRegulatoryLedgerID,
+		Code:            1,
+	}})
+	if err != nil {
+		return fmt.Errorf("tigerbeetle create transfer: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tbclient.TransferCreated && r.Status != tbclient.TransferExists {
+			return fmt.Errorf("tigerbeetle transfer rejected: status=%d", uint32(r.Status))
+		}
+	}
+	return nil
+}
+
+// compensateTBEntry reverses a confirmed mirror transfer whose PG audit-row
+// insert failed (canonical reverse-transfer compensation; idempotent via
+// idemKey+"-REV"). Failure is logged at CRITICAL for manual reconciliation.
+func compensateTBEntry(glCode, accountID, entryType string, amountKobo int64, idemKey string) {
+	// Reverse the direction of the original mirror.
+	revType := "credit"
+	if entryType == "credit" {
+		revType = "debit"
+	}
+	if err := mirrorEntryToTB(context.Background(), glCode, accountID, revType, amountKobo, idemKey+"-REV"); err != nil {
+		log.Printf("[tb-regulatory-ledger] CRITICAL: TB compensation FAILED entry=%s amount=%d: %v — manual reconciliation required", idemKey, amountKobo, err)
+		return
+	}
+	log.Printf("[tb-regulatory-ledger] TB compensation posted entry=%s (PG audit insert failed; mirror reversed)", idemKey)
+}
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -103,29 +185,10 @@ func initDB() {
 	log.Println("[tb-regulatory-ledger] Schema initialized (append-only)")
 }
 
-func loadEntries() {
-	if db == nil {
-		return
-	}
-	rows, err := db.Query(`SELECT entry_id, source_system, gl_code, account_id, type, amount_kobo, currency,
-		narration, transaction_ref, original_timestamp, replicated_at, hash_chain
-		FROM tb_regulatory_ledger ORDER BY replicated_at DESC LIMIT 100`)
-	if err != nil {
-		log.Printf("Load entries error: %v", err)
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var e RegLedgerEntry
-		if err := rows.Scan(&e.EntryID, &e.SourceSystem, &e.GLCode, &e.AccountID, &e.Type, &e.AmountKobo,
-			&e.Currency, &e.Narration, &e.TransactionRef, &e.OriginalTS, &e.ReplicatedAt, &e.HashChain); err != nil {
-			continue
-		}
-		entries = append(entries, e)
-		lastHash = e.HashChain
-	}
-	log.Printf("[tb-regulatory-ledger] Loaded %d entries from DB", len(entries))
-}
+// Entries are served from the PG audit table (append-only) — no in-memory
+// copy is kept (C3-P0-B1). The hash chain head is read from PG inside the
+// replicating transaction so the chain survives restarts and concurrent
+// replicas serialize on the chain-head row lock.
 
 func computeHash(prevHash, entryID string, amountKobo int64) string {
 	data := fmt.Sprintf("%s|%s|%d", prevHash, entryID, amountKobo)
@@ -154,13 +217,51 @@ func replicateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.EntryID == "" || req.GLCode == "" || req.AccountID == "" {
+		http.Error(w, `{"error":"entry_id, gl_code and account_id are required"}`, 400)
+		return
+	}
+	if req.Type != "debit" && req.Type != "credit" {
+		http.Error(w, `{"error":"type must be debit or credit"}`, 400)
+		return
+	}
+	if req.AmountKobo <= 0 {
+		http.Error(w, `{"error":"amount_kobo must be positive"}`, 400)
+		return
+	}
+	if db == nil || tbClient == nil {
+		http.Error(w, `{"error":"audit store or ledger unavailable — entry NOT replicated"}`, 503)
+		return
+	}
+
 	originalTS, _ := time.Parse(time.RFC3339, req.OriginalTS)
 	if originalTS.IsZero() {
 		originalTS = time.Now()
 	}
 
-	entriesMu.Lock()
-	hash := computeHash(lastHash, req.EntryID, req.AmountKobo)
+	// AUTHORITATIVE LEDGER STEP (TigerBeetle) FIRST: mirror the entry on the
+	// regulatory ledger with deterministic accounts and an id derived from
+	// entry_id — a retried replication is idempotent at the cluster.
+	if err := mirrorEntryToTB(r.Context(), req.GLCode, req.AccountID, req.Type, req.AmountKobo, req.EntryID); err != nil {
+		log.Printf("[tb-regulatory-ledger] TB mirror FAILED entry=%s: %v", req.EntryID, err)
+		http.Error(w, `{"error":"ledger mirror failed — entry NOT replicated"}`, 502)
+		return
+	}
+
+	// PG audit row (append-only, hash-chained) — TB is already confirmed; the
+	// chain head is read + advanced inside one transaction so concurrent
+	// replicas cannot fork the chain.
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		compensateTBEntry(req.GLCode, req.AccountID, req.Type, req.AmountKobo, req.EntryID)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
+	}
+	defer tx.Rollback()
+	var prevHash string
+	// Serialize chain advancement: lock the most recent row (if any).
+	tx.QueryRowContext(r.Context(), `SELECT hash_chain FROM tb_regulatory_ledger ORDER BY replicated_at DESC, entry_id DESC LIMIT 1 FOR UPDATE`).Scan(&prevHash)
+	hash := computeHash(prevHash, req.EntryID, req.AmountKobo)
 	entry := RegLedgerEntry{
 		EntryID:        req.EntryID,
 		SourceSystem:   req.SourceSystem,
@@ -175,60 +276,78 @@ func replicateHandler(w http.ResponseWriter, r *http.Request) {
 		ReplicatedAt:   time.Now(),
 		HashChain:      hash,
 	}
-	entries = append(entries, entry)
-	lastHash = hash
-	entriesMu.Unlock()
-
-	if db != nil {
-		_, err := db.Exec(`INSERT INTO tb_regulatory_ledger (entry_id, source_system, gl_code, account_id, type, amount_kobo, currency, narration, transaction_ref, original_timestamp, replicated_at, hash_chain)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-			ON CONFLICT (entry_id) DO NOTHING`,
-			entry.EntryID, entry.SourceSystem, entry.GLCode, entry.AccountID, entry.Type, entry.AmountKobo,
-			entry.Currency, entry.Narration, entry.TransactionRef, entry.OriginalTS, entry.ReplicatedAt, entry.HashChain)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+	res, err := tx.ExecContext(r.Context(), `INSERT INTO tb_regulatory_ledger (entry_id, source_system, gl_code, account_id, type, amount_kobo, currency, narration, transaction_ref, original_timestamp, replicated_at, hash_chain)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (entry_id) DO NOTHING`,
+		entry.EntryID, entry.SourceSystem, entry.GLCode, entry.AccountID, entry.Type, entry.AmountKobo,
+		entry.Currency, entry.Narration, entry.TransactionRef, entry.OriginalTS, entry.ReplicatedAt, entry.HashChain)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n == 0 {
+			// Idempotent retry: entry already replicated — return the stored
+			// row instead of advancing a phantom hash chain link.
+			tx.Rollback()
+			var stored RegLedgerEntry
+			if qerr := db.QueryRowContext(r.Context(), `SELECT entry_id, source_system, gl_code, account_id, type, amount_kobo, currency,
+				narration, transaction_ref, original_timestamp, replicated_at, hash_chain
+				FROM tb_regulatory_ledger WHERE entry_id = $1`, req.EntryID).
+				Scan(&stored.EntryID, &stored.SourceSystem, &stored.GLCode, &stored.AccountID, &stored.Type, &stored.AmountKobo,
+					&stored.Currency, &stored.Narration, &stored.TransactionRef, &stored.OriginalTS, &stored.ReplicatedAt, &stored.HashChain); qerr != nil {
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, qerr.Error()), 500)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"replicated":      stored,
+				"chain_integrity": map[string]string{"hash": stored.HashChain, "previous": ""},
+				"idempotent":      true,
+			})
 			return
 		}
+		err = tx.Commit()
 	}
-
-	// Mirror entry to TigerBeetle regulatory cluster
-	if tbClient != nil {
-		debitAcct := tbclient.NewUint128()
-		creditAcct := tbclient.NewUint128()
-		code := tbclient.CodeAsset
-		if req.Type == "credit" {
-			code = tbclient.CodeLiability
-		}
-		_, err := tbClient.CreateTransfers(context.Background(), []tbclient.Transfer{{
-			ID: tbclient.NewUint128(), DebitAccountID: debitAcct, CreditAccountID: creditAcct,
-			Amount: uint64(req.AmountKobo), Ledger: tbclient.LedgerNGN, Code: code,
-		}})
-		if err != nil {
-			log.Printf("[tb-regulatory-ledger] TB CreateTransfers error: %v", err)
-		}
+	if err != nil {
+		// TB mirror confirmed but the audit row failed: compensate with an
+		// idempotent reverse mirror so ledger and audit store never diverge
+		// silently (canonical C3 pattern).
+		compensateTBEntry(req.GLCode, req.AccountID, req.Type, req.AmountKobo, req.EntryID)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(201)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"replicated":      entry,
-		"chain_integrity": map[string]string{"hash": hash, "previous": lastHash},
+		"chain_integrity": map[string]string{"hash": hash, "previous": prevHash},
 	})
 }
 
 func queryHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		http.Error(w, `{"error":"audit store unavailable"}`, 503)
+		return
+	}
 	glCode := r.URL.Query().Get("gl_code")
 	currency := r.URL.Query().Get("currency")
 
-	entriesMu.RLock()
+	q := `SELECT entry_id, source_system, gl_code, account_id, type, amount_kobo, currency,
+		narration, transaction_ref, original_timestamp, replicated_at, hash_chain
+		FROM tb_regulatory_ledger WHERE ($1 = '' OR gl_code = $1) AND ($2 = '' OR currency = $2)
+		ORDER BY replicated_at, entry_id`
+	rows, err := db.QueryContext(r.Context(), q, glCode, currency)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
+	}
+	defer rows.Close()
 	results := []RegLedgerEntry{}
 	totalDebits := int64(0)
 	totalCredits := int64(0)
-	for _, e := range entries {
-		if glCode != "" && e.GLCode != glCode {
-			continue
-		}
-		if currency != "" && e.Currency != currency {
+	for rows.Next() {
+		var e RegLedgerEntry
+		if err := rows.Scan(&e.EntryID, &e.SourceSystem, &e.GLCode, &e.AccountID, &e.Type, &e.AmountKobo,
+			&e.Currency, &e.Narration, &e.TransactionRef, &e.OriginalTS, &e.ReplicatedAt, &e.HashChain); err != nil {
 			continue
 		}
 		results = append(results, e)
@@ -239,7 +358,6 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 			totalCredits += e.AmountKobo
 		}
 	}
-	entriesMu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -253,25 +371,41 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func integrityHandler(w http.ResponseWriter, r *http.Request) {
-	entriesMu.RLock()
+	if db == nil {
+		http.Error(w, `{"error":"audit store unavailable"}`, 503)
+		return
+	}
+	rows, err := db.QueryContext(r.Context(), `SELECT entry_id, amount_kobo, hash_chain
+		FROM tb_regulatory_ledger ORDER BY replicated_at, entry_id`)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
+	}
+	defer rows.Close()
 	valid := true
 	prevHash := ""
-	for _, e := range entries {
-		expected := computeHash(prevHash, e.EntryID, e.AmountKobo)
-		if e.HashChain != expected {
+	latestHash := ""
+	count := 0
+	for rows.Next() {
+		var entryID, hash string
+		var amount int64
+		if err := rows.Scan(&entryID, &amount, &hash); err != nil {
+			continue
+		}
+		if hash != computeHash(prevHash, entryID, amount) {
 			valid = false
 			break
 		}
-		prevHash = e.HashChain
+		prevHash = hash
+		latestHash = hash
+		count++
 	}
-	count := len(entries)
-	entriesMu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"chain_valid": valid,
 		"entry_count": count,
-		"latest_hash": lastHash,
+		"latest_hash": latestHash,
 	})
 }
 
@@ -281,14 +415,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func initTBClient() {
-	cfg := tbclient.DefaultConfig()
+	var cfg tbclient.Config
 	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
 		cfg.Addresses = []string{addr}
 	}
 	var err error
 	tbClient, err = tbclient.NewClient(cfg)
 	if err != nil {
-		log.Printf("[tb-regulatory-ledger] TB client init failed: %v", err)
+		log.Printf("[tb-regulatory-ledger] TB client init failed (replication fails closed): %v", err)
 	}
 }
 
@@ -470,10 +604,11 @@ func main() {
 
 	initDB()
 	initTBClient()
-	loadEntries()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/tb-regulatory/replicate", replicateHandler)
+	// W12-B5-P0-D3: the only mutating handler is gated by a real Permify
+	// check (regulatory_ledger:replicate) after jwtAuthMiddleware; fail-closed.
+	mux.HandleFunc("/v1/tb-regulatory/replicate", permifyAuthzGuard("regulatory_ledger", "replicate", replicateHandler))
 	mux.HandleFunc("/v1/tb-regulatory/query", queryHandler)
 	mux.HandleFunc("/v1/tb-regulatory/integrity", integrityHandler)
 	mux.HandleFunc("/healthz", healthHandler)

@@ -485,6 +485,11 @@ async fn screen(body: web::Json<ScreenReq>, data: web::Data<AppState>, req: acti
             .json(json!({"error": "tenant_id and triggered_by are required"}));
     }
 
+    let permify_entity = body.customer_id.as_deref().filter(|s| !s.trim().is_empty())
+        .or_else(|| body.transaction_id.as_deref().filter(|s| !s.trim().is_empty()))
+        .unwrap_or(&name);
+    if let Err(resp) = permify_check(&req, "screening", permify_entity, "screen").await { return resp; }
+
     if !pbac_check(&tid, &user_id, "sanctions:screen").await {
         return HttpResponse::Forbidden()
             .json(json!({"error": "forbidden: sanctions:screen permission required"}));
@@ -724,6 +729,8 @@ async fn publish_screening_verdict(resp: &ScreeningResponse) {
 
 async fn add_entry(body: web::Json<AddEntryReq>, data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    let permify_entity = if body.list_id.trim().is_empty() { body.list_name.trim() } else { body.list_id.trim() };
+    if let Err(resp) = permify_check(&req, "watchlist", permify_entity, "add").await { return resp; }
     let client = match data.pool.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -1294,6 +1301,7 @@ async fn sync_all_lists(
 
 async fn trigger_sync(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "watchlist", "sanctions-lists", "manage").await { return resp; }
     // Wave-11 (RS-25): single-flight background sync (was: unbounded spawn per request).
     static SYNC_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SYNC_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -1317,6 +1325,71 @@ async fn trigger_sync(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+
+// --- Permify authorization (W12-B5-P0-D3) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = X-Tenant-Id header or
+// PERMIFY_DEFAULT_TENANT, resource = domain entity id, permission per action
+// (schema: services/auth-service/schemas/permify/v2-kyc-compliance.fragment).
+// FAIL-CLOSED: Permify unreachable/non-200 => 503; denied => 403.
+// Canonical pattern: services/permify-authz-go/main.go:428 (REST check) and
+// services/auth-service/adapters/permify.py check_permission.
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    let subject = {
+        let ext = req.extensions();
+        ext.get::<VerifiedClaims>()
+            .and_then(|c| c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = req.headers().get("X-Tenant-Id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {

@@ -89,6 +89,38 @@ class AccountService {
       throw new Error("Network error — account service unreachable");
     }
   }
+
+  // Set a customer's transaction PIN via account-service POST /account/setup-pin.
+  public async setupPin(
+    tenant_id: string,
+    keycloak_id: string,
+    ledger_id: string,
+    pin: string,
+  ) {
+    try {
+      const response = await this._axiosInstance.post(
+        `/account/setup-pin`,
+        { pin },
+        {
+          headers: {
+            "x-tenant-id": tenant_id,
+            "x-keycloak-id": keycloak_id,
+            "x-ledger-id": ledger_id,
+          },
+        },
+      );
+      return response.data;
+    } catch (error: any) {
+      if (error.response) {
+        const detail =
+          error.response.data?.message ?? error.response.data?.detail;
+        throw new Error(
+          `PIN setup failed (status ${error.response.status})${detail ? `: ${detail}` : ""}`,
+        );
+      }
+      throw new Error("Network error — account service unreachable");
+    }
+  }
 }
 
 export const accountService = new AccountService();

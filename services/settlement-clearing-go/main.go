@@ -525,7 +525,7 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/api/v1/settlement/transfer", processTransfer)
+	mux.HandleFunc("/api/v1/settlement/transfer", permifyAuthzGuard("settlement", "transfer", processTransfer))
 	mux.HandleFunc("/api/v1/settlement/positions", getPositions)
 	srv := &http.Server{
 		Addr:              ":" + port,

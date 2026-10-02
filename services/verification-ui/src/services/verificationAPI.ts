@@ -33,8 +33,27 @@ const API_BASE_URL =
   import.meta.env.VITE_VERIFICATION_API_URL ||
   "https://54link-dev.upi.dev/verification";
 
-const ENV_API_KEY = import.meta.env.VITE_KYC_FLOW_API_KEY || "";
-const FALLBACK_API_KEY = "Zr6lIvOEuGDlzlDyV+/dEDcUX7cChZKs";
+// W12-A4-P0-E: the hardcoded FALLBACK_API_KEY that shipped in this client
+// bundle was removed (treat the old literal as compromised — it MUST be
+// rotated by the operator). The key now comes exclusively from the build-time
+// env VITE_VERIFICATION_API_KEY (VITE_KYC_FLOW_API_KEY kept as a legacy
+// alias). Empty-string fallback: requests then carry no API key and the
+// gateway will reject them 401/403 — visible failure, never a silent
+// baked-in credential.
+const ENV_API_KEY = (
+  import.meta.env.VITE_VERIFICATION_API_KEY ||
+  import.meta.env.VITE_KYC_FLOW_API_KEY ||
+  ""
+).trim();
+
+// Runtime guard: surface the misconfiguration immediately in development.
+if (!ENV_API_KEY && import.meta.env.DEV) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    "[verification-ui] VITE_VERIFICATION_API_KEY is not set — verification " +
+      "API calls will be rejected by the gateway. Set it in the build env.",
+  );
+}
 
 /**
  * APISIX Routes Registry — single source of truth for all endpoints
@@ -79,8 +98,8 @@ class VerificationAPIClient {
 
   constructor(baseUrl: string = API_BASE_URL, apiKey?: string) {
     this.baseUrl = baseUrl;
-    // Resolve API key: explicit > env > fallback
-    this.apiKey = (apiKey || ENV_API_KEY || FALLBACK_API_KEY).trim();
+    // Resolve API key: explicit > env (no hardcoded fallback — W12-A4-P0-E).
+    this.apiKey = (apiKey || ENV_API_KEY || "").trim();
   }
 
   /** Override the API key (e.g. from URL params) */

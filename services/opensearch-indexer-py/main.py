@@ -10,11 +10,14 @@ Published by payment-processing-service using TransactionEventSchema.
 """
 
 import os
+import hmac
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, Request
+from permify_guard import require_permify  # W12-B5P1DF
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from opensearchpy import OpenSearch, RequestsHttpConnection
@@ -147,11 +150,47 @@ def dapr_subscribe():
 
 
 # ---------------------------------------------------------------------------
+# Event-callback authentication (W12-B5-P0-A, fail-closed)
+#
+# The /transaction_* POST routes are Dapr pub/sub push callbacks: server-to-
+# server deliveries with no end-user JWT, i.e. webhook semantics. They are
+# therefore authenticated with a shared-secret HMAC-SHA256 signature over the
+# raw request body (X-Event-Signature hex header, "sha256=" prefix tolerated),
+# mirroring the webhook HMAC pattern in services/telegram-service/main.go:194.
+# TRANSACTION_EVENTS_HMAC_SECRET has NO default: when it is unset every event
+# delivery is rejected (401) — fail closed, never warn-and-allow.
+# Publishers (payment-processing-service et al.) MUST sign the raw cloud-event
+# body with the same secret; see w12 fix-dispositions b5-fixes.md (B5-P0-A).
+# ---------------------------------------------------------------------------
+
+EVENTS_HMAC_SECRET = os.environ.get("TRANSACTION_EVENTS_HMAC_SECRET", "")
+
+
+async def verify_event_signature(request: Request) -> None:
+    """FastAPI dependency enforcing HMAC-SHA256 body signatures on the Dapr
+    event-delivery callbacks."""
+    if not EVENTS_HMAC_SECRET or EVENTS_HMAC_SECRET.startswith("${"):
+        logger.error("TRANSACTION_EVENTS_HMAC_SECRET unset — rejecting event delivery (fail-closed)")
+        raise HTTPException(status_code=401, detail="event authentication not configured")
+    body = await request.body()
+    sig = request.headers.get("x-event-signature", "")
+    if sig.startswith("sha256="):
+        sig = sig[len("sha256="):]
+    try:
+        provided = bytes.fromhex(sig)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="invalid event signature encoding")
+    expected = hmac.new(EVENTS_HMAC_SECRET.encode(), body, hashlib.sha256).digest()
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="invalid event signature")
+
+
+# ---------------------------------------------------------------------------
 # Event handlers
 # ---------------------------------------------------------------------------
 
 @app.post("/transaction_initiated")
-def on_initiated(event: DaprEvent):
+def on_initiated(event: DaprEvent, _: None = Depends(verify_event_signature), _p: None = Depends(require_permify("search_index", "transaction_initiated"))):
     try:
         _index(event, "transaction_initiated")
         return {"status": "SUCCESS"}
@@ -161,7 +200,7 @@ def on_initiated(event: DaprEvent):
 
 
 @app.post("/transaction_failed")
-def on_failed(event: DaprEvent):
+def on_failed(event: DaprEvent, _: None = Depends(verify_event_signature), _p: None = Depends(require_permify("search_index", "transaction_failed"))):
     try:
         _index(event, "transaction_failed")
         return {"status": "SUCCESS"}
@@ -171,7 +210,7 @@ def on_failed(event: DaprEvent):
 
 
 @app.post("/transaction_success")
-def on_success(event: DaprEvent):
+def on_success(event: DaprEvent, _: None = Depends(verify_event_signature), _p: None = Depends(require_permify("search_index", "transaction_success"))):
     try:
         _index(event, "transaction_success")
         return {"status": "SUCCESS"}

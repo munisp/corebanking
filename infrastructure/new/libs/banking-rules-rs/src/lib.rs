@@ -125,7 +125,7 @@ pub struct AMLFactors {
 }
 
 pub fn compute_aml_risk_score(f: &AMLFactors) -> (f64, Vec<&'static str>) {
-    let mut score = 0.0;
+    let mut score: f64 = 0.0;
     let mut indicators = Vec::new();
     if f.is_pep { score += 30.0; indicators.push("PEP_STATUS"); }
     if f.is_high_risk_country { score += 25.0; indicators.push("HIGH_RISK_JURISDICTION"); }

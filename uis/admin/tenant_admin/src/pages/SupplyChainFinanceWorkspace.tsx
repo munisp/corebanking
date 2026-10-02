@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import apiClient from "@/services/api";
 import kybService from "@/services/kybService";
 import type { Business } from "@/types/kyb";
+import { supplyChainOpsApi } from "@/api/tradeFinanceApi";
 
 const PROGRAM_TYPES = ['invoice_discounting', 'reverse_factoring', 'payables_finance', 'distributor_finance'];
 
@@ -171,12 +172,143 @@ function SCFCreateDialog({ open, onClose, onSuccess }: { open: boolean; onClose:
   );
 }
 
+/**
+ * W12 A4-P1-A — dialogs wiring previously-orphaned supply-chain-service routes:
+ * invoice-financing/apply, po-financing/apply, financing/{id}/approve+disburse
+ * (CrudWorkspace row actions below), system record-payment, relationships/create.
+ */
+type ScfDialogKind = "invoice" | "po" | "repayment" | "relationship" | null;
+
+function ScfOpsDialog({ kind, onClose, onSuccess }: { kind: Exclude<ScfDialogKind, null>; onClose: () => void; onSuccess: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [f, setF] = useState<Record<string, string>>({});
+  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) => setF((cur) => ({ ...cur, [k]: e.target.value }));
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      if (kind === "invoice") {
+        await supplyChainOpsApi.applyInvoiceFinancing({
+          supplier_id: f.supplier_id,
+          invoice_number: f.invoice_number,
+          invoice_amount: Number(f.invoice_amount),
+          financing_percentage: Number(f.financing_percentage),
+          invoice_due_date: new Date(f.invoice_due_date).toISOString(),
+          invoice_document_url: f.invoice_document_url,
+        });
+        toast.success("Invoice financing application submitted");
+      } else if (kind === "po") {
+        await supplyChainOpsApi.applyPoFinancing({
+          supplier_id: f.supplier_id,
+          buyer_id: f.buyer_id,
+          po_number: f.po_number,
+          po_amount: Number(f.po_amount),
+          financing_amount: Number(f.financing_amount),
+          delivery_date: new Date(f.delivery_date).toISOString(),
+          po_document_url: f.po_document_url,
+        });
+        toast.success("PO financing application submitted");
+      } else if (kind === "repayment") {
+        await supplyChainOpsApi.recordPayment(f.financing_id, {
+          transaction_id: f.transaction_id,
+          amount: Number(f.amount),
+          payment_date: f.payment_date,
+          payment_method: f.payment_method,
+        });
+        toast.success("Repayment recorded");
+      } else {
+        await supplyChainOpsApi.createRelationship(f.supplier_id, f.buyer_id);
+        toast.success("Supplier-buyer relationship created");
+      }
+      onSuccess();
+      onClose();
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+      toast.error(typeof detail === "string" ? detail : err instanceof Error ? err.message : "Request failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const titles: Record<string, string> = {
+    invoice: "Apply — Invoice Financing",
+    po: "Apply — Purchase Order Financing",
+    repayment: "Record Financing Repayment",
+    relationship: "Link Supplier ↔ Buyer",
+  };
+
+  const field = (key: string, label: string, type = "text", required = true) => (
+    <div className="space-y-1" key={key}>
+      <Label>{label} {required && <span className="text-destructive">*</span>}</Label>
+      <Input type={type} required={required} value={f[key] ?? ""} onChange={set(key)} />
+    </div>
+  );
+
+  return (
+    <Dialog open onOpenChange={onClose}>
+      <DialogContent className="max-w-md">
+        <DialogHeader><DialogTitle>{titles[kind]}</DialogTitle></DialogHeader>
+        <form onSubmit={(e) => void submit(e)} className="space-y-3">
+          {kind === "invoice" && (
+            <>
+              {field("supplier_id", "Supplier ID")}
+              {field("invoice_number", "Invoice Number")}
+              {field("invoice_amount", "Invoice Amount (₦)", "number")}
+              {field("financing_percentage", "Financing %", "number")}
+              {field("invoice_due_date", "Invoice Due Date", "date")}
+              {field("invoice_document_url", "Invoice Document URL", "url")}
+            </>
+          )}
+          {kind === "po" && (
+            <>
+              {field("supplier_id", "Supplier ID")}
+              {field("buyer_id", "Buyer ID")}
+              {field("po_number", "PO Number")}
+              {field("po_amount", "PO Amount (₦)", "number")}
+              {field("financing_amount", "Financing Amount (₦)", "number")}
+              {field("delivery_date", "Delivery Date", "date")}
+              {field("po_document_url", "PO Document URL", "url")}
+            </>
+          )}
+          {kind === "repayment" && (
+            <>
+              {field("financing_id", "Financing ID (e.g. INV…)")}
+              {field("transaction_id", "Payment Transaction ID")}
+              {field("amount", "Amount (₦)", "number")}
+              {field("payment_date", "Payment Date", "date")}
+              {field("payment_method", "Payment Method (e.g. bank_transfer)")}
+            </>
+          )}
+          {kind === "relationship" && (
+            <>
+              {field("supplier_id", "Supplier ID")}
+              {field("buyer_id", "Buyer ID")}
+            </>
+          )}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={onClose}>Cancel</Button>
+            <Button type="submit" disabled={busy}>{busy ? "Submitting…" : "Submit"}</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export default function SupplyChainFinanceWorkspace() {
   const [createOpen, setCreateOpen] = useState(false);
+  const [opsDialog, setOpsDialog] = useState<ScfDialogKind>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
   return (
     <>
+      <div className="flex flex-wrap gap-2 px-6 pt-4">
+        <Button size="sm" variant="outline" onClick={() => setOpsDialog("invoice")}>Apply: Invoice Financing</Button>
+        <Button size="sm" variant="outline" onClick={() => setOpsDialog("po")}>Apply: PO Financing</Button>
+        <Button size="sm" variant="outline" onClick={() => setOpsDialog("repayment")}>Record Repayment</Button>
+        <Button size="sm" variant="outline" onClick={() => setOpsDialog("relationship")}>Link Supplier-Buyer</Button>
+      </div>
       <CrudWorkspace
         key={refreshKey}
         onCreateClick={() => setCreateOpen(true)}
@@ -202,6 +334,23 @@ export default function SupplyChainFinanceWorkspace() {
             { key: "status", label: "Status", sortable: true },
           ],
           fields: [],
+          // W12 A4-P1-A: wire financing approve/disburse lifecycle actions.
+          actions: [
+            {
+              label: "Approve",
+              key: "approve",
+              method: "POST",
+              pathField: "financing_id",
+              condition: (row) => ["pending", "submitted", "under_review"].includes(String(row.status ?? "").toLowerCase()),
+            },
+            {
+              label: "Disburse",
+              key: "disburse",
+              method: "POST",
+              pathField: "financing_id",
+              condition: (row) => String(row.status ?? "").toLowerCase() === "approved",
+            },
+          ],
         }}
       />
       <SCFCreateDialog
@@ -209,6 +358,13 @@ export default function SupplyChainFinanceWorkspace() {
         onClose={() => setCreateOpen(false)}
         onSuccess={() => setRefreshKey((k) => k + 1)}
       />
+      {opsDialog && (
+        <ScfOpsDialog
+          kind={opsDialog}
+          onClose={() => setOpsDialog(null)}
+          onSuccess={() => setRefreshKey((k) => k + 1)}
+        />
+      )}
     </>
   );
 }

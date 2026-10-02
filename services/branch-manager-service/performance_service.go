@@ -11,8 +11,8 @@ import (
 // PerformanceService handles performance and target operations
 type PerformanceService struct {
 	tenantID    string
-	targets     map[string]*BranchTarget
-	performance map[string]*BranchPerformance
+	targets     *repo[BranchTarget]
+	performance *repo[BranchPerformance]
 	mu          sync.RWMutex
 }
 
@@ -20,18 +20,20 @@ type PerformanceService struct {
 func NewPerformanceService(tenantID string) *PerformanceService {
 	return &PerformanceService{
 		tenantID:    tenantID,
-		targets:     make(map[string]*BranchTarget),
-		performance: make(map[string]*BranchPerformance),
+		targets:     newRepo[BranchTarget](serviceDB, "branch_targets"),
+		performance: newRepo[BranchPerformance](serviceDB, "branch_performance"),
 	}
 }
 
 // ListTargets returns targets based on filters
-func (s *PerformanceService) ListTargets(tenantID, branchID, period string) []*BranchTarget {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *PerformanceService) ListTargets(tenantID, branchID, period string) ([]*BranchTarget, error) {
 
 	var result []*BranchTarget
-	for _, target := range s.targets {
+	__ALL__, __ERR__ := s.targets.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, target := range __ALL__ {
 		if target.TenantID != tenantID {
 			continue
 		}
@@ -43,16 +45,14 @@ func (s *PerformanceService) ListTargets(tenantID, branchID, period string) []*B
 		}
 		result = append(result, target)
 	}
-	return result
+	return result, nil
 }
 
 // GetTarget retrieves a target by ID
 func (s *PerformanceService) GetTarget(tenantID, targetID string) (*BranchTarget, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	target, exists := s.targets[targetID]
-	if !exists || target.TenantID != tenantID {
+	target, err := s.targets.get(tenantID, targetID)
+	if err != nil {
 		return nil, errors.New("target not found")
 	}
 	return target, nil
@@ -60,8 +60,6 @@ func (s *PerformanceService) GetTarget(tenantID, targetID string) (*BranchTarget
 
 // CreateTarget creates a new target
 func (s *PerformanceService) CreateTarget(tenantID, branchID string, req *CreateTargetRequest) (*BranchTarget, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	target := &BranchTarget{
 		TargetID:    uuid.New().String(),
@@ -79,17 +77,17 @@ func (s *PerformanceService) CreateTarget(tenantID, branchID string, req *Create
 		UpdatedAt:   time.Now(),
 	}
 
-	s.targets[target.TargetID] = target
+	if err := s.targets.put(tenantID, target.TargetID, target); err != nil {
+		return nil, err
+	}
 	return target, nil
 }
 
 // UpdateTarget updates a target
 func (s *PerformanceService) UpdateTarget(target *BranchTarget) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.targets[target.TargetID]
-	if !exists || existing.TenantID != target.TenantID {
+	existing, err := s.targets.get(target.TenantID, target.TargetID)
+	if err != nil {
 		return errors.New("target not found")
 	}
 
@@ -105,16 +103,17 @@ func (s *PerformanceService) UpdateTarget(target *BranchTarget) error {
 		target.Status = "on_track"
 	}
 
-	s.targets[target.TargetID] = target
-	return nil
+	return s.targets.put(target.TenantID, target.TargetID, target)
 }
 
 // GetPerformance returns performance metrics
-func (s *PerformanceService) GetPerformance(tenantID, branchID, period string) *BranchPerformance {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *PerformanceService) GetPerformance(tenantID, branchID, period string) (*BranchPerformance, error) {
 
-	for _, perf := range s.performance {
+	__ALL__, __ERR__ := s.performance.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, perf := range __ALL__ {
 		if perf.TenantID != tenantID {
 			continue
 		}
@@ -124,63 +123,33 @@ func (s *PerformanceService) GetPerformance(tenantID, branchID, period string) *
 		if period != "" && perf.Period != period {
 			continue
 		}
-		return perf
+		return perf, nil
 	}
 
-	// Return default performance if none found
-	return &BranchPerformance{
-		PerformanceID:         uuid.New().String(),
-		TenantID:              tenantID,
-		BranchID:              branchID,
-		Period:                period,
-		Date:                  time.Now(),
-		TotalTransactions:     150,
-		DepositCount:          75,
-		WithdrawalCount:       50,
-		TransferCount:         25,
-		TotalDepositAmount:    25000000000,
-		TotalWithdrawalAmount: 15000000000,
-		TotalTransferAmount:   5000000000,
-		NewAccountsOpened:     5,
-		AccountsClosed:        1,
-		ActiveAccounts:        1500,
-		DormantAccounts:       50,
-		LoanApplications:      10,
-		LoansApproved:         7,
-		LoansDisbursed:        5,
-		TotalDisbursedAmount:  50000000000,
-		NPLCount:              3,
-		NPLAmount:             5000000000,
-		CustomersServed:       120,
-		AvgWaitTime:           8.5,
-		AvgServiceTime:        12.3,
-		CustomerSatisfaction:  4.2,
-		FeeIncome:             500000000,
-		InterestIncome:        2000000000,
-		TotalRevenue:          2500000000,
-		CashPosition:          100000000000,
-		VaultBalance:          50000000000,
-		ATMUptime:             99.5,
-		SystemUptime:          99.9,
-		CreatedAt:             time.Now(),
-		UpdatedAt:             time.Now(),
-	}
+	// Fail closed: no fabricated performance record is served on a miss.
+	return nil, ErrNotFound
 }
 
 // GetDailyPerformance returns daily performance
-func (s *PerformanceService) GetDailyPerformance(tenantID, branchID, date string) *BranchPerformance {
+func (s *PerformanceService) GetDailyPerformance(tenantID, branchID, date string) (*BranchPerformance, error) {
 	return s.GetPerformance(tenantID, branchID, "daily")
 }
 
 // GetMonthlyPerformance returns monthly performance
-func (s *PerformanceService) GetMonthlyPerformance(tenantID, branchID, month, year string) *BranchPerformance {
+func (s *PerformanceService) GetMonthlyPerformance(tenantID, branchID, month, year string) (*BranchPerformance, error) {
 	return s.GetPerformance(tenantID, branchID, "monthly")
 }
 
 // ComparePerformance compares performance between branches or periods
-func (s *PerformanceService) ComparePerformance(tenantID, branchID, compareTo, period string) map[string]interface{} {
-	current := s.GetPerformance(tenantID, branchID, period)
-	comparison := s.GetPerformance(tenantID, compareTo, period)
+func (s *PerformanceService) ComparePerformance(tenantID, branchID, compareTo, period string) (map[string]interface{}, error) {
+	current, err := s.GetPerformance(tenantID, branchID, period)
+	if err != nil {
+		return nil, err
+	}
+	comparison, err := s.GetPerformance(tenantID, compareTo, period)
+	if err != nil {
+		return nil, err
+	}
 
 	return map[string]interface{}{
 		"current":    current,
@@ -194,7 +163,7 @@ func (s *PerformanceService) ComparePerformance(tenantID, branchID, compareTo, p
 			"satisfactionDiff": current.CustomerSatisfaction - comparison.CustomerSatisfaction,
 			"revenueDiff":      current.TotalRevenue - comparison.TotalRevenue,
 		},
-	}
+	}, nil
 }
 
 // GetQueueStatus returns current queue status
@@ -218,8 +187,11 @@ func (s *PerformanceService) GetQueueStatus(tenantID, branchID string) map[strin
 }
 
 // GetDailyReport returns daily report
-func (s *PerformanceService) GetDailyReport(tenantID, branchID, date string) map[string]interface{} {
-	perf := s.GetDailyPerformance(tenantID, branchID, date)
+func (s *PerformanceService) GetDailyReport(tenantID, branchID, date string) (map[string]interface{}, error) {
+	perf, err := s.GetDailyPerformance(tenantID, branchID, date)
+	if err != nil {
+		return nil, err
+	}
 
 	return map[string]interface{}{
 		"reportType": "daily",
@@ -241,7 +213,7 @@ func (s *PerformanceService) GetDailyReport(tenantID, branchID, date string) map
 			"cashOut": perf.TotalWithdrawalAmount,
 		},
 		"generatedAt": time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetWeeklyReport returns weekly report
@@ -299,8 +271,11 @@ func (s *PerformanceService) GetMonthlyReport(tenantID, branchID, month, year st
 }
 
 // GetStaffPerformanceReport returns staff performance report
-func (s *PerformanceService) GetStaffPerformanceReport(tenantID, branchID, period string, staffService *StaffService) map[string]interface{} {
-	staff := staffService.ListStaff(tenantID, branchID, "", "active")
+func (s *PerformanceService) GetStaffPerformanceReport(tenantID, branchID, period string, staffService *StaffService) (map[string]interface{}, error) {
+	staff, err := staffService.ListStaff(tenantID, branchID, "", "active")
+	if err != nil {
+		return nil, err
+	}
 
 	var staffMetrics []map[string]interface{}
 	for _, st := range staff {
@@ -324,7 +299,7 @@ func (s *PerformanceService) GetStaffPerformanceReport(tenantID, branchID, perio
 		"staffMetrics":  staffMetrics,
 		"topPerformers": staffMetrics[:min(3, len(staffMetrics))],
 		"generatedAt":   time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 func min(a, b int) int {

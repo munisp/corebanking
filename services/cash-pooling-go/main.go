@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -75,14 +78,54 @@ type SweepExecRequest struct {
 	PoolID string `json:"poolId"`
 }
 
-var (
-	pools  []PoolStructure
-	sweeps []SweepTransaction
-	mu     sync.Mutex
-)
+// ── Persistence (wave-12 C3-P0-B7) ─────────────────────────────────────────
+// Pools and sweep transactions are Postgres-authoritative (tables cash_pools
+// and sweep_transactions, typed columns; child accounts as jsonb because the
+// nested array is read/written atomically with the pool). The package-level
+// slices were removed: list/stats are served from PG, and sweep execution
+// (the money-moving path) runs pool-read + sweep-inserts in ONE transaction.
+// reference_number is UNIQUE to give DB-level duplicate protection on sweep
+// records. Fail-closed: endpoints return 503 when DATABASE_URL is unset/down.
+var db *sql.DB
 
-func init() {
-	pools = []PoolStructure{
+const cashPoolingDDL = `
+CREATE SEQUENCE IF NOT EXISTS sweep_txn_id_seq START 100;
+CREATE TABLE IF NOT EXISTS cash_pools (
+    id              text PRIMARY KEY,
+    tenant_id       text NOT NULL DEFAULT '',
+    pool_name       text NOT NULL,
+    pool_type       text NOT NULL,
+    header_account  text NOT NULL,
+    header_name     text NOT NULL DEFAULT '',
+    currency        text NOT NULL DEFAULT 'NGN',
+    child_accounts  jsonb NOT NULL DEFAULT '[]'::jsonb,
+    sweep_frequency text NOT NULL DEFAULT 'eod',
+    status          text NOT NULL DEFAULT 'active',
+    created_date    text NOT NULL DEFAULT '',
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS sweep_transactions (
+    id               text PRIMARY KEY,
+    tenant_id        text NOT NULL DEFAULT '',
+    pool_id          text NOT NULL REFERENCES cash_pools (id),
+    from_account     text NOT NULL,
+    to_account       text NOT NULL,
+    amount           double precision NOT NULL CHECK (amount > 0),
+    sweep_type       text NOT NULL,
+    executed_at      text NOT NULL,
+    status           text NOT NULL DEFAULT 'completed',
+    reference_number text NOT NULL UNIQUE,
+    created_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sweep_tx_pool ON sweep_transactions (pool_id);
+`
+
+// seedPools/seedSweeps are the demo fixtures previously held in process memory;
+// they are now inserted once at boot with ON CONFLICT DO NOTHING (idempotent,
+// never overwrites live rows).
+var (
+	seedPools = []PoolStructure{
 		{
 			ID: "POOL-001", PoolName: "Dangote Group ZBA Pool", PoolType: "zero_balance",
 			HeaderAccount: "0012345678", HeaderName: "Dangote Industries Master Account",
@@ -125,13 +168,179 @@ func init() {
 		},
 	}
 
-	sweeps = []SweepTransaction{
+	seedSweeps = []SweepTransaction{
 		{"SWP-001", "POOL-001", "0012345679", "0012345678", 250_000_000, "zero_balance", "2026-05-09T23:00:00Z", "completed", "SWP-ZBA-20260509-001"},
 		{"SWP-002", "POOL-001", "0012345680", "0012345678", 180_000_000, "zero_balance", "2026-05-09T23:00:00Z", "completed", "SWP-ZBA-20260509-002"},
 		{"SWP-003", "POOL-002", "0098765433", "0098765432", 700_000_000, "sweep_out", "2026-05-09T14:30:00Z", "completed", "SWP-TGT-20260509-001"},
 		{"SWP-004", "POOL-002", "0098765432", "0098765434", 150_000_000, "target_top_up", "2026-05-09T14:30:00Z", "completed", "SWP-TGT-20260509-002"},
 		{"SWP-005", "POOL-004", "0033344456", "0033344455", 600_000_000, "sweep_out", "2026-05-09T23:00:00Z", "completed", "SWP-HYB-20260509-001"},
 	}
+)
+
+func initDB() {
+	dsn := envOr("DATABASE_URL", "")
+	if dsn == "" {
+		log.Printf("[cash-pooling-go] DATABASE_URL not set — pool/sweep endpoints fail-closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[cash-pooling-go] pg open failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[cash-pooling-go] pg ping failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(cashPoolingDDL); err != nil {
+		log.Fatalf("[cash-pooling-go] DDL failed: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		log.Fatalf("[cash-pooling-go] seed tx begin: %v", err)
+	}
+	for _, p := range seedPools {
+		children, _ := json.Marshal(p.ChildAccounts)
+		if _, err = tx.Exec(
+			`INSERT INTO cash_pools (id, pool_name, pool_type, header_account, header_name, currency, child_accounts, sweep_frequency, status, created_date)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
+			p.ID, p.PoolName, p.PoolType, p.HeaderAccount, p.HeaderName, p.Currency, children, p.SweepFrequency, p.Status, p.CreatedDate); err != nil {
+			tx.Rollback()
+			log.Fatalf("[cash-pooling-go] seed pool %s: %v", p.ID, err)
+		}
+	}
+	for _, s := range seedSweeps {
+		if _, err = tx.Exec(
+			`INSERT INTO sweep_transactions (id, pool_id, from_account, to_account, amount, sweep_type, executed_at, status, reference_number)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (reference_number) DO NOTHING`,
+			s.ID, s.PoolID, s.FromAccount, s.ToAccount, s.Amount, s.SweepType, s.ExecutedAt, s.Status, s.ReferenceNumber); err != nil {
+			tx.Rollback()
+			log.Fatalf("[cash-pooling-go] seed sweep %s: %v", s.ID, err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		log.Fatalf("[cash-pooling-go] seed tx commit: %v", err)
+	}
+	log.Printf("[cash-pooling-go] postgres authoritative store ready (cash_pools, sweep_transactions)")
+}
+
+func dbListPools() ([]PoolStructure, error) {
+	rows, err := db.Query(`SELECT id, pool_name, pool_type, header_account, header_name, currency, child_accounts, sweep_frequency, status, created_date FROM cash_pools ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PoolStructure{}
+	for rows.Next() {
+		var p PoolStructure
+		var children []byte
+		if err := rows.Scan(&p.ID, &p.PoolName, &p.PoolType, &p.HeaderAccount, &p.HeaderName, &p.Currency, &children, &p.SweepFrequency, &p.Status, &p.CreatedDate); err != nil {
+			return nil, err
+		}
+		json.Unmarshal(children, &p.ChildAccounts)
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func dbListSweeps() ([]SweepTransaction, error) {
+	rows, err := db.Query(`SELECT id, pool_id, from_account, to_account, amount, sweep_type, executed_at, status, reference_number FROM sweep_transactions ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SweepTransaction{}
+	for rows.Next() {
+		var s SweepTransaction
+		if err := rows.Scan(&s.ID, &s.PoolID, &s.FromAccount, &s.ToAccount, &s.Amount, &s.SweepType, &s.ExecutedAt, &s.Status, &s.ReferenceNumber); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// dbExecuteSweep locks the pool row (FOR UPDATE), computes the sweep set, and
+// inserts all sweep transactions in ONE transaction — the money-moving record
+// is atomic and cannot be half-persisted across a restart.
+func dbExecuteSweep(poolID string) ([]SweepTransaction, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var p PoolStructure
+	var children []byte
+	err = tx.QueryRow(
+		`SELECT id, pool_name, pool_type, header_account, header_name, currency, child_accounts, sweep_frequency, status, created_date
+		 FROM cash_pools WHERE id = $1 FOR UPDATE`, poolID).
+		Scan(&p.ID, &p.PoolName, &p.PoolType, &p.HeaderAccount, &p.HeaderName, &p.Currency, &children, &p.SweepFrequency, &p.Status, &p.CreatedDate)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal(children, &p.ChildAccounts)
+	executedAt := time.Now().UTC().Format(time.RFC3339)
+	newSweeps := []SweepTransaction{}
+	for _, child := range p.ChildAccounts {
+		var amount float64
+		var sweepType string
+		switch p.PoolType {
+		case "zero_balance":
+			amount = child.Balance
+			sweepType = "zero_balance"
+		case "target_balance":
+			amount = child.Balance - child.TargetBalance
+			if amount > 0 {
+				sweepType = "sweep_out"
+			} else {
+				sweepType = "target_top_up"
+				amount = -amount
+			}
+		default:
+			amount = child.Balance * 0.8
+			sweepType = "sweep_out"
+		}
+		if amount <= 0 {
+			continue
+		}
+		var seq int64
+		if err = tx.QueryRow(`SELECT nextval('sweep_txn_id_seq')`).Scan(&seq); err != nil {
+			return nil, err
+		}
+		swp := SweepTransaction{
+			ID:          fmt.Sprintf("SWP-%03d", seq),
+			PoolID:      p.ID,
+			FromAccount: child.AccountID, ToAccount: p.HeaderAccount,
+			Amount: amount, SweepType: sweepType,
+			ExecutedAt:      executedAt,
+			Status:          "completed",
+			ReferenceNumber: fmt.Sprintf("SWP-%s-%s-%s", p.PoolType, p.ID, child.AccountID) + fmt.Sprintf("-%06d", seq),
+		}
+		if sweepType == "target_top_up" {
+			swp.FromAccount = p.HeaderAccount
+			swp.ToAccount = child.AccountID
+		}
+		if _, err = tx.Exec(
+			`INSERT INTO sweep_transactions (id, pool_id, from_account, to_account, amount, sweep_type, executed_at, status, reference_number)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (reference_number) DO NOTHING`,
+			swp.ID, swp.PoolID, swp.FromAccount, swp.ToAccount, swp.Amount, swp.SweepType, swp.ExecutedAt, swp.Status, swp.ReferenceNumber); err != nil {
+			return nil, err
+		}
+		newSweeps = append(newSweeps, swp)
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return newSweeps, nil
 }
 
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -314,6 +523,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	initDB()
 	startJWKSRefresh()
 
 	mux := http.NewServeMux()
@@ -322,17 +532,31 @@ func main() {
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/cash-pooling/pools", func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		respondJSON(w, 200, map[string]interface{}{"items": pools, "total": len(pools)})
-		mu.Unlock()
-	})
+	mux.HandleFunc("/v1/cash-pooling/pools", permifyAuthzGuard("sweep", "register", func(w http.ResponseWriter, _ *http.Request) {
+		if db == nil {
+			respondJSON(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+			return
+		}
+		items, err := dbListPools()
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+			return
+		}
+		respondJSON(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
+	}))
 
-	mux.HandleFunc("/v1/cash-pooling/sweeps", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/cash-pooling/sweeps", permifyAuthzGuard("sweep", "register", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			respondJSON(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+			return
+		}
 		if r.Method == http.MethodGet {
-			mu.Lock()
-			respondJSON(w, 200, map[string]interface{}{"items": sweeps, "total": len(sweeps)})
-			mu.Unlock()
+			items, err := dbListSweeps()
+			if err != nil {
+				respondJSON(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+				return
+			}
+			respondJSON(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -345,90 +569,54 @@ func main() {
 				respondJSON(w, 400, map[string]string{"error": "poolId is required"})
 				return
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			var pool *PoolStructure
-			for i := range pools {
-				if pools[i].ID == req.PoolID {
-					pool = &pools[i]
-					break
-				}
+			newSweeps, err := dbExecuteSweep(req.PoolID)
+			if err != nil {
+				respondJSON(w, 500, map[string]string{"error": "sweep execution failed: " + err.Error()})
+				return
 			}
-			if pool == nil {
+			if newSweeps == nil {
 				respondJSON(w, 404, map[string]string{"error": "pool not found"})
 				return
 			}
-			newSweeps := []SweepTransaction{}
-			for _, child := range pool.ChildAccounts {
-				var amount float64
-				var sweepType string
-				switch pool.PoolType {
-				case "zero_balance":
-					amount = child.Balance
-					sweepType = "zero_balance"
-				case "target_balance":
-					amount = child.Balance - child.TargetBalance
-					if amount > 0 {
-						sweepType = "sweep_out"
-					} else {
-						sweepType = "target_top_up"
-						amount = -amount
-					}
-				default:
-					amount = child.Balance * 0.8
-					sweepType = "sweep_out"
-				}
-				if amount <= 0 {
-					continue
-				}
-				swp := SweepTransaction{
-					ID:          fmt.Sprintf("SWP-%03d", len(sweeps)+len(newSweeps)+1),
-					PoolID:      pool.ID,
-					FromAccount: child.AccountID, ToAccount: pool.HeaderAccount,
-					Amount: amount, SweepType: sweepType,
-					ExecutedAt: "2026-05-10T00:00:00Z", Status: "completed",
-					ReferenceNumber: fmt.Sprintf("SWP-%s-%03d", pool.PoolType, len(sweeps)+len(newSweeps)+1),
-				}
-				if sweepType == "target_top_up" {
-					swp.FromAccount = pool.HeaderAccount
-					swp.ToAccount = child.AccountID
-				}
-				newSweeps = append(newSweeps, swp)
-			}
-			sweeps = append(sweeps, newSweeps...)
 			respondJSON(w, 201, map[string]interface{}{"executed": len(newSweeps), "sweeps": newSweeps})
 			return
 		}
 		respondJSON(w, 405, map[string]string{"error": "method not allowed"})
-	})
+	}))
 
-	mux.HandleFunc("/v1/cash-pooling/stats", func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
+	mux.HandleFunc("/v1/cash-pooling/stats", permifyAuthzGuard("sweep", "view", func(w http.ResponseWriter, _ *http.Request) {
+		if db == nil {
+			respondJSON(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+			return
+		}
+		poolsList, err := dbListPools()
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+			return
+		}
 		totalPoolBalance := 0.0
 		totalChildAccounts := 0
-		for _, p := range pools {
+		byType := map[string]int{}
+		for _, p := range poolsList {
+			byType[p.PoolType]++
 			for _, c := range p.ChildAccounts {
 				totalPoolBalance += c.Balance
 				totalChildAccounts++
 			}
 		}
-		totalSwept := 0.0
-		for _, s := range sweeps {
-			totalSwept += s.Amount
+		var sweepCount int
+		var totalSwept float64
+		if err = db.QueryRow(`SELECT count(*), COALESCE(sum(amount), 0) FROM sweep_transactions`).Scan(&sweepCount, &totalSwept); err != nil {
+			respondJSON(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+			return
 		}
 		respondJSON(w, 200, map[string]interface{}{
-			"totalPools": len(pools), "totalChildAccounts": totalChildAccounts,
-			"totalPoolBalance": totalPoolBalance, "totalSweepTransactions": len(sweeps),
-			"totalSweptAmount": totalSwept,
-			"byType": map[string]int{
-				"zero_balance":   1,
-				"target_balance": 1,
-				"notional":       1,
-				"hybrid":         1,
-			},
+			"totalPools": len(poolsList), "totalChildAccounts": totalChildAccounts,
+			"totalPoolBalance": totalPoolBalance, "totalSweepTransactions": sweepCount,
+			"totalSweptAmount": totalSwept, "source": "postgres",
+			"byType": byType,
 		})
-	})
+	}))
 
 	port := envOr("PORT", "8159")
 	fmt.Printf("Cash Pooling service on :%s\n", port)

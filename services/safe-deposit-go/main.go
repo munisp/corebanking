@@ -132,43 +132,11 @@ type AuditEntry struct {
 	Details   string `json:"details"`
 }
 
-var (
-	mu    sync.RWMutex
-	boxes = []DepositBox{
-		{ID: "BOX-0001", BoxSize: BoxSizeSmall, CustomerName: "Adebayo Okafor", CustomerID: "CUST-1001", Branch: "Lagos Island", AnnualRent: 45000, Currency: "NGN", RenewalDate: "2027-01-15", Status: BoxStatusOccupied, CreatedAt: "2025-01-15T09:00:00Z", UpdatedAt: "2025-01-15T09:00:00Z"},
-		{ID: "BOX-0002", BoxSize: BoxSizeMedium, CustomerName: "Ngozi Eze", CustomerID: "CUST-1002", Branch: "Abuja Central", AnnualRent: 80000, Currency: "NGN", RenewalDate: "2027-03-20", Status: BoxStatusOccupied, CreatedAt: "2025-03-20T10:30:00Z", UpdatedAt: "2025-03-20T10:30:00Z"},
-		{ID: "BOX-0003", BoxSize: BoxSizeLarge, CustomerName: "", CustomerID: "", Branch: "Port Harcourt", AnnualRent: 120000, Currency: "NGN", RenewalDate: "", Status: BoxStatusAvailable, CreatedAt: "2025-02-01T08:00:00Z", UpdatedAt: "2025-02-01T08:00:00Z"},
-		{ID: "BOX-0004", BoxSize: BoxSizeSmall, CustomerName: "", CustomerID: "", Branch: "Lagos Island", AnnualRent: 45000, Currency: "NGN", RenewalDate: "", Status: BoxStatusMaintenance, CreatedAt: "2025-04-10T11:00:00Z", UpdatedAt: "2026-05-01T09:00:00Z"},
-		{ID: "BOX-0005", BoxSize: BoxSizeMedium, CustomerName: "Emeka Chukwu", CustomerID: "CUST-1003", Branch: "Enugu", AnnualRent: 80000, Currency: "NGN", RenewalDate: "2026-11-30", Status: BoxStatusOccupied, CreatedAt: "2025-11-30T14:00:00Z", UpdatedAt: "2025-11-30T14:00:00Z"},
-		{ID: "BOX-0006", BoxSize: BoxSizeLarge, CustomerName: "", CustomerID: "", Branch: "Abuja Central", AnnualRent: 120000, Currency: "NGN", RenewalDate: "", Status: BoxStatusAvailable, CreatedAt: "2025-06-15T10:00:00Z", UpdatedAt: "2025-06-15T10:00:00Z"},
-	}
-	auditLog = []AuditEntry{}
-)
-
-const (
-	maxInMemoryBoxes = 5000
-	maxAuditEntries  = 2000
-)
-
-// appendBox appends to the in-memory store, evicting the oldest entries once
-// the store exceeds maxInMemoryBoxes (bounded store, GPT-06).
-func appendBox(box DepositBox) {
-	boxes = append(boxes, box)
-	if len(boxes) > maxInMemoryBoxes {
-		copy(boxes, boxes[len(boxes)-maxInMemoryBoxes:])
-		boxes = boxes[:maxInMemoryBoxes]
-	}
-}
-
-// appendAudit appends to the audit log, evicting the oldest entries once the
-// log exceeds maxAuditEntries (bounded store, GPT-06).
-func appendAudit(e AuditEntry) {
-	auditLog = append(auditLog, e)
-	if len(auditLog) > maxAuditEntries {
-		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
-		auditLog = auditLog[:maxAuditEntries]
-	}
-}
+// C3-P2-B5-go-2 (c3-0301): the in-memory boxes/auditLog slices, appendBox and
+// appendAudit were removed. Deposit boxes are business records and MUST be
+// durable: they now live in Postgres (deposit_boxes + deposit_box_audit, see
+// initSchema) with all mutations transactional and fail-closed (503
+// persistence_unavailable) — no in-memory fallback on business data.
 
 // parsePageParams extracts limit/offset query params with a hard cap (GPT-07).
 func parsePageParams(r *http.Request, defLimit, maxLimit int) (limit, offset int) {
@@ -185,30 +153,45 @@ func parsePageParams(r *http.Request, defLimit, maxLimit int) (limit, offset int
 	return
 }
 
-// paginateBoxes bounds list responses (default 100, max 500 per page).
-func paginateBoxes(all []DepositBox, r *http.Request) []DepositBox {
-	limit, offset := parsePageParams(r, 100, 500)
-	if offset >= len(all) {
-		return []DepositBox{}
+// Pagination is applied in SQL (LIMIT/OFFSET) on the Postgres-backed queries;
+// the former in-memory paginateBoxes/paginateAudit helpers were removed with
+// the slice store (c3-0301).
+
+// requireDB fails closed when Postgres is unavailable: business data has no
+// in-memory fallback (c3-0301).
+func requireDB(w http.ResponseWriter) bool {
+	if db == nil {
+		respondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "persistence_unavailable"})
+		return false
 	}
-	end := offset + limit
-	if end > len(all) {
-		end = len(all)
-	}
-	return all[offset:end]
+	return true
 }
 
-// paginateAudit bounds audit responses (default 100, max 500 per page).
-func paginateAudit(all []AuditEntry, r *http.Request) []AuditEntry {
-	limit, offset := parsePageParams(r, 100, 500)
-	if offset >= len(all) {
-		return []AuditEntry{}
-	}
-	end := offset + limit
-	if end > len(all) {
-		end = len(all)
-	}
-	return all[offset:end]
+// boxColumns is the canonical column list for deposit_boxes scans.
+const boxColumns = `box_number, box_size, customer_name, assigned_customer, branch, annual_rent, currency, renewal_date, status, created_at, updated_at`
+
+func scanDepositBox(sc interface {
+	Scan(dest ...interface{}) error
+}) (DepositBox, error) {
+	var b DepositBox
+	var createdAt, updatedAt time.Time
+	err := sc.Scan(&b.ID, &b.BoxSize, &b.CustomerName, &b.CustomerID, &b.Branch, &b.AnnualRent, &b.Currency, &b.RenewalDate, &b.Status, &createdAt, &updatedAt)
+	b.CreatedAt = createdAt.Format(time.RFC3339)
+	b.UpdatedAt = updatedAt.Format(time.RFC3339)
+	return b, err
+}
+
+// tenantOf returns the tenant identity from the verified-JWT header (set by
+// jwtMiddleware from token claims only). Empty → caller must fail closed.
+func tenantOf(r *http.Request) string { return r.Header.Get("X-Tenant-ID") }
+
+// insertAuditTx records a safe-deposit audit entry inside tx (idempotent on
+// the random entry id).
+func insertAuditTx(tx *sql.Tx, tenantID, action, recordID, actor, details string) error {
+	_, err := tx.Exec(`INSERT INTO deposit_box_audit (id, tenant_id, action, record_id, actor, details)
+		VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+		fmt.Sprintf("AUD-%08X", secureUint32()), tenantID, action, recordID, actor, details)
+	return err
 }
 
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
@@ -237,27 +220,51 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleList(w http.ResponseWriter, r *http.Request) {
-	cacheKey := "safe_deposit_list"
-	if cached, ok := cacheGet(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.WriteHeader(200)
-		w.Write([]byte(cached))
+	if !requireDB(w) {
 		return
 	}
-	mu.RLock()
-	defer mu.RUnlock()
-	resp := DepositBoxListResponse{Items: paginateBoxes(boxes, r), Total: len(boxes)}
-	if resp.Items == nil {
-		resp.Items = []DepositBox{}
+	tenantID := tenantOf(r)
+	if tenantID == "" {
+		respondJSON(w, 403, map[string]string{"error": "forbidden: tenant required"})
+		return
 	}
-	respondJSON(w, 200, resp)
+	limit, offset := parsePageParams(r, 100, 500)
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT `+boxColumns+` FROM deposit_boxes WHERE tenant_id = $1 ORDER BY box_number LIMIT $2 OFFSET $3`,
+		tenantID, limit, offset)
+	if err != nil {
+		log.Printf("[%s] handleList query failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer rows.Close()
+	items := []DepositBox{}
+	for rows.Next() {
+		b, err := scanDepositBox(rows)
+		if err != nil {
+			log.Printf("[%s] handleList scan failed: %v", serviceName, err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		b.TenantID = tenantID
+		items = append(items, b)
+	}
+	var total int
+	if err := db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*) FROM deposit_boxes WHERE tenant_id = $1`, tenantID).Scan(&total); err != nil {
+		log.Printf("[%s] handleList count failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	respondJSON(w, 200, DepositBoxListResponse{Items: items, Total: total})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
-	cacheSet("safe_deposit_list", "", 1)
 	if r.Method != "POST" {
 		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	if !requireDB(w) {
 		return
 	}
 
@@ -288,12 +295,36 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		status = BoxStatusOccupied
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	// Tenant identity comes from verified JWT claims (X-Tenant-ID is set by
+	// jwtMiddleware); fall back to the request body only when the header is
+	// absent, and fail closed when neither carries a tenant.
+	tenantID := tenantOf(r)
+	if tenantID == "" {
+		tenantID = body.TenantID
+	}
+	if tenantID == "" {
+		respondJSON(w, 403, map[string]string{"error": "forbidden: tenant required"})
+		return
+	}
 
-	now := time.Now().Format(time.RFC3339)
+	// Transactional create: box row + audit entry commit atomically. The box
+	// number comes from a Postgres sequence (durable across restarts).
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("[%s] handleCreate begin tx failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer tx.Rollback()
+
+	var seq int64
+	if err := tx.QueryRowContext(r.Context(), `SELECT nextval('deposit_box_number_seq')`).Scan(&seq); err != nil {
+		log.Printf("[%s] handleCreate seq failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	box := DepositBox{
-		ID:           fmt.Sprintf("BOX-%04d", len(boxes)+1),
+		ID:           fmt.Sprintf("BOX-%04d", seq),
 		BoxSize:      BoxSize(body.BoxSize),
 		Branch:       body.Branch,
 		AnnualRent:   body.AnnualRent,
@@ -302,17 +333,37 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		CustomerID:   body.CustomerID,
 		RenewalDate:  body.RenewalDate,
 		Status:       status,
-		TenantID:     body.TenantID,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		TenantID:     tenantID,
 	}
-	appendBox(box)
+	var createdAt, updatedAt time.Time
+	err = tx.QueryRowContext(r.Context(),
+		`INSERT INTO deposit_boxes (tenant_id, branch, box_number, box_size, status, assigned_customer, customer_name, annual_rent, currency, renewal_date, payload)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		 ON CONFLICT (tenant_id, branch, box_number) DO NOTHING
+		 RETURNING created_at, updated_at`,
+		tenantID, box.Branch, box.ID, string(box.BoxSize), string(box.Status), box.CustomerID, box.CustomerName, box.AnnualRent, box.Currency, box.RenewalDate, "{}").Scan(&createdAt, &updatedAt)
+	if err == sql.ErrNoRows {
+		respondJSON(w, 409, map[string]string{"error": "box already exists: " + box.ID})
+		return
+	}
+	if err != nil {
+		log.Printf("[%s] handleCreate insert failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	box.CreatedAt = createdAt.Format(time.RFC3339)
+	box.UpdatedAt = updatedAt.Format(time.RFC3339)
 
-	appendAudit(AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
-		RecordID: box.ID, Actor: body.CustomerID,
-		Timestamp: now, Details: "Box created",
-	})
+	if err := insertAuditTx(tx, tenantID, "create", box.ID, body.CustomerID, "Box created"); err != nil {
+		log.Printf("[%s] handleCreate audit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[%s] handleCreate commit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 
 	respondJSON(w, 201, map[string]interface{}{"created": true, "box": box})
 }
@@ -341,35 +392,99 @@ func handleAssign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	if !requireDB(w) {
+		return
+	}
+	tenantID := tenantOf(r)
+	if tenantID == "" {
+		respondJSON(w, 403, map[string]string{"error": "forbidden: tenant required"})
+		return
+	}
 
-	for i := range boxes {
-		if boxes[i].ID == body.ID {
-			if boxes[i].Status != BoxStatusAvailable {
-				respondJSON(w, 409, map[string]string{"error": "box is not available for assignment"})
-				return
-			}
-			boxes[i].CustomerName = body.CustomerName
-			boxes[i].CustomerID = body.CustomerID
-			if body.AnnualRent > 0 {
-				boxes[i].AnnualRent = body.AnnualRent
-			}
-			if body.RenewalDate != "" {
-				boxes[i].RenewalDate = body.RenewalDate
-			}
-			boxes[i].Status = BoxStatusOccupied
-			boxes[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			appendAudit(AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "assign",
-				RecordID: body.ID, Actor: body.UpdatedBy,
-				Timestamp: boxes[i].UpdatedAt, Details: "Box assigned to customer",
-			})
-			respondJSON(w, 200, map[string]interface{}{"updated": true, "box": boxes[i]})
+	// Transactional conditional assignment: the UPDATE only fires while the
+	// box is still 'available', so concurrent assigns cannot double-book.
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("[%s] handleAssign begin tx failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(r.Context(),
+		`UPDATE deposit_boxes
+		 SET customer_name = $1,
+		     assigned_customer = $2,
+		     annual_rent = CASE WHEN $3 > 0 THEN $3 ELSE annual_rent END,
+		     renewal_date = CASE WHEN $4 <> '' THEN $4 ELSE renewal_date END,
+		     status = 'occupied',
+		     updated_at = NOW()
+		 WHERE tenant_id = $5 AND box_number = $6 AND status = 'available'`,
+		body.CustomerName, body.CustomerID, body.AnnualRent, body.RenewalDate, tenantID, body.ID)
+	if err != nil {
+		log.Printf("[%s] handleAssign update failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		// Either the box does not exist, or it is not available. Distinguish,
+		// and make assignment idempotent: replaying the SAME assignment
+		// (same customer on the already-occupied box) returns success without
+		// writing a duplicate audit entry.
+		var curStatus, curCustomer string
+		err := tx.QueryRowContext(r.Context(),
+			`SELECT status, assigned_customer FROM deposit_boxes WHERE tenant_id = $1 AND box_number = $2`,
+			tenantID, body.ID).Scan(&curStatus, &curCustomer)
+		if err == sql.ErrNoRows {
+			respondJSON(w, 404, map[string]string{"error": "box not found: " + body.ID})
 			return
 		}
+		if err != nil {
+			log.Printf("[%s] handleAssign lookup failed: %v", serviceName, err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		if curStatus == string(BoxStatusOccupied) && curCustomer == body.CustomerID {
+			box, err := loadDepositBox(r, tenantID, body.ID)
+			if err != nil {
+				log.Printf("[%s] handleAssign replay load failed: %v", serviceName, err)
+				respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+				return
+			}
+			respondJSON(w, 200, map[string]interface{}{"updated": true, "replayed": true, "box": box})
+			return
+		}
+		respondJSON(w, 409, map[string]string{"error": "box is not available for assignment"})
+		return
 	}
-	respondJSON(w, 404, map[string]string{"error": "box not found: " + body.ID})
+	if err := insertAuditTx(tx, tenantID, "assign", body.ID, body.UpdatedBy, "Box assigned to customer"); err != nil {
+		log.Printf("[%s] handleAssign audit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[%s] handleAssign commit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	box, err := loadDepositBox(r, tenantID, body.ID)
+	if err != nil {
+		log.Printf("[%s] handleAssign reload failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"updated": true, "box": box})
+}
+
+// loadDepositBox reads one box by tenant + box number (post-mutation reload).
+func loadDepositBox(r *http.Request, tenantID, boxNumber string) (DepositBox, error) {
+	row := db.QueryRowContext(r.Context(),
+		`SELECT `+boxColumns+` FROM deposit_boxes WHERE tenant_id = $1 AND box_number = $2`,
+		tenantID, boxNumber)
+	b, err := scanDepositBox(row)
+	b.TenantID = tenantID
+	return b, err
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -394,31 +509,60 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	for i := range boxes {
-		if boxes[i].ID == body.ID {
-			if body.Status != "" {
-				boxes[i].Status = BoxStatus(body.Status)
-			}
-			if body.RenewalDate != "" {
-				boxes[i].RenewalDate = body.RenewalDate
-			}
-			if body.AnnualRent > 0 {
-				boxes[i].AnnualRent = body.AnnualRent
-			}
-			boxes[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			appendAudit(AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
-				RecordID: body.ID, Actor: body.UpdatedBy,
-				Timestamp: boxes[i].UpdatedAt, Details: "Box updated",
-			})
-			respondJSON(w, 200, map[string]interface{}{"updated": true, "box": boxes[i]})
-			return
-		}
+	if !requireDB(w) {
+		return
 	}
-	respondJSON(w, 404, map[string]string{"error": "box not found: " + body.ID})
+	tenantID := tenantOf(r)
+	if tenantID == "" {
+		respondJSON(w, 403, map[string]string{"error": "forbidden: tenant required"})
+		return
+	}
+
+	// Transactional update: row mutation + audit entry commit atomically;
+	// 404 when the box does not exist for this tenant.
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("[%s] handleUpdate begin tx failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(r.Context(),
+		`UPDATE deposit_boxes
+		 SET status = CASE WHEN $1 <> '' THEN $1 ELSE status END,
+		     renewal_date = CASE WHEN $2 <> '' THEN $2 ELSE renewal_date END,
+		     annual_rent = CASE WHEN $3 > 0 THEN $3 ELSE annual_rent END,
+		     updated_at = NOW()
+		 WHERE tenant_id = $4 AND box_number = $5`,
+		body.Status, body.RenewalDate, body.AnnualRent, tenantID, body.ID)
+	if err != nil {
+		log.Printf("[%s] handleUpdate update failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		respondJSON(w, 404, map[string]string{"error": "box not found: " + body.ID})
+		return
+	}
+	if err := insertAuditTx(tx, tenantID, "update", body.ID, body.UpdatedBy, "Box updated"); err != nil {
+		log.Printf("[%s] handleUpdate audit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[%s] handleUpdate commit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	box, err := loadDepositBox(r, tenantID, body.ID)
+	if err != nil {
+		log.Printf("[%s] handleUpdate reload failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"updated": true, "box": box})
 }
 
 func handleVacate(w http.ResponseWriter, r *http.Request) {
@@ -440,26 +584,57 @@ func handleVacate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	for i := range boxes {
-		if boxes[i].ID == body.ID {
-			boxes[i].CustomerName = ""
-			boxes[i].CustomerID = ""
-			boxes[i].RenewalDate = ""
-			boxes[i].Status = BoxStatusAvailable
-			boxes[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			appendAudit(AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "vacate",
-				RecordID: body.ID, Actor: body.UpdatedBy,
-				Timestamp: boxes[i].UpdatedAt, Details: "Box vacated",
-			})
-			respondJSON(w, 200, map[string]interface{}{"updated": true, "box": boxes[i]})
-			return
-		}
+	if !requireDB(w) {
+		return
 	}
-	respondJSON(w, 404, map[string]string{"error": "box not found: " + body.ID})
+	tenantID := tenantOf(r)
+	if tenantID == "" {
+		respondJSON(w, 403, map[string]string{"error": "forbidden: tenant required"})
+		return
+	}
+
+	// Transactional vacate: row mutation + audit entry commit atomically.
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		log.Printf("[%s] handleVacate begin tx failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(r.Context(),
+		`UPDATE deposit_boxes
+		 SET customer_name = '', assigned_customer = '', renewal_date = '',
+		     status = 'available', updated_at = NOW()
+		 WHERE tenant_id = $1 AND box_number = $2`,
+		tenantID, body.ID)
+	if err != nil {
+		log.Printf("[%s] handleVacate update failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		respondJSON(w, 404, map[string]string{"error": "box not found: " + body.ID})
+		return
+	}
+	if err := insertAuditTx(tx, tenantID, "vacate", body.ID, body.UpdatedBy, "Box vacated"); err != nil {
+		log.Printf("[%s] handleVacate audit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[%s] handleVacate commit failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	box, err := loadDepositBox(r, tenantID, body.ID)
+	if err != nil {
+		log.Printf("[%s] handleVacate reload failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"updated": true, "box": box})
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
@@ -467,25 +642,69 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
+	if !requireDB(w) {
+		return
+	}
+	tenantID := tenantOf(r)
+	if tenantID == "" {
+		respondJSON(w, 403, map[string]string{"error": "forbidden: tenant required"})
+		return
+	}
+	limit, offset := parsePageParams(r, 100, 500)
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT id, action, record_id, actor, details, created_at
+		 FROM deposit_box_audit WHERE tenant_id = $1
+		 ORDER BY created_at DESC, id LIMIT $2 OFFSET $3`,
+		tenantID, limit, offset)
+	if err != nil {
+		log.Printf("[%s] handleAudit query failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer rows.Close()
+	entries := []AuditEntry{}
+	for rows.Next() {
+		var e AuditEntry
+		var createdAt time.Time
+		if err := rows.Scan(&e.ID, &e.Action, &e.RecordID, &e.Actor, &e.Details, &createdAt); err != nil {
+			log.Printf("[%s] handleAudit scan failed: %v", serviceName, err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		e.Timestamp = createdAt.Format(time.RFC3339)
+		entries = append(entries, e)
+	}
+	var total int
+	if err := db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*) FROM deposit_box_audit WHERE tenant_id = $1`, tenantID).Scan(&total); err != nil {
+		log.Printf("[%s] handleAudit count failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"auditLog": entries, "total": total})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	stats := DepositBoxStats{}
-	for _, b := range boxes {
-		stats.TotalBoxes++
-		switch b.Status {
-		case BoxStatusOccupied:
-			stats.Occupied++
-		case BoxStatusAvailable:
-			stats.Available++
-		case BoxStatusMaintenance:
-			stats.Maintenance++
-		}
+	if !requireDB(w) {
+		return
+	}
+	tenantID := tenantOf(r)
+	if tenantID == "" {
+		respondJSON(w, 403, map[string]string{"error": "forbidden: tenant required"})
+		return
+	}
+	var stats DepositBoxStats
+	err := db.QueryRowContext(r.Context(),
+		`SELECT COUNT(*),
+		        COUNT(*) FILTER (WHERE status = 'occupied'),
+		        COUNT(*) FILTER (WHERE status = 'available'),
+		        COUNT(*) FILTER (WHERE status = 'maintenance')
+		 FROM deposit_boxes WHERE tenant_id = $1`, tenantID).
+		Scan(&stats.TotalBoxes, &stats.Occupied, &stats.Available, &stats.Maintenance)
+	if err != nil {
+		log.Printf("[%s] handleStats query failed: %v", serviceName, err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
 	}
 	respondJSON(w, 200, stats)
 }
@@ -572,6 +791,10 @@ func initDB() {
 		return
 	}
 	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	// Boot-time schema + idempotent seeds (c3-0301): deposit_boxes and
+	// deposit_box_audit are created idempotently; without them every business
+	// handler would fail closed (503 persistence_unavailable).
+	initSchema()
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -1072,6 +1295,68 @@ func initSchema() {
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_cards_created ON cards(created_at DESC)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
+
+	// ── Safe-deposit domain store (c3-0301, C3-P2-B5-go-2) ─────────────────
+	// deposit_boxes: durable box inventory keyed by (tenant, branch, box
+	// number); payload jsonb carries future extension attributes. Box numbers
+	// come from deposit_box_number_seq (starts past the seed range).
+	if _, err := db.Exec(`CREATE SEQUENCE IF NOT EXISTS deposit_box_number_seq START 7`); err != nil {
+		log.Fatalf("schema init (deposit_box_number_seq) failed: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS deposit_boxes (
+		tenant_id TEXT NOT NULL,
+		branch TEXT NOT NULL,
+		box_number TEXT NOT NULL,
+		box_size TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'available',
+		assigned_customer TEXT NOT NULL DEFAULT '',
+		customer_name TEXT NOT NULL DEFAULT '',
+		annual_rent DOUBLE PRECISION NOT NULL DEFAULT 0,
+		currency TEXT NOT NULL DEFAULT 'NGN',
+		renewal_date TEXT NOT NULL DEFAULT '',
+		payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		PRIMARY KEY (tenant_id, branch, box_number)
+	)`); err != nil {
+		log.Fatalf("schema init (deposit_boxes) failed: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS deposit_box_audit (
+		id TEXT PRIMARY KEY,
+		tenant_id TEXT NOT NULL,
+		action TEXT NOT NULL,
+		record_id TEXT NOT NULL,
+		actor TEXT NOT NULL DEFAULT '',
+		details TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Fatalf("schema init (deposit_box_audit) failed: %v", err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_deposit_boxes_tenant_status ON deposit_boxes(tenant_id, status)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_deposit_box_audit_tenant ON deposit_box_audit(tenant_id, created_at DESC)`)
+
+	// Idempotent seed of the original demonstration inventory under the
+	// 'default' tenant (matches the pre-PG in-memory seed set).
+	seeds := []struct {
+		boxNumber, boxSize, customerName, customerID, branch, renewalDate, status, createdAt string
+		annualRent                                                                           float64
+	}{
+		{"BOX-0001", "small", "Adebayo Okafor", "CUST-1001", "Lagos Island", "2027-01-15", "occupied", "2025-01-15T09:00:00Z", 45000},
+		{"BOX-0002", "medium", "Ngozi Eze", "CUST-1002", "Abuja Central", "2027-03-20", "occupied", "2025-03-20T10:30:00Z", 80000},
+		{"BOX-0003", "large", "", "", "Port Harcourt", "", "available", "2025-02-01T08:00:00Z", 120000},
+		{"BOX-0004", "small", "", "", "Lagos Island", "", "maintenance", "2025-04-10T11:00:00Z", 45000},
+		{"BOX-0005", "medium", "Emeka Chukwu", "CUST-1003", "Enugu", "2026-11-30", "occupied", "2025-11-30T14:00:00Z", 80000},
+		{"BOX-0006", "large", "", "", "Abuja Central", "", "available", "2025-06-15T10:00:00Z", 120000},
+	}
+	for _, s := range seeds {
+		if _, err := db.Exec(`INSERT INTO deposit_boxes
+			(tenant_id, branch, box_number, box_size, status, assigned_customer, customer_name, annual_rent, currency, renewal_date, created_at, updated_at)
+			VALUES ('default', $1, $2, $3, $4, $5, $6, $7, 'NGN', $8, $9, $9)
+			ON CONFLICT (tenant_id, branch, box_number) DO NOTHING`,
+			s.branch, s.boxNumber, s.boxSize, s.status, s.customerID, s.customerName, s.annualRent, s.renewalDate, s.createdAt); err != nil {
+			log.Printf("seed deposit_boxes %s (may already exist): %v", s.boxNumber, err)
+		}
+	}
 }
 
 func domainHandler(w http.ResponseWriter, r *http.Request) {
@@ -1154,8 +1439,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO cards (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1163,10 +1455,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"cards.created", id, string(payload))
+		"cards.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1203,7 +1505,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE cards SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1211,25 +1520,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"cards.updated", id, string(payload))
+		"cards.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE cards SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"cards.deleted", id, `{"id":"`+id+`"}`)
+		"cards.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1521,17 +1859,17 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "manage", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/safe-deposit/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
-	mux.Handle("/v1/safe-deposit/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
-	mux.Handle("/v1/safe-deposit/assign", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAssign)))
-	mux.Handle("/v1/safe-deposit/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
-	mux.Handle("/v1/safe-deposit/vacate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleVacate)))
-	mux.Handle("/v1/safe-deposit/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
-	mux.Handle("/v1/safe-deposit/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
-	mux.Handle("/v1/safe-deposit/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
+	mux.Handle("/v1/safe-deposit/list", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "view", http.HandlerFunc(handleList))))
+	mux.Handle("/v1/safe-deposit/create", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "create", http.HandlerFunc(handleCreate))))
+	mux.Handle("/v1/safe-deposit/assign", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "assign", http.HandlerFunc(handleAssign))))
+	mux.Handle("/v1/safe-deposit/update", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "update", http.HandlerFunc(handleUpdate))))
+	mux.Handle("/v1/safe-deposit/vacate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "vacate", http.HandlerFunc(handleVacate))))
+	mux.Handle("/v1/safe-deposit/process", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "process", http.HandlerFunc(handleProcess))))
+	mux.Handle("/v1/safe-deposit/audit", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "view", http.HandlerFunc(handleAudit))))
+	mux.Handle("/v1/safe-deposit/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("safe_deposit", "view", http.HandlerFunc(handleStats))))
 	log.Printf("Safe Deposit v2.0 (Payments) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1561,6 +1899,10 @@ func main() {
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+
+// listHandler is the historical handler name referenced by main_test.go; it
+// maps to the Postgres-backed safe-deposit list handler (c3-0301).
+func listHandler(w http.ResponseWriter, r *http.Request) { handleList(w, r) }
 
 // jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
 // scripts/fix-go-wire-jwt.py).

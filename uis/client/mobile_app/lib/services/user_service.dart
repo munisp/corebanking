@@ -31,7 +31,9 @@ class UserService {
 
         // Fetch and store account data
         try {
-          final accountResponse = await _apiService.get('${AppConfig.accountEndpoint}/keycloak_id=$keycloakId');
+          // W12-A4-P0-D: service route is GET /account/keycloak/{id} —
+          // '/keycloak_id=$keycloakId' never matched any route (404).
+          final accountResponse = await _apiService.get('${AppConfig.accountEndpoint}/keycloak/$keycloakId');
           
           if (accountResponse.statusCode == 200) {
             final accountData = accountResponse.data['account'];
@@ -106,7 +108,9 @@ class UserService {
 
     // Fetch and store account data
         try {
-          final accountResponse = await _apiService.get('${AppConfig.accountEndpoint}/keycloak_id=$keycloakId');
+          // W12-A4-P0-D: service route is GET /account/keycloak/{id} —
+          // '/keycloak_id=$keycloakId' never matched any route (404).
+          final accountResponse = await _apiService.get('${AppConfig.accountEndpoint}/keycloak/$keycloakId');
           
           if (accountResponse.statusCode == 200) {
             final accountData = accountResponse.data['account'];
@@ -171,8 +175,11 @@ class UserService {
     if (postalCode != null) data['postal_code'] = postalCode;
     if (dateOfBirth != null) data['date_of_birth'] = dateOfBirth;
 
+    // W12-A4A: was /auth/user (404 — auth-service served no /user route);
+    // backend handler created at auth-service /auth/user (api/v1/auth.py),
+    // gateway strips the first /auth segment → double-prefix convention.
     final response = await _apiService.put(
-      '${AppConfig.authEndpoint}/user?keycloak_id=$keycloakId',
+      '${AppConfig.authEndpoint}/auth/user?keycloak_id=$keycloakId',
       data: data,
     );
 

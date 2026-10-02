@@ -1,5 +1,11 @@
 // LC Amendment Lifecycle — Letter of Credit amendment workflow with SWIFT MT707 messaging
+//
+// W12-C3-P0: amendments were an in-memory array (lifecycle state lost on
+// restart). They are now Postgres-authoritative (lc_amendments) via the
+// server's drizzle pool; seeds inserted once, new amendments persist.
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeSeed, storeList, storeGet, storeInsert } from "./pgJsonStore";
+import { logger } from "./logger";
 
 interface LCAmendment {
   id: string;
@@ -21,7 +27,7 @@ interface LCAmendment {
   beneficiaryAcceptedAt: string | null;
 }
 
-const amendments: LCAmendment[] = [
+const AMENDMENT_SEED: LCAmendment[] = [
   {
     id: "AMND-001", lcNumber: "LC-2026-0042", amendmentNumber: 1,
     requestedBy: "Dangote Cement PLC", amendmentType: "amount_increase",
@@ -86,65 +92,93 @@ const LIFECYCLE_STAGES = [
   "beneficiary_accepted", "rejected", "cancelled"
 ];
 
+function ensure(): Promise<void> {
+  return ensureTables("lcAmendmentLifecycle", storeDDL("lc_amendments")).then(() =>
+    storeSeed("lc_amendments", AMENDMENT_SEED, () => ""),
+  );
+}
+
+function dbUnavailable(res: Response, err: unknown) {
+  logger.error("lcAmendmentLifecycle: database unavailable", { error: String(err) });
+  return res.status(503).json({ error: "lc_amendment_store_unavailable", message: "LC amendment store (Postgres) unavailable; refusing to serve in-memory data" });
+}
+
 export function registerLCAmendmentRoutes(app: Express): void {
   app.get("/api/platform/trade-finance/lc-amendments/lifecycle-stages", (_req: Request, res: Response) => {
     res.json({ stages: LIFECYCLE_STAGES, count: LIFECYCLE_STAGES.length });
   });
 
-  app.get("/api/platform/trade-finance/lc-amendments/stats", (_req: Request, res: Response) => {
-    const byStatus: Record<string, number> = {};
-    const byType: Record<string, number> = {};
-    let totalAmountImpact = 0;
-    for (const a of amendments) {
-      byStatus[a.status] = (byStatus[a.status] || 0) + 1;
-      byType[a.amendmentType] = (byType[a.amendmentType] || 0) + 1;
-      totalAmountImpact += a.impactOnAmount;
-    }
-    res.json({
-      total: amendments.length,
-      byStatus, byType, totalAmountImpact,
-      avgProcessingDays: 2.3,
-    });
+  app.get("/api/platform/trade-finance/lc-amendments/stats", async (_req: Request, res: Response) => {
+    try {
+      await ensure();
+      const amendments = await storeList<LCAmendment>("lc_amendments");
+      const byStatus: Record<string, number> = {};
+      const byType: Record<string, number> = {};
+      let totalAmountImpact = 0;
+      for (const a of amendments) {
+        byStatus[a.status] = (byStatus[a.status] || 0) + 1;
+        byType[a.amendmentType] = (byType[a.amendmentType] || 0) + 1;
+        totalAmountImpact += a.impactOnAmount;
+      }
+      res.json({
+        total: amendments.length,
+        byStatus, byType, totalAmountImpact,
+        avgProcessingDays: 2.3,
+      });
+    } catch (err) { dbUnavailable(res, err); }
   });
 
-  app.get("/api/platform/trade-finance/lc-amendments/by-lc/:lcNumber", (req: Request, res: Response) => {
-    const lcAmendments = amendments.filter(a => a.lcNumber === req.params.lcNumber);
-    res.json({ items: lcAmendments, total: lcAmendments.length, lcNumber: req.params.lcNumber });
+  app.get("/api/platform/trade-finance/lc-amendments/by-lc/:lcNumber", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const amendments = await storeList<LCAmendment>("lc_amendments");
+      const lcAmendments = amendments.filter(a => a.lcNumber === req.params.lcNumber);
+      res.json({ items: lcAmendments, total: lcAmendments.length, lcNumber: req.params.lcNumber });
+    } catch (err) { dbUnavailable(res, err); }
   });
 
-  app.get("/api/platform/trade-finance/lc-amendments", (_req: Request, res: Response) => {
-    res.json({ items: amendments, total: amendments.length });
+  app.get("/api/platform/trade-finance/lc-amendments", async (_req: Request, res: Response) => {
+    try { await ensure(); const items = await storeList<LCAmendment>("lc_amendments"); res.json({ items, total: items.length }); }
+    catch (err) { dbUnavailable(res, err); }
   });
 
-  app.post("/api/platform/trade-finance/lc-amendments", (req: Request, res: Response) => {
-    const { lcNumber, requestedBy, amendmentType, description, originalValue, amendedValue, impactOnAmount, currency } = req.body;
-    if (!lcNumber || !amendmentType || !description) {
-      return res.status(400).json({ error: "lcNumber, amendmentType, and description are required" });
-    }
-    const validTypes = ["amount_increase", "amount_decrease", "expiry_extension", "document_change", "partial_shipment", "beneficiary_change", "port_change", "terms_change"];
-    if (!validTypes.includes(amendmentType)) {
-      return res.status(400).json({ error: `Invalid amendment type. Valid: ${validTypes.join(", ")}` });
-    }
-    const existingForLC = amendments.filter(a => a.lcNumber === lcNumber);
-    const newAmendment: LCAmendment = {
-      id: `AMND-${String(amendments.length + 1).padStart(3, "0")}`,
-      lcNumber, amendmentNumber: existingForLC.length + 1,
-      requestedBy: requestedBy || "Unknown",
-      amendmentType, description,
-      originalValue: originalValue || "", amendedValue: amendedValue || "",
-      impactOnAmount: impactOnAmount || 0, currency: currency || "USD",
-      swiftRef: `MT707-AMND-${String(amendments.length + 1).padStart(3, "0")}-2026`,
-      status: "pending_approval",
-      requestedAt: new Date().toISOString(),
-      approvedAt: null, issuedAt: null, advisedAt: null, beneficiaryAcceptedAt: null,
-    };
-    amendments.push(newAmendment);
-    res.status(201).json(newAmendment);
+  app.post("/api/platform/trade-finance/lc-amendments", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const { lcNumber, requestedBy, amendmentType, description, originalValue, amendedValue, impactOnAmount, currency } = req.body;
+      if (!lcNumber || !amendmentType || !description) {
+        return res.status(400).json({ error: "lcNumber, amendmentType, and description are required" });
+      }
+      const validTypes = ["amount_increase", "amount_decrease", "expiry_extension", "document_change", "partial_shipment", "beneficiary_change", "port_change", "terms_change"];
+      if (!validTypes.includes(amendmentType)) {
+        return res.status(400).json({ error: `Invalid amendment type. Valid: ${validTypes.join(", ")}` });
+      }
+      const amendments = await storeList<LCAmendment>("lc_amendments");
+      const existingForLC = amendments.filter(a => a.lcNumber === lcNumber);
+      const newAmendment: LCAmendment = {
+        id: `AMND-${String(amendments.length + 1).padStart(3, "0")}-${Date.now()}`,
+        lcNumber, amendmentNumber: existingForLC.length + 1,
+        requestedBy: requestedBy || "Unknown",
+        amendmentType, description,
+        originalValue: originalValue || "", amendedValue: amendedValue || "",
+        impactOnAmount: impactOnAmount || 0, currency: currency || "USD",
+        swiftRef: `MT707-AMND-${String(amendments.length + 1).padStart(3, "0")}-${Date.now()}`,
+        status: "pending_approval",
+        requestedAt: new Date().toISOString(),
+        approvedAt: null, issuedAt: null, advisedAt: null, beneficiaryAcceptedAt: null,
+      };
+      // W12-C3-P0: amendment creation now persists (was memory-only).
+      await storeInsert("lc_amendments", "", newAmendment);
+      res.status(201).json(newAmendment);
+    } catch (err) { dbUnavailable(res, err); }
   });
 
-  app.get("/api/platform/trade-finance/lc-amendments/:id", (req: Request, res: Response) => {
-    const amnd = amendments.find(a => a.id === req.params.id);
-    if (!amnd) return res.status(404).json({ error: "Amendment not found" });
-    res.json(amnd);
+  app.get("/api/platform/trade-finance/lc-amendments/:id", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const amnd = await storeGet<LCAmendment>("lc_amendments", req.params.id);
+      if (!amnd) return res.status(404).json({ error: "Amendment not found" });
+      res.json(amnd);
+    } catch (err) { dbUnavailable(res, err); }
   });
 }

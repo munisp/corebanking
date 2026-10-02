@@ -2,11 +2,22 @@
 use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+// W12-RUSTFIX-2: statics referenced by rl_allow()/metrics()/handlers but never
+// emitted by the generator (E0425). Pre-B1 per-replica token bucket shape
+// (this crate is not covered by W12-C3P1B1's redis limiter).
+static RL_TOKENS: AtomicU64 = AtomicU64::new(100);
+static RL_LAST: AtomicU64 = AtomicU64::new(0);
+static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -260,7 +271,7 @@ async fn check_jwt(req: &actix_web::HttpRequest) -> Result<serde_json::Value, ac
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
@@ -333,13 +344,12 @@ fn call_service_sync(url: &str, payload: &str) -> Result<String, String> {
 }
 
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
+    // W12-RUSTFIX-2: flush via shared sqlx pool (AppState.db; the referenced
+    // db_client/records fields were never emitted on AppState — E0609).
     let id = format!("{}_{}_{}", "falkordb-coa-rs".replace("-","_"), endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let svc = String::from("falkordb-coa-rs");
-    if let Some(client) = &state.db_client {
-        let _ = client.execute("INSERT INTO records (id,service,tenant,status,data,created_at) VALUES ($1,$2,'default','active',$3,NOW()) ON CONFLICT (id) DO UPDATE SET data=$3", &[&id, &svc, &data.to_string()]).await;
-    } else {
-        state.records.lock().unwrap().push(json!({"id": id, "service": svc, "data": data}));
-    }
+    let _ = sqlx::query("INSERT INTO records (id,service,tenant,status,data,created_at) VALUES ($1,$2,'default','active',$3,NOW()) ON CONFLICT (id) DO UPDATE SET data=$3")
+        .bind(&id).bind(&svc).bind(data.to_string()).execute(&state.db).await;
 }
 
 
@@ -381,7 +391,7 @@ async fn graph_query(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     db_persist(&state, "graph_query", &input).await;
     let upstream = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
     { // Wave-11: fire-and-forget upstream call (was awaited-and-discarded)
-        let (w11_url, w11_body) = ((format!("{}/v1/notify", upstream)).to_string(), (format!(r#"{"source": "falkordb-coa-rs", "action": "graph_query"}"#)).to_string());
+        let (w11_url, w11_body) = ((format!("{}/v1/notify", upstream)).to_string(), (format!(r#"{{"source": "falkordb-coa-rs", "action": "graph_query"}}"#)).to_string());
         tokio::spawn(async move {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(3),
                 tokio::task::spawn_blocking(move || call_service_sync(&w11_url, &w11_body))).await;
@@ -411,6 +421,7 @@ async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, 
     let _ = sanitize_input("");
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "service_config", "create").await { return resp; } // W12-B5D1
     db_persist(&state, "create", &body.into_inner()).await;
     HttpResponse::Created().json(json!({"created": true}))
 }
@@ -510,7 +521,30 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[falkordb-coa-rs] starting");
 
-    let state = web::Data::new(AppState { records: Mutex::new(Vec::new()), db_url, db_client });
+    // W12-RUSTFIX-2: main() never initialised port/db/state (generator-truncated;
+    // baseline did not compile). Fleet-canonical init (same shape as W12-RUSTFIX's
+    // agri-iot-sensor-rs main); fleet port 8504 per infrastructure/new/k8s/services/falkordb-coa-rs.yaml.
+    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8504);
+    let db: sqlx::PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("falkordb-coa-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[falkordb-coa-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[falkordb-coa-rs] DATABASE_URL not set — DB endpoints will fail");
+            sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+        }
+    };
+    let state = web::Data::new(AppState { db });
     println!("falkordb-coa-rs listening on port {}", port);
     start_grpc_server("falkordb-coa-rs", 10478);
     HttpServer::new(move || {
@@ -525,7 +559,7 @@ async fn main() -> std::io::Result<()> {
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
+            .route("/readyz", web::get().to(ready))
             .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
             .service(web::resource("/api/v1/service_configs").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::get().to(list_records)))
@@ -554,23 +588,33 @@ mod tests {
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "service_config", "update").await { return resp; } // W12-B5D1
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -579,19 +623,86 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "service_config", "delete").await { return resp; } // W12-B5D1
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }
+
+// W12-RUSTFIX-2: synthesized canonical handlers — route registrations in main()
+// referenced list_records/get_record but the generator never emitted them
+// (baseline did not compile). Fleet-canonical shape against service_records
+// (same pattern as W12-RUSTFIX's synthesized handlers, e.g. fx-rates-engine-rs).
+async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
+    let offset = (page - 1) * limit;
+    match sqlx::query(
+        "SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+    )
+    .bind("falkordb_coa_rs")
+    .bind(limit as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.db)
+    .await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+                json!({
+                    "id": r.get::<String, _>(0),
+                    "service": r.get::<String, _>(1),
+                    "type": r.get::<String, _>(2),
+                    "status": r.get::<String, _>(3),
+                    "data": r.get::<serde_json::Value, _>(4),
+                })
+            }).collect();
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_records WHERE service = $1")
+                .bind("falkordb_coa_rs").fetch_one(&state.db).await.unwrap_or(0);
+            HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "database"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_records WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<String, _>("id"),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

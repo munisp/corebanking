@@ -1,7 +1,24 @@
 /**
  * Collateral management — pledges, valuations, liens, and coverage tracking.
  * Supports property, vehicle, equipment, inventory, securities, and cash collateral.
+ *
+ * W12-C3-P2-MLIB (c3-1006): the 'collaterals' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `collaterals`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "collaterals";
+
+async function ensureCollateralsStore(): Promise<void> {
+  await ensureTables("ensureCollateralsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, COLLATERALS_SEED, () => "");
+}
+
 
 export interface Collateral {
   id: string;
@@ -25,7 +42,8 @@ export interface Collateral {
   insuranceExpiry?: string;
 }
 
-const collaterals: Collateral[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const COLLATERALS_SEED: Collateral[]  = [
   { id: "COL-001", type: "property", description: "3-Bedroom Duplex, Lekki Phase 1, Lagos", ownerId: "CUST-003", ownerName: "Zenith Construction Ltd", linkedLoanId: "LN-003", marketValue: 150_000_000, forcedSaleValue: 105_000_000, haircut: 30, netCollateralValue: 105_000_000, loanExposure: 80_000_000, coverageRatio: 131.25, currency: "NGN", valuationDate: "2026-01-15", nextValuationDue: "2027-01-15", status: "active", registrationRef: "LAGOS/LK1/2026/001", insured: true, insuranceExpiry: "2027-01-15" },
   { id: "COL-002", type: "vehicle", description: "Toyota Hilux 2025 (fleet of 5)", ownerId: "CUST-003", ownerName: "Zenith Construction Ltd", linkedLoanId: "LN-003", marketValue: 75_000_000, forcedSaleValue: 52_500_000, haircut: 30, netCollateralValue: 52_500_000, loanExposure: 80_000_000, coverageRatio: 65.63, currency: "NGN", valuationDate: "2026-02-01", nextValuationDue: "2026-08-01", status: "active", registrationRef: "FMVR/2026/ABJ/5512", insured: true, insuranceExpiry: "2027-02-01" },
   { id: "COL-003", type: "securities", description: "FGN Bond 14.55% 2029 (N500M face)", ownerId: "CUST-010", ownerName: "Pinnacle Holdings Ltd", linkedLoanId: "LN-010", marketValue: 520_000_000, forcedSaleValue: 494_000_000, haircut: 5, netCollateralValue: 494_000_000, loanExposure: 400_000_000, coverageRatio: 123.5, currency: "NGN", valuationDate: "2026-05-01", nextValuationDue: "2026-06-01", status: "active", insured: false },
@@ -35,9 +53,12 @@ const collaterals: Collateral[] = [
   { id: "COL-007", type: "guarantee", description: "Corporate Guarantee — Dangote Industries", ownerId: "CUST-012", ownerName: "Dangote Cement PLC", linkedLoanId: "LN-012", marketValue: 1_000_000_000, forcedSaleValue: 800_000_000, haircut: 20, netCollateralValue: 800_000_000, loanExposure: 500_000_000, coverageRatio: 160.0, currency: "NGN", valuationDate: "2026-01-01", nextValuationDue: "2027-01-01", status: "active", insured: false },
 ];
 
-export function getCollaterals() { return collaterals; }
+export async function getCollaterals(): Promise<Collateral[]> {
+  return pgGuard((async () => { await ensureCollateralsStore(); return storeList<Collateral>(TABLE); })());
+}
 
-export function getCollateralSummary() {
+export async function getCollateralSummary() {
+  const collaterals = await getCollaterals();
   const byType: Record<string, { count: number; totalValue: number }> = {};
   let totalMarketValue = 0;
   let totalExposure = 0;

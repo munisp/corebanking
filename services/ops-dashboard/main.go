@@ -178,7 +178,6 @@ type OpsDashboard struct {
 	manuals       []ManualAdjustment
 	disputes      []DisputeCase
 	receipts      []WarehouseReceiptCase
-	settlements   []PartnerSettlement
 	serviceHealth map[string]ServiceHealth
 	activeAlerts  []Alert
 	promClient    *PrometheusClient
@@ -199,7 +198,6 @@ func NewOpsDashboard(config *Config) *OpsDashboard {
 		manuals:       []ManualAdjustment{},
 		disputes:      []DisputeCase{},
 		receipts:      []WarehouseReceiptCase{},
-		settlements:   []PartnerSettlement{},
 		serviceHealth: make(map[string]ServiceHealth),
 		activeAlerts:  []Alert{},
 		promClient:    NewPrometheusClient(config.PrometheusURL),
@@ -209,11 +207,37 @@ func NewOpsDashboard(config *Config) *OpsDashboard {
 	od.smokeDB = openSmokeDB(config.PostgresURL)
 	if od.smokeDB != nil {
 		log.Printf("smoke-results DB connected")
+		// Partner settlements are Postgres-authoritative (wave-12 C3-P0-B7,
+		// reusing this service's existing pool — b1 REUSE-POOL). The
+		// in-memory settlements slice was removed: list is served from PG and
+		// release is a transactional UPDATE ... RETURNING (idempotent —
+		// re-releasing the same settlement_id converges to the stored row).
+		if _, err := od.smokeDB.Exec(partnerSettlementsDDL); err != nil {
+			log.Printf("partner_settlements DDL failed: %v — settlement endpoints fail-closed", err)
+			od.smokeDB = nil
+		}
 	} else {
 		log.Printf("smoke-results DB not available (DATABASE_URL not set or unreachable)")
 	}
 	return od
 }
+
+const partnerSettlementsDDL = `
+CREATE TABLE IF NOT EXISTS partner_settlements (
+    settlement_id text PRIMARY KEY,
+    tenant_id     text NOT NULL DEFAULT '',
+    partner_type  text NOT NULL DEFAULT '',
+    partner_name  text NOT NULL DEFAULT '',
+    amount        double precision NOT NULL DEFAULT 0,
+    currency      text NOT NULL DEFAULT 'NGN',
+    status        text NOT NULL DEFAULT 'pending',
+    expected_at   timestamptz,
+    reference     text NOT NULL DEFAULT '',
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_partner_settlements_status ON partner_settlements (status);
+`
 
 // refreshHealthAndAlerts fetches live service health and alerts.
 //
@@ -397,7 +421,7 @@ func (od *OpsDashboard) getOverview(c *gin.Context) {
 			"warehouse_receipts":  len(od.receipts),
 			"manual_adjustments":  len(od.manuals),
 			"disputes":            len(od.disputes),
-			"partner_settlements": len(od.settlements),
+			"partner_settlements": od.partnerSettlementCount(),
 		},
 	})
 }
@@ -571,31 +595,80 @@ func (od *OpsDashboard) advanceWarehouseReceipt(c *gin.Context) {
 
 func (od *OpsDashboard) listPartnerSettlements(c *gin.Context) {
 	status := strings.TrimSpace(c.Query("status"))
-	od.mutex.RLock()
-	defer od.mutex.RUnlock()
-	items := make([]PartnerSettlement, 0, len(od.settlements))
-	for _, settlement := range od.settlements {
-		if status != "" && settlement.Status != status {
-			continue
-		}
-		items = append(items, settlement)
+	if od.smokeDB == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "postgres unavailable — fail-closed"})
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"settlements": items, "total": len(items)})
+	q := `SELECT settlement_id, partner_type, partner_name, amount, currency, status, expected_at, reference FROM partner_settlements`
+	args := []interface{}{}
+	if status != "" {
+		q += ` WHERE status = $1`
+		args = append(args, status)
+	}
+	q += ` ORDER BY created_at, settlement_id`
+	rows, err := od.smokeDB.QueryContext(c.Request.Context(), q, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list failed: " + err.Error()})
+		return
+	}
+	defer rows.Close()
+	items := make([]PartnerSettlement, 0)
+	for rows.Next() {
+		var s PartnerSettlement
+		var expectedAt sql.NullTime
+		if err := rows.Scan(&s.SettlementID, &s.PartnerType, &s.PartnerName, &s.Amount, &s.Currency, &s.Status, &expectedAt, &s.Reference); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "list failed: " + err.Error()})
+			return
+		}
+		if expectedAt.Valid {
+			s.ExpectedAt = expectedAt.Time
+		}
+		items = append(items, s)
+	}
+	c.JSON(http.StatusOK, gin.H{"settlements": items, "total": len(items), "source": "postgres"})
 }
 
 func (od *OpsDashboard) releasePartnerSettlement(c *gin.Context) {
 	id := c.Param("id")
-	od.mutex.Lock()
-	defer od.mutex.Unlock()
-	for idx, settlement := range od.settlements {
-		if settlement.SettlementID == id {
-			od.settlements[idx].Status = "released"
-			od.settlements[idx].ExpectedAt = time.Now().UTC()
-			c.JSON(http.StatusOK, gin.H{"settlement": od.settlements[idx]})
-			return
-		}
+	if od.smokeDB == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "postgres unavailable — fail-closed"})
+		return
 	}
-	c.JSON(http.StatusNotFound, gin.H{"error": "settlement not found"})
+	// Idempotent release: settlement_id is the primary key; a retried release
+	// UPDATE converges to the same stored row (no duplicate side effects).
+	var s PartnerSettlement
+	var expectedAt sql.NullTime
+	err := od.smokeDB.QueryRowContext(c.Request.Context(),
+		`UPDATE partner_settlements SET status = 'released', expected_at = now(), updated_at = now()
+		 WHERE settlement_id = $1
+		 RETURNING settlement_id, partner_type, partner_name, amount, currency, status, expected_at, reference`, id).
+		Scan(&s.SettlementID, &s.PartnerType, &s.PartnerName, &s.Amount, &s.Currency, &s.Status, &expectedAt, &s.Reference)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "settlement not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "release failed: " + err.Error()})
+		return
+	}
+	if expectedAt.Valid {
+		s.ExpectedAt = expectedAt.Time
+	}
+	c.JSON(http.StatusOK, gin.H{"settlement": s})
+}
+
+// partnerSettlementCount reports the durable queue depth from PG (0 when PG
+// is unavailable — the dashboard summary is best-effort, unlike the
+// settlement endpoints which fail closed).
+func (od *OpsDashboard) partnerSettlementCount() int {
+	if od.smokeDB == nil {
+		return 0
+	}
+	var n int
+	if err := od.smokeDB.QueryRow(`SELECT count(*) FROM partner_settlements`).Scan(&n); err != nil {
+		return 0
+	}
+	return n
 }
 
 func firstNonEmpty(values ...string) string {

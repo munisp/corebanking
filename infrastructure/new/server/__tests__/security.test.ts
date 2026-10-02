@@ -50,13 +50,16 @@ describe("PII Encryption (production lib/securityHardening)", () => {
 });
 
 describe("Brute-force Tracking (production lib/securityHardening)", () => {
-  it("recordLoginAttempt does not throw on failure or success paths", () => {
+  // W12 C3-P1-B2 (c3-1027): the tracker is redis-backed (failed_login:* keys).
+  // Integration test against a REAL redis (REDIS_URL) — no mock redis —
+  // skipped when no redis is configured.
+  it.skipIf(!process.env.REDIS_URL)("recordLoginAttempt does not throw on failure or success paths", async () => {
     const ip = "198.51.100.77";
     // Five failures (the lockout threshold) must be recorded without error.
     for (let i = 0; i < 5; i++) {
-      expect(() => recordLoginAttempt(ip, false)).not.toThrow();
+      await expect(recordLoginAttempt(ip, false)).resolves.not.toThrow();
     }
     // A success clears the record.
-    expect(() => recordLoginAttempt(ip, true)).not.toThrow();
+    await expect(recordLoginAttempt(ip, true)).resolves.not.toThrow();
   });
 });

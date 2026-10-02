@@ -1,5 +1,22 @@
 // Cheque Imaging & Truncation — Digital cheque processing with MICR/OCR and image-based clearing
+//
+// W12-C3-P2-MLIB (c3-0976): the cheque-image registry was module process
+// memory (lost on restart, divergent across replicas). Now Postgres-authoritative
+// (table `cheque_images`) via lib/pgJsonStore.ts; fail-closed 503 on PG outage,
+// no degraded-memory fallback.
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const TABLE = "cheque_images";
+
+async function loadChequeImages(): Promise<ChequeImage[]> {
+  return pgGuard((async () => {
+    await ensureTables("chequeImaging", storeDDL(TABLE));
+    await storeSeed(TABLE, CHEQUE_IMAGES_SEED, () => "");
+    return storeList<ChequeImage>(TABLE);
+  })());
+}
 
 interface ChequeImage {
   id: string;
@@ -25,7 +42,8 @@ interface ChequeImage {
   processedBy: string;
 }
 
-const chequeImages: ChequeImage[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const CHEQUE_IMAGES_SEED: ChequeImage[] = [
   {
     id: "CHQ-IMG-001", chequeNumber: "000145", bankCode: "058", branchCode: "001",
     accountNumber: "0012345678", amount: 2500000, currency: "NGN",
@@ -89,17 +107,20 @@ const chequeImages: ChequeImage[] = [
 ];
 
 export function registerChequeImagingRoutes(app: Express): void {
-  app.get("/api/platform/cheque-imaging/images", (_req: Request, res: Response) => {
+  app.get("/api/platform/cheque-imaging/images", asyncRoute(async (_req: Request, res: Response) => {
+    const chequeImages = await loadChequeImages();
     res.json({ items: chequeImages, total: chequeImages.length });
-  });
+  }));
 
-  app.get("/api/platform/cheque-imaging/images/:id", (req: Request, res: Response) => {
+  app.get("/api/platform/cheque-imaging/images/:id", asyncRoute(async (req: Request, res: Response) => {
+    const chequeImages = await loadChequeImages();
     const img = chequeImages.find(c => c.id === req.params.id);
     if (!img) return res.status(404).json({ error: "Cheque image not found" });
     res.json(img);
-  });
+  }));
 
-  app.get("/api/platform/cheque-imaging/stats", (_req: Request, res: Response) => {
+  app.get("/api/platform/cheque-imaging/stats", asyncRoute(async (_req: Request, res: Response) => {
+    const chequeImages = await loadChequeImages();
     const cleared = chequeImages.filter(c => c.clearingStatus === "cleared").length;
     const returned = chequeImages.filter(c => c.clearingStatus === "returned").length;
     const pending = chequeImages.filter(c => c.clearingStatus === "pending").length;
@@ -115,7 +136,7 @@ export function registerChequeImagingRoutes(app: Express): void {
       amountMismatches, signatureFailures, totalClearedValue: totalValue,
       clearingRates: { t0: pending, t1: cleared + returned, t2: manualReview },
     });
-  });
+  }));
 
   app.post("/api/platform/cheque-imaging/validate-micr", (req: Request, res: Response) => {
     const { micrLine } = req.body;

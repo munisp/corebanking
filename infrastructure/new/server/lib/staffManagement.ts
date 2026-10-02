@@ -1,6 +1,23 @@
 /**
  * Staff/role management — employees, roles, permissions, branches, dual control.
+ *
+ * W12-C3-P2-MLIB (c3-0971): the 'staff' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `staff`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "staff";
+
+async function ensureStaffStore(): Promise<void> {
+  await ensureTables("ensureStaffStore", storeDDL(TABLE));
+  await storeSeed(TABLE, STAFF_SEED, () => "");
+}
+
 
 export interface StaffMember {
   id: string;
@@ -17,7 +34,8 @@ export interface StaffMember {
   supervisorId?: string;
 }
 
-const staff: StaffMember[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const STAFF_SEED: StaffMember[] = [
   { id: "STF-001", employeeId: "E-1001", fullName: "Adebayo Ogundimu", email: "a.ogundimu@54bank.ng", role: "Branch Manager", department: "Retail Banking", branch: "Lagos Island", status: "active", permissions: ["account.create", "account.approve", "loan.approve", "teller.supervise", "report.generate"], lastLogin: "2026-05-09T08:00:00Z", mfaEnabled: true },
   { id: "STF-002", employeeId: "E-1002", fullName: "Halima Yusuf", email: "h.yusuf@54bank.ng", role: "Head Teller", department: "Operations", branch: "Lagos Island", status: "active", permissions: ["teller.cash_in", "teller.cash_out", "teller.vault_access", "teller.eod_reconcile"], lastLogin: "2026-05-09T07:30:00Z", mfaEnabled: true, supervisorId: "STF-001" },
   { id: "STF-003", employeeId: "E-1003", fullName: "Chinedu Okafor", email: "c.okafor@54bank.ng", role: "Teller", department: "Operations", branch: "Lagos Island", status: "active", permissions: ["teller.cash_in", "teller.cash_out"], lastLogin: "2026-05-09T07:45:00Z", mfaEnabled: true, supervisorId: "STF-002" },
@@ -28,9 +46,12 @@ const staff: StaffMember[] = [
   { id: "STF-008", employeeId: "E-5001", fullName: "Fatima Aliyu", email: "f.aliyu@54bank.ng", role: "Branch Manager", department: "Retail Banking", branch: "Kano Central", status: "on_leave", permissions: ["account.create", "account.approve", "loan.approve", "teller.supervise", "report.generate"], lastLogin: "2026-05-05T08:00:00Z", mfaEnabled: true },
 ];
 
-export function getStaff() { return staff; }
+export async function getStaff(): Promise<StaffMember[]> {
+  return pgGuard((async () => { await ensureStaffStore(); return storeList<StaffMember>(TABLE); })());
+}
 
-export function getStaffStats() {
+export async function getStaffStats() {
+  const staff = await getStaff();
   const byRole: Record<string, number> = {};
   const byBranch: Record<string, number> = {};
   const byStatus: Record<string, number> = {};

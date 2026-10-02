@@ -12,7 +12,7 @@ export default function AIFraudDetectionWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/aml-alerts/count")
+    fetch("/api/db/aml-alerts/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

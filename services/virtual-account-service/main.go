@@ -125,11 +125,12 @@ type VANAllocation struct {
 
 // VirtualAccountService manages virtual accounts
 type VirtualAccountService struct {
-	mu             sync.RWMutex
-	accounts       map[string]*VirtualAccount // VAN -> Account
-	accountsByID   map[string]*VirtualAccount // ID -> Account
-	payments       map[string]*VANPayment
-	allocations    map[string]*VANAllocation
+	mu sync.RWMutex
+	// W12-C3-P2-B2 (GO-SVC-FIELD-MAPS): the accounts / accountsByID /
+	// payments / allocations maps (register items main.go:129-132) were
+	// removed. Domain state is served from PostgreSQL (virtual_accounts,
+	// van_payments, van_allocations — repository.go). TigerBeetle remains the
+	// balance-of-record; TotalReceived/PaymentCount are reconciled counters.
 	bankPrefixes   map[string]string // BankID -> Prefix
 	tigerBeetleURL string
 	nibssURL       string
@@ -172,6 +173,12 @@ func initDedupStore() *sql.DB {
 		log.Printf("[virtual-account-service] dedup table init failed: %v", err)
 		return nil
 	}
+	// W12-C3-P2-B2: domain tables (virtual_accounts, van_payments,
+	// van_allocations) on the same handle.
+	if err := initVanDomainStore(db); err != nil {
+		log.Printf("[virtual-account-service] domain table init failed: %v", err)
+		return nil
+	}
 	return db
 }
 
@@ -184,10 +191,6 @@ func NewVirtualAccountService() *VirtualAccountService {
 	secretKey := getEnv("NIBSS_SECRET_KEY", "sandbox-secret")
 
 	return &VirtualAccountService{
-		accounts:       make(map[string]*VirtualAccount),
-		accountsByID:   make(map[string]*VirtualAccount),
-		payments:       make(map[string]*VANPayment),
-		allocations:    make(map[string]*VANAllocation),
 		bankPrefixes:   make(map[string]string),
 		tigerBeetleURL: tigerBeetleURL,
 		nibssURL:       nibssURL,
@@ -271,14 +274,13 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 		return nil, err
 	}
 
-	// GCM-102: hold s.mu ONLY for in-memory map updates — all RPC/HTTP
-	// (TigerBeetle, NIBSS, lakehouse) run after the lock is released.
-	s.mu.Lock()
+	// W12-C3-P2-B2: VAN generation + account insert run against PG
+	// (UNIQUE(van) constraint is the collision guard); TigerBeetle, NIBSS and
+	// lakehouse side effects run after the row is persisted.
 
 	// Generate unique VAN
 	van, err := s.generateVAN(req.BankID)
 	if err != nil {
-		s.mu.Unlock()
 		return nil, fmt.Errorf("failed to generate VAN: %w", err)
 	}
 
@@ -312,10 +314,12 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 		UpdatedAt:       now,
 	}
 
-	// Store account
-	s.accounts[van] = account
-	s.accountsByID[account.ID] = account
-	s.mu.Unlock()
+	// Store account (PG, idempotent on id; UNIQUE(van) rejects collisions)
+	storeCtx, cancel := vanCtx()
+	defer cancel()
+	if err := saveAccount(storeCtx, s.db, account); err != nil {
+		return nil, fmt.Errorf("failed to persist virtual account: %w", err)
+	}
 
 	// Escrow VANs need a dedicated holding account in TigerBeetle.
 	// All other purposes credit the parent account directly on payment, so no sub-account is needed.
@@ -346,13 +350,17 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 
 // generateVAN generates a unique 10-digit NUBAN-format virtual account number
 func (s *VirtualAccountService) generateVAN(bankID string) (string, error) {
-	// Get or create bank prefix (first 3 digits)
+	// Get or create bank prefix (first 3 digits). s.mu guards bankPrefixes
+	// (the only remaining in-memory field; domain maps were removed in
+	// W12-C3-P2-B2).
+	s.mu.Lock()
 	prefix, ok := s.bankPrefixes[bankID]
 	if !ok {
 		// Generate a unique prefix for this bank
 		prefix = fmt.Sprintf("%03d", len(s.bankPrefixes)+100)
 		s.bankPrefixes[bankID] = prefix
 	}
+	s.mu.Unlock()
 
 	// Generate random 6 digits
 	randomBytes := make([]byte, 4)
@@ -367,9 +375,12 @@ func (s *VirtualAccountService) generateVAN(bankID string) (string, error) {
 
 	van := baseNumber + strconv.Itoa(checkDigit)
 
-	// Ensure uniqueness
-	if _, exists := s.accounts[van]; exists {
-		return s.generateVAN(bankID) // Retry
+	// Ensure uniqueness (W12-C3-P2-B2: checked against PG, not a map; the
+	// UNIQUE(van) index is the final guard at insert time).
+	ctx, cancel := vanCtx()
+	defer cancel()
+	if _, err := getAccountByVAN(ctx, s.db, van); err == nil {
+		return s.generateVAN(bankID) // Retry — VAN already exists
 	}
 
 	return van, nil
@@ -440,53 +451,41 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 			}
 		}
 	} else {
-		log.Printf("[virtual-account-service] WARNING: in-memory dedup fallback (DATABASE_URL unset)")
-		s.mu.RLock()
-		for _, existing := range s.payments {
-			if payment.SessionID != "" && existing.SessionID == payment.SessionID {
-				s.mu.RUnlock()
-				return ErrDuplicateInboundPayment
-			}
-			if payment.TransactionRef != "" && existing.TransactionRef == payment.TransactionRef {
-				s.mu.RUnlock()
-				return ErrDuplicateInboundPayment
-			}
-		}
-		s.mu.RUnlock()
+		// W12-C3-P2-B2: the in-memory dedup fallback (scan of the payments
+		// map) was removed with the map. Without PG we cannot prove this
+		// payment was not already processed — fail closed (money path).
+		return fmt.Errorf("dedup store unavailable: DATABASE_URL not configured")
 	}
 
-	// Find and validate the VAN under a read lock. The account fields used
-	// below and by the TigerBeetle client (ID, VAN, BankID, ParentAccountID,
-	// Purpose, ReferenceID, Currency) are immutable after creation.
-	s.mu.RLock()
-	account, ok := s.accounts[payment.VAN]
-	if !ok {
-		s.mu.RUnlock()
+	// Find and validate the VAN (W12-C3-P2-B2: read from PG). The account
+	// fields used below and by the TigerBeetle client (ID, VAN, BankID,
+	// ParentAccountID, Purpose, ReferenceID, Currency) are immutable after
+	// creation.
+	account, err := getAccountByVAN(ctx, s.db, payment.VAN)
+	if errors.Is(err, errVanNotFound) {
 		return fmt.Errorf("VAN not found: %s", payment.VAN)
+	}
+	if err != nil {
+		return fmt.Errorf("VAN lookup failed: %w", err)
 	}
 
 	// Validate account status
 	if account.Status != "active" {
-		s.mu.RUnlock()
 		return fmt.Errorf("VAN is not active: %s", account.Status)
 	}
 
 	// Check expiry
 	if account.ExpiresAt != nil && time.Now().After(*account.ExpiresAt) {
-		s.mu.RUnlock()
 		return fmt.Errorf("VAN has expired")
 	}
 
 	// Validate amount constraints
 	if account.MinAmount != nil && payment.Amount < *account.MinAmount {
-		s.mu.RUnlock()
 		return fmt.Errorf("payment amount %.2f below minimum %.2f", payment.Amount, *account.MinAmount)
 	}
 	if account.MaxAmount != nil && payment.Amount > *account.MaxAmount {
-		s.mu.RUnlock()
 		return fmt.Errorf("payment amount %.2f exceeds maximum %.2f", payment.Amount, *account.MaxAmount)
 	}
-	s.mu.RUnlock()
 
 	// Generate payment ID
 	payment.ID = uuid.New().String()
@@ -502,31 +501,38 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	ledgerEntryID, err := s.createLedgerEntry(ctx, account, payment)
 	if err != nil {
 		payment.Status = "failed"
-		s.mu.Lock()
-		s.payments[payment.ID] = payment
-		s.mu.Unlock()
+		// W12-C3-P2-B2: persist the failed payment record to PG.
+		if perr := insertPayment(ctx, s.db, payment); perr != nil {
+			log.Printf("[virtual-account-service] failed to persist failed-payment %s: %v", payment.ID, perr)
+		}
 		return fmt.Errorf("failed to create ledger entry: %w", err)
 	}
 	payment.LedgerEntryID = ledgerEntryID
 
-	// Update account stats + record the payment (in-memory mutations only).
-	s.mu.Lock()
-	account.TotalReceived += payment.Amount
-	account.PaymentCount++
+	// Update account stats + record the payment (W12-C3-P2-B2: single PG
+	// transaction — SELECT ... FOR UPDATE on the account row, counter
+	// increments applied to the locked row, payment insert). Counters are
+	// applied inside the tx so concurrent payments on one VAN cannot lose
+	// updates. TotalReceived/PaymentCount are reconciled counters;
+	// TigerBeetle is the balance-of-record.
 	now := time.Now()
-	account.LastPaymentAt = &now
-	account.UpdatedAt = now
-
-	// Handle single-use VAN
-	if account.SingleUse {
-		account.Status = "closed"
-	}
-
-	// Mark payment as processed
 	payment.Status = "processed"
 	payment.ProcessedAt = &now
-	s.payments[payment.ID] = payment
-	s.mu.Unlock()
+	if err := recordPaymentTx(ctx, s.db, payment, func(a *VirtualAccount) {
+		a.TotalReceived += payment.Amount
+		a.PaymentCount++
+		a.LastPaymentAt = &now
+		a.UpdatedAt = now
+		// Handle single-use VAN
+		if a.SingleUse {
+			a.Status = "closed"
+		}
+		// Mirror the persisted counter state back to the caller's copy
+		// (used by webhook/metrics below).
+		*account = *a
+	}); err != nil {
+		return fmt.Errorf("failed to record payment: %w", err)
+	}
 
 	// Send webhook notification
 	go s.sendWebhookNotification(account, payment)
@@ -628,10 +634,14 @@ func (s *VirtualAccountService) sendWebhookNotification(account *VirtualAccount,
 	}
 	defer resp.Body.Close()
 
-	s.mu.Lock()
 	payment.WebhookSent = true
 	payment.WebhookResponse = fmt.Sprintf("Status: %d", resp.StatusCode)
-	s.mu.Unlock()
+	// W12-C3-P2-B2: persist the webhook outcome on the payment row.
+	webhookCtx, cancel := vanCtx()
+	defer cancel()
+	if err := updatePayment(webhookCtx, s.db, payment); err != nil {
+		log.Printf("[virtual-account-service] failed to persist webhook outcome for payment %s: %v", payment.ID, err)
+	}
 
 	log.Printf("Webhook sent for VAN %s payment %s: status %d", account.VAN, payment.ID, resp.StatusCode)
 }
@@ -644,52 +654,64 @@ func (s *VirtualAccountService) generateWebhookSignature(payload []byte) string 
 	return "sha256=" + hex.EncodeToString(hash)
 }
 
-// GetVAN retrieves a virtual account by VAN
+// GetVAN retrieves a virtual account by VAN (W12-C3-P2-B2: from PG)
 func (s *VirtualAccountService) GetVAN(van string) (*VirtualAccount, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	account, ok := s.accounts[van]
-	if !ok {
+	ctx, cancel := vanCtx()
+	defer cancel()
+	account, err := getAccountByVAN(ctx, s.db, van)
+	if errors.Is(err, errVanNotFound) {
 		return nil, fmt.Errorf("VAN not found: %s", van)
 	}
-	return account, nil
-}
-
-// GetVANByID retrieves a virtual account by ID
-func (s *VirtualAccountService) GetVANByID(id string) (*VirtualAccount, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	account, ok := s.accountsByID[id]
-	if !ok {
-		return nil, fmt.Errorf("VAN not found: %s", id)
+	if err != nil {
+		return nil, err
 	}
 	return account, nil
 }
 
-// ListVANsByCustomer lists all VANs for a customer
-func (s *VirtualAccountService) ListVANsByCustomer(bankID, customerID string) []*VirtualAccount {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// GetVANByID retrieves a virtual account by ID (W12-C3-P2-B2: from PG)
+func (s *VirtualAccountService) GetVANByID(id string) (*VirtualAccount, error) {
+	ctx, cancel := vanCtx()
+	defer cancel()
+	account, err := getAccountByID(ctx, s.db, id)
+	if errors.Is(err, errVanNotFound) {
+		return nil, fmt.Errorf("VAN not found: %s", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return account, nil
+}
 
+// ListVANsByCustomer lists all VANs for a customer (W12-C3-P2-B2: from PG)
+func (s *VirtualAccountService) ListVANsByCustomer(bankID, customerID string) []*VirtualAccount {
+	ctx, cancel := vanCtx()
+	defer cancel()
+	all, err := listAccounts(ctx, s.db, bankID)
+	if err != nil {
+		log.Printf("[virtual-account-service] ListVANsByCustomer: %v", err)
+		return nil
+	}
 	var accounts []*VirtualAccount
-	for _, account := range s.accounts {
-		if account.BankID == bankID && account.CustomerID == customerID {
+	for _, account := range all {
+		if account.CustomerID == customerID {
 			accounts = append(accounts, account)
 		}
 	}
 	return accounts
 }
 
-// ListVANsByReference lists all VANs for a reference (e.g., loan ID)
+// ListVANsByReference lists all VANs for a reference (e.g., loan ID) (W12-C3-P2-B2: from PG)
 func (s *VirtualAccountService) ListVANsByReference(bankID, referenceType, referenceID string) []*VirtualAccount {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	ctx, cancel := vanCtx()
+	defer cancel()
+	all, err := listAccounts(ctx, s.db, bankID)
+	if err != nil {
+		log.Printf("[virtual-account-service] ListVANsByReference: %v", err)
+		return nil
+	}
 	var accounts []*VirtualAccount
-	for _, account := range s.accounts {
-		if account.BankID == bankID && account.ReferenceType == referenceType && account.ReferenceID == referenceID {
+	for _, account := range all {
+		if account.ReferenceType == referenceType && account.ReferenceID == referenceID {
 			accounts = append(accounts, account)
 		}
 	}
@@ -697,12 +719,17 @@ func (s *VirtualAccountService) ListVANsByReference(bankID, referenceType, refer
 }
 
 func (s *VirtualAccountService) SearchVANs(bankID, query string, limit int) []*VirtualAccount {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	ctx, cancel := vanCtx()
+	defer cancel()
+	all, err := listAccounts(ctx, s.db, bankID)
+	if err != nil {
+		log.Printf("[virtual-account-service] SearchVANs: %v", err)
+		return nil
+	}
 
 	query = strings.ToLower(strings.TrimSpace(query))
 	var accounts []*VirtualAccount
-	for _, account := range s.accounts {
+	for _, account := range all {
 		if bankID != "" && account.BankID != bankID {
 			continue
 		}
@@ -716,23 +743,22 @@ func (s *VirtualAccountService) SearchVANs(bankID, query string, limit int) []*V
 	return accounts
 }
 
-// UpdateVANStatus updates the status of a VAN
+// UpdateVANStatus updates the status of a VAN (W12-C3-P2-B2: transactional PG update)
 func (s *VirtualAccountService) UpdateVANStatus(van, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	account, ok := s.accounts[van]
-	if !ok {
-		return fmt.Errorf("VAN not found: %s", van)
-	}
-
 	validStatuses := map[string]bool{"active": true, "suspended": true, "closed": true}
 	if !validStatuses[status] {
 		return fmt.Errorf("invalid status: %s", status)
 	}
 
-	account.Status = status
-	account.UpdatedAt = time.Now()
+	ctx, cancel := vanCtx()
+	defer cancel()
+	account, err := updateAccountStatusTx(ctx, s.db, van, status)
+	if errors.Is(err, errVanNotFound) {
+		return fmt.Errorf("VAN not found: %s", van)
+	}
+	if err != nil {
+		return err
+	}
 
 	// Update NIBSS registration
 	go s.updateNIBSSStatus(context.Background(), account)
@@ -747,19 +773,14 @@ func (s *VirtualAccountService) updateNIBSSStatus(ctx context.Context, account *
 	}
 }
 
-// GetPaymentHistory retrieves payment history for a VAN
+// GetPaymentHistory retrieves payment history for a VAN (W12-C3-P2-B2: from PG)
 func (s *VirtualAccountService) GetPaymentHistory(van string, limit int) []*VANPayment {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var payments []*VANPayment
-	for _, payment := range s.payments {
-		if payment.VAN == van {
-			payments = append(payments, payment)
-			if limit > 0 && len(payments) >= limit {
-				break
-			}
-		}
+	ctx, cancel := vanCtx()
+	defer cancel()
+	payments, err := listPaymentsByVAN(ctx, s.db, van, limit)
+	if err != nil {
+		log.Printf("[virtual-account-service] GetPaymentHistory: %v", err)
+		return nil
 	}
 	return payments
 }

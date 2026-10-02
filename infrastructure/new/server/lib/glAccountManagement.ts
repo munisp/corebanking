@@ -1,7 +1,24 @@
 /**
  * General Ledger account management — chart of accounts, trial balance,
  * balance sheet, income statement, GL inquiry.
+ *
+ * W12-C3-P2-MLIB (c3-1010): the 'glAccounts' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `gl_accounts`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "gl_accounts";
+
+async function ensureGlaccountsStore(): Promise<void> {
+  await ensureTables("ensureGlaccountsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, GLACCOUNTS_SEED, () => "");
+}
+
 
 export interface GLAccount {
   id: string;
@@ -19,7 +36,8 @@ export interface GLAccount {
   isHeader: boolean;
 }
 
-const glAccounts: GLAccount[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const GLACCOUNTS_SEED: GLAccount[]  = [
   { id: "GL-001", accountCode: "1000", accountName: "Cash and Cash Equivalents", category: "asset", subcategory: "Current Assets", currency: "NGN", debitBalance: 45_000_000_000, creditBalance: 0, netBalance: 45_000_000_000, status: "active", level: 1, isHeader: true },
   { id: "GL-002", accountCode: "1001", accountName: "Cash on Hand — Vault", category: "asset", subcategory: "Current Assets", currency: "NGN", debitBalance: 8_500_000_000, creditBalance: 0, netBalance: 8_500_000_000, status: "active", parentCode: "1000", level: 2, isHeader: false },
   { id: "GL-003", accountCode: "1002", accountName: "Cash at CBN", category: "asset", subcategory: "Current Assets", currency: "NGN", debitBalance: 22_000_000_000, creditBalance: 0, netBalance: 22_000_000_000, status: "active", parentCode: "1000", level: 2, isHeader: false },
@@ -42,9 +60,12 @@ const glAccounts: GLAccount[] = [
   { id: "GL-020", accountCode: "5100", accountName: "Operating Expenses", category: "expense", subcategory: "Operating Expenses", currency: "NGN", debitBalance: 15_000_000_000, creditBalance: 0, netBalance: 15_000_000_000, status: "active", level: 1, isHeader: true },
 ];
 
-export function getGLAccounts() { return glAccounts; }
+export async function getGLAccounts(): Promise<GLAccount[]> {
+  return pgGuard((async () => { await ensureGlaccountsStore(); return storeList<GLAccount>(TABLE); })());
+}
 
-export function getTrialBalance() {
+export async function getTrialBalance() {
+  const glAccounts = await getGLAccounts();
   let totalDebit = 0;
   let totalCredit = 0;
   for (const a of glAccounts) {
@@ -55,7 +76,10 @@ export function getTrialBalance() {
   return { accounts: glAccounts.filter((a) => !a.isHeader), totalDebit, totalCredit, balanced: totalDebit === totalCredit };
 }
 
-export function getBalanceSheet() {
+// W12-C3-P2-MLIB-2: restored — predecessor's conversion dropped this export
+// while the /api/platform/gl/balance-sheet route in index.ts still calls it.
+export async function getBalanceSheet() {
+  const glAccounts = await getGLAccounts();
   const assets = glAccounts.filter((a) => a.category === "asset");
   const liabilities = glAccounts.filter((a) => a.category === "liability");
   const equity = glAccounts.filter((a) => a.category === "equity");

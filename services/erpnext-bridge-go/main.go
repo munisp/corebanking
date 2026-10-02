@@ -274,21 +274,14 @@ type WebhookEvent struct {
 	ErrorMsg    string                 `json:"errorMessage,omitempty"`
 }
 
-var (
-	webhookEvents []WebhookEvent
-	webhookMu     sync.RWMutex
-)
+// C3-P2-B5-go-2 (webhookEvents register item): the in-memory webhookEvents
+// slice was removed. ERPNext webhook events are integration business records
+// and MUST be durable: they now live in Postgres (webhook_events — see
+// initDB) with idempotent seeds and fail-closed handlers (503
+// persistence_unavailable). No in-memory fallback on business data.
 
 func init() {
 	initCoAMappings()
-	// Pre-seed some webhook events (ERPNext → Banking)
-	webhookEvents = []WebhookEvent{
-		{ID: "WH-001", EventType: "on_submit", DocType: "Payment Entry", DocName: "PE-2026-0451", Data: map[string]interface{}{"customer": "TEN-ZENITH", "amount": 25000000, "currency": "NGN", "payment_type": "Receive", "reference": "INV-2026-05-001"}, Source: "erpnext", ReceivedAt: "2026-05-08T14:30:00Z", ProcessedAt: "2026-05-08T14:30:02Z", Status: "synced", SyncAction: "update_invoice_status_to_paid"},
-		{ID: "WH-002", EventType: "on_submit", DocType: "Payment Entry", DocName: "PE-2026-0452", Data: map[string]interface{}{"customer": "WL-OPAY", "amount": 12120000, "currency": "NGN", "payment_type": "Receive", "reference": "INV-2026-05-003"}, Source: "erpnext", ReceivedAt: "2026-05-07T10:15:00Z", ProcessedAt: "2026-05-07T10:15:01Z", Status: "synced", SyncAction: "update_invoice_status_to_paid"},
-		{ID: "WH-003", EventType: "on_submit", DocType: "Journal Entry", DocName: "JV-2026-0890", Data: map[string]interface{}{"voucher_type": "Credit Note", "amount": 500000, "against_invoice": "INV-2026-04-012", "reason": "Service Level Agreement Breach"}, Source: "erpnext", ReceivedAt: "2026-05-06T16:00:00Z", ProcessedAt: "2026-05-06T16:00:03Z", Status: "synced", SyncAction: "create_billing_credit_note"},
-		{ID: "WH-004", EventType: "on_update", DocType: "Sales Invoice", DocName: "SI-2026-0334", Data: map[string]interface{}{"customer": "TEN-UBA", "status": "Overdue", "outstanding_amount": 25000000, "due_date": "2026-05-01"}, Source: "erpnext", ReceivedAt: "2026-05-09T08:00:00Z", ProcessedAt: "2026-05-09T08:00:01Z", Status: "synced", SyncAction: "update_billing_status_overdue"},
-		{ID: "WH-005", EventType: "on_submit", DocType: "Payment Entry", DocName: "PE-2026-0455", Data: map[string]interface{}{"customer": "TEN-LAPO-MFB", "amount": 2800000, "currency": "NGN", "payment_type": "Receive", "reference": "INV-2026-05-004"}, Source: "erpnext", ReceivedAt: "2026-05-09T11:00:00Z", ProcessedAt: "2026-05-09T11:00:01Z", Status: "synced", SyncAction: "update_invoice_status_to_paid"},
-	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -388,17 +381,57 @@ func handleCoASync(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// webhookStoreUnavailable fails closed when Postgres is unavailable: webhook
+// events are business data with no in-memory fallback.
+func webhookStoreUnavailable(w http.ResponseWriter) bool {
+	if db == nil {
+		http.Error(w, `{"error":"persistence_unavailable"}`, http.StatusServiceUnavailable)
+		return true
+	}
+	return false
+}
+
 func handleWebhookReceive(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
-		webhookMu.RLock()
-		respondJSON(w, map[string]interface{}{"items": webhookEvents, "total": len(webhookEvents), "middleware": middlewareStatus()})
-		webhookMu.RUnlock()
+		if webhookStoreUnavailable(w) {
+			return
+		}
+		rows, err := db.QueryContext(r.Context(),
+			`SELECT id, event_type, doc_type, doc_name, data, source, received_at, processed_at, status, sync_action, error_msg
+			 FROM webhook_events ORDER BY created_at ASC, id ASC`)
+		if err != nil {
+			log.Printf("[%s] webhook list query failed: %v", serviceName, err)
+			http.Error(w, `{"error":"persistence_unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		defer rows.Close()
+		items := []WebhookEvent{}
+		for rows.Next() {
+			var e WebhookEvent
+			var data []byte
+			if err := rows.Scan(&e.ID, &e.EventType, &e.DocType, &e.DocName, &data, &e.Source, &e.ReceivedAt, &e.ProcessedAt, &e.Status, &e.SyncAction, &e.ErrorMsg); err != nil {
+				log.Printf("[%s] webhook list scan failed: %v", serviceName, err)
+				http.Error(w, `{"error":"persistence_unavailable"}`, http.StatusServiceUnavailable)
+				return
+			}
+			e.Data = map[string]interface{}{}
+			if len(data) > 0 {
+				if json.Unmarshal(data, &e.Data) != nil {
+					e.Data = map[string]interface{}{}
+				}
+			}
+			items = append(items, e)
+		}
+		respondJSON(w, map[string]interface{}{"items": items, "total": len(items), "middleware": middlewareStatus()})
 		return
 	}
 	// POST — receive webhook from ERPNext
 	var event WebhookEvent
 	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
 		http.Error(w, `{"error":"invalid webhook payload"}`, 400)
+		return
+	}
+	if webhookStoreUnavailable(w) {
 		return
 	}
 	event.ReceivedAt = time.Now().Format(time.RFC3339)
@@ -420,9 +453,28 @@ func handleWebhookReceive(w http.ResponseWriter, r *http.Request) {
 		event.Status = "ignored"
 	}
 
-	webhookMu.Lock()
-	webhookEvents = append(webhookEvents, event)
-	webhookMu.Unlock()
+	// Events arriving without an id get one from the Postgres sequence;
+	// insert is idempotent on the event id (safe webhook replay).
+	if event.ID == "" {
+		var seq int64
+		if err := db.QueryRowContext(r.Context(), `SELECT nextval('webhook_event_number_seq')`).Scan(&seq); err != nil {
+			log.Printf("[%s] webhook id seq failed: %v", serviceName, err)
+			http.Error(w, `{"error":"persistence_unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		event.ID = fmt.Sprintf("WH-%03d", seq)
+	}
+	dataJSON, _ := json.Marshal(event.Data)
+	if _, err := db.ExecContext(r.Context(),
+		`INSERT INTO webhook_events (id, event_type, doc_type, doc_name, data, source, received_at, processed_at, status, sync_action, error_msg)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		 ON CONFLICT (id) DO NOTHING`,
+		event.ID, event.EventType, event.DocType, event.DocName, string(dataJSON), event.Source,
+		event.ReceivedAt, event.ProcessedAt, event.Status, event.SyncAction, event.ErrorMsg); err != nil {
+		log.Printf("[%s] webhook insert failed: %v", serviceName, err)
+		http.Error(w, `{"error":"persistence_unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
 
 	respondJSON(w, map[string]interface{}{
 		"success":    true,
@@ -479,6 +531,17 @@ func handleSyncStreams(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSyncSummary(w http.ResponseWriter, r *http.Request) {
+	// webhooksReceived reports the durable webhook store; fail closed when it
+	// is unavailable (C3-P2-B5-go-2).
+	if webhookStoreUnavailable(w) {
+		return
+	}
+	var webhooksReceived int
+	if err := db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM webhook_events`).Scan(&webhooksReceived); err != nil {
+		log.Printf("[%s] sync summary webhook count failed: %v", serviceName, err)
+		http.Error(w, `{"error":"persistence_unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
 	respondJSON(w, map[string]interface{}{
 		"gapsClosed": []map[string]interface{}{
 			{"gap": 1, "name": "CoA Auto-Discovery", "status": "active", "description": "ERPNext chart auto-mapped to 32 banking GL codes with 91% avg confidence"},
@@ -489,7 +552,7 @@ func handleSyncSummary(w http.ResponseWriter, r *http.Request) {
 		},
 		"metrics": map[string]interface{}{
 			"coaMappings":       len(coaMappings),
-			"webhooksReceived":  len(webhookEvents),
+			"webhooksReceived":  webhooksReceived,
 			"creditNotesSynced": len(creditNoteSyncs),
 			"activeStreams":     len(syncStreams),
 			"eventsToday":       totalEventsToday(),
@@ -700,6 +763,45 @@ func initDB() {
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
+
+	// ── ERPNext webhook event store (C3-P2-B5-go-2) ─────────────────────────
+	// data jsonb carries the raw webhook payload; ids for events that arrive
+	// without one come from webhook_event_number_seq (starts past the seed
+	// range WH-001..005).
+	if _, err := db.Exec(`CREATE SEQUENCE IF NOT EXISTS webhook_event_number_seq START 6`); err != nil {
+		log.Fatalf("schema init (webhook_event_number_seq) failed: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS webhook_events (
+		id TEXT PRIMARY KEY,
+		event_type TEXT NOT NULL DEFAULT '',
+		doc_type TEXT NOT NULL DEFAULT '',
+		doc_name TEXT NOT NULL DEFAULT '',
+		data JSONB NOT NULL DEFAULT '{}'::jsonb,
+		source TEXT NOT NULL DEFAULT 'erpnext',
+		received_at TEXT NOT NULL DEFAULT '',
+		processed_at TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'received',
+		sync_action TEXT NOT NULL DEFAULT '',
+		error_msg TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Fatalf("schema init (webhook_events) failed: %v", err)
+	}
+	// Idempotent seed of the original demonstration event set.
+	whSeeds := []string{
+		`INSERT INTO webhook_events (id, event_type, doc_type, doc_name, data, source, received_at, processed_at, status, sync_action) VALUES
+			('WH-001', 'on_submit', 'Payment Entry', 'PE-2026-0451', '{"customer":"TEN-ZENITH","amount":25000000,"currency":"NGN","payment_type":"Receive","reference":"INV-2026-05-001"}', 'erpnext', '2026-05-08T14:30:00Z', '2026-05-08T14:30:02Z', 'synced', 'update_invoice_status_to_paid'),
+			('WH-002', 'on_submit', 'Payment Entry', 'PE-2026-0452', '{"customer":"WL-OPAY","amount":12120000,"currency":"NGN","payment_type":"Receive","reference":"INV-2026-05-003"}', 'erpnext', '2026-05-07T10:15:00Z', '2026-05-07T10:15:01Z', 'synced', 'update_invoice_status_to_paid'),
+			('WH-003', 'on_submit', 'Journal Entry', 'JV-2026-0890', '{"voucher_type":"Credit Note","amount":500000,"against_invoice":"INV-2026-04-012","reason":"Service Level Agreement Breach"}', 'erpnext', '2026-05-06T16:00:00Z', '2026-05-06T16:00:03Z', 'synced', 'create_billing_credit_note'),
+			('WH-004', 'on_update', 'Sales Invoice', 'SI-2026-0334', '{"customer":"TEN-UBA","status":"Overdue","outstanding_amount":25000000,"due_date":"2026-05-01"}', 'erpnext', '2026-05-09T08:00:00Z', '2026-05-09T08:00:01Z', 'synced', 'update_billing_status_overdue'),
+			('WH-005', 'on_submit', 'Payment Entry', 'PE-2026-0455', '{"customer":"TEN-LAPO-MFB","amount":2800000,"currency":"NGN","payment_type":"Receive","reference":"INV-2026-05-004"}', 'erpnext', '2026-05-09T11:00:00Z', '2026-05-09T11:00:01Z', 'synced', 'update_invoice_status_to_paid')
+			ON CONFLICT (id) DO NOTHING`,
+	}
+	for _, stmt := range whSeeds {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Printf("seed webhook_events (may already exist): %v", err)
+		}
+	}
 }
 
 func dbList(service string, limit int) ([]map[string]interface{}, error) {
@@ -1476,18 +1578,18 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "manage", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", healthz)
-	mux.Handle("/v1/erpnext-bridge/coa-discovery", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCoADiscovery)))
-	mux.Handle("/v1/erpnext-bridge/coa-sync", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCoASync)))
-	mux.Handle("/v1/erpnext-bridge/webhooks", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleWebhookReceive)))
-	mux.Handle("/v1/erpnext-bridge/credit-notes", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreditNotes)))
-	mux.Handle("/v1/erpnext-bridge/sync-streams", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleSyncStreams)))
-	mux.Handle("/v1/erpnext-bridge/summary", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleSyncSummary)))
+	mux.Handle("/v1/erpnext-bridge/coa-discovery", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "coa_discovery", http.HandlerFunc(handleCoADiscovery))))
+	mux.Handle("/v1/erpnext-bridge/coa-sync", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "coa_sync", http.HandlerFunc(handleCoASync))))
+	mux.Handle("/v1/erpnext-bridge/webhooks", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "manage", http.HandlerFunc(handleWebhookReceive))))
+	mux.Handle("/v1/erpnext-bridge/credit-notes", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "manage", http.HandlerFunc(handleCreditNotes))))
+	mux.Handle("/v1/erpnext-bridge/sync-streams", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "manage", http.HandlerFunc(handleSyncStreams))))
+	mux.Handle("/v1/erpnext-bridge/summary", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "view", http.HandlerFunc(handleSyncSummary))))
 
-	mux.Handle("/v1/erpnext-bridge/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(erpnext_bridgeScoreHandler)))
-	mux.Handle("/v1/erpnext-bridge/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(erpnext_bridgeValidateRequestHandler)))
+	mux.Handle("/v1/erpnext-bridge/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "score", http.HandlerFunc(erpnext_bridgeScoreHandler))))
+	mux.Handle("/v1/erpnext-bridge/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("erpnext_bridge", "validate", http.HandlerFunc(erpnext_bridgeValidateRequestHandler))))
 	log.Printf("ERPNext Bridge (Go) on :%s — 5 gaps closed", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

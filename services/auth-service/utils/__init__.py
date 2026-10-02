@@ -13,6 +13,7 @@ from .helpers import generate_api_key, create_logger, hash_api_secret, verify_ap
 from .vpn_detector import VPNDetector, detect_vpn
 from .failed_login_tracker import FailedLoginTracker, get_failed_login_tracker
 from .otp_service import OTPService, get_otp_service
+from .pin_service import PinService, get_pin_service
 from .permissions import PermissionManager, require_permission
 from .role_mapper import RoleMapper
 
@@ -37,6 +38,8 @@ __all__ = [
     "get_failed_login_tracker",
     "OTPService",
     "get_otp_service",
+    "PinService",
+    "get_pin_service",
     "PermissionManager",
     "require_permission",
     "RoleMapper",

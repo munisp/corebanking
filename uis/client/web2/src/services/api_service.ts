@@ -258,12 +258,15 @@ class ApiService {
   }
 
   // POST request
+  // W12-A4B: optional per-call `headers` — fx-service POST /api/v1/fx/exchange
+  // requires an x-actor-id header that the interceptor does not set.
   async post<T = unknown>(
     path: string,
     data?: unknown,
     params?: Record<string, unknown>,
+    headers?: Record<string, string>,
   ): Promise<AxiosResponse<T>> {
-    return this.axiosInstance.post<T>(path, data, { params });
+    return this.axiosInstance.post<T>(path, data, { params, headers });
   }
 
   // PUT request
@@ -276,11 +279,14 @@ class ApiService {
   }
 
   // DELETE request
+  // W12-A4B: optional `data` body — beneficiary-management-go's
+  // DELETE /v1/beneficiaries takes {beneficiaryId} in the request body.
   async delete<T = unknown>(
     path: string,
     params?: Record<string, unknown>,
+    data?: unknown,
   ): Promise<AxiosResponse<T>> {
-    return this.axiosInstance.delete<T>(path, { params });
+    return this.axiosInstance.delete<T>(path, { params, data });
   }
 
   // Get stored token

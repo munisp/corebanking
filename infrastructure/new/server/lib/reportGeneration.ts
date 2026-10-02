@@ -2,8 +2,27 @@
  * Report Generation Engine — PDF/Excel exports for regulatory returns,
  * account statements, audit reports, and management dashboards.
  * Supports scheduled generation, template management, and delivery queuing.
+ *
+ * W12-C3-P2-MLIB (c3-1015): the generated-report registry was module process
+ * memory (a restart erased the report-generation audit trail). Now
+ * Postgres-authoritative (table `generated_reports`) via lib/pgJsonStore.ts;
+ * fail-closed 503 on PG outage, no degraded-memory fallback.
+ * (TEMPLATES is out of this batch's scope.)
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeInsert, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const GENERATED_TABLE = "generated_reports";
+
+async function ensureReportStores(): Promise<void> {
+  await ensureTables("reportGeneration", storeDDL(GENERATED_TABLE));
+  await storeSeed(GENERATED_TABLE, GENERATED_REPORTS_SEED, (r) => r.tenantId ?? "");
+}
+
+async function loadGeneratedReports(): Promise<GeneratedReport[]> {
+  await ensureReportStores(); return storeList<GeneratedReport>(GENERATED_TABLE);
+}
 
 interface ReportTemplate {
   id: string;
@@ -48,7 +67,8 @@ const TEMPLATES: ReportTemplate[] = [
   { id: "RPT-012", name: "Audit Trail Export", category: "audit", format: "csv", parameters: ["startDate", "endDate", "entityType"], description: "Complete audit trail export for compliance review and forensic analysis", lastGenerated: "2026-05-09T08:00:00Z", status: "active" },
 ];
 
-const GENERATED_REPORTS: GeneratedReport[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const GENERATED_REPORTS_SEED: GeneratedReport[] = [
   { id: "GEN-001", templateId: "RPT-003", name: "Basel III LCR — 2026-05-08", tenantId: "TEN-GTBANK", format: "excel", sizeBytes: 245000, generatedBy: "system-scheduler", generatedAt: "2026-05-09T00:01:00Z", period: "2026-05-08", status: "completed", downloadUrl: "/reports/LCR-2026-05-08.xlsx", metadata: { lcr: 145.2, hqla: 85000000000, netCashOutflows: 58500000000 } },
   { id: "GEN-002", templateId: "RPT-005", name: "CTR — 2026-05-08", tenantId: "TEN-PLATFORM-ADMIN", format: "xml", sizeBytes: 128000, generatedBy: "system-scheduler", generatedAt: "2026-05-09T00:02:00Z", period: "2026-05-08", status: "completed", downloadUrl: "/reports/CTR-2026-05-08.xml", metadata: { transactionsReported: 47, totalAmount: 2850000000 } },
   { id: "GEN-003", templateId: "RPT-008", name: "Statement — 0012345678 — May 2026", tenantId: "TEN-GTBANK", format: "pdf", sizeBytes: 85000, generatedBy: "USR-GT-001", generatedAt: "2026-05-09T10:00:00Z", period: "2026-05-01 to 2026-05-09", status: "completed", downloadUrl: "/reports/STMT-0012345678-202605.pdf", metadata: { transactions: 45, openingBalance: 3200000, closingBalance: 8500000 } },
@@ -60,33 +80,37 @@ export function registerReportGeneration(app: Express) {
   app.get("/api/reports/v1/templates", (_req: Request, res: Response) => {
     res.json({ items: TEMPLATES, total: TEMPLATES.length });
   });
-  app.get("/api/reports/v1/generated", (req: Request, res: Response) => {
+  app.get("/api/reports/v1/generated", asyncRoute(async (req: Request, res: Response) => {
     const category = req.query.category as string;
     const tplIds = category ? TEMPLATES.filter((t) => t.category === category).map((t) => t.id) : null;
-    const filtered = tplIds ? GENERATED_REPORTS.filter((r) => tplIds.includes(r.templateId)) : GENERATED_REPORTS;
+    const generated = await pgGuard(loadGeneratedReports());
+    const filtered = tplIds ? generated.filter((r) => tplIds.includes(r.templateId)) : generated;
     res.json({ items: filtered, total: filtered.length });
-  });
-  app.post("/api/reports/v1/generate", (req: Request, res: Response) => {
+  }));
+  app.post("/api/reports/v1/generate", asyncRoute(async (req: Request, res: Response) => {
     const { templateId, parameters } = req.body ?? {};
     const tpl = TEMPLATES.find((t) => t.id === templateId);
     if (!tpl) return res.status(404).json({ error: "Template not found" });
+    const generated = await pgGuard(loadGeneratedReports());
+    const tenantId = (req.headers["x-tenant-id"] as string) ?? "TEN-PLATFORM-ADMIN";
     const report: GeneratedReport = {
-      id: `GEN-${String(GENERATED_REPORTS.length + 1).padStart(3, "0")}`,
+      id: `GEN-${String(generated.length + 1).padStart(3, "0")}`,
       templateId, name: `${tpl.name} — ${new Date().toISOString().slice(0, 10)}`,
-      tenantId: (req.headers["x-tenant-id"] as string) ?? "TEN-PLATFORM-ADMIN",
+      tenantId,
       format: tpl.format, sizeBytes: 0, generatedBy: "api-request",
       generatedAt: new Date().toISOString(), period: parameters?.period ?? "current",
       status: "generating", metadata: { parameters },
     };
-    GENERATED_REPORTS.push(report);
+    await pgGuard(storeInsert(GENERATED_TABLE, tenantId, report));
     res.status(201).json(report);
-  });
-  app.get("/api/reports/v1/stats", (_req: Request, res: Response) => {
+  }));
+  app.get("/api/reports/v1/stats", asyncRoute(async (_req: Request, res: Response) => {
+    const generated = await pgGuard(loadGeneratedReports());
     res.json({
-      totalTemplates: TEMPLATES.length, generatedToday: 3, totalGenerated: GENERATED_REPORTS.length,
+      totalTemplates: TEMPLATES.length, generatedToday: 3, totalGenerated: generated.length,
       regulatory: TEMPLATES.filter((t) => t.category === "regulatory").length,
       scheduledReports: TEMPLATES.filter((t) => t.schedule).length,
-      avgGenerationTimeMs: 4500, storageUsedBytes: GENERATED_REPORTS.reduce((s, r) => s + r.sizeBytes, 0),
+      avgGenerationTimeMs: 4500, storageUsedBytes: generated.reduce((s, r) => s + r.sizeBytes, 0),
     });
-  });
+  }));
 }

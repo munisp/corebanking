@@ -132,7 +132,7 @@ export class AuthService {
   // Get current user from API or storage fallback
   async getCurrentUser(): Promise<User | null> {
     try {
-      const response = await apiService.get(`${AppConfig.authEndpoint}/me`);
+      const response = await apiService.get(`${AppConfig.authEndpoint}/auth/me`);
       if (response.status === 200) {
         const data = response.data as { data: Record<string, unknown> };
         const user = User.fromJson(data.data);
@@ -174,7 +174,7 @@ getUser(): User | null {
   // Logout
   async logout(): Promise<void> {
     try {
-      await apiService.post(`${AppConfig.authEndpoint}/logout`);
+      await apiService.post(`${AppConfig.authEndpoint}/auth/logout`);
     } catch {
       // Continue with local logout even if API fails
     } finally {
@@ -229,7 +229,7 @@ getUser(): User | null {
 
   // create PIN
   async createPin(currentPin: string, newPin: string): Promise<void> {
-    await apiService.post(`${AppConfig.authEndpoint}/create-pin`, {
+    await apiService.post(`${AppConfig.authEndpoint}/auth/create-pin`, {
       current_pin: currentPin,
       new_pin: newPin,
     });
@@ -237,17 +237,17 @@ getUser(): User | null {
 
   // Verify email
   async verifyEmail(token: string): Promise<void> {
-    await apiService.post(`${AppConfig.authEndpoint}/verify-email`, { token });
+    await apiService.post(`${AppConfig.authEndpoint}/auth/verify-email`, { token });
   }
 
   // Resend verification email
   async resendVerificationEmail(): Promise<void> {
-    await apiService.post(`${AppConfig.authEndpoint}/resend-verification`);
+    await apiService.post(`${AppConfig.authEndpoint}/auth/resend-verification`);
   }
 
   // Verify OTP
   async verifyOtp(otp: string): Promise<void> {
-    const response = await apiService.post(`${AppConfig.authEndpoint}/verify-otp`, { otp });
+    const response = await apiService.post(`${AppConfig.authEndpoint}/auth/verify-otp`, { otp });
     if (response.status === 200) {
       let data: unknown;
       if (response.data && typeof response.data === 'object' && 'data' in response.data) {
@@ -284,7 +284,7 @@ getUser(): User | null {
 
   // Resend OTP
   async resendOtp(): Promise<void> {
-    await apiService.post(`${AppConfig.authEndpoint}/resend-otp`);
+    await apiService.post(`${AppConfig.authEndpoint}/auth/resend-otp`);
   }
 }
 

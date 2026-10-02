@@ -15,6 +15,107 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
 import logging
+import os
+import json
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(row.get(self.key, "")), row.get(self.tenant_key),
+                          json.dumps(row, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +219,9 @@ class TransactionCategorizationModel:
         # Recurring transaction detection
         self.user_recurring: Dict[str, List[Dict]] = {}
         
-        # User category overrides
-        self.user_overrides: Dict[str, Dict[str, TransactionCategory]] = {}
+        # W12-C3P2B5: user category overrides persisted in PG
+        # (table user_category_overrides, record_id = "<user_id>:<normalized_merchant>").
+        self._overrides_store = _W12Store("user_category_overrides")
         
         # Merchant normalization cache
         self.merchant_cache: Dict[str, str] = {}
@@ -264,10 +366,10 @@ class TransactionCategorizationModel:
         # Normalize merchant name
         normalized_merchant = self._normalize_merchant(merchant_name)
         
-        # Check user overrides first
-        if user_id in self.user_overrides:
-            if normalized_merchant in self.user_overrides[user_id]:
-                category = self.user_overrides[user_id][normalized_merchant]
+        # Check user overrides first (PG: user_category_overrides)
+        _override = self._get_override(user_id, normalized_merchant)
+        if _override is not None:
+                category = _override
                 return CategorizedTransaction(
                     transaction_id=transaction_id,
                     category=category,
@@ -420,13 +522,30 @@ class TransactionCategorizationModel:
         
         return tags
 
+    def _get_override(self, user_id: str, normalized_merchant: str):
+        """W12-C3P2B5: PG lookup in user_category_overrides. W12-DEGRADED: on PG
+        failure returns None (falls through to pattern categorization, logged)."""
+        try:
+            row = self._overrides_store.get(f"{user_id}:{normalized_merchant}")
+        except Exception as e:
+            logger.warning("W12-DEGRADED user_category_overrides read failed: %s", e)
+            return None
+        if row:
+            try:
+                return TransactionCategory(row["category"])
+            except (ValueError, KeyError):
+                return None
+        return None
+
     def set_user_override(self, user_id: str, merchant: str, category: TransactionCategory):
-        """Set user-specific category override"""
-        if user_id not in self.user_overrides:
-            self.user_overrides[user_id] = {}
-        
+        """Set user-specific category override (PG upsert; idempotent on user:merchant)."""
         normalized = self._normalize_merchant(merchant)
-        self.user_overrides[user_id][normalized] = category
+        try:
+            self._overrides_store.put(f"{user_id}:{normalized}",
+                                      {"user_id": user_id, "merchant": normalized,
+                                       "category": category.value})
+        except Exception as e:
+            logger.warning("W12-DEGRADED user_category_overrides write failed: %s", e)
         logger.info(f"Set override for user {user_id}: {normalized} -> {category.value}")
 
     def get_category_summary(self, transactions: List[CategorizedTransaction]) -> Dict:

@@ -1,8 +1,8 @@
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpMessage, HttpResponse, HttpServer}; // Wave-12 drive-by: HttpMessage import required by actix-web resolved in the lockfile
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::PgPool;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct Order {
     id: String,
     security: String,
@@ -18,7 +18,7 @@ struct Order {
     timestamp: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct Security {
     id: String,
     symbol: String,
@@ -31,9 +31,235 @@ struct Security {
     market_cap: f64,
 }
 
+// Wave-12 (C3-P0-B5): Postgres is the sole order/security store (was:
+// in-memory Mutex<Vec<..>> lost on every restart). Typed columns — both
+// shapes are fully known — per c3 policy; DDL at startup per repo convention.
 struct AppState {
-    orders: Mutex<Vec<Order>>,
-    securities: Mutex<Vec<Security>>,
+    db: PgPool,
+}
+
+async fn init_db(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS trading_orders (
+            id TEXT PRIMARY KEY,
+            security TEXT NOT NULL,
+            order_type TEXT NOT NULL,
+            side TEXT NOT NULL,
+            quantity BIGINT NOT NULL,
+            price DOUBLE PRECISION NOT NULL DEFAULT 0,
+            filled_qty BIGINT NOT NULL DEFAULT 0,
+            avg_fill_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            client TEXT NOT NULL DEFAULT '',
+            exchange TEXT NOT NULL DEFAULT '',
+            timestamp TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("securities-trading-rs: trading_orders DDL failed: {}", e);
+    }
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS securities (
+            id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            exchange TEXT NOT NULL DEFAULT '',
+            sector TEXT NOT NULL DEFAULT '',
+            last_price DOUBLE PRECISION NOT NULL DEFAULT 0,
+            change_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+            volume BIGINT NOT NULL DEFAULT 0,
+            market_cap DOUBLE PRECISION NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("securities-trading-rs: securities DDL failed: {}", e);
+    }
+}
+
+/// Idempotent seed of reference orders/securities (was: in-memory seed on
+/// every boot). ON CONFLICT DO NOTHING so restarts never duplicate.
+async fn seed_to_db(pool: &PgPool) {
+    for o in seed_orders() {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO trading_orders (id, security, order_type, side, quantity, price, filled_qty,
+                avg_fill_price, status, client, exchange, timestamp)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&o.id).bind(&o.security).bind(&o.order_type).bind(&o.side).bind(o.quantity).bind(o.price)
+        .bind(o.filled_qty).bind(o.avg_fill_price).bind(&o.status).bind(&o.client).bind(&o.exchange).bind(&o.timestamp)
+        .execute(pool)
+        .await
+        {
+            eprintln!("securities-trading-rs: seed order {} failed: {}", o.id, e);
+        }
+    }
+    for s in seed_securities() {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO securities (id, symbol, name, exchange, sector, last_price, change_pct, volume, market_cap)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&s.id).bind(&s.symbol).bind(&s.name).bind(&s.exchange).bind(&s.sector)
+        .bind(s.last_price).bind(s.change_pct).bind(s.volume).bind(s.market_cap)
+        .execute(pool)
+        .await
+        {
+            eprintln!("securities-trading-rs: seed security {} failed: {}", s.id, e);
+        }
+    }
+}
+
+fn seed_orders() -> Vec<Order> {
+    vec![
+        Order {
+            id: "ORD-001".into(),
+            security: "DANGCEM".into(),
+            order_type: "limit".into(),
+            side: "buy".into(),
+            quantity: 10000,
+            price: 290.50,
+            filled_qty: 10000,
+            avg_fill_price: 290.25,
+            status: "filled".into(),
+            client: "INST-001".into(),
+            exchange: "NGX".into(),
+            timestamp: "2026-05-11T10:00:00Z".into(),
+        },
+        Order {
+            id: "ORD-002".into(),
+            security: "GTCO".into(),
+            order_type: "market".into(),
+            side: "sell".into(),
+            quantity: 50000,
+            price: 0.0,
+            filled_qty: 50000,
+            avg_fill_price: 42.80,
+            status: "filled".into(),
+            client: "INST-002".into(),
+            exchange: "NGX".into(),
+            timestamp: "2026-05-11T10:05:00Z".into(),
+        },
+        Order {
+            id: "ORD-003".into(),
+            security: "AIRTELAFRI".into(),
+            order_type: "limit".into(),
+            side: "buy".into(),
+            quantity: 25000,
+            price: 1850.00,
+            filled_qty: 15000,
+            avg_fill_price: 1848.50,
+            status: "partial_fill".into(),
+            client: "INST-003".into(),
+            exchange: "NGX".into(),
+            timestamp: "2026-05-11T10:15:00Z".into(),
+        },
+        Order {
+            id: "ORD-004".into(),
+            security: "MTNN".into(),
+            order_type: "limit".into(),
+            side: "buy".into(),
+            quantity: 100000,
+            price: 260.00,
+            filled_qty: 100000,
+            avg_fill_price: 259.75,
+            status: "filled".into(),
+            client: "RET-001".into(),
+            exchange: "NGX".into(),
+            timestamp: "2026-05-11T10:30:00Z".into(),
+        },
+        Order {
+            id: "ORD-005".into(),
+            security: "FBN_BONDS_2030".into(),
+            order_type: "limit".into(),
+            side: "buy".into(),
+            quantity: 5000,
+            price: 980.00,
+            filled_qty: 5000,
+            avg_fill_price: 979.50,
+            status: "filled".into(),
+            client: "INST-004".into(),
+            exchange: "NASD".into(),
+            timestamp: "2026-05-11T11:00:00Z".into(),
+        },
+    ]
+}
+
+fn seed_securities() -> Vec<Security> {
+    vec![
+        Security {
+            id: "SEC-001".into(),
+            symbol: "DANGCEM".into(),
+            name: "Dangote Cement Plc".into(),
+            exchange: "NGX".into(),
+            sector: "Building Materials".into(),
+            last_price: 290.50,
+            change_pct: 2.3,
+            volume: 5200000,
+            market_cap: 4950000000000.0,
+        },
+        Security {
+            id: "SEC-002".into(),
+            symbol: "GTCO".into(),
+            name: "Guaranty Trust Holding".into(),
+            exchange: "NGX".into(),
+            sector: "Banking".into(),
+            last_price: 42.80,
+            change_pct: -0.5,
+            volume: 12000000,
+            market_cap: 1260000000000.0,
+        },
+        Security {
+            id: "SEC-003".into(),
+            symbol: "AIRTELAFRI".into(),
+            name: "Airtel Africa Plc".into(),
+            exchange: "NGX".into(),
+            sector: "Telecoms".into(),
+            last_price: 1850.00,
+            change_pct: 1.8,
+            volume: 850000,
+            market_cap: 6950000000000.0,
+        },
+        Security {
+            id: "SEC-004".into(),
+            symbol: "MTNN".into(),
+            name: "MTN Nigeria Communications".into(),
+            exchange: "NGX".into(),
+            sector: "Telecoms".into(),
+            last_price: 260.00,
+            change_pct: 0.7,
+            volume: 8500000,
+            market_cap: 5300000000000.0,
+        },
+        Security {
+            id: "SEC-005".into(),
+            symbol: "BUACEMENT".into(),
+            name: "BUA Cement Plc".into(),
+            exchange: "NGX".into(),
+            sector: "Building Materials".into(),
+            last_price: 95.00,
+            change_pct: -1.2,
+            volume: 3200000,
+            market_cap: 3230000000000.0,
+        },
+        Security {
+            id: "SEC-006".into(),
+            symbol: "ACCESSCORP".into(),
+            name: "Access Holdings Plc".into(),
+            exchange: "NGX".into(),
+            sector: "Banking".into(),
+            last_price: 18.50,
+            change_pct: 3.1,
+            volume: 25000000,
+            market_cap: 657000000000.0,
+        },
+    ]
 }
 
 async fn healthz() -> HttpResponse {
@@ -59,24 +285,100 @@ async fn healthz() -> HttpResponse {
 }
 
 async fn get_orders(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let orders = data.orders.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({"items": *orders, "total": orders.len()}))
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    if let Err(resp) = permify::require_permify(&req, "security_order", "view").await {
+        return resp;
+    } // W12-B5P1DD
+    let orders = match sqlx::query_as::<_, Order>(
+        "SELECT id, security, order_type, side, quantity, price, filled_qty, avg_fill_price,
+            status, client, exchange, timestamp FROM trading_orders ORDER BY id",
+    )
+    .fetch_all(&data.db)
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("securities-trading-rs: get_orders query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "order_store_unavailable"}));
+        }
+    };
+    HttpResponse::Ok().json(serde_json::json!({"items": orders, "total": orders.len()}))
 }
 
 async fn get_securities(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let securities = data.securities.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({"items": *securities, "total": securities.len()}))
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    if let Err(resp) = permify::require_permify(&req, "security_order", "view").await {
+        return resp;
+    } // W12-B5P1DD
+    let securities = match sqlx::query_as::<_, Security>(
+        "SELECT id, symbol, name, exchange, sector, last_price, change_pct, volume, market_cap
+            FROM securities ORDER BY id",
+    )
+    .fetch_all(&data.db)
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("securities-trading-rs: get_securities query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "securities_store_unavailable"}));
+        }
+    };
+    HttpResponse::Ok().json(serde_json::json!({"items": securities, "total": securities.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let orders = data.orders.lock().unwrap();
-    let securities = data.securities.lock().unwrap();
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    if let Err(resp) = permify::require_permify(&req, "security_order", "view").await {
+        return resp;
+    } // W12-B5P1DD
+    let orders = match sqlx::query_as::<_, Order>(
+        "SELECT id, security, order_type, side, quantity, price, filled_qty, avg_fill_price,
+            status, client, exchange, timestamp FROM trading_orders ORDER BY id",
+    )
+    .fetch_all(&data.db)
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "securities-trading-rs: get_stats orders query failed: {}",
+                e
+            );
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "order_store_unavailable"}));
+        }
+    };
+    let securities = match sqlx::query_as::<_, Security>(
+        "SELECT id, symbol, name, exchange, sector, last_price, change_pct, volume, market_cap
+            FROM securities ORDER BY id",
+    )
+    .fetch_all(&data.db)
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "securities-trading-rs: get_stats securities query failed: {}",
+                e
+            );
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "securities_store_unavailable"}));
+        }
+    };
     let filled: usize = orders.iter().filter(|o| o.status == "filled").count();
     let total_volume: i64 = orders.iter().map(|o| o.filled_qty).sum();
-    let total_value: f64 = orders.iter().map(|o| o.filled_qty as f64 * o.avg_fill_price).sum();
+    let total_value: f64 = orders
+        .iter()
+        .map(|o| o.filled_qty as f64 * o.avg_fill_price)
+        .sum();
     let total_market_cap: f64 = securities.iter().map(|s| s.market_cap).sum();
     HttpResponse::Ok().json(serde_json::json!({
         "totalOrders": orders.len(), "filledOrders": filled,
@@ -103,7 +405,8 @@ struct JwksCacheEntry {
     keys: jsonwebtoken::jwk::JwkSet,
 }
 
-static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> =
+    std::sync::OnceLock::new();
 
 fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
     JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
@@ -116,9 +419,10 @@ fn jwks_url() -> Option<String> {
         }
     }
     match std::env::var("KEYCLOAK_REALM_URL") {
-        Ok(realm) if !realm.is_empty() => {
-            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
-        }
+        Ok(realm) if !realm.is_empty() => Some(format!(
+            "{}/protocol/openid-connect/certs",
+            realm.trim_end_matches('/')
+        )),
         _ => None,
     }
 }
@@ -128,10 +432,12 @@ async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpRespon
     let url = match jwks_url() {
         Some(u) => u,
         None => {
-            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                "error": "jwt_validation_unavailable",
-                "detail": "no JWKS endpoint configured"
-            })))
+            return Err(
+                actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "error": "jwt_validation_unavailable",
+                    "detail": "no JWKS endpoint configured"
+                })),
+            )
         }
     };
     {
@@ -145,27 +451,38 @@ async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpRespon
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "client init failed"
-        })))?;
+        .map_err(|_| {
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "client init failed"
+            }))
+        })?;
     let resp = client.get(&url).send().await.map_err(|_| {
-        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+        actix_web::HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "jwks_unavailable"}))
     })?;
     if !resp.status().is_success() {
-        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "upstream returned error status"
-        })));
+        return Err(
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "upstream returned error status"
+            })),
+        );
     }
-    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
-        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "malformed JWKS payload"
-        }))
-    })?;
+    let keys = resp
+        .json::<jsonwebtoken::jwk::JwkSet>()
+        .await
+        .map_err(|_| {
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "malformed JWKS payload"
+            }))
+        })?;
     let mut cache = jwks_cache().lock().unwrap();
-    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    *cache = Some(JwksCacheEntry {
+        fetched_at: std::time::Instant::now(),
+        keys: keys.clone(),
+    });
     Ok(keys)
 }
 
@@ -183,13 +500,18 @@ fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
 }
 
 async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
-    let header = jsonwebtoken::decode_header(token)
-        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    let header = jsonwebtoken::decode_header(token).map_err(|_| {
+        actix_web::HttpResponse::Unauthorized()
+            .json(serde_json::json!({"error": "malformed token header"}))
+    })?;
     match header.alg {
         jsonwebtoken::Algorithm::RS256 => {
             let kid = match header.kid.clone() {
                 Some(k) if !k.is_empty() => k,
-                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+                _ => {
+                    return Err(actix_web::HttpResponse::Unauthorized()
+                        .json(serde_json::json!({"error": "missing kid"})))
+                }
             };
             // JWKS outage => 503 (fail closed). Unknown kid => force one cache
             // refresh (key rotation), then 401 if still unknown.
@@ -205,20 +527,24 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
                     match refreshed.find(&kid) {
                         Some(j) => j.clone(),
                         None => {
-                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                            return Err(actix_web::HttpResponse::Unauthorized()
+                                .json(serde_json::json!({"error": "unknown kid"})))
                         }
                     }
                 }
             };
-            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
-                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk).map_err(|_| {
+                actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid jwk"}))
+            })?;
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
             validation.validate_exp = true;
             validation.validate_nbf = true;
             apply_iss_aud(&mut validation);
             match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
                 Ok(data) => Ok(data.claims),
-                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid or expired token"}))),
             }
         }
         jsonwebtoken::Algorithm::HS256 => {
@@ -226,10 +552,12 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
             let secret = match std::env::var("JWT_SECRET") {
                 Ok(s) if !s.is_empty() => s,
                 _ => {
-                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                        "error": "jwt_validation_unavailable",
-                        "detail": "JWT_SECRET is not configured; refusing to validate"
-                    })))
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(
+                        serde_json::json!({
+                            "error": "jwt_validation_unavailable",
+                            "detail": "JWT_SECRET is not configured; refusing to validate"
+                        }),
+                    ))
                 }
             };
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -242,27 +570,47 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
                 &validation,
             ) {
                 Ok(data) => Ok(data.claims),
-                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid or expired token"}))),
             }
         }
-        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
-            "error": format!("unsupported alg {:?}", other)
-        }))),
+        other => Err(
+            actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+                "error": format!("unsupported alg {:?}", other)
+            })),
+        ),
     }
 }
 
-async fn check_jwt(req: &actix_web::HttpRequest) -> Result<serde_json::Value, actix_web::HttpResponse> {
+async fn check_jwt(
+    req: &actix_web::HttpRequest,
+) -> Result<serde_json::Value, actix_web::HttpResponse> {
     let path = req.path();
-    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
+    if path == "/healthz"
+        || path == "/readyz"
+        || path == "/livez"
+        || path == "/metrics"
+        || path == "/health"
+    {
         return Ok(serde_json::json!({}));
     }
-    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+    let header = match req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(h) => h,
-        None => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+        None => {
+            return Err(actix_web::HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "missing Authorization header"})))
+        }
     };
     let token = match header.strip_prefix("Bearer ") {
         Some(t) if !t.is_empty() => t,
-        _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+        _ => {
+            return Err(actix_web::HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "invalid auth header"})))
+        }
     };
     let claims = verify_jwt_token(token).await?;
     req.extensions_mut().insert(VerifiedClaims(claims.clone()));
@@ -285,24 +633,22 @@ fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8254".into()).parse().unwrap_or(8254);
-    let data = web::Data::new(AppState {
-        orders: Mutex::new(vec![
-            Order { id: "ORD-001".into(), security: "DANGCEM".into(), order_type: "limit".into(), side: "buy".into(), quantity: 10000, price: 290.50, filled_qty: 10000, avg_fill_price: 290.25, status: "filled".into(), client: "INST-001".into(), exchange: "NGX".into(), timestamp: "2026-05-11T10:00:00Z".into() },
-            Order { id: "ORD-002".into(), security: "GTCO".into(), order_type: "market".into(), side: "sell".into(), quantity: 50000, price: 0.0, filled_qty: 50000, avg_fill_price: 42.80, status: "filled".into(), client: "INST-002".into(), exchange: "NGX".into(), timestamp: "2026-05-11T10:05:00Z".into() },
-            Order { id: "ORD-003".into(), security: "AIRTELAFRI".into(), order_type: "limit".into(), side: "buy".into(), quantity: 25000, price: 1850.00, filled_qty: 15000, avg_fill_price: 1848.50, status: "partial_fill".into(), client: "INST-003".into(), exchange: "NGX".into(), timestamp: "2026-05-11T10:15:00Z".into() },
-            Order { id: "ORD-004".into(), security: "MTNN".into(), order_type: "limit".into(), side: "buy".into(), quantity: 100000, price: 260.00, filled_qty: 100000, avg_fill_price: 259.75, status: "filled".into(), client: "RET-001".into(), exchange: "NGX".into(), timestamp: "2026-05-11T10:30:00Z".into() },
-            Order { id: "ORD-005".into(), security: "FBN_BONDS_2030".into(), order_type: "limit".into(), side: "buy".into(), quantity: 5000, price: 980.00, filled_qty: 5000, avg_fill_price: 979.50, status: "filled".into(), client: "INST-004".into(), exchange: "NASD".into(), timestamp: "2026-05-11T11:00:00Z".into() },
-        ]),
-        securities: Mutex::new(vec![
-            Security { id: "SEC-001".into(), symbol: "DANGCEM".into(), name: "Dangote Cement Plc".into(), exchange: "NGX".into(), sector: "Building Materials".into(), last_price: 290.50, change_pct: 2.3, volume: 5200000, market_cap: 4950000000000.0 },
-            Security { id: "SEC-002".into(), symbol: "GTCO".into(), name: "Guaranty Trust Holding".into(), exchange: "NGX".into(), sector: "Banking".into(), last_price: 42.80, change_pct: -0.5, volume: 12000000, market_cap: 1260000000000.0 },
-            Security { id: "SEC-003".into(), symbol: "AIRTELAFRI".into(), name: "Airtel Africa Plc".into(), exchange: "NGX".into(), sector: "Telecoms".into(), last_price: 1850.00, change_pct: 1.8, volume: 850000, market_cap: 6950000000000.0 },
-            Security { id: "SEC-004".into(), symbol: "MTNN".into(), name: "MTN Nigeria Communications".into(), exchange: "NGX".into(), sector: "Telecoms".into(), last_price: 260.00, change_pct: 0.7, volume: 8500000, market_cap: 5300000000000.0 },
-            Security { id: "SEC-005".into(), symbol: "BUACEMENT".into(), name: "BUA Cement Plc".into(), exchange: "NGX".into(), sector: "Building Materials".into(), last_price: 95.00, change_pct: -1.2, volume: 3200000, market_cap: 3230000000000.0 },
-            Security { id: "SEC-006".into(), symbol: "ACCESSCORP".into(), name: "Access Holdings Plc".into(), exchange: "NGX".into(), sector: "Banking".into(), last_price: 18.50, change_pct: 3.1, volume: 25000000, market_cap: 657000000000.0 },
-        ]),
-    });
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "8254".into())
+        .parse()
+        .unwrap_or(8254);
+    // Wave-12 (C3-P0-B5): shared sqlx pool (max 25), aligned with the
+    // tigerbeetle-batch-engine-rs Wave-11 convention; DATABASE_URL is mandatory.
+    let db_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set - refusing to boot with default database credentials");
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_lazy(&db_url)
+        .expect("DATABASE_URL must parse");
+    init_db(&db).await;
+    seed_to_db(&db).await;
+    let data = web::Data::new(AppState { db });
     println!("Securities Trading on port {}", port);
     HttpServer::new(move || {
         App::new()
@@ -311,47 +657,17 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/trading/orders", web::get().to(get_orders))
             .route("/v1/trading/securities", web::get().to(get_securities))
             .route("/v1/trading/stats", web::get().to(get_stats))
-    }).bind(("0.0.0.0", port))?.run().await
+    })
+    .bind(("0.0.0.0", port))?
+    .run()
+    .await
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+// Wave-12 (C3-P0-B5): removed the unrouted `update_record`/`delete_record`
+// stubs that referenced a non-existent `CreateRequest` type and an AppState
+// `db` field that did not exist (the file did not compile as shipped; they
+// also targeted service_configs/outbox tables unrelated to this service's
+// order/securities domain).
 
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
-}
+// Wave-12 B5-P1-D-D: Permify authorization guard module.
+mod permify;

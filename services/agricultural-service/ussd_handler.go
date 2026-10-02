@@ -5,11 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/mux"
 )
 
@@ -43,14 +46,35 @@ type USSDResponse struct {
 }
 
 type USSDHandler struct {
-	db       *sql.DB
-	sessions map[string]*USSDSession
+	db *sql.DB
+	// W12 C3-P1-B2 (c3-0413): the per-process sessions map is gone — USSD
+	// session state lives in redis (ussd:session:{session_id}, 900s sliding)
+	// via the previously declared-but-uninitialized go-redis/v8 dependency,
+	// so sessions are consistent across replicas and survive restarts.
+	redis *redis.Client
+}
+
+// ussdSessionTTL is the sliding session lifetime — refreshed on every touch.
+const ussdSessionTTL = 900 * time.Second
+
+func ussdSessionKey(sessionID string) string {
+	return "ussd:session:" + sessionID
 }
 
 func NewUSSDHandler(db *sql.DB) *USSDHandler {
+	addr := os.Getenv("REDIS_URL")
+	if addr == "" {
+		addr = "localhost:6379"
+	}
 	return &USSDHandler{
-		db:       db,
-		sessions: make(map[string]*USSDSession),
+		db: db,
+		redis: redis.NewClient(&redis.Options{
+			Addr:         addr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		}),
 	}
 }
 
@@ -73,20 +97,51 @@ func (h *USSDHandler) HandleUSSD(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get or create session
-	session := h.getOrCreateSession(req.SessionID, req.PhoneNumber)
+	// Get or create session (redis-backed, fail-closed)
+	session, err := h.getOrCreateSession(r.Context(), req.SessionID, req.PhoneNumber)
+	if err != nil {
+		log.Printf("[agriculture-ussd] session state unavailable — failing closed: %v", err)
+		http.Error(w, "session state unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
 	// Process input and get response
 	response := h.processInput(r.Context(), session, req.Input)
+
+	// Persist the mutated session (sliding 900s TTL); on session end the key
+	// is deleted so ended sessions cannot be resumed. FAIL CLOSED: a session
+	// that cannot be persisted is refused rather than silently dropped.
+	if response.EndSession {
+		if err := h.redis.Del(r.Context(), ussdSessionKey(session.SessionID)).Err(); err != nil {
+			log.Printf("[agriculture-ussd] session delete failed — failing closed: %v", err)
+			http.Error(w, "session state unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	} else {
+		session.LastActivity = time.Now()
+		if err := h.saveSession(r.Context(), session); err != nil {
+			log.Printf("[agriculture-ussd] session persist failed — failing closed: %v", err)
+			http.Error(w, "session state unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
-func (h *USSDHandler) getOrCreateSession(sessionID, phoneNumber string) *USSDSession {
-	if session, exists := h.sessions[sessionID]; exists {
-		session.LastActivity = time.Now()
-		return session
+func (h *USSDHandler) getOrCreateSession(ctx context.Context, sessionID, phoneNumber string) (*USSDSession, error) {
+	raw, err := h.redis.Get(ctx, ussdSessionKey(sessionID)).Bytes()
+	if err == nil {
+		var session USSDSession
+		if err := json.Unmarshal(raw, &session); err == nil {
+			session.LastActivity = time.Now()
+			return &session, nil
+		}
+		// Corrupt entry — fall through and create a fresh session.
+	} else if err != redis.Nil {
+		// FAIL CLOSED: session state cannot be verified on redis outage.
+		return nil, fmt.Errorf("session load: %w", err)
 	}
 
 	session := &USSDSession{
@@ -102,7 +157,7 @@ func (h *USSDHandler) getOrCreateSession(sessionID, phoneNumber string) *USSDSes
 
 	// Try to find farmer by phone number
 	var farmerID, tenantID string
-	err := h.db.QueryRow(
+	err = h.db.QueryRow(
 		`SELECT id, tenant_id FROM farmers WHERE phone_number = $1 LIMIT 1`,
 		phoneNumber).Scan(&farmerID, &tenantID)
 
@@ -111,8 +166,16 @@ func (h *USSDHandler) getOrCreateSession(sessionID, phoneNumber string) *USSDSes
 		session.TenantID = tenantID
 	}
 
-	h.sessions[sessionID] = session
-	return session
+	return session, nil
+}
+
+// saveSession writes the session with the sliding 900s TTL.
+func (h *USSDHandler) saveSession(ctx context.Context, session *USSDSession) error {
+	data, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("session encode: %w", err)
+	}
+	return h.redis.Set(ctx, ussdSessionKey(session.SessionID), data, ussdSessionTTL).Err()
 }
 
 func (h *USSDHandler) processInput(ctx context.Context, session *USSDSession, input string) *USSDResponse {

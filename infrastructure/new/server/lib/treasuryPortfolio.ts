@@ -2,7 +2,13 @@
  * B6: Treasury investment portfolio management.
  * Tracks fixed income securities, T-bills, bonds, placements with maturity ladder,
  * yield computation, and mark-to-market valuation.
+ *
+ * W12-C3-P0: the investment book was an in-memory array. It is now
+ * Postgres-authoritative (treasury_investments) via the server's drizzle
+ * pool; seeds inserted once, all reads served from Postgres.
  */
+
+import { ensureTables, storeDDL, storeSeed, storeList } from "./pgJsonStore";
 
 export interface Investment {
   id: string;
@@ -30,7 +36,7 @@ export interface MaturityLadder {
   weightedYield: number;
 }
 
-const investments: Investment[] = [
+const INVESTMENT_SEED: Investment[] = [
   {
     id: "INV-001", type: "treasury_bill", issuer: "Federal Government of Nigeria",
     faceValue: 5_000_000_000, purchasePrice: 4_750_000_000, currentValue: 4_850_000_000,
@@ -75,9 +81,19 @@ const investments: Investment[] = [
   },
 ];
 
-export function getInvestments() { return investments; }
+function ensure(): Promise<void> {
+  return ensureTables("treasuryPortfolio", storeDDL("treasury_investments")).then(() =>
+    storeSeed("treasury_investments", INVESTMENT_SEED, () => ""),
+  );
+}
 
-export function getMaturityLadder(): MaturityLadder[] {
+export async function getInvestments(): Promise<Investment[]> {
+  await ensure();
+  return storeList<Investment>("treasury_investments");
+}
+
+export async function getMaturityLadder(): Promise<MaturityLadder[]> {
+  const investments = await getInvestments();
   const now = new Date("2026-05-09");
   const buckets: Record<string, Investment[]> = {
     "0-30 days": [], "31-90 days": [], "91-180 days": [],
@@ -109,7 +125,8 @@ export function getMaturityLadder(): MaturityLadder[] {
   }));
 }
 
-export function getPortfolioSummary() {
+export async function getPortfolioSummary() {
+  const investments = await getInvestments();
   const byPortfolio: Record<string, { count: number; totalValue: number; totalPnl: number }> = {};
   const byType: Record<string, { count: number; totalValue: number }> = {};
 

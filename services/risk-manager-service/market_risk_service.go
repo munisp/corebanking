@@ -8,7 +8,7 @@ import (
 // MarketRiskService handles market risk operations
 type MarketRiskService struct {
 	tenantID string
-	risks    map[string]*MarketRisk
+	risks    *repo[MarketRisk]
 	mu       sync.RWMutex
 }
 
@@ -16,7 +16,7 @@ type MarketRiskService struct {
 func NewMarketRiskService(tenantID string) *MarketRiskService {
 	svc := &MarketRiskService{
 		tenantID: tenantID,
-		risks:    make(map[string]*MarketRisk),
+		risks:    newRepo[MarketRisk](serviceDB, "market_risks"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -24,7 +24,7 @@ func NewMarketRiskService(tenantID string) *MarketRiskService {
 
 func (s *MarketRiskService) initializeDefaultData(tenantID string) {
 	// Trading book VaR
-	s.risks["mr-001"] = &MarketRisk{
+	s.risks.seed(tenantID, "mr-001", &MarketRisk{
 		RiskID:            "mr-001",
 		TenantID:          tenantID,
 		Date:              time.Now(),
@@ -42,10 +42,10 @@ func (s *MarketRiskService) initializeDefaultData(tenantID string) {
 		Metadata:          make(map[string]interface{}),
 		CreatedAt:         time.Now(),
 		UpdatedAt:         time.Now(),
-	}
+	})
 
 	// FX book VaR
-	s.risks["mr-002"] = &MarketRisk{
+	s.risks.seed(tenantID, "mr-002", &MarketRisk{
 		RiskID:            "mr-002",
 		TenantID:          tenantID,
 		Date:              time.Now(),
@@ -63,10 +63,10 @@ func (s *MarketRiskService) initializeDefaultData(tenantID string) {
 		Metadata:          make(map[string]interface{}),
 		CreatedAt:         time.Now(),
 		UpdatedAt:         time.Now(),
-	}
+	})
 
 	// Interest rate book VaR
-	s.risks["mr-003"] = &MarketRisk{
+	s.risks.seed(tenantID, "mr-003", &MarketRisk{
 		RiskID:            "mr-003",
 		TenantID:          tenantID,
 		Date:              time.Now(),
@@ -84,10 +84,10 @@ func (s *MarketRiskService) initializeDefaultData(tenantID string) {
 		Metadata:          make(map[string]interface{}),
 		CreatedAt:         time.Now(),
 		UpdatedAt:         time.Now(),
-	}
+	})
 
 	// Banking book
-	s.risks["mr-004"] = &MarketRisk{
+	s.risks.seed(tenantID, "mr-004", &MarketRisk{
 		RiskID:            "mr-004",
 		TenantID:          tenantID,
 		Date:              time.Now(),
@@ -105,16 +105,18 @@ func (s *MarketRiskService) initializeDefaultData(tenantID string) {
 		Metadata:          make(map[string]interface{}),
 		CreatedAt:         time.Now(),
 		UpdatedAt:         time.Now(),
-	}
+	})
 }
 
 // ListRisks returns market risks based on filters
-func (s *MarketRiskService) ListRisks(tenantID, portfolio string) []*MarketRisk {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *MarketRiskService) ListRisks(tenantID, portfolio string) ([]*MarketRisk, error) {
 
 	var result []*MarketRisk
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -123,18 +125,20 @@ func (s *MarketRiskService) ListRisks(tenantID, portfolio string) []*MarketRisk 
 		}
 		result = append(result, risk)
 	}
-	return result
+	return result, nil
 }
 
 // GetVaR returns current VaR summary
-func (s *MarketRiskService) GetVaR(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *MarketRiskService) GetVaR(tenantID string) (map[string]interface{}, error) {
 
 	var totalVaR, totalES, totalStressVaR int64
 	portfolioVaR := make(map[string]int64)
 
-	for _, risk := range s.risks {
+	__ALL__, __ERR__ := s.risks.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, risk := range __ALL__ {
 		if risk.TenantID != tenantID {
 			continue
 		}
@@ -166,7 +170,7 @@ func (s *MarketRiskService) GetVaR(tenantID string) map[string]interface{} {
 		"confidence":     99.0,
 		"horizon":        1,
 		"timestamp":      time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetVaRHistory returns VaR history

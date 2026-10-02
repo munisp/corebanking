@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -62,11 +65,81 @@ type NameEnquiry struct {
 	SessionID     string `json:"sessionId"`
 }
 
-var (
-	benMu         sync.RWMutex
-	beneficiaries []Beneficiary
-	benCounter    int64
+// ── Persistence (wave-12 C3-P0-B7) ─────────────────────────────────────────
+// Beneficiaries are Postgres-authoritative (typed table beneficiaries). The
+// in-memory slice was removed: create/delete/favorite/limits ALL hit PG
+// transactionally, lists are served from PG. The duplicate-beneficiary guard
+// is enforced by a UNIQUE constraint on the natural key
+// (customer_id, account_number, bank_code), not by an in-memory scan.
+// Fail-closed 503 when DATABASE_URL is unset/down.
+var db *sql.DB
 
+const beneficiaryDDL = `
+CREATE SEQUENCE IF NOT EXISTS beneficiary_id_seq START 1;
+CREATE TABLE IF NOT EXISTS beneficiaries (
+    id             text PRIMARY KEY,
+    tenant_id      text NOT NULL DEFAULT '',
+    customer_id    text NOT NULL,
+    name           text NOT NULL DEFAULT '',
+    nickname       text NOT NULL DEFAULT '',
+    bank_code      text NOT NULL,
+    bank_name      text NOT NULL DEFAULT '',
+    account_number text NOT NULL,
+    account_type   text NOT NULL DEFAULT '',
+    currency       text NOT NULL DEFAULT 'NGN',
+    verified       boolean NOT NULL DEFAULT false,
+    verified_name  text NOT NULL DEFAULT '',
+    daily_limit    double precision NOT NULL DEFAULT 1000000,
+    monthly_limit  double precision NOT NULL DEFAULT 10000000,
+    total_sent     double precision NOT NULL DEFAULT 0,
+    txn_count      integer NOT NULL DEFAULT 0,
+    is_favorite    boolean NOT NULL DEFAULT false,
+    last_used_at   timestamptz,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (customer_id, account_number, bank_code)
+);
+CREATE INDEX IF NOT EXISTS idx_beneficiaries_customer ON beneficiaries (customer_id);
+`
+
+func initDB() {
+	dsn := getEnv("DATABASE_URL", "")
+	if dsn == "" {
+		log.Printf("[beneficiary-management-go] DATABASE_URL not set — endpoints fail-closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[beneficiary-management-go] pg open failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[beneficiary-management-go] pg ping failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(beneficiaryDDL); err != nil {
+		log.Fatalf("[beneficiary-management-go] DDL failed: %v", err)
+	}
+	log.Printf("[beneficiary-management-go] postgres authoritative store ready (beneficiaries)")
+}
+
+const beneficiaryCols = `id, customer_id, name, nickname, bank_code, bank_name, account_number, account_type, currency, verified, verified_name, daily_limit, monthly_limit, total_sent, txn_count, is_favorite, last_used_at, created_at`
+
+func scanBeneficiary(row interface{ Scan(...interface{}) error }) (Beneficiary, error) {
+	var b Beneficiary
+	err := row.Scan(&b.ID, &b.CustomerID, &b.Name, &b.Nickname, &b.BankCode, &b.BankName,
+		&b.AccountNumber, &b.AccountType, &b.Currency, &b.Verified, &b.VerifiedName,
+		&b.DailyLimit, &b.MonthlyLimit, &b.TotalSent, &b.TxnCount, &b.IsFavorite, &b.LastUsedAt, &b.CreatedAt)
+	return b, err
+}
+
+var (
 	bankDirectory = map[string]string{
 		"000": "54Bank", "044": "Access Bank", "058": "GTBank", "011": "First Bank",
 		"033": "UBA", "032": "Union Bank", "035": "Wema Bank", "057": "Zenith Bank",
@@ -250,6 +323,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	initDB()
 	startJWKSRefresh()
 
 	port := os.Getenv("PORT")
@@ -261,11 +335,11 @@ func main() {
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/beneficiaries", handleBeneficiaries)
-	mux.HandleFunc("/v1/beneficiaries/verify", handleNameEnquiry)
-	mux.HandleFunc("/v1/beneficiaries/favorite", handleToggleFavorite)
-	mux.HandleFunc("/v1/beneficiaries/banks", handleBankDirectory)
-	mux.HandleFunc("/v1/beneficiaries/limits", handleSetLimits)
+	mux.HandleFunc("/v1/beneficiaries", permifyAuthzGuard("beneficiary_management", "manage", handleBeneficiaries))
+	mux.HandleFunc("/v1/beneficiaries/verify", permifyAuthzGuard("beneficiary_management", "verify", handleNameEnquiry))
+	mux.HandleFunc("/v1/beneficiaries/favorite", permifyAuthzGuard("beneficiary_management", "favorite", handleToggleFavorite))
+	mux.HandleFunc("/v1/beneficiaries/banks", permifyAuthzGuard("beneficiary_management", "manage", handleBankDirectory))
+	mux.HandleFunc("/v1/beneficiaries/limits", permifyAuthzGuard("beneficiary_management", "manage", handleSetLimits))
 
 	handler := corsMiddleware(mux)
 	log.Printf("Beneficiary Management Service starting on :%s", port)
@@ -274,18 +348,38 @@ func main() {
 
 func handleBeneficiaries(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if db == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
+	}
 	if r.Method == "GET" {
-		benMu.RLock()
-		defer benMu.RUnlock()
 		customerID := r.URL.Query().Get("customerId")
+		q := `SELECT ` + beneficiaryCols + ` FROM beneficiaries`
+		args := []interface{}{}
+		if customerID != "" {
+			q += ` WHERE customer_id = $1`
+			args = append(args, customerID)
+		}
+		q += ` ORDER BY created_at, id`
+		rows, err := db.Query(q, args...)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": "list failed: " + err.Error()})
+			return
+		}
+		defer rows.Close()
 		filtered := make([]Beneficiary, 0)
-		for _, b := range beneficiaries {
-			if customerID != "" && b.CustomerID != customerID {
-				continue
+		for rows.Next() {
+			b, err := scanBeneficiary(rows)
+			if err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(map[string]string{"error": "list failed: " + err.Error()})
+				return
 			}
 			filtered = append(filtered, b)
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"items": filtered, "total": len(filtered)})
+		json.NewEncoder(w).Encode(map[string]interface{}{"items": filtered, "total": len(filtered), "source": "postgres"})
 		return
 	}
 	if r.Method == "POST" {
@@ -307,34 +401,34 @@ func handleBeneficiaries(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Check for duplicate
-		benMu.RLock()
-		for _, existing := range beneficiaries {
-			if existing.CustomerID == b.CustomerID && existing.AccountNumber == b.AccountNumber && existing.BankCode == b.BankCode {
-				benMu.RUnlock()
-				w.WriteHeader(409)
-				json.NewEncoder(w).Encode(map[string]string{"error": "beneficiary already exists for this customer"})
-				return
-			}
-		}
-		benMu.RUnlock()
-
 		bankName, ok := bankDirectory[b.BankCode]
 		if !ok {
 			bankName = "Unknown Bank"
 		}
 		b.BankName = bankName
 
-		benMu.Lock()
-		benCounter++
-		b.ID = fmt.Sprintf("BEN-%d", benCounter)
+		// Duplicate guard is the UNIQUE(customer_id, account_number,
+		// bank_code) constraint — race-safe, unlike the old in-memory scan.
+		err := db.QueryRow(
+			`INSERT INTO beneficiaries (id, customer_id, name, nickname, bank_code, bank_name, account_number, account_type, currency, verified, verified_name, daily_limit, monthly_limit, total_sent, txn_count, is_favorite)
+			 VALUES ('BEN-' || nextval('beneficiary_id_seq')::text, $1,$2,$3,$4,$5,$6,$7,'NGN',false,'',1000000,10000000,0,0,false)
+			 RETURNING id, created_at`,
+			b.CustomerID, b.Name, b.Nickname, b.BankCode, b.BankName, b.AccountNumber, b.AccountType).
+			Scan(&b.ID, &b.CreatedAt)
+		if err != nil {
+			if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
+				w.WriteHeader(409)
+				json.NewEncoder(w).Encode(map[string]string{"error": "beneficiary already exists for this customer"})
+				return
+			}
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": "persist failed: " + err.Error()})
+			return
+		}
 		b.Verified = false
 		b.DailyLimit = 1000000    // default NGN 1M daily
 		b.MonthlyLimit = 10000000 // default NGN 10M monthly
 		b.Currency = "NGN"
-		b.CreatedAt = time.Now()
-		beneficiaries = append(beneficiaries, b)
-		benMu.Unlock()
 
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(b)
@@ -346,14 +440,15 @@ func handleBeneficiaries(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 
-		benMu.Lock()
-		defer benMu.Unlock()
-		for i := range beneficiaries {
-			if beneficiaries[i].ID == body.BeneficiaryID {
-				beneficiaries = append(beneficiaries[:i], beneficiaries[i+1:]...)
-				json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
-				return
-			}
+		res, err := db.Exec(`DELETE FROM beneficiaries WHERE id = $1`, body.BeneficiaryID)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": "delete failed: " + err.Error()})
+			return
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+			return
 		}
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "beneficiary not found"})
@@ -404,17 +499,25 @@ func handleToggleFavorite(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	benMu.Lock()
-	defer benMu.Unlock()
-	for i := range beneficiaries {
-		if beneficiaries[i].ID == body.BeneficiaryID {
-			beneficiaries[i].IsFavorite = !beneficiaries[i].IsFavorite
-			json.NewEncoder(w).Encode(beneficiaries[i])
-			return
-		}
+	if db == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
 	}
-	w.WriteHeader(404)
-	json.NewEncoder(w).Encode(map[string]string{"error": "beneficiary not found"})
+	b, err := scanBeneficiary(db.QueryRow(
+		`UPDATE beneficiaries SET is_favorite = NOT is_favorite, updated_at = now() WHERE id = $1 RETURNING `+beneficiaryCols,
+		body.BeneficiaryID))
+	if err == sql.ErrNoRows {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "beneficiary not found"})
+		return
+	}
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "update failed: " + err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(b)
 }
 
 func handleBankDirectory(w http.ResponseWriter, r *http.Request) {
@@ -450,18 +553,25 @@ func handleSetLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	benMu.Lock()
-	defer benMu.Unlock()
-	for i := range beneficiaries {
-		if beneficiaries[i].ID == body.BeneficiaryID {
-			beneficiaries[i].DailyLimit = body.DailyLimit
-			beneficiaries[i].MonthlyLimit = body.MonthlyLimit
-			json.NewEncoder(w).Encode(beneficiaries[i])
-			return
-		}
+	if db == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
 	}
-	w.WriteHeader(404)
-	json.NewEncoder(w).Encode(map[string]string{"error": "beneficiary not found"})
+	b, err := scanBeneficiary(db.QueryRow(
+		`UPDATE beneficiaries SET daily_limit = $2, monthly_limit = $3, updated_at = now() WHERE id = $1 RETURNING `+beneficiaryCols,
+		body.BeneficiaryID, body.DailyLimit, body.MonthlyLimit))
+	if err == sql.ErrNoRows {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "beneficiary not found"})
+		return
+	}
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "update failed: " + err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(b)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

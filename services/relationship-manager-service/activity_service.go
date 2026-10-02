@@ -11,7 +11,7 @@ import (
 // ActivityService handles activity operations
 type ActivityService struct {
 	tenantID   string
-	activities map[string]*Activity
+	activities *repo[Activity]
 	mu         sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type ActivityService struct {
 func NewActivityService(tenantID string) *ActivityService {
 	svc := &ActivityService{
 		tenantID:   tenantID,
-		activities: make(map[string]*Activity),
+		activities: newRepo[Activity](serviceDB, "activities"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -30,7 +30,7 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 	followUp2 := time.Now().AddDate(0, 0, 7)
 
 	// Recent call
-	s.activities["act-001"] = &Activity{
+	s.activities.seed(tenantID, "act-001", &Activity{
 		ActivityID:    "act-001",
 		TenantID:      tenantID,
 		CustomerID:    "cust-001",
@@ -46,10 +46,10 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, 0, -2),
 		UpdatedAt:     time.Now().AddDate(0, 0, -2),
-	}
+	})
 
 	// Meeting
-	s.activities["act-002"] = &Activity{
+	s.activities.seed(tenantID, "act-002", &Activity{
 		ActivityID:    "act-002",
 		TenantID:      tenantID,
 		CustomerID:    "cust-002",
@@ -65,10 +65,10 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, 0, -5),
 		UpdatedAt:     time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// Email
-	s.activities["act-003"] = &Activity{
+	s.activities.seed(tenantID, "act-003", &Activity{
 		ActivityID:   "act-003",
 		TenantID:     tenantID,
 		CustomerID:   "cust-003",
@@ -82,10 +82,10 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 		Metadata:     make(map[string]interface{}),
 		CreatedAt:    time.Now().AddDate(0, 0, -3),
 		UpdatedAt:    time.Now().AddDate(0, 0, -3),
-	}
+	})
 
 	// Site visit
-	s.activities["act-004"] = &Activity{
+	s.activities.seed(tenantID, "act-004", &Activity{
 		ActivityID:   "act-004",
 		TenantID:     tenantID,
 		CustomerID:   "cust-003",
@@ -99,11 +99,11 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 		Metadata:     make(map[string]interface{}),
 		CreatedAt:    time.Now().AddDate(0, 0, -10),
 		UpdatedAt:    time.Now().AddDate(0, 0, -10),
-	}
+	})
 
 	// Annual review
 	overdueFollowUp := time.Now().AddDate(0, 0, -2)
-	s.activities["act-005"] = &Activity{
+	s.activities.seed(tenantID, "act-005", &Activity{
 		ActivityID:    "act-005",
 		TenantID:      tenantID,
 		CustomerID:    "cust-005",
@@ -119,16 +119,18 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, 0, -7),
 		UpdatedAt:     time.Now().AddDate(0, 0, -7),
-	}
+	})
 }
 
 // ListActivities returns activities based on filters
-func (s *ActivityService) ListActivities(tenantID, rmID, activityType string) []*Activity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ActivityService) ListActivities(tenantID, rmID, activityType string) ([]*Activity, error) {
 
 	var result []*Activity
-	for _, activity := range s.activities {
+	__ALL__, __ERR__ := s.activities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, activity := range __ALL__ {
 		if activity.TenantID != tenantID {
 			continue
 		}
@@ -140,16 +142,14 @@ func (s *ActivityService) ListActivities(tenantID, rmID, activityType string) []
 		}
 		result = append(result, activity)
 	}
-	return result
+	return result, nil
 }
 
 // GetActivity retrieves an activity by ID
 func (s *ActivityService) GetActivity(tenantID, activityID string) (*Activity, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	activity, exists := s.activities[activityID]
-	if !exists || activity.TenantID != tenantID {
+	activity, err := s.activities.get(tenantID, activityID)
+	if err != nil {
 		return nil, errors.New("activity not found")
 	}
 	return activity, nil
@@ -157,8 +157,6 @@ func (s *ActivityService) GetActivity(tenantID, activityID string) (*Activity, e
 
 // CreateActivity creates a new activity
 func (s *ActivityService) CreateActivity(tenantID, rmID string, req *CreateActivityRequest) (*Activity, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	var followUpDate *time.Time
 	if req.FollowUpDate != "" {
@@ -184,33 +182,34 @@ func (s *ActivityService) CreateActivity(tenantID, rmID string, req *CreateActiv
 		UpdatedAt:    time.Now(),
 	}
 
-	s.activities[activity.ActivityID] = activity
+	if err := s.activities.put(tenantID, activity.ActivityID, activity); err != nil {
+		return nil, err
+	}
 	return activity, nil
 }
 
 // UpdateActivity updates an activity
 func (s *ActivityService) UpdateActivity(activity *Activity) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.activities[activity.ActivityID]
-	if !exists || existing.TenantID != activity.TenantID {
+	existing, err := s.activities.get(activity.TenantID, activity.ActivityID)
+	if err != nil {
 		return errors.New("activity not found")
 	}
 
 	activity.CreatedAt = existing.CreatedAt
 	activity.UpdatedAt = time.Now()
-	s.activities[activity.ActivityID] = activity
-	return nil
+	return s.activities.put(activity.TenantID, activity.ActivityID, activity)
 }
 
 // GetCustomerActivities returns activities for a customer
-func (s *ActivityService) GetCustomerActivities(tenantID, customerID string) []*Activity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ActivityService) GetCustomerActivities(tenantID, customerID string) ([]*Activity, error) {
 
 	var result []*Activity
-	for _, activity := range s.activities {
+	__ALL__, __ERR__ := s.activities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, activity := range __ALL__ {
 		if activity.TenantID != tenantID {
 			continue
 		}
@@ -218,16 +217,18 @@ func (s *ActivityService) GetCustomerActivities(tenantID, customerID string) []*
 			result = append(result, activity)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetFollowUps returns pending follow-ups
-func (s *ActivityService) GetFollowUps(tenantID, rmID string) []*Activity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ActivityService) GetFollowUps(tenantID, rmID string) ([]*Activity, error) {
 
 	var result []*Activity
-	for _, activity := range s.activities {
+	__ALL__, __ERR__ := s.activities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, activity := range __ALL__ {
 		if activity.TenantID != tenantID {
 			continue
 		}
@@ -238,17 +239,19 @@ func (s *ActivityService) GetFollowUps(tenantID, rmID string) []*Activity {
 			result = append(result, activity)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetCalendar returns activity calendar
-func (s *ActivityService) GetCalendar(tenantID, rmID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ActivityService) GetCalendar(tenantID, rmID string) (map[string]interface{}, error) {
 
 	calendar := make(map[string][]map[string]interface{})
 
-	for _, activity := range s.activities {
+	__ALL__, __ERR__ := s.activities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, activity := range __ALL__ {
 		if activity.TenantID != tenantID {
 			continue
 		}
@@ -269,20 +272,22 @@ func (s *ActivityService) GetCalendar(tenantID, rmID string) map[string]interfac
 	return map[string]interface{}{
 		"calendar":  calendar,
 		"timestamp": time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetActivityStats returns activity statistics
-func (s *ActivityService) GetActivityStats(tenantID, rmID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ActivityService) GetActivityStats(tenantID, rmID string) (map[string]interface{}, error) {
 
 	var today, thisWeek, pendingFollowUps int
 	now := time.Now()
 	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	startOfWeek := startOfDay.AddDate(0, 0, -int(now.Weekday()))
 
-	for _, activity := range s.activities {
+	__ALL__, __ERR__ := s.activities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, activity := range __ALL__ {
 		if activity.TenantID != tenantID {
 			continue
 		}
@@ -305,5 +310,5 @@ func (s *ActivityService) GetActivityStats(tenantID, rmID string) map[string]int
 		"today":            today,
 		"thisWeek":         thisWeek,
 		"pendingFollowUps": pendingFollowUps,
-	}
+	}, nil
 }

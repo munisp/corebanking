@@ -9,6 +9,124 @@ from dataclasses import dataclass, asdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 
 @dataclass
 class ChurnPrediction:
@@ -54,7 +172,7 @@ class AnomalyAlert:
     status: str
 
 
-CHURN_PREDICTIONS: list[ChurnPrediction] = [
+_CHURN_SEED: list[ChurnPrediction] = [
     ChurnPrediction("CP-001", "CUST-005", "Fatimah Abdullahi", "mass_retail", 0.78, "high", ["20 days since last login", "Balance below ₦50K", "No transactions in 15 days", "NPS score 5/10"], ["Personal call from RM", "Offer zero-fee transfer promo", "Push notification with savings goal"], 450_000, "churn-v3.2", "2026-05-09T08:00:00Z"),
     ChurnPrediction("CP-002", "CUST-020", "Olusegun Bakare", "diaspora", 0.62, "medium", ["Reduced remittance frequency", "No app login in 10 days", "Competitor rate alert viewed"], ["Exclusive diaspora rate offer", "Property investment pitch", "WhatsApp engagement"], 2_500_000, "churn-v3.2", "2026-05-09T08:00:00Z"),
     ChurnPrediction("CP-003", "CUST-004", "Emeka Nwosu", "sme", 0.45, "medium", ["Declining transaction volume", "Viewed competitor loan rates", "2 support tickets unresolved"], ["Resolve support tickets", "SME loan pre-approval", "Business advisory session"], 8_200_000, "churn-v3.2", "2026-05-09T08:00:00Z"),
@@ -71,7 +189,7 @@ CROSS_SELL_SCORES: list[CrossSellScore] = [
     CrossSellScore("XS-006", "CUST-012", "Dangote Cement PLC", "PRD-008", "54Invest T-Bills", 0.95, 0.97, 50_000_000, "CAMP-INST-TBILL", "accepted"),
 ]
 
-ANOMALY_ALERTS: list[AnomalyAlert] = [
+_ANOMALY_SEED: list[AnomalyAlert] = [
     AnomalyAlert("AN-001", "CUST-010", "Pinnacle Holdings Ltd", "volume_spike", "warning", "Transaction volume 3.2x above 30-day average", 8500, 27200, 3.2, "2026-05-09T10:00:00Z", "open"),
     AnomalyAlert("AN-002", "CUST-020", "Olusegun Bakare", "unusual_destination", "high", "Wire transfer to new country (Cayman Islands) not in profile", 0, 1, 0, "2026-05-09T11:30:00Z", "investigating"),
     AnomalyAlert("AN-003", "CUST-005", "Fatimah Abdullahi", "balance_drain", "critical", "Balance dropped 92% in 48 hours — possible account takeover", 2_500_000, 200_000, 4.1, "2026-05-09T09:00:00Z", "escalated"),
@@ -89,6 +207,11 @@ def compute_clv(avg_monthly_revenue: float, churn_rate: float, discount_rate: fl
     if monthly_churn + monthly_discount <= 0:
         return 0
     return round(avg_monthly_revenue * margin / (monthly_churn + monthly_discount), 2)
+
+
+# W12-C3P2B5: PG-backed stores (idempotent seeds).
+CHURN_STORE = _W12Store("churn_predictions", seed=[asdict(p) for p in _CHURN_SEED])
+ANOMALY_STORE = _W12Store("anomaly_alerts", seed=[asdict(a) for a in _ANOMALY_SEED])
 
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
@@ -273,12 +396,28 @@ class Handler(BaseHTTPRequestHandler):
                              "models": ["churn-v3.2", "cross-sell-v2.1", "anomaly-v1.5", "clv-v1.0"],
                              "middleware": ["Postgres", "Redis", "Kafka", "MLflow"]})
         elif self.path == "/v1/insights/churn":
-            self._json(200, {"items": [asdict(p) for p in CHURN_PREDICTIONS], "total": len(CHURN_PREDICTIONS)})
+            try:
+                _items = CHURN_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _items, "total": len(_items)})
         elif self.path == "/v1/insights/cross-sell":
             self._json(200, {"items": [asdict(s) for s in CROSS_SELL_SCORES], "total": len(CROSS_SELL_SCORES)})
         elif self.path == "/v1/insights/anomalies":
-            self._json(200, {"items": [asdict(a) for a in ANOMALY_ALERTS], "total": len(ANOMALY_ALERTS)})
+            try:
+                _items = ANOMALY_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _items, "total": len(_items)})
         elif self.path == "/v1/insights/dashboard":
+            try:
+                CHURN_PREDICTIONS = [ChurnPrediction(**r) for r in CHURN_STORE.all()]
+                ANOMALY_ALERTS = [AnomalyAlert(**r) for r in ANOMALY_STORE.all()]
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             high_churn = sum(1 for p in CHURN_PREDICTIONS if p.risk_level == "high")
             total_revenue_at_risk = sum(p.predicted_revenue_loss for p in CHURN_PREDICTIONS if p.churn_probability >= 0.5)
             open_anomalies = sum(1 for a in ANOMALY_ALERTS if a.status in ("open", "investigating", "escalated"))

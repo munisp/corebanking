@@ -464,9 +464,9 @@ func main() {
 	loadFlags()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/tb-flags/set", setFlagHandler)
+	mux.HandleFunc("/v1/tb-flags/set", permifyAuthzGuard("account", "manage", setFlagHandler))
 	mux.HandleFunc("/v1/tb-flags/get", getFlagsHandler)
-	mux.HandleFunc("/v1/tb-flags/validate-transfer", validateTransferHandler)
+	mux.HandleFunc("/v1/tb-flags/validate-transfer", permifyAuthzGuard("transfer", "validate", validateTransferHandler))
 	mux.HandleFunc("/healthz", healthHandler)
 
 	port := os.Getenv("PORT")

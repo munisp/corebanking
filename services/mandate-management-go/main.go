@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -66,13 +69,81 @@ type Mandate struct {
 	TotalDebited float64 `json:"totalDebited"`
 }
 
-var (
-	mandates []Mandate
-	mu       sync.RWMutex
-)
+// ── Persistence (wave-12 C3-P0-B7) ─────────────────────────────────────────
+// Mandates are Postgres-authoritative (typed table mandates; the register's
+// proposed name — NOTE: nibss-nip-engine-go also owns a `mandates` table per
+// its register entry; these services are deployed against separate databases
+// per fleet convention, so the names do not collide). The in-memory slice
+// was removed: list/stats/health are served from PG. Fail-closed 503 when
+// DATABASE_URL is unset/down.
+var db *sql.DB
 
-func init() {
-	mandates = []Mandate{}
+const mandateDDL = `
+CREATE TABLE IF NOT EXISTS mandates (
+    id            text PRIMARY KEY,
+    tenant_id     text NOT NULL DEFAULT '',
+    account_no    text NOT NULL DEFAULT '',
+    account_name  text NOT NULL DEFAULT '',
+    beneficiary   text NOT NULL DEFAULT '',
+    mandate_ref   text NOT NULL DEFAULT '' UNIQUE,
+    type          text NOT NULL DEFAULT '',
+    amount        double precision NOT NULL DEFAULT 0,
+    currency      text NOT NULL DEFAULT 'NGN',
+    frequency     text NOT NULL DEFAULT '',
+    status        text NOT NULL DEFAULT 'created',
+    start_date    text NOT NULL DEFAULT '',
+    end_date      text NOT NULL DEFAULT '',
+    next_exec     text NOT NULL DEFAULT '',
+    total_exec    integer NOT NULL DEFAULT 0,
+    total_debited double precision NOT NULL DEFAULT 0,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_mandates_status ON mandates (status);
+`
+
+func initDB() {
+	dsn := getEnv("DATABASE_URL", "")
+	if dsn == "" {
+		log.Printf("[mandate-management] DATABASE_URL not set — endpoints fail-closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[mandate-management] pg open failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[mandate-management] pg ping failed: %v — fail-closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(mandateDDL); err != nil {
+		log.Fatalf("[mandate-management] DDL failed: %v", err)
+	}
+	log.Printf("[mandate-management] postgres authoritative store ready (mandates)")
+}
+
+func dbListMandates() ([]Mandate, error) {
+	rows, err := db.Query(`SELECT id, account_no, account_name, beneficiary, mandate_ref, type, amount, currency, frequency, status, start_date, end_date, next_exec, total_exec, total_debited FROM mandates ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Mandate{}
+	for rows.Next() {
+		var m Mandate
+		if err := rows.Scan(&m.ID, &m.AccountNo, &m.AccountName, &m.Beneficiary, &m.MandateRef, &m.Type, &m.Amount, &m.Currency, &m.Frequency, &m.Status, &m.StartDate, &m.EndDate, &m.NextExec, &m.TotalExec, &m.TotalDebited); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 func getEnv(key, fallback string) string {
@@ -256,6 +327,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	initDB()
 	startJWKSRefresh()
 
 	mux := http.NewServeMux()
@@ -263,45 +335,73 @@ func main() {
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/mandates", func(w http.ResponseWriter, r *http.Request) {
-		jsonResponse(w, 200, map[string]interface{}{"items": mandates, "total": len(mandates)})
-	})
-	mux.HandleFunc("/v1/stats", func(w http.ResponseWriter, r *http.Request) {
-		active, suspended := 0, 0
-		totalDebited := 0.0
-		totalExec := 0
-		for _, m := range mandates {
-			if m.Status == "active" {
-				active++
+	mux.HandleFunc("/v1/mandates", permifyAuthzGuard("mandate_management", "manage", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			jsonResponse(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+			return
+		}
+		items, err := dbListMandates()
+		if err != nil {
+			jsonResponse(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+			return
+		}
+		jsonResponse(w, 200, map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
+	}))
+	mux.HandleFunc("/v1/stats", permifyAuthzGuard("mandate_management", "view", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			jsonResponse(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+			return
+		}
+		var total, active, suspended, totalExec int
+		var totalDebited float64
+		if err := db.QueryRow(`SELECT count(*),
+		        count(*) FILTER (WHERE status = 'active'),
+		        count(*) FILTER (WHERE status = 'suspended'),
+		        COALESCE(sum(total_debited), 0),
+		        COALESCE(sum(total_exec), 0) FROM mandates`).
+			Scan(&total, &active, &suspended, &totalDebited, &totalExec); err != nil {
+			jsonResponse(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+			return
+		}
+		types := map[string]int{}
+		rows, err := db.Query(`SELECT type, count(*) FROM mandates GROUP BY type`)
+		if err != nil {
+			jsonResponse(w, 500, map[string]string{"error": "stats failed: " + err.Error()})
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t string
+			var c int
+			if err := rows.Scan(&t, &c); err == nil {
+				types[t] = c
 			}
-			if m.Status == "suspended" {
-				suspended++
-			}
-			totalDebited += m.TotalDebited
-			totalExec += m.TotalExec
 		}
 		jsonResponse(w, 200, map[string]interface{}{
-			"totalMandates": len(mandates), "active": active, "suspended": suspended,
+			"totalMandates": total, "active": active, "suspended": suspended,
 			"totalDebited": totalDebited, "totalExecutions": totalExec,
-			"types": map[string]int{"direct-debit": 5, "standing-order": 1},
+			"source": "postgres",
+			"types":  types,
 		})
-	})
+	}))
 
-	log.Printf("[mandate-management] Listening on :%s with %d mandates\n", port, len(mandates))
+	mandateCount := 0
+	if db != nil {
+		_ = db.QueryRow(`SELECT count(*) FROM mandates`).Scan(&mandateCount)
+	}
+	log.Printf("[mandate-management] Listening on :%s with %d mandates\n", port, mandateCount)
 	log.Fatal((&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 // healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	active := 0
-	for _, m := range mandates {
-		if m.Status == "active" {
-			active++
-		}
+	total, active := 0, 0
+	if db != nil {
+		_ = db.QueryRow(`SELECT count(*), count(*) FILTER (WHERE status = 'active') FROM mandates`).Scan(&total, &active)
 	}
 	jsonResponse(w, 200, map[string]interface{}{
 		"status": "healthy", "service": "mandate-management",
-		"mandates":   map[string]int{"total": len(mandates), "active": active},
+		"mandates":   map[string]int{"total": total, "active": active},
 		"middleware": middlewareConfig,
 	})
 }

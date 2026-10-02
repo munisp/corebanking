@@ -123,9 +123,14 @@ export class UserService {
   // Change password
   async changePassword(oldPassword: string, newPassword: string): Promise<{ success: boolean; message: string }> {
     try {
-      const response = await apiService.post(`${AppConfig.authEndpoint}/change-password`, {
-        old_password: oldPassword,
+      // W12-A4A: was `${authEndpoint}/change-password` → gateway rewrote to
+      // /change-password which auth-service does not serve (404). Endpoint
+      // exists at auth-service /auth/change-password (api/v1/auth.py:274) and
+      // requires current_password + confirm_password (ChangePassword schema).
+      const response = await apiService.post(`${AppConfig.authEndpoint}/auth/change-password`, {
+        current_password: oldPassword,
         new_password: newPassword,
+        confirm_password: newPassword,
       });
 
       const data = response.data as { message?: string };
@@ -180,7 +185,11 @@ export class UserService {
   // Verify BVN
   async verifyBvn(keycloakId: string, bvn: string): Promise<{ success: boolean; message: string }> {
     try {
-      const response = await apiService.post(`${AppConfig.authEndpoint}/verify-bvn`, {
+      // W12-A4A: was `${authEndpoint}/verify-bvn` — auth-service has no such
+      // route. BVN verification lives in kyc-aml-screening-py
+      // POST /v1/kyc/verify-bvn (service.py:928), gateway-exposed at
+      // /kyc-aml-screening/* (kyc-aml-screening-py.yaml strips the prefix).
+      const response = await apiService.post(`/kyc-aml-screening/v1/kyc/verify-bvn`, {
         keycloak_id: keycloakId,
         bvn: bvn,
       });

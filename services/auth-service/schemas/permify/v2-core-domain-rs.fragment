@@ -1,0 +1,207 @@
+// ============================================================================
+// W12-B5-P1-D-B: core-domain-rs / auth-security-rs schema FRAGMENT (83 rust
+// services, wave 2 batch D-B). Merged into the canonical v2.perm by the
+// integrator; kept separate so the canonical-schema owner (B5-P0-D1), the D-A
+// core-domain fragment owner and this batch never edit the same file. Syntax
+// identical to v2.perm. The `user` entity is declared in the canonical file
+// and referenced here by type only. The `service_config` entity (canonical
+// v2.perm, W12-B5-P0-D1) covers the generic service_configs CRUD guarded by
+// this batch and is NOT redeclared here.
+//
+// Convention: every mutating handler checks subject = verified JWT sub
+// (user), resource = <entity>:<domain-id or "collection">, permission =
+// <entity>.<action> as below. Checks fail closed (502 unreachable / 403 denied).
+// ============================================================================
+
+entity billing_enforcement {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission enforce      = admin
+  permission meter        = admin or operator
+}
+
+entity billing_rate {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission rate         = admin or operator
+}
+
+entity biometric_credential {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission enroll       = admin or operator
+  permission revoke       = admin
+  permission verify       = admin or operator
+}
+
+entity cache_operation {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission apply        = admin or operator
+}
+
+entity clickjack_check {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission check        = admin or operator
+}
+
+entity code_signing {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission sign         = admin
+  permission verify       = admin or operator
+}
+
+entity collateral_valuation {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission compute      = admin or operator
+}
+
+entity credential_rotation {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission rotate       = admin
+}
+
+entity dormancy {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission notify       = admin or operator
+  permission reactivate   = admin
+}
+
+entity face_match {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission compare      = admin or operator
+}
+
+entity jwt_validation {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission validate     = admin or operator
+}
+
+entity knowledge_graph {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission classify     = admin or operator
+  permission create       = admin or operator
+  permission query        = admin or operator
+  permission seed         = admin
+  permission traverse     = admin or operator
+}
+
+entity liveness {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission analyze      = admin or operator
+  permission challenge    = admin or operator
+  permission evaluate     = admin or operator
+  permission score        = admin or operator
+  permission verify       = admin or operator
+}
+
+entity offline_sync {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission sync         = admin or operator
+}
+
+entity otp {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission send         = admin or operator
+  permission verify       = admin or operator
+}
+
+entity pin_block {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission encode       = admin
+  permission hash         = admin
+  permission verify       = admin or operator
+}
+
+entity product_factory {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission manage       = admin or operator
+}
+
+entity rate_limit {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission check        = admin or operator
+}
+
+entity self_dealing {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission check        = admin or operator
+  permission register     = admin or operator
+}
+
+entity stream_processing {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission process      = admin or operator
+}
+
+entity waf_evaluation {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission evaluate     = admin or operator
+}
+
+entity wasm_transform {
+  relation admin    @user
+  relation operator @user
+  relation auditor  @user
+
+  permission transform    = admin or operator
+}

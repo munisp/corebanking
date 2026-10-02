@@ -78,16 +78,63 @@ type EmployeeWindow struct {
 	LastUpdated  time.Time             `json:"last_updated"`
 }
 
+// W12-C3-PX (c3-0516): the velocity rule set is no longer an in-memory package
+// singleton. Rules are seeded into and read from the Postgres `velocity_rules`
+// table (register target postgres:velocity_rules). The role is the natural key
+// (idempotent seed/upsert). defaultVelocityRules is only seed data for first
+// boot, never a runtime store.
+var defaultVelocityRules = map[string]*VelocityRule{
+	"teller":        {Role: "teller", MaxTxnPerHour: 50, MaxAmountPerHour: 50_000_000_00, AlertThreshold: 0.85},
+	"senior_teller": {Role: "senior_teller", MaxTxnPerHour: 80, MaxAmountPerHour: 200_000_000_00, AlertThreshold: 0.85},
+	"supervisor":    {Role: "supervisor", MaxTxnPerHour: 100, MaxAmountPerHour: 500_000_000_00, AlertThreshold: 0.90},
+}
+
 var (
-	mu    sync.RWMutex
-	rules = map[string]*VelocityRule{
-		"teller":        {Role: "teller", MaxTxnPerHour: 50, MaxAmountPerHour: 50_000_000_00, AlertThreshold: 0.85},
-		"senior_teller": {Role: "senior_teller", MaxTxnPerHour: 80, MaxAmountPerHour: 200_000_000_00, AlertThreshold: 0.85},
-		"supervisor":    {Role: "supervisor", MaxTxnPerHour: 100, MaxAmountPerHour: 500_000_000_00, AlertThreshold: 0.90},
-	}
+	mu           sync.RWMutex
 	db           *sql.DB
 	blockedCount uint64
 )
+
+// dbLoadRule reads one velocity rule by role from Postgres. Fail-closed: a
+// database error is returned to the caller (velocity/fraud controls must not
+// silently fall back to an empty or stale in-memory rule set).
+func dbLoadRule(role string) (*VelocityRule, error) {
+	if db == nil {
+		return nil, fmt.Errorf("persistence_unavailable: DATABASE_URL is not configured; velocity rules cannot be loaded")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var r VelocityRule
+	err := db.QueryRowContext(ctx, `SELECT role, max_txn_per_hour, max_amount_per_hour_kobo, alert_threshold_pct FROM velocity_rules WHERE role=$1`, role).
+		Scan(&r.Role, &r.MaxTxnPerHour, &r.MaxAmountPerHour, &r.AlertThreshold)
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// dbListRules reads the full authoritative rule set from Postgres.
+func dbListRules() (map[string]*VelocityRule, error) {
+	if db == nil {
+		return nil, fmt.Errorf("persistence_unavailable: DATABASE_URL is not configured; velocity rules cannot be loaded")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT role, max_txn_per_hour, max_amount_per_hour_kobo, alert_threshold_pct FROM velocity_rules ORDER BY role`)
+	if err != nil {
+		return nil, fmt.Errorf("persistence_unavailable: %w", err)
+	}
+	defer rows.Close()
+	rules := make(map[string]*VelocityRule)
+	for rows.Next() {
+		var r VelocityRule
+		if err := rows.Scan(&r.Role, &r.MaxTxnPerHour, &r.MaxAmountPerHour, &r.AlertThreshold); err != nil {
+			return nil, fmt.Errorf("persistence_unavailable: %w", err)
+		}
+		rules[r.Role] = &r
+	}
+	return rules, rows.Err()
+}
 
 func initSchema() {
 	if db == nil {
@@ -105,9 +152,26 @@ func initSchema() {
 			risk_score FLOAT DEFAULT 0, checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
 		`CREATE INDEX IF NOT EXISTS idx_vel_checks_emp ON velocity_checks(employee_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_vel_checks_time ON velocity_checks(checked_at)`,
+		// W12-C3-PX (c3-0516): velocity_rules — PG home for the per-role
+		// velocity rule set (was the in-memory `rules` package singleton).
+		// role is the natural key.
+		`CREATE TABLE IF NOT EXISTS velocity_rules (
+			role TEXT PRIMARY KEY, max_txn_per_hour INT NOT NULL,
+			max_amount_per_hour_kobo BIGINT NOT NULL, alert_threshold_pct FLOAT NOT NULL DEFAULT 0.85,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
 	} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			log.Printf("[velocity] schema: %v", err)
+		}
+	}
+	// W12-C3-PX: idempotent seed of the default rule set (ON CONFLICT DO
+	// NOTHING on the natural key) so first-boot behaviour is unchanged but
+	// rules survive restarts and are shared across replicas.
+	for _, r := range defaultVelocityRules {
+		if _, err := db.ExecContext(ctx, `INSERT INTO velocity_rules (role, max_txn_per_hour, max_amount_per_hour_kobo, alert_threshold_pct)
+			VALUES ($1,$2,$3,$4) ON CONFLICT (role) DO NOTHING`,
+			r.Role, r.MaxTxnPerHour, r.MaxAmountPerHour, r.AlertThreshold); err != nil {
+			log.Printf("[velocity] rule seed %s: %v", r.Role, err)
 		}
 	}
 	log.Println("[velocity] PostgreSQL schema initialized")
@@ -180,9 +244,17 @@ func checkVelocity(employeeID, role string, amountKobo int64, txnType string) (b
 	mu.Lock()
 	defer mu.Unlock()
 
-	rule, ok := rules[role]
-	if !ok {
-		rule = rules["teller"]
+	// W12-C3-PX (c3-0516): the authoritative rule comes from PG with the same
+	// role->teller fallback. Fail CLOSED on persistence errors — a velocity
+	// control that cannot load its limits must not silently allow the txn.
+	rule, err := dbLoadRule(role)
+	if err != nil {
+		rule, err = dbLoadRule("teller")
+	}
+	if err != nil {
+		log.Printf("[velocity] rule load failed, failing closed: %v", err)
+		atomic.AddUint64(&blockedCount, 1)
+		return false, []string{"persistence_unavailable: velocity rules cannot be loaded"}, 1.0
 	}
 
 	window := dbLoadWindow(employeeID)
@@ -284,12 +356,28 @@ func handleListWindows(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleListRules(w http.ResponseWriter, r *http.Request) {
+	// W12-C3-PX (c3-0516): list reads come from PG.
+	rules, err := dbListRules()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(rules)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	windows := dbListWindows()
+	// W12-C3-PX (c3-0516): rule count comes from PG.
+	rules, err := dbListRules()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"tracked_employees": len(windows), "blocked_count": atomic.LoadUint64(&blockedCount),

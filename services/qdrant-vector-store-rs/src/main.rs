@@ -2,6 +2,7 @@
 use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
@@ -197,9 +198,12 @@ fn cbn_reporting_threshold_ngn() -> f64 { 5_000_000.0 }
 
 // ─── APP STATE ───────────────────────────────────────────────────────────────
 
+// Wave-12 (C3-P2-RSVEC): collection configs are persisted in Postgres (was
+// in-memory Mutex<Vec<CollectionConfig>>). `points` stays in memory: it is a
+// derived mirror of the authoritative external Qdrant vector DB (upserted to
+// Qdrant on every write), not the system of record.
 struct AppState {
     db: PgPool,
-    collections: Mutex<Vec<CollectionConfig>>,
     points: Mutex<std::collections::HashMap<String, Vec<VectorPoint>>>,
     qdrant: QdrantClient,
     db_url: Option<String>,
@@ -570,6 +574,7 @@ fn degradation_mode() -> &'static str {
 
 async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "view").await { return resp; } // W12-B5P1DF
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -579,7 +584,18 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let collections = state.collections.lock().await;
+    // Wave-12 (C3-P2-RSVEC): collection count from Postgres (was in-memory Vec).
+    let collection_count: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM vector_collections")
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            log::warn!("qdrant-vector-store-rs: health collection count failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "collection_store_unavailable"}));
+        }
+    };
     let points = state.points.lock().await;
     let total_points: usize = points.values().map(|v| v.len()).sum();
     let _cbn = cbn_reporting_threshold_ngn();
@@ -588,7 +604,7 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
         "service": "qdrant-vector-store-rs",
         "version": "1.0.0",
         "qdrant": {"url": state.qdrant.base_url},
-        "collections": collections.len(),
+        "collections": collection_count,
         "totalVectors": total_points,
         "capabilities": [
             "semantic_search", "regulatory_document_retrieval", "entity_deduplication",
@@ -609,6 +625,7 @@ async fn metrics() -> HttpResponse {
 // --- Alerting ---
 async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "view").await { return resp; } // W12-B5P1DF
     let reqs = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
     let errs = ERROR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -630,13 +647,28 @@ async fn livez(req: actix_web::HttpRequest) -> HttpResponse {
 
 async fn init_collections(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "init").await { return resp; } // W12-B5P1DF
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let configs = get_collections();
     for cfg in &configs {
         let _ = state.qdrant.create_collection(&cfg.name, cfg.vector_size);
     }
-    let mut collections = state.collections.lock().await;
-    *collections = configs.clone();
+    // Wave-12 (C3-P2-RSVEC): persist collection configs to Postgres (was
+    // in-memory Vec overwrite). Idempotent; fail closed on PG error.
+    for cfg in &configs {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO vector_collections (id, payload) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&cfg.name)
+        .bind(serde_json::to_value(cfg).unwrap_or_else(|_| json!({})))
+        .execute(&state.db)
+        .await
+        {
+            log::warn!("qdrant-vector-store-rs: init_collections insert failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "collection_store_unavailable"}));
+        }
+    }
 
     // Seed regulatory embeddings
     let reg_points = seed_regulatory_embeddings();
@@ -653,6 +685,7 @@ async fn upsert_vectors(req: actix_web::HttpRequest, state: web::Data<AppState>,
     sanitize_input("");
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "upsert").await { return resp; } // W12-B5P1DF
     let req_data = body.into_inner();
     let count = req_data.points.len();
     let _ = state.qdrant.upsert_points(&req_data.collection, &req_data.points);
@@ -666,6 +699,7 @@ async fn semantic_search(req: actix_web::HttpRequest, state: web::Data<AppState>
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     sanitize_input("");
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "view").await { return resp; } // W12-B5P1DF
     let search = body.into_inner();
     let limit = search.limit.unwrap_or(10) as usize;
 
@@ -689,6 +723,7 @@ async fn semantic_search(req: actix_web::HttpRequest, state: web::Data<AppState>
 async fn embed_text(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "embed").await { return resp; } // W12-B5P1DF
     let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
     let dim = body.get("dimension").and_then(|v| v.as_u64()).unwrap_or(768) as usize;
     let embedding = generate_text_embedding(text, dim);
@@ -699,6 +734,7 @@ async fn embed_text(req: actix_web::HttpRequest, body: web::Json<serde_json::Val
 async fn search_regulations(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "view").await { return resp; } // W12-B5P1DF
     let query_text = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
     let query_vec = generate_text_embedding(query_text, 768);
@@ -843,7 +879,6 @@ async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8163);
     let state = web::Data::new(AppState {
         db: pool,
-        collections: Mutex::new(Vec::new()),
         points: Mutex::new(std::collections::HashMap::new()),
         qdrant: QdrantClient {
             base_url: env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()),
@@ -943,6 +978,19 @@ async fn init_schema(pool: &PgPool) {
     .await
     .expect("Failed to create service_configs table");
 
+    // Wave-12 (C3-P2-RSVEC): durable vector-collection config store (was
+    // in-memory Mutex<Vec<CollectionConfig>>). jsonb payload; name is the key.
+    if let Err(e) = sqlx::query(r#"CREATE TABLE IF NOT EXISTS vector_collections (
+    id TEXT PRIMARY KEY,
+    payload JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await {
+        log::warn!("qdrant-vector-store-rs: vector_collections DDL failed: {}", e);
+    }
+
     sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         event_type VARCHAR(64) NOT NULL,
@@ -958,6 +1006,7 @@ async fn init_schema(pool: &PgPool) {
 
 async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "view").await { return resp; } // W12-B5P1DF
     let tenant_id = match claims_tenant(&req) {
         Some(t) if !t.is_empty() => t,
         _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
@@ -986,6 +1035,7 @@ async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
 
 async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "service_configs").await { return resp; } // W12-B5P1DF
     let tenant_id = match claims_tenant(&req) {
         Some(t) if !t.is_empty() => t,
         _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
@@ -993,22 +1043,31 @@ async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>
 
     let status = body.status.clone().unwrap_or_else(|| "active".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
     )
     .bind(&tenant_id)
     .bind(&status)
-    .fetch_one(&data.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
         Ok(id) => {
             let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.created")
                 .bind(id.to_string())
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -1017,6 +1076,7 @@ async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>
 
 async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "view").await { return resp; } // W12-B5P1DF
     let id = path.into_inner();
     let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
         .bind(&id)
@@ -1036,23 +1096,33 @@ async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: act
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "update").await { return resp; } // W12-B5P1DF
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -1061,19 +1131,33 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "dataset", "delete").await { return resp; } // W12-B5P1DF
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }
+
+// Wave-12 B5-P1-D-F: Permify authorization guard module.
+mod permify;

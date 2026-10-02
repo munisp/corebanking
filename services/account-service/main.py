@@ -57,9 +57,23 @@ with engine.begin() as _conn:
     _conn.execute(text("ALTER TABLE account ADD COLUMN IF NOT EXISTS guardian_id VARCHAR"))
     _conn.execute(text("ALTER TABLE account ADD COLUMN IF NOT EXISTS daily_limit_kobo BIGINT"))
     _conn.execute(text("ALTER TABLE account ADD COLUMN IF NOT EXISTS mandate VARCHAR NOT NULL DEFAULT 'single'"))
-    # MN-01/MN-02/MN-05: new status enum values (expand-only; idempotent).
-    for _status in ("dormant", "closed", "deceased"):
+    # W12-A4-P0-D: primary-account flag backing POST /account/{id}/set-primary.
+    _conn.execute(text("ALTER TABLE account ADD COLUMN IF NOT EXISTS is_primary BOOLEAN NOT NULL DEFAULT FALSE"))
+    # MN-01/MN-02/MN-05 + W12-A4-P0-D: new status enum values (expand-only; idempotent).
+    for _status in ("dormant", "closed", "deceased", "frozen"):
         _conn.execute(text(f"ALTER TYPE accountstatus ADD VALUE IF NOT EXISTS '{_status}'"))
+    # W12-A4-P0-D: statement-generation jobs table.
+    _conn.execute(text("""CREATE TABLE IF NOT EXISTS statement_jobs (
+        id VARCHAR PRIMARY KEY,
+        tenant_id VARCHAR NOT NULL,
+        account_id VARCHAR NOT NULL,
+        account_number VARCHAR NOT NULL,
+        period_from VARCHAR,
+        period_to VARCHAR,
+        status VARCHAR NOT NULL DEFAULT 'completed',
+        payload TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"""))
     # MN-03: signatories table.
     _conn.execute(text("""CREATE TABLE IF NOT EXISTS account_signatories (
         id VARCHAR PRIMARY KEY,

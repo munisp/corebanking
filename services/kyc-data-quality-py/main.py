@@ -12,7 +12,9 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -345,7 +347,7 @@ def metrics():
         return {"service": "kyc-data-quality-py", "total_records": 0}
 
 
-@app.get("/api/v1/kyc_records")
+@app.get("/api/v1/kyc_records", dependencies=[Depends(require_permify("kyc_record", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:

@@ -3,7 +3,7 @@ Compliance & Regulatory Service - Complete Production Implementation
 Handles regulatory reporting, AML/CFT, sanctions screening, transaction monitoring, and SAR filing
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from audit_middleware import AuditMiddleware
@@ -258,6 +258,58 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
 
 
 app.add_middleware(JWTAuthMiddleware)
+
+# --- Permify authorization (W12-B5-P0-D2) ---
+# Every mutating handler performs a REAL Permify permission check AFTER
+# JWTAuthMiddleware has authenticated the caller. Subject = verified JWT sub,
+# tenant = verified tenant claim, resource = domain entity id, permission per
+# action (schema entities: services/auth-service/schemas/permify/
+# v2-kyc-compliance.fragment). FAIL-CLOSED: Permify unreachable/non-200 => 503;
+# denied => 403. Canonical pattern: services/auth-service/adapters/permify.py
+# check_permission (REST /v1/tenants/{tenant}/permissions/check).
+import logging as _permify_logging
+
+_PERMIFY_URL = os.getenv("PERMIFY_URL", "http://permify:3476").rstrip("/")
+_PERMIFY_DEFAULT_TENANT = os.getenv("PERMIFY_DEFAULT_TENANT", "bpmgd")
+_permify_logger = _permify_logging.getLogger(__name__)
+
+
+def permify_authorize(request, entity_type, entity_id, permission):
+    """Enforce <permission> on entity_type:entity_id for the JWT-verified caller.
+
+    Raises HTTPException(403) on denial and HTTPException(503) when Permify is
+    unreachable or errors (fail-closed). Returns True when allowed.
+    """
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    subject = claims.get("sub") or claims.get("keycloak_id") or ""
+    tenant_id = claims.get("tenant_id") or claims.get("tenant") or _PERMIFY_DEFAULT_TENANT
+    entity_id = str(entity_id or "")
+    if not subject or not entity_id:
+        raise HTTPException(status_code=403, detail="authorization context incomplete")
+    payload = {
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    }
+    try:
+        resp = requests.post(
+            f"{_PERMIFY_URL}/v1/tenants/{tenant_id}/permissions/check",
+            json=payload,
+            timeout=5,
+        )
+    except Exception as exc:
+        _permify_logger.error("permify check %s on %s:%s unreachable: %s", permission, entity_type, entity_id, exc)
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify unreachable (fail-closed)")
+    if resp.status_code != 200:
+        _permify_logger.error("permify check %s on %s:%s http=%s", permission, entity_type, entity_id, resp.status_code)
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify check failed (fail-closed)")
+    can = resp.json().get("can")
+    allowed = can == "CHECK_RESULT_ALLOWED" or can is True
+    if not allowed:
+        raise HTTPException(status_code=403, detail=f"permify: {permission} denied on {entity_type}:{entity_id}")
+    return True
+
 
 
 _CORS_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",") if o.strip()]
@@ -590,11 +642,13 @@ async def health_check():
 # Regulatory Reporting Endpoints
 @app.post("/api/v1/compliance/reports/generate")
 async def generate_regulatory_report(
+    request: Request,
     report: RegulatoryReport,
     background_tasks: BackgroundTasks,
     db=Depends(get_db)
 ):
     """Generate a regulatory report"""
+    permify_authorize(request, "compliance_report", report.tenant_id, "generate")
     report_id = f"RPT{int(datetime.now().timestamp())}"
     
     async with db.acquire() as conn:
@@ -749,6 +803,7 @@ async def list_regulatory_reports(
 
 @app.post("/api/v1/compliance/reports/{report_id}/submit")
 async def submit_regulatory_report(
+    request: Request,
     report_id: str,
     db=Depends(get_db)
 ):
@@ -760,6 +815,7 @@ async def submit_regulatory_report(
     'prepared_for_manual_filing': an officer must file the generated report
     through the regulator's portal and record the acknowledgement out of band.
     """
+    permify_authorize(request, "compliance_report", report_id, "submit")
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE regulatory_reports
@@ -785,10 +841,12 @@ async def submit_regulatory_report(
 # Compliance Alerts Endpoints
 @app.post("/api/v1/compliance/alerts")
 async def create_compliance_alert(
+    request: Request,
     alert: ComplianceAlert,
     db=Depends(get_db)
 ):
     """Create a compliance alert"""
+    permify_authorize(request, "compliance_alert", alert.tenant_id, "create")
     alert_id = f"ALT{int(datetime.now().timestamp())}"
     
     async with db.acquire() as conn:
@@ -860,11 +918,13 @@ async def list_compliance_alerts(
 
 @app.post("/api/v1/compliance/alerts/{alert_id}/resolve")
 async def resolve_compliance_alert(
+    request: Request,
     alert_id: str,
     payload: ResolveComplianceAlert,
     db=Depends(get_db)
 ):
     """Resolve a compliance alert"""
+    permify_authorize(request, "compliance_alert", alert_id, "resolve")
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE compliance_alerts
@@ -890,10 +950,12 @@ async def resolve_compliance_alert(
 # SAR Filing Endpoints
 @app.post("/api/v1/compliance/sar/file")
 async def file_sar(
+    request: Request,
     payload: FileSar,
     db = Depends(get_db)
 ):
     """File a Suspicious Activity Report (SAR)"""
+    permify_authorize(request, "regulatory_filing", payload.tenant_id, "file")
     sar_id = f"SAR{int(datetime.now().timestamp())}"
     
     async with db.acquire() as conn:
@@ -1123,6 +1185,7 @@ async def _sar_ack_poll_loop():
 
 @app.post("/api/v1/compliance/sar/{sar_id}/submit")
 async def submit_sar(
+    request: Request,
     sar_id: str,
     payload: SubmitSar,
     db = Depends(get_db)
@@ -1135,6 +1198,7 @@ async def submit_sar(
     filer's goAML acknowledgement, fetched by the ack poller. On filer outage
     the request is queued durably (sar_filing_queue) and 503 is returned.
     """
+    permify_authorize(request, "regulatory_filing", sar_id, "submit")
     if not NFIU_FILING_URL:
         raise HTTPException(
             status_code=503,
@@ -1170,10 +1234,12 @@ async def submit_sar(
 # Transaction Monitoring Endpoints
 @app.post("/api/v1/compliance/monitoring/rules")
 async def create_monitoring_rule(
+    request: Request,
     payload: MonitoringRule,
     db= Depends(get_db)
 ):
     """Create transaction monitoring rule"""
+    permify_authorize(request, "monitoring_rule", payload.tenant_id, "create")
     rule_id = f"RULE{int(datetime.now().timestamp())}"
     
     async with db.acquire() as conn:
@@ -1232,11 +1298,13 @@ async def list_monitoring_rules(
 
 @app.put("/api/v1/compliance/monitoring/rules/{rule_id}/toggle")
 async def toggle_monitoring_rule(
+    request: Request,
     rule_id: str,
     is_active: bool,
     db = Depends(get_db)
 ):
     """Toggle monitoring rule active status"""
+    permify_authorize(request, "monitoring_rule", rule_id, "toggle")
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE transaction_monitoring_rules
@@ -1256,10 +1324,12 @@ async def toggle_monitoring_rule(
 
 @app.post("/api/v1/compliance/monitoring/evaluate")
 async def evaluate_transaction(
+    request: Request,
     payload: MonitorTransaction,
     db = Depends(get_db)
 ):
     """Evaluate transaction against monitoring rules"""
+    permify_authorize(request, "monitoring_rule", payload.tenant_id, "evaluate")
     async with db.acquire() as conn:
         # Get active rules
         rules = await conn.fetch("""
@@ -1366,10 +1436,12 @@ async def list_aml_assessments(
 
 @app.post("/api/v1/compliance/aml/assess")
 async def assess_aml_risk(
+    request: Request,
     payload: AccessAMLRisk,
     db = Depends(get_db)
 ):
     """Perform AML risk assessment"""
+    permify_authorize(request, "aml_case", payload.tenant_id, "create")
     assessment_id = f"AML{int(datetime.now().timestamp())}"
     
     # Calculate risk score based on factors

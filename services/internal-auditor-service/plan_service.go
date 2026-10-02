@@ -12,7 +12,7 @@ import (
 // PlanService handles audit plan operations
 type PlanService struct {
 	tenantID string
-	plans    map[string]*AuditPlan
+	plans    *repo[AuditPlan]
 	mu       sync.RWMutex
 }
 
@@ -20,7 +20,7 @@ type PlanService struct {
 func NewPlanService(tenantID string) *PlanService {
 	svc := &PlanService{
 		tenantID: tenantID,
-		plans:    make(map[string]*AuditPlan),
+		plans:    newRepo[AuditPlan](serviceDB, "audit_plans"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -31,7 +31,7 @@ func (s *PlanService) initializeDefaultData(tenantID string) {
 	startDate := time.Now().AddDate(0, 0, -15)
 
 	// Annual operational audit plan
-	s.plans["plan-001"] = &AuditPlan{
+	s.plans.seed(tenantID, "plan-001", &AuditPlan{
 		PlanID:           "plan-001",
 		TenantID:         tenantID,
 		PlanName:         "2026 Annual Operational Audit Plan",
@@ -54,10 +54,10 @@ func (s *PlanService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, -2, 0),
 		UpdatedAt:        time.Now(),
-	}
+	})
 
 	// IT audit plan
-	s.plans["plan-002"] = &AuditPlan{
+	s.plans.seed(tenantID, "plan-002", &AuditPlan{
 		PlanID:           "plan-002",
 		TenantID:         tenantID,
 		PlanName:         "Core Banking System IT Audit",
@@ -79,10 +79,10 @@ func (s *PlanService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, -1, 0),
 		UpdatedAt:        time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// Compliance audit plan
-	s.plans["plan-003"] = &AuditPlan{
+	s.plans.seed(tenantID, "plan-003", &AuditPlan{
 		PlanID:           "plan-003",
 		TenantID:         tenantID,
 		PlanName:         "AML/CFT Compliance Audit",
@@ -102,11 +102,11 @@ func (s *PlanService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, 0, -7),
 		UpdatedAt:        time.Now().AddDate(0, 0, -7),
-	}
+	})
 
 	// Completed financial audit
 	endDate := time.Now().AddDate(0, -1, 0)
-	s.plans["plan-004"] = &AuditPlan{
+	s.plans.seed(tenantID, "plan-004", &AuditPlan{
 		PlanID:           "plan-004",
 		TenantID:         tenantID,
 		PlanName:         "Q4 2025 Financial Audit",
@@ -130,16 +130,18 @@ func (s *PlanService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, -4, 0),
 		UpdatedAt:        time.Now().AddDate(0, -1, 0),
-	}
+	})
 }
 
 // ListPlans returns plans based on filters
-func (s *PlanService) ListPlans(tenantID, status, auditType string) []*AuditPlan {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *PlanService) ListPlans(tenantID, status, auditType string) ([]*AuditPlan, error) {
 
 	var result []*AuditPlan
-	for _, plan := range s.plans {
+	__ALL__, __ERR__ := s.plans.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, plan := range __ALL__ {
 		if plan.TenantID != tenantID {
 			continue
 		}
@@ -151,16 +153,14 @@ func (s *PlanService) ListPlans(tenantID, status, auditType string) []*AuditPlan
 		}
 		result = append(result, plan)
 	}
-	return result
+	return result, nil
 }
 
 // GetPlan retrieves a plan by ID
 func (s *PlanService) GetPlan(tenantID, planID string) (*AuditPlan, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	plan, exists := s.plans[planID]
-	if !exists || plan.TenantID != tenantID {
+	plan, err := s.plans.get(tenantID, planID)
+	if err != nil {
 		return nil, errors.New("plan not found")
 	}
 	return plan, nil
@@ -168,8 +168,6 @@ func (s *PlanService) GetPlan(tenantID, planID string) (*AuditPlan, error) {
 
 // CreatePlan creates a new audit plan
 func (s *PlanService) CreatePlan(tenantID, auditorID string, req *CreatePlanRequest) (*AuditPlan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	startDate, _ := time.Parse("2006-01-02", req.PlannedStartDate)
 	endDate, _ := time.Parse("2006-01-02", req.PlannedEndDate)
@@ -196,101 +194,84 @@ func (s *PlanService) CreatePlan(tenantID, auditorID string, req *CreatePlanRequ
 		UpdatedAt:        time.Now(),
 	}
 
-	s.plans[plan.PlanID] = plan
+	if err := s.plans.put(tenantID, plan.PlanID, plan); err != nil {
+		return nil, err
+	}
 	return plan, nil
 }
 
 // UpdatePlan updates a plan
 func (s *PlanService) UpdatePlan(plan *AuditPlan) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.plans[plan.PlanID]
-	if !exists || existing.TenantID != plan.TenantID {
+	existing, err := s.plans.get(plan.TenantID, plan.PlanID)
+	if err != nil {
 		return errors.New("plan not found")
 	}
 
 	plan.CreatedAt = existing.CreatedAt
 	plan.UpdatedAt = time.Now()
-	s.plans[plan.PlanID] = plan
-	return nil
+	return s.plans.put(plan.TenantID, plan.PlanID, plan)
 }
 
 // ApprovePlan approves a plan
 func (s *PlanService) ApprovePlan(tenantID, planID, approverID string) (*AuditPlan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.plans.update(tenantID, planID, func(plan *AuditPlan) error {
+		if plan.Status != "draft" {
+			return errors.New("plan is not in draft status")
+		}
 
-	plan, exists := s.plans[planID]
-	if !exists || plan.TenantID != tenantID {
-		return nil, errors.New("plan not found")
-	}
+		now := time.Now()
+		plan.Status = "approved"
+		plan.ApprovedBy = approverID
+		plan.ApprovedAt = &now
+		plan.UpdatedAt = now
 
-	if plan.Status != "draft" {
-		return nil, errors.New("plan is not in draft status")
-	}
-
-	now := time.Now()
-	plan.Status = "approved"
-	plan.ApprovedBy = approverID
-	plan.ApprovedAt = &now
-	plan.UpdatedAt = now
-
-	return plan, nil
+		return nil
+	})
 }
 
 // StartPlan starts a plan
 func (s *PlanService) StartPlan(tenantID, planID string) (*AuditPlan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.plans.update(tenantID, planID, func(plan *AuditPlan) error {
+		if plan.Status != "approved" {
+			return errors.New("plan is not approved")
+		}
 
-	plan, exists := s.plans[planID]
-	if !exists || plan.TenantID != tenantID {
-		return nil, errors.New("plan not found")
-	}
+		now := time.Now()
+		plan.Status = "in_progress"
+		plan.ActualStartDate = &now
+		plan.UpdatedAt = now
 
-	if plan.Status != "approved" {
-		return nil, errors.New("plan is not approved")
-	}
-
-	now := time.Now()
-	plan.Status = "in_progress"
-	plan.ActualStartDate = &now
-	plan.UpdatedAt = now
-
-	return plan, nil
+		return nil
+	})
 }
 
 // CompletePlan completes a plan
 func (s *PlanService) CompletePlan(tenantID, planID string) (*AuditPlan, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.plans.update(tenantID, planID, func(plan *AuditPlan) error {
+		if plan.Status != "in_progress" {
+			return errors.New("plan is not in progress")
+		}
 
-	plan, exists := s.plans[planID]
-	if !exists || plan.TenantID != tenantID {
-		return nil, errors.New("plan not found")
-	}
+		now := time.Now()
+		plan.Status = "completed"
+		plan.ActualEndDate = &now
+		plan.UpdatedAt = now
 
-	if plan.Status != "in_progress" {
-		return nil, errors.New("plan is not in progress")
-	}
-
-	now := time.Now()
-	plan.Status = "completed"
-	plan.ActualEndDate = &now
-	plan.UpdatedAt = now
-
-	return plan, nil
+		return nil
+	})
 }
 
 // GetPlansByYear returns plans for a specific year
-func (s *PlanService) GetPlansByYear(tenantID, year string) []*AuditPlan {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *PlanService) GetPlansByYear(tenantID, year string) ([]*AuditPlan, error) {
 
 	yearInt, _ := strconv.Atoi(year)
 	var result []*AuditPlan
-	for _, plan := range s.plans {
+	__ALL__, __ERR__ := s.plans.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, plan := range __ALL__ {
 		if plan.TenantID != tenantID {
 			continue
 		}
@@ -298,17 +279,19 @@ func (s *PlanService) GetPlansByYear(tenantID, year string) []*AuditPlan {
 			result = append(result, plan)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetSummary returns plan summary
-func (s *PlanService) GetSummary(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *PlanService) GetSummary(tenantID string) (map[string]interface{}, error) {
 
 	var total, draft, approved, inProgress, completed int
 
-	for _, plan := range s.plans {
+	__ALL__, __ERR__ := s.plans.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, plan := range __ALL__ {
 		if plan.TenantID != tenantID {
 			continue
 		}
@@ -332,5 +315,5 @@ func (s *PlanService) GetSummary(tenantID string) map[string]interface{} {
 		"inProgress": inProgress,
 		"completed":  completed,
 		"timestamp":  time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

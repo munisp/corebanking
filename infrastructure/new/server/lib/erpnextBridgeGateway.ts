@@ -7,8 +7,20 @@
  * 5. Dispute → ERPNext credit note sync
  *
  * Routes to: erpnext-bridge-go:8110
+ *
+ * W12-C3-P2-MLIB (c3-1002/1003): the 'WEBHOOK_EVENTS' and 'CREDIT_NOTE_SYNCS'
+ * stores were module process memory (lost on restart, divergent across
+ * replicas). They are now Postgres-authoritative (tables
+ * `erpnext_webhook_events`, `erpnext_credit_note_syncs`) via
+ * lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first use, seeds ON
+ * CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
+ * RECORDS, not balances-of-record — TigerBeetle is balance authority (W12-C3-P0-B1).
+ * 'COA_MAPPINGS' and 'SYNC_STREAMS' remain static reference config.
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeInsert, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
 
 // ─── Gap 1: CoA Auto-Discovery ──────────────────────────────────────────────
 
@@ -58,7 +70,7 @@ interface WebhookEvent {
   syncAction: string;
 }
 
-const WEBHOOK_EVENTS: WebhookEvent[] = [
+const WEBHOOK_EVENTS_SEED: WebhookEvent[] = [
   { id: "WH-001", eventType: "on_submit", docType: "Payment Entry", docName: "PE-2026-0451", data: { customer: "TEN-ZENITH", amount: 25000000, currency: "NGN", payment_type: "Receive", reference: "INV-2026-05-001" }, source: "erpnext", receivedAt: "2026-05-08T14:30:00Z", processedAt: "2026-05-08T14:30:02Z", status: "synced", syncAction: "update_invoice_status_to_paid" },
   { id: "WH-002", eventType: "on_submit", docType: "Payment Entry", docName: "PE-2026-0452", data: { customer: "WL-OPAY", amount: 12120000, currency: "NGN", payment_type: "Receive", reference: "INV-2026-05-003" }, source: "erpnext", receivedAt: "2026-05-07T10:15:00Z", processedAt: "2026-05-07T10:15:01Z", status: "synced", syncAction: "update_invoice_status_to_paid" },
   { id: "WH-003", eventType: "on_submit", docType: "Journal Entry", docName: "JV-2026-0890", data: { voucher_type: "Credit Note", amount: 500000, against_invoice: "INV-2026-04-012", reason: "SLA breach" }, source: "erpnext", receivedAt: "2026-05-06T16:00:00Z", processedAt: "2026-05-06T16:00:03Z", status: "synced", syncAction: "create_billing_credit_note" },
@@ -105,7 +117,7 @@ interface CreditNoteSync {
   syncedAt?: string;
 }
 
-const CREDIT_NOTE_SYNCS: CreditNoteSync[] = [
+const CREDIT_NOTE_SYNCS_SEED: CreditNoteSync[] = [
   {
     id: "CN-001", disputeId: "DISP-2026-012", invoiceId: "INV-2026-04-012", tenantId: "TEN-ZENITH",
     amountNGN: 500000, reason: "SLA breach — 99.99% uptime not met in April (actual: 99.91%)",
@@ -138,6 +150,31 @@ const CREDIT_NOTE_SYNCS: CreditNoteSync[] = [
   },
 ];
 
+// ─── Postgres-backed stores (fail-closed via pgJsonStore) ───────────────────
+
+const WEBHOOK_EVENTS_TABLE = "erpnext_webhook_events";
+const CREDIT_NOTE_SYNCS_TABLE = "erpnext_credit_note_syncs";
+
+async function ensureWebhookEventsStore(): Promise<void> {
+  await ensureTables("erpnextBridgeGateway.webhookEvents", storeDDL(WEBHOOK_EVENTS_TABLE));
+  await storeSeed(WEBHOOK_EVENTS_TABLE, WEBHOOK_EVENTS_SEED, () => "");
+}
+
+export async function loadWebhookEvents(): Promise<WebhookEvent[]> {
+  await ensureWebhookEventsStore();
+  return storeList<WebhookEvent>(WEBHOOK_EVENTS_TABLE);
+}
+
+async function ensureCreditNoteSyncsStore(): Promise<void> {
+  await ensureTables("erpnextBridgeGateway.creditNoteSyncs", storeDDL(CREDIT_NOTE_SYNCS_TABLE));
+  await storeSeed(CREDIT_NOTE_SYNCS_TABLE, CREDIT_NOTE_SYNCS_SEED, () => "");
+}
+
+export async function loadCreditNoteSyncs(): Promise<CreditNoteSync[]> {
+  await ensureCreditNoteSyncsStore();
+  return storeList<CreditNoteSync>(CREDIT_NOTE_SYNCS_TABLE);
+}
+
 // ─── Route Registration ─────────────────────────────────────────────────────
 
 export function registerERPNextBridgeRoutes(app: Express) {
@@ -166,17 +203,18 @@ export function registerERPNextBridgeRoutes(app: Express) {
   });
 
   // Gap 2 & 4: Bidirectional Sync & Webhook Listener
-  app.get("/api/erpnext-bridge/webhooks", (_req: Request, res: Response) => {
+  app.get("/api/erpnext-bridge/webhooks", asyncRoute(async (_req: Request, res: Response) => {
+    const webhookEvents = await pgGuard(loadWebhookEvents());
     res.json({
-      events: WEBHOOK_EVENTS,
-      total: WEBHOOK_EVENTS.length,
-      synced: WEBHOOK_EVENTS.filter(e => e.status === "synced").length,
-      pending: WEBHOOK_EVENTS.filter(e => e.status === "received" || e.status === "processing").length,
-      failed: WEBHOOK_EVENTS.filter(e => e.status === "failed").length,
+      events: webhookEvents,
+      total: webhookEvents.length,
+      synced: webhookEvents.filter(e => e.status === "synced").length,
+      pending: webhookEvents.filter(e => e.status === "received" || e.status === "processing").length,
+      failed: webhookEvents.filter(e => e.status === "failed").length,
     });
-  });
+  }));
 
-  app.post("/api/erpnext-bridge/webhooks", (req: Request, res: Response) => {
+  app.post("/api/erpnext-bridge/webhooks", asyncRoute(async (req: Request, res: Response) => {
     const { eventType, docType, docName, data } = req.body;
     let syncAction = "log_and_ignore";
     if (docType === "Payment Entry") syncAction = "update_invoice_status_to_paid";
@@ -184,8 +222,9 @@ export function registerERPNextBridgeRoutes(app: Express) {
     else if (docType === "Credit Note") syncAction = "create_billing_credit_note";
     else if (docType === "Sales Invoice") syncAction = "update_billing_status";
 
+    const webhookEvents = await pgGuard(loadWebhookEvents());
     const event: WebhookEvent = {
-      id: `WH-${String(WEBHOOK_EVENTS.length + 1).padStart(3, "0")}`,
+      id: `WH-${String(webhookEvents.length + 1).padStart(3, "0")}`,
       eventType: eventType ?? "on_submit",
       docType, docName, data,
       source: "erpnext",
@@ -194,9 +233,10 @@ export function registerERPNextBridgeRoutes(app: Express) {
       status: syncAction === "log_and_ignore" ? "ignored" : "synced",
       syncAction,
     };
-    WEBHOOK_EVENTS.push(event);
+    // Fail-closed: persisted BEFORE the 201 is returned.
+    await pgGuard(storeInsert(WEBHOOK_EVENTS_TABLE, "", event));
     res.status(201).json({ success: true, event });
-  });
+  }));
 
   // Gap 3: Real-Time Sync Streams
   app.get("/api/erpnext-bridge/sync-streams", (_req: Request, res: Response) => {
@@ -214,27 +254,29 @@ export function registerERPNextBridgeRoutes(app: Express) {
   });
 
   // Gap 5: Dispute → Credit Note Sync
-  app.get("/api/erpnext-bridge/credit-notes", (_req: Request, res: Response) => {
+  app.get("/api/erpnext-bridge/credit-notes", asyncRoute(async (_req: Request, res: Response) => {
+    const creditNoteSyncs = await pgGuard(loadCreditNoteSyncs());
     res.json({
-      creditNotes: CREDIT_NOTE_SYNCS,
-      total: CREDIT_NOTE_SYNCS.length,
-      totalAmount: CREDIT_NOTE_SYNCS.reduce((sum, cn) => sum + cn.amountNGN, 0),
-      confirmed: CREDIT_NOTE_SYNCS.filter(cn => cn.erpStatus === "confirmed").length,
-      pending: CREDIT_NOTE_SYNCS.filter(cn => cn.erpStatus === "queued" || cn.erpStatus === "posted").length,
+      creditNotes: creditNoteSyncs,
+      total: creditNoteSyncs.length,
+      totalAmount: creditNoteSyncs.reduce((sum, cn) => sum + cn.amountNGN, 0),
+      confirmed: creditNoteSyncs.filter(cn => cn.erpStatus === "confirmed").length,
+      pending: creditNoteSyncs.filter(cn => cn.erpStatus === "queued" || cn.erpStatus === "posted").length,
     });
-  });
+  }));
 
-  app.post("/api/erpnext-bridge/credit-notes", (req: Request, res: Response) => {
+  app.post("/api/erpnext-bridge/credit-notes", asyncRoute(async (req: Request, res: Response) => {
     const { disputeId, invoiceId, tenantId, amount, reason } = req.body;
     if (!disputeId || !invoiceId || !tenantId || !amount) {
       res.status(400).json({ error: "disputeId, invoiceId, tenantId, amount required" });
       return;
     }
+    const creditNoteSyncs = await pgGuard(loadCreditNoteSyncs());
     const cn: CreditNoteSync = {
-      id: `CN-${String(CREDIT_NOTE_SYNCS.length + 1).padStart(3, "0")}`,
+      id: `CN-${String(creditNoteSyncs.length + 1).padStart(3, "0")}`,
       disputeId, invoiceId, tenantId,
       amountNGN: amount, reason: reason ?? "Billing dispute resolution",
-      erpCreditNoteRef: `CN-2026-${String(CREDIT_NOTE_SYNCS.length + 50).padStart(4, "0")}`,
+      erpCreditNoteRef: `CN-2026-${String(creditNoteSyncs.length + 50).padStart(4, "0")}`,
       erpStatus: "queued",
       glEntries: [
         { glCode: "4201", type: "debit", amount, narration: `Credit note: ${reason ?? "dispute"}` },
@@ -242,19 +284,22 @@ export function registerERPNextBridgeRoutes(app: Express) {
       ],
       createdAt: new Date().toISOString(),
     };
-    CREDIT_NOTE_SYNCS.push(cn);
+    // Fail-closed: persisted BEFORE the 201 is returned.
+    await pgGuard(storeInsert(CREDIT_NOTE_SYNCS_TABLE, tenantId, cn));
     res.status(201).json({ success: true, creditNote: cn });
-  });
+  }));
 
   // Summary endpoint
-  app.get("/api/erpnext-bridge/summary", (_req: Request, res: Response) => {
+  app.get("/api/erpnext-bridge/summary", asyncRoute(async (_req: Request, res: Response) => {
+    const webhookEvents = await pgGuard(loadWebhookEvents());
+    const creditNoteSyncs = await pgGuard(loadCreditNoteSyncs());
     res.json({
       gapsClosed: [
         { gap: 1, name: "CoA Auto-Discovery", status: "active", mappings: COA_MAPPINGS.length, avgConfidence: 0.91 },
-        { gap: 2, name: "Bidirectional Sync (ERPNext → Banking)", status: "active", eventsProcessed: WEBHOOK_EVENTS.filter(e => e.status === "synced").length },
+        { gap: 2, name: "Bidirectional Sync (ERPNext → Banking)", status: "active", eventsProcessed: webhookEvents.filter(e => e.status === "synced").length },
         { gap: 3, name: "Real-Time Sync Streams", status: "active", streams: SYNC_STREAMS.length, avgLatencyMs: 60 },
-        { gap: 4, name: "Webhook Listener", status: "active", webhooksReceived: WEBHOOK_EVENTS.length },
-        { gap: 5, name: "Dispute → Credit Note Sync", status: "active", creditNotes: CREDIT_NOTE_SYNCS.length, totalCredited: CREDIT_NOTE_SYNCS.reduce((s, c) => s + c.amountNGN, 0) },
+        { gap: 4, name: "Webhook Listener", status: "active", webhooksReceived: webhookEvents.length },
+        { gap: 5, name: "Dispute → Credit Note Sync", status: "active", creditNotes: creditNoteSyncs.length, totalCredited: creditNoteSyncs.reduce((s, c) => s + c.amountNGN, 0) },
       ],
       services: [
         { service: "erpnext-bridge-go", port: 8110, role: "CoA discovery, webhook processing, credit note sync", language: "Go" },
@@ -276,5 +321,5 @@ export function registerERPNextBridgeRoutes(app: Express) {
         mojaloop: "cross-border settlement sync",
       },
     });
-  });
+  }));
 }

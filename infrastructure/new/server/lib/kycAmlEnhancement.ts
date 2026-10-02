@@ -1,11 +1,30 @@
 // B8: KYC/AML Enhancement — Continuous monitoring, risk-based CDD/EDD, SAR filing, PEP database
+//
+// W12-C3-P2-MLIB (c3-0999): the AML watchlist was module process memory (lost
+// on restart — a restart silently dropped watchlist entries used by screening).
+// Now Postgres-authoritative (table `aml_watchlist`) via lib/pgJsonStore.ts;
+// fail-closed 503 on PG outage (screening is never silently skipped), no
+// degraded-memory fallback. (sarReports/pepDatabase are out of this batch's scope.)
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const WATCHLIST_TABLE = "aml_watchlist";
+
+async function loadWatchlist(): Promise<WatchlistEntry[]> {
+  return pgGuard((async () => {
+    await ensureTables("kycAmlEnhancement.watchlist", storeDDL(WATCHLIST_TABLE));
+    await storeSeed(WATCHLIST_TABLE, WATCHLIST_SEED, () => "");
+    return storeList<WatchlistEntry>(WATCHLIST_TABLE);
+  })());
+}
 
 interface WatchlistEntry { id: string; name: string; type: string; source: string; addedDate: string; riskLevel: string; }
 interface SARReport { id: string; customerId: string; customerName: string; reason: string; amount: number; currency: string; filedDate: string; status: string; cbnReference: string; }
 interface PEPRecord { id: string; name: string; position: string; category: string; jurisdiction: string; startDate: string; endDate: string | null; riskTier: string; }
 
-const watchlist: WatchlistEntry[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const WATCHLIST_SEED: WatchlistEntry[] = [
   { id: "WL-001", name: "Global Sanctions Entity A", type: "entity", source: "OFAC-SDN", addedDate: "2025-06-15", riskLevel: "critical" },
   { id: "WL-002", name: "Regional Risk Individual B", type: "individual", source: "UN-Security-Council", addedDate: "2025-03-20", riskLevel: "high" },
   { id: "WL-003", name: "Shell Company Network C", type: "entity", source: "FATF-Grey-List", addedDate: "2025-09-01", riskLevel: "high" },
@@ -28,19 +47,21 @@ const pepDatabase: PEPRecord[] = [
 ];
 
 export function registerKYCAMLEnhancement(app: Express) {
-  app.get("/api/platform/kyc/watchlist", (_: Request, res: Response) => {
+  app.get("/api/platform/kyc/watchlist", asyncRoute(async (_: Request, res: Response) => {
+    const watchlist = await loadWatchlist();
     res.json({ items: watchlist, total: watchlist.length });
-  });
+  }));
 
-  app.post("/api/platform/kyc/screen", (req: Request, res: Response) => {
+  app.post("/api/platform/kyc/screen", asyncRoute(async (req: Request, res: Response) => {
     const { name } = req.body || {};
     if (!name) return res.status(400).json({ error: "name required" });
     const n = name.toLowerCase();
+    const watchlist = await loadWatchlist();
     const matches = watchlist.filter(w => w.name.toLowerCase().includes(n));
     const pepMatches = pepDatabase.filter(p => p.name.toLowerCase().includes(n));
     const riskLevel = matches.some(m => m.riskLevel === "critical") ? "critical" : matches.length > 0 ? "high" : pepMatches.length > 0 ? "elevated" : "low";
     res.json({ screened_name: name, watchlist_matches: matches.length, pep_matches: pepMatches.length, risk_level: riskLevel, action: riskLevel === "critical" ? "block" : riskLevel === "high" ? "edd_required" : riskLevel === "elevated" ? "enhanced_monitoring" : "proceed", matches: [...matches, ...pepMatches.map(p => ({ ...p, source: "PEP-Database" }))] });
-  });
+  }));
 
   app.get("/api/platform/kyc/sar-reports", (_: Request, res: Response) => {
     res.json({ items: sarReports, total: sarReports.length });
@@ -50,7 +71,8 @@ export function registerKYCAMLEnhancement(app: Express) {
     res.json({ items: pepDatabase, total: pepDatabase.length });
   });
 
-  app.get("/api/platform/kyc/risk-dashboard", (_: Request, res: Response) => {
+  app.get("/api/platform/kyc/risk-dashboard", asyncRoute(async (_: Request, res: Response) => {
+    const watchlist = await loadWatchlist();
     res.json({
       total_watchlist: watchlist.length,
       critical_entries: watchlist.filter(w => w.riskLevel === "critical").length,
@@ -59,5 +81,5 @@ export function registerKYCAMLEnhancement(app: Express) {
       active_peps: pepDatabase.filter(p => !p.endDate).length,
       last_sync: new Date().toISOString(),
     });
-  });
+  }));
 }

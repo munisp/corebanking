@@ -1,16 +1,19 @@
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpMessage, HttpResponse, HttpServer}; // Wave-12 drive-by: HttpMessage import required by actix-web resolved in the lockfile
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use sqlx::PgPool;
 use std::time::{Duration, Instant};
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
+// Wave-12 (C3-P0-B5): enrollments and kyc_records are persisted in Postgres
+// (was: Mutex<Vec<..>> memory-only, lost on every restart). The pool replaces
+// the single tokio_postgres::Client; None means DATABASE_URL was unset or the
+// initial connect failed — handlers then fail closed with 503 (no in-memory
+// fallback).
 struct AppState {
     start_time: Instant,
-    enrollments: Mutex<Vec<serde_json::Value>>,
-    records: Mutex<Vec<serde_json::Value>>,
-    db_client: Option<Arc<tokio_postgres::Client>>,
+    db: Option<PgPool>,
 }
 
 #[derive(Deserialize)]
@@ -42,16 +45,24 @@ fn multi_factor_score(biometric: f64, device: f64, behavioral: f64) -> f64 {
 
 fn liveness_score(blink_detected: bool, head_movement: bool, texture_score: f64) -> f64 {
     let mut score = texture_score * 0.4;
-    if blink_detected { score += 0.3; }
-    if head_movement { score += 0.3; }
+    if blink_detected {
+        score += 0.3;
+    }
+    if head_movement {
+        score += 0.3;
+    }
     score.min(1.0)
 }
 
 fn auth_decision(mfa_score: f64, liveness: f64) -> (&'static str, f64) {
     let combined = mfa_score * 0.7 + liveness * 0.3;
-    if combined >= 0.8 { ("authenticated", combined) }
-    else if combined >= 0.5 { ("step_up_required", combined) }
-    else { ("rejected", combined) }
+    if combined >= 0.8 {
+        ("authenticated", combined)
+    } else if combined >= 0.5 {
+        ("step_up_required", combined)
+    } else {
+        ("rejected", combined)
+    }
 }
 
 /// Minimal synchronous HTTP POST used to reach the liveness upstream.
@@ -62,19 +73,28 @@ fn http_post_json(url: &str, body: &str) -> Result<String, String> {
     }
     let url_parsed = url.strip_prefix("http://").unwrap_or(url);
     let (host_port, path) = url_parsed.split_once('/').unwrap_or((url_parsed, "/"));
-    let host_port = if host_port.contains(':') { host_port.to_string() } else { format!("{}:80", host_port) };
+    let host_port = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{}:80", host_port)
+    };
     let mut stream = std::net::TcpStream::connect_timeout(
         &host_port.parse().map_err(|e| format!("{}", e))?,
         Duration::from_secs(5),
-    ).map_err(|e| format!("connection failed: {}", e))?;
+    )
+    .map_err(|e| format!("connection failed: {}", e))?;
     let host = host_port.split(':').next().unwrap_or("localhost");
     let req = format!(
         "POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         path, host, body.len(), body
     );
-    stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("{}", e))?;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).map_err(|e| format!("{}", e))?;
+    stream
+        .read_to_string(&mut resp)
+        .map_err(|e| format!("{}", e))?;
     Ok(resp)
 }
 
@@ -91,29 +111,37 @@ fn obtain_liveness(body: &VerifyRequest) -> Result<f64, HttpResponse> {
                         "blink_detected": body.blink_detected,
                         "head_movement": body.head_movement,
                         "texture_score": body.texture_score,
-                    }).to_string();
-                    let resp = http_post_json(&format!("{}/v1/score/liveness", base.trim_end_matches('/')), &payload)
-                        .map_err(|e| {
-                            eprintln!("biometric-auth-rs: liveness upstream failed: {}", e);
-                            HttpResponse::ServiceUnavailable().json(json!({
-                                "error": "liveness_upstream_unavailable",
-                                "decision": "rejected",
-                            }))
-                        })?;
-                    // Response body follows the blank line in a raw HTTP response.
-                    let body_str = resp.split("\r\n\r\n").nth(1).unwrap_or("");
-                    let parsed: serde_json::Value = serde_json::from_str(body_str).map_err(|_| {
+                    })
+                    .to_string();
+                    let resp = http_post_json(
+                        &format!("{}/v1/score/liveness", base.trim_end_matches('/')),
+                        &payload,
+                    )
+                    .map_err(|e| {
+                        eprintln!("biometric-auth-rs: liveness upstream failed: {}", e);
                         HttpResponse::ServiceUnavailable().json(json!({
                             "error": "liveness_upstream_unavailable",
                             "decision": "rejected",
                         }))
                     })?;
-                    return parsed.get("overall_score").and_then(|v| v.as_f64()).ok_or_else(|| {
-                        HttpResponse::ServiceUnavailable().json(json!({
-                            "error": "liveness_upstream_unavailable",
-                            "decision": "rejected",
-                        }))
-                    });
+                    // Response body follows the blank line in a raw HTTP response.
+                    let body_str = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(body_str).map_err(|_| {
+                            HttpResponse::ServiceUnavailable().json(json!({
+                                "error": "liveness_upstream_unavailable",
+                                "decision": "rejected",
+                            }))
+                        })?;
+                    return parsed
+                        .get("overall_score")
+                        .and_then(|v| v.as_f64())
+                        .ok_or_else(|| {
+                            HttpResponse::ServiceUnavailable().json(json!({
+                                "error": "liveness_upstream_unavailable",
+                                "decision": "rejected",
+                            }))
+                        });
                 }
             }
             // No liveness evidence and no upstream configured: fail closed.
@@ -145,7 +173,8 @@ struct JwksCacheEntry {
     keys: jsonwebtoken::jwk::JwkSet,
 }
 
-static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> =
+    std::sync::OnceLock::new();
 
 fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
     JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
@@ -158,9 +187,10 @@ fn jwks_url() -> Option<String> {
         }
     }
     match std::env::var("KEYCLOAK_REALM_URL") {
-        Ok(realm) if !realm.is_empty() => {
-            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
-        }
+        Ok(realm) if !realm.is_empty() => Some(format!(
+            "{}/protocol/openid-connect/certs",
+            realm.trim_end_matches('/')
+        )),
         _ => None,
     }
 }
@@ -170,10 +200,12 @@ async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpRespon
     let url = match jwks_url() {
         Some(u) => u,
         None => {
-            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                "error": "jwt_validation_unavailable",
-                "detail": "no JWKS endpoint configured"
-            })))
+            return Err(
+                actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "error": "jwt_validation_unavailable",
+                    "detail": "no JWKS endpoint configured"
+                })),
+            )
         }
     };
     {
@@ -187,27 +219,38 @@ async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpRespon
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "client init failed"
-        })))?;
+        .map_err(|_| {
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "client init failed"
+            }))
+        })?;
     let resp = client.get(&url).send().await.map_err(|_| {
-        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+        actix_web::HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "jwks_unavailable"}))
     })?;
     if !resp.status().is_success() {
-        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "upstream returned error status"
-        })));
+        return Err(
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "upstream returned error status"
+            })),
+        );
     }
-    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
-        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "malformed JWKS payload"
-        }))
-    })?;
+    let keys = resp
+        .json::<jsonwebtoken::jwk::JwkSet>()
+        .await
+        .map_err(|_| {
+            actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwks_unavailable",
+                "detail": "malformed JWKS payload"
+            }))
+        })?;
     let mut cache = jwks_cache().lock().unwrap();
-    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    *cache = Some(JwksCacheEntry {
+        fetched_at: std::time::Instant::now(),
+        keys: keys.clone(),
+    });
     Ok(keys)
 }
 
@@ -225,13 +268,18 @@ fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
 }
 
 async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
-    let header = jsonwebtoken::decode_header(token)
-        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    let header = jsonwebtoken::decode_header(token).map_err(|_| {
+        actix_web::HttpResponse::Unauthorized()
+            .json(serde_json::json!({"error": "malformed token header"}))
+    })?;
     match header.alg {
         jsonwebtoken::Algorithm::RS256 => {
             let kid = match header.kid.clone() {
                 Some(k) if !k.is_empty() => k,
-                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+                _ => {
+                    return Err(actix_web::HttpResponse::Unauthorized()
+                        .json(serde_json::json!({"error": "missing kid"})))
+                }
             };
             // JWKS outage => 503 (fail closed). Unknown kid => force one cache
             // refresh (key rotation), then 401 if still unknown.
@@ -247,20 +295,24 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
                     match refreshed.find(&kid) {
                         Some(j) => j.clone(),
                         None => {
-                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                            return Err(actix_web::HttpResponse::Unauthorized()
+                                .json(serde_json::json!({"error": "unknown kid"})))
                         }
                     }
                 }
             };
-            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
-                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk).map_err(|_| {
+                actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid jwk"}))
+            })?;
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
             validation.validate_exp = true;
             validation.validate_nbf = true;
             apply_iss_aud(&mut validation);
             match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
                 Ok(data) => Ok(data.claims),
-                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid or expired token"}))),
             }
         }
         jsonwebtoken::Algorithm::HS256 => {
@@ -268,10 +320,12 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
             let secret = match std::env::var("JWT_SECRET") {
                 Ok(s) if !s.is_empty() => s,
                 _ => {
-                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                        "error": "jwt_validation_unavailable",
-                        "detail": "JWT_SECRET is not configured; refusing to validate"
-                    })))
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(
+                        serde_json::json!({
+                            "error": "jwt_validation_unavailable",
+                            "detail": "JWT_SECRET is not configured; refusing to validate"
+                        }),
+                    ))
                 }
             };
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -284,27 +338,47 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
                 &validation,
             ) {
                 Ok(data) => Ok(data.claims),
-                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized()
+                    .json(serde_json::json!({"error": "invalid or expired token"}))),
             }
         }
-        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
-            "error": format!("unsupported alg {:?}", other)
-        }))),
+        other => Err(
+            actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+                "error": format!("unsupported alg {:?}", other)
+            })),
+        ),
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+// Wave-12 drive-by compile fix: was `req: &actix_web` (expected type, found
+// crate — the file did not compile as shipped).
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
-    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
+    if path == "/healthz"
+        || path == "/readyz"
+        || path == "/livez"
+        || path == "/metrics"
+        || path == "/health"
+    {
         return Ok(());
     }
-    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+    let header = match req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(h) => h,
-        None => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+        None => {
+            return Err(HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "missing Authorization header"})))
+        }
     };
     let token = match header.strip_prefix("Bearer ") {
         Some(t) if !t.is_empty() => t,
-        _ => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+        _ => {
+            return Err(HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "invalid auth header"})))
+        }
     };
     let claims = verify_jwt_token(token).await?;
     req.extensions_mut().insert(VerifiedClaims(claims));
@@ -332,28 +406,72 @@ async fn metrics() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
-async fn degradation_status(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
+async fn degradation_status(
+    state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
     HttpResponse::Ok().json(json!({
-        "db_available": state.db_client.is_some(),
-        "mode": if state.db_client.is_some() { "normal" } else { "degraded" },
+        "db_available": state.db.is_some(),
+        "mode": if state.db.is_some() { "normal" } else { "degraded" },
     }))
 }
 
-async fn enroll(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let mut enrollments = state.enrollments.lock().unwrap();
-    enrollments.push(body.into_inner());
-    HttpResponse::Ok().json(json!({"enrolled": true, "total_enrollments": enrollments.len()}))
+async fn enroll(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    if let Err(resp) = permify_check(&req, "biometric_credential", "collection", "enroll").await { return resp; }
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "enrollment_store_unavailable",
+                "detail": "DATABASE_URL is not configured; refusing to accept an enrollment that cannot be persisted",
+            }))
+        }
+    };
+    let payload = body.into_inner();
+    if let Err(e) = sqlx::query("INSERT INTO biometric_enrollments (payload) VALUES ($1)")
+        .bind(&payload)
+        .execute(pool)
+        .await
+    {
+        eprintln!("biometric-auth-rs: enroll insert failed: {}", e);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "enrollment_store_unavailable"}));
+    }
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM biometric_enrollments")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(-1);
+    HttpResponse::Ok().json(json!({"enrolled": true, "total_enrollments": total}))
 }
 
 /// POST /v1/biometric/verify — combine ONLY real supplied scores; missing
 /// inputs are rejected (422) and upstream failures fail closed (503).
-async fn verify(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<VerifyRequest>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
+async fn verify(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<VerifyRequest>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    if let Err(resp) = permify_check(&req, "biometric_credential", "collection", "verify").await { return resp; }
 
     let (distance, threshold, biometric, device, behavioral) = match (
-        body.template_distance, body.threshold, body.biometric_score, body.device_score, body.behavioral_score,
+        body.template_distance,
+        body.threshold,
+        body.biometric_score,
+        body.device_score,
+        body.behavioral_score,
     ) {
         (Some(d), Some(t), Some(b), Some(dev), Some(beh)) => (d, t, b, dev, beh),
         _ => {
@@ -365,7 +483,8 @@ async fn verify(req: actix_web::HttpRequest, state: web::Data<AppState>, body: w
         }
     };
     if threshold <= 0.0 {
-        return HttpResponse::UnprocessableEntity().json(json!({"error": "invalid_threshold", "decision": "rejected"}));
+        return HttpResponse::UnprocessableEntity()
+            .json(json!({"error": "invalid_threshold", "decision": "rejected"}));
     }
 
     let live = match obtain_liveness(&body) {
@@ -377,7 +496,12 @@ async fn verify(req: actix_web::HttpRequest, state: web::Data<AppState>, body: w
     let mfa = multi_factor_score(biometric, device, behavioral);
     let (decision, combined) = auth_decision(mfa, live);
 
-    db_persist(&state, "verify", &json!({"endpoint": "verify", "decision": decision})).await;
+    db_persist(
+        &state,
+        "verify",
+        &json!({"endpoint": "verify", "decision": decision}),
+    )
+    .await;
     let status = if decision == "authenticated" {
         actix_web::http::StatusCode::OK
     } else {
@@ -394,111 +518,285 @@ async fn verify(req: actix_web::HttpRequest, state: web::Data<AppState>, body: w
 }
 
 async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let enrollments = state.enrollments.lock().unwrap();
-    HttpResponse::Ok().json(json!({"total_enrollments": enrollments.len(), "service": "biometric-auth-rs"}))
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "enrollment_store_unavailable"}))
+        }
+    };
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM biometric_enrollments")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("biometric-auth-rs: stats count failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "enrollment_store_unavailable"}));
+        }
+    };
+    HttpResponse::Ok().json(json!({"total_enrollments": total, "service": "biometric-auth-rs"}))
 }
 
-// ─── kyc_records CRUD (Postgres-backed when available, else in-memory) ──────
+// ─── kyc_records CRUD (Wave-12 C3-P0-B5: Postgres-authoritative; no in-memory
+// fallback — when the pool is missing or a query fails the handlers return 503
+// instead of silently serving volatile state) ────────────────────────────────
 
-async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let records = state.records.lock().unwrap();
-    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
-    let total = records.len();
-    let items: Vec<&serde_json::Value> = records.iter().skip((page - 1) * limit).take(limit).collect();
+fn record_store_unavailable() -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({"error": "record_store_unavailable"}))
+}
+
+async fn list_records(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => return record_store_unavailable(),
+    };
+    let page: i64 = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let limit: i64 = query
+        .get("limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(20);
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM kyc_records")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("biometric-auth-rs: list_records count failed: {}", e);
+            return record_store_unavailable();
+        }
+    };
+    let items: Vec<serde_json::Value> = match sqlx::query_scalar(
+        "SELECT data FROM kyc_records ORDER BY created_at, id LIMIT $1 OFFSET $2",
+    )
+    .bind(limit)
+    .bind((page - 1) * limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("biometric-auth-rs: list_records query failed: {}", e);
+            return record_store_unavailable();
+        }
+    };
     HttpResponse::Ok().json(json!({
         "items": items,
         "total": total,
         "page": page,
-        "source": if state.db_client.is_some() { "database" } else { "in-memory" },
+        "source": "database",
     }))
 }
 
-async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
+async fn create_record(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    if let Err(resp) = permify_check(&req, "service_config", "collection", "create").await { return resp; }
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => return record_store_unavailable(),
+    };
     let mut rec = body.into_inner();
     rec["id"] = json!(uuid::Uuid::new_v4().to_string());
     rec["created_at"] = json!(chrono::Utc::now().to_rfc3339());
-    state.records.lock().unwrap().push(rec.clone());
+    let id = rec["id"].as_str().unwrap_or_default().to_string();
+    if let Err(e) = sqlx::query("INSERT INTO kyc_records (id, data) VALUES ($1, $2)")
+        .bind(&id)
+        .bind(&rec)
+        .execute(pool)
+        .await
+    {
+        eprintln!("biometric-auth-rs: create_record insert failed: {}", e);
+        return record_store_unavailable();
+    }
     db_persist(&state, "create_record", &rec).await;
     HttpResponse::Created().json(rec)
 }
 
-async fn get_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let id = path.into_inner();
-    let records = state.records.lock().unwrap();
-    match records.iter().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
-        Some(r) => HttpResponse::Ok().json(r),
-        None => HttpResponse::NotFound().json(json!({"error": "not found"})),
+async fn get_record(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
     }
-}
-
-async fn update_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => return record_store_unavailable(),
+    };
     let id = path.into_inner();
-    let mut records = state.records.lock().unwrap();
-    match records.iter_mut().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
-        Some(r) => {
-            if let Some(obj) = body.into_inner().as_object() {
-                for (k, v) in obj {
-                    if k != "id" { r[k.as_str()] = v.clone(); }
-                }
-            }
-            HttpResponse::Ok().json(r.clone())
+    match sqlx::query_scalar::<_, serde_json::Value>("SELECT data FROM kyc_records WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(r)) => HttpResponse::Ok().json(r),
+        Ok(None) => HttpResponse::NotFound().json(json!({"error": "not found"})),
+        Err(e) => {
+            eprintln!("biometric-auth-rs: get_record query failed: {}", e);
+            record_store_unavailable()
         }
-        None => HttpResponse::NotFound().json(json!({"error": "not found"})),
     }
 }
 
-async fn delete_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let id = path.into_inner();
-    let mut records = state.records.lock().unwrap();
-    let before = records.len();
-    records.retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
-    if records.len() == before {
-        return HttpResponse::NotFound().json(json!({"error": "not found"}));
+async fn update_record(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<serde_json::Value>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
     }
-    HttpResponse::NoContent().finish()
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => return record_store_unavailable(),
+    };
+    let id = path.into_inner();
+    if let Err(resp) = permify_check(&req, "service_config", &id, "update").await { return resp; }
+    // Merge caller-supplied keys (except "id") into the stored document —
+    // same semantics as the previous in-memory merge.
+    match sqlx::query_scalar::<_, serde_json::Value>(
+        "UPDATE kyc_records SET data = data || ($2::jsonb - 'id'), updated_at = NOW() WHERE id = $1 RETURNING data",
+    )
+    .bind(&id)
+    .bind(&body.into_inner())
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(r)) => HttpResponse::Ok().json(r),
+        Ok(None) => HttpResponse::NotFound().json(json!({"error": "not found"})),
+        Err(e) => { eprintln!("biometric-auth-rs: update_record query failed: {}", e); record_store_unavailable() }
+    }
+}
+
+async fn delete_record(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await {
+        return resp;
+    }
+    let pool = match state.db.as_ref() {
+        Some(p) => p,
+        None => return record_store_unavailable(),
+    };
+    let id = path.into_inner();
+    if let Err(resp) = permify_check(&req, "service_config", &id, "delete").await { return resp; }
+    match sqlx::query("DELETE FROM kyc_records WHERE id = $1")
+        .bind(&id)
+        .execute(pool)
+        .await
+    {
+        Ok(res) if res.rows_affected() > 0 => HttpResponse::NoContent().finish(),
+        Ok(_) => HttpResponse::NotFound().json(json!({"error": "not found"})),
+        Err(e) => {
+            eprintln!("biometric-auth-rs: delete_record query failed: {}", e);
+            record_store_unavailable()
+        }
+    }
 }
 
 // ─── Persistence ────────────────────────────────────────────────────────────
 
-use tokio_postgres::NoTls;
-
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); } });
-            let _ = client.execute(
+// Wave-12 (C3-P0-B5): shared sqlx pool (max 25) replaces the single
+// tokio_postgres::Client, aligned with the tigerbeetle-batch-engine-rs
+// Wave-11 convention. DDL applied at connect; None on failure (fail closed).
+async fn init_db(db_url: &str) -> Option<PgPool> {
+    match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(db_url)
+        .await
+    {
+        Ok(pool) => {
+            let _ = sqlx::query(
                 "CREATE TABLE IF NOT EXISTS service_records (
                     id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
                     status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
                     created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            Some(client)
+                )",
+            )
+            .execute(&pool)
+            .await;
+            // Biometric enrollment payloads (Wave-12: was in-memory Vec).
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS biometric_enrollments (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )",
+            )
+            .execute(&pool)
+            .await;
+            // kyc_records documents (Wave-12: was in-memory Vec).
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS kyc_records (
+                    id TEXT PRIMARY KEY,
+                    data JSONB NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )",
+            )
+            .execute(&pool)
+            .await;
+            Some(pool)
         }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
+        Err(e) => {
+            eprintln!(
+                "DB connect failed: {} — DB endpoints will fail closed (503)",
+                e
+            );
+            None
+        }
     }
 }
 
 // Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
-// or every 100 rows by a spawned task (was: one blocking INSERT per request).
-static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+// or every 100 rows by a spawned task on the shared sqlx pool
+// (was: one blocking INSERT per request on a single tokio_postgres::Client).
+static W11_AUDIT_BUF: std::sync::OnceLock<
+    std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>,
+> = std::sync::OnceLock::new();
 static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        let id = format!("{}_{}_{}", "biometric_auth_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    if let Some(ref pool) = state.db {
+        let buf =
+            W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let id = format!(
+            "{}_{}_{}",
+            "biometric_auth_rs",
+            endpoint,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         let svc_name = String::from("biometric-auth-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
         if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let client = client.clone();
+            let pool = pool.clone();
             let buf = buf.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -506,14 +804,15 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
                     tick.tick().await;
                     let rows: Vec<(String, String, String, String, String)> = {
                         let mut b = buf.lock().unwrap();
-                        if b.is_empty() { continue; }
+                        if b.is_empty() {
+                            continue;
+                        }
                         std::mem::take(&mut *b)
                     };
                     for (id, svc, ep, st, d) in rows {
-                        let _ = client.execute(
+                        let _ = sqlx::query(
                             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-                            &[&id, &svc, &ep, &st, &d],
-                        ).await;
+                        ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
                     }
                 }
             });
@@ -523,40 +822,144 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         if b.len() >= 100 {
             let rows = std::mem::take(&mut *b);
             drop(b);
-            let client = client.clone();
+            let pool = pool.clone();
             tokio::spawn(async move {
                 for (id, svc, ep, st, d) in rows {
-                    let _ = client.execute(
+                    let _ = sqlx::query(
                         "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-                        &[&id, &svc, &ep, &st, &d],
-                    ).await;
+                    ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
                 }
             });
         }
     }
 }
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = verified JWT tenant claim
+// (fallback: X-Tenant-Id header, PERMIFY_DEFAULT_TENANT, "bpmgd"), resource =
+// domain entity id, permission per action (schema: canonical v2.perm
+// service_config entity + services/auth-service/schemas/permify/
+// v2-core-domain-rs.fragment). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (services/risk-scoring-rs/src/main.rs).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    use actix_web::HttpMessage as _;
+    let (subject, claim_tenant) = {
+        let ext = req.extensions();
+        match ext.get::<VerifiedClaims>() {
+            Some(c) => (
+                c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ),
+            None => (None, None),
+        }
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8202);
-    let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
-        init_db(&url).await.map(Arc::new)
-    } else { None };
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8202);
+    let db = if let Ok(url) = std::env::var("DATABASE_URL") {
+        init_db(&url).await
+    } else {
+        None
+    };
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        enrollments: Mutex::new(Vec::new()),
-        records: Mutex::new(Vec::new()),
-        db_client,
+        db,
     });
     println!("biometric-auth-rs on port {}", port);
     HttpServer::new(move || {
         App::new()
-            .wrap(actix_web::middleware::DefaultHeaders::new()
-                .add(("X-Content-Type-Options", "nosniff"))
-                .add(("X-Frame-Options", "DENY"))
-                .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-                .add(("Content-Security-Policy", "default-src 'self'"))
-                .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .wrap(
+                actix_web::middleware::DefaultHeaders::new()
+                    .add(("X-Content-Type-Options", "nosniff"))
+                    .add(("X-Frame-Options", "DENY"))
+                    .add((
+                        "Strict-Transport-Security",
+                        "max-age=31536000; includeSubDomains",
+                    ))
+                    .add(("Content-Security-Policy", "default-src 'self'"))
+                    .add(("Referrer-Policy", "strict-origin-when-cross-origin")),
+            )
             .app_data(state.clone())
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))

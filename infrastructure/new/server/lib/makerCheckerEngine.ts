@@ -2,8 +2,15 @@
  * Maker-Checker Workflow Engine — Multi-level approval for high-value operations.
  * Implements approval chains, delegation, escalation, SLA tracking,
  * and comprehensive audit trails for Nigerian banking compliance.
+ *
+ * W12-C3-P0: approval requests (and their decision state) were an in-memory
+ * array — approvals/rejections vanished on restart. They are now
+ * Postgres-authoritative (approval_rules / approval_requests) via the
+ * server's drizzle pool. Reads are served from Postgres; decisions persist.
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeSeed, storeList, storeGet, storeReplace } from "./pgJsonStore";
+import { logger } from "./logger";
 
 interface ApprovalRule {
   id: string;
@@ -35,7 +42,7 @@ interface ApprovalRequest {
   completedAt?: string;
 }
 
-const APPROVAL_RULES: ApprovalRule[] = [
+const APPROVAL_RULE_SEED: ApprovalRule[] = [
   { id: "RULE-001", name: "High-Value Transfer (>₦10M)", entityType: "transfer", condition: "amount > 10000000", approvalLevels: 2, approvers: [["branch_manager", "operations_head"], ["cfo", "ceo"]], slaMinutes: 60, escalationPolicy: "escalate_to_next_level_after_sla", status: "active" },
   { id: "RULE-002", name: "Loan Approval (>₦5M)", entityType: "loan", condition: "amount > 5000000", approvalLevels: 3, approvers: [["loan_officer"], ["credit_committee"], ["md_approval"]], slaMinutes: 1440, escalationPolicy: "notify_compliance_after_sla", status: "active" },
   { id: "RULE-003", name: "New Account Opening (Corporate)", entityType: "account", condition: "accountType == corporate", approvalLevels: 2, approvers: [["kyc_officer"], ["compliance_officer"]], slaMinutes: 480, escalationPolicy: "escalate_to_next_level_after_sla", status: "active" },
@@ -46,7 +53,7 @@ const APPROVAL_RULES: ApprovalRule[] = [
   { id: "RULE-008", name: "Bulk Payment (>100 beneficiaries)", entityType: "bulk_payment", condition: "beneficiaryCount > 100", approvalLevels: 2, approvers: [["operations_head"], ["cfo"]], slaMinutes: 120, escalationPolicy: "escalate_to_next_level_after_sla", status: "active" },
 ];
 
-const APPROVAL_REQUESTS: ApprovalRequest[] = [
+const APPROVAL_REQUEST_SEED: ApprovalRequest[] = [
   {
     id: "APR-001", tenantId: "TEN-GTBANK", entityType: "transfer", entityId: "TXN-HV-001", ruleId: "RULE-001",
     initiator: { userId: "USR-GT-OP01", email: "operations@gtbank.ng", role: "operator" },
@@ -91,53 +98,90 @@ const APPROVAL_REQUESTS: ApprovalRequest[] = [
   },
 ];
 
+function ensure(): Promise<void> {
+  return ensureTables("makerCheckerEngine", [
+    ...storeDDL("approval_rules"),
+    ...storeDDL("approval_requests"),
+  ]).then(async () => {
+    await storeSeed("approval_rules", APPROVAL_RULE_SEED, () => "");
+    await storeSeed("approval_requests", APPROVAL_REQUEST_SEED, (r) => r.tenantId);
+  });
+}
+
+function dbUnavailable(res: Response, err: unknown) {
+  logger.error("makerCheckerEngine: database unavailable", { error: String(err) });
+  return res.status(503).json({ error: "approval_store_unavailable", message: "Approval store (Postgres) unavailable; refusing to serve in-memory data" });
+}
+
 export function registerMakerCheckerEngine(app: Express) {
-  app.get("/api/maker-checker/v1/rules", (_req: Request, res: Response) => {
-    res.json({ items: APPROVAL_RULES, total: APPROVAL_RULES.length });
+  app.get("/api/maker-checker/v1/rules", async (_req: Request, res: Response) => {
+    try { await ensure(); const items = await storeList<ApprovalRule>("approval_rules"); res.json({ items, total: items.length }); }
+    catch (err) { dbUnavailable(res, err); }
   });
-  app.get("/api/maker-checker/v1/requests", (req: Request, res: Response) => {
-    const status = req.query.status as string;
-    const filtered = status ? APPROVAL_REQUESTS.filter((r) => r.status === status) : APPROVAL_REQUESTS;
-    res.json({ items: filtered, total: filtered.length });
+  app.get("/api/maker-checker/v1/requests", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const all = await storeList<ApprovalRequest>("approval_requests");
+      const status = req.query.status as string;
+      const filtered = status ? all.filter((r) => r.status === status) : all;
+      res.json({ items: filtered, total: filtered.length });
+    } catch (err) { dbUnavailable(res, err); }
   });
-  app.get("/api/maker-checker/v1/requests/:id", (req: Request, res: Response) => {
-    const r = APPROVAL_REQUESTS.find((x) => x.id === req.params.id);
-    r ? res.json(r) : res.status(404).json({ error: "Request not found" });
+  app.get("/api/maker-checker/v1/requests/:id", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const r = await storeGet<ApprovalRequest>("approval_requests", req.params.id);
+      r ? res.json(r) : res.status(404).json({ error: "Request not found" });
+    } catch (err) { dbUnavailable(res, err); }
   });
-  app.post("/api/maker-checker/v1/requests/:id/approve", (req: Request, res: Response) => {
-    const r = APPROVAL_REQUESTS.find((x) => x.id === req.params.id);
-    if (!r) return res.status(404).json({ error: "Not found" });
-    const pending = r.approvals.find((a) => a.decision === "pending");
-    if (pending) {
-      pending.decision = "approved";
-      pending.approverId = req.body?.approverId ?? "USR-APPROVER";
-      pending.email = req.body?.email ?? "approver@54bank.com";
-      pending.comment = req.body?.comment ?? "";
-      pending.decidedAt = new Date().toISOString();
-      r.currentLevel++;
-    }
-    if (r.approvals.every((a) => a.decision === "approved")) {
-      r.status = "approved";
+  app.post("/api/maker-checker/v1/requests/:id/approve", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const r = await storeGet<ApprovalRequest>("approval_requests", req.params.id);
+      if (!r) return res.status(404).json({ error: "Not found" });
+      const pending = r.approvals.find((a) => a.decision === "pending");
+      if (pending) {
+        pending.decision = "approved";
+        pending.approverId = req.body?.approverId ?? "USR-APPROVER";
+        pending.email = req.body?.email ?? "approver@54bank.com";
+        pending.comment = req.body?.comment ?? "";
+        pending.decidedAt = new Date().toISOString();
+        r.currentLevel++;
+      }
+      if (r.approvals.every((a) => a.decision === "approved")) {
+        r.status = "approved";
+        r.completedAt = new Date().toISOString();
+      }
+      // W12-C3-P0: the decision now persists (was memory-only).
+      await storeReplace("approval_requests", r.id, r);
+      res.json(r);
+    } catch (err) { dbUnavailable(res, err); }
+  });
+  app.post("/api/maker-checker/v1/requests/:id/reject", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const r = await storeGet<ApprovalRequest>("approval_requests", req.params.id);
+      if (!r) return res.status(404).json({ error: "Not found" });
+      r.status = "rejected";
       r.completedAt = new Date().toISOString();
-    }
-    res.json(r);
+      const pending = r.approvals.find((a) => a.decision === "pending");
+      if (pending) { pending.decision = "rejected"; pending.comment = req.body?.reason ?? "Rejected"; pending.decidedAt = new Date().toISOString(); }
+      await storeReplace("approval_requests", r.id, r);
+      res.json(r);
+    } catch (err) { dbUnavailable(res, err); }
   });
-  app.post("/api/maker-checker/v1/requests/:id/reject", (req: Request, res: Response) => {
-    const r = APPROVAL_REQUESTS.find((x) => x.id === req.params.id);
-    if (!r) return res.status(404).json({ error: "Not found" });
-    r.status = "rejected";
-    r.completedAt = new Date().toISOString();
-    const pending = r.approvals.find((a) => a.decision === "pending");
-    if (pending) { pending.decision = "rejected"; pending.comment = req.body?.reason ?? "Rejected"; pending.decidedAt = new Date().toISOString(); }
-    res.json(r);
-  });
-  app.get("/api/maker-checker/v1/stats", (_req: Request, res: Response) => {
-    res.json({
-      totalRules: APPROVAL_RULES.length, totalRequests: APPROVAL_REQUESTS.length,
-      pending: APPROVAL_REQUESTS.filter((r) => r.status === "pending").length,
-      approved: APPROVAL_REQUESTS.filter((r) => r.status === "approved").length,
-      rejected: APPROVAL_REQUESTS.filter((r) => r.status === "rejected").length,
-      avgApprovalTimeMin: 42, slaBreaches: 0, escalations: 0,
-    });
+  app.get("/api/maker-checker/v1/stats", async (_req: Request, res: Response) => {
+    try {
+      await ensure();
+      const rules = await storeList<ApprovalRule>("approval_rules");
+      const requests = await storeList<ApprovalRequest>("approval_requests");
+      res.json({
+        totalRules: rules.length, totalRequests: requests.length,
+        pending: requests.filter((r) => r.status === "pending").length,
+        approved: requests.filter((r) => r.status === "approved").length,
+        rejected: requests.filter((r) => r.status === "rejected").length,
+        avgApprovalTimeMin: 42, slaBreaches: 0, escalations: 0,
+      });
+    } catch (err) { dbUnavailable(res, err); }
   });
 }

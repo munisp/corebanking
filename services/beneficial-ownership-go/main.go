@@ -137,20 +137,96 @@ type RegisterEntry struct {
 	Status       string  `json:"status"` // current, under_review, expired
 }
 
-var (
-	mu       sync.Mutex
-	register = []RegisterEntry{
-		{ID: "REG-001", CompanyID: "CMP-001", CompanyName: "Zenith Agro Ltd", TotalUBOs: 2,
-			ThresholdPct: 25, LastUpdated: "2026-04-01T10:00:00Z", NextReview: "2026-10-01T10:00:00Z", Status: "current",
-			UBOs: []UBO{
-				{ID: "UBO-001", EntityType: "individual", FullName: "John Okechukwu", Nationality: "NG",
-					OwnershipPct: 45, VotingRightPct: 45, ControlType: "direct_ownership",
-					IsPEP: false, IsSanctioned: false, VerificationSt: "verified", IdentifiedAt: "2026-04-01T10:00:00Z"},
-				{ID: "UBO-002", EntityType: "individual", FullName: "Grace Okafor", Nationality: "NG",
-					OwnershipPct: 30, VotingRightPct: 30, ControlType: "direct_ownership",
-					IsPEP: false, IsSanctioned: false, VerificationSt: "verified", IdentifiedAt: "2026-04-01T10:00:00Z"},
-			}},
+// seedRegister is the demo register fixture previously held in process
+// memory; it is inserted once at boot ON CONFLICT (company_id) DO NOTHING
+// (idempotent, never overwrites live rows).
+var seedRegister = []RegisterEntry{
+	{ID: "REG-001", CompanyID: "CMP-001", CompanyName: "Zenith Agro Ltd", TotalUBOs: 2,
+		ThresholdPct: 25, LastUpdated: "2026-04-01T10:00:00Z", NextReview: "2026-10-01T10:00:00Z", Status: "current",
+		UBOs: []UBO{
+			{ID: "UBO-001", EntityType: "individual", FullName: "John Okechukwu", Nationality: "NG",
+				OwnershipPct: 45, VotingRightPct: 45, ControlType: "direct_ownership",
+				IsPEP: false, IsSanctioned: false, VerificationSt: "verified", IdentifiedAt: "2026-04-01T10:00:00Z"},
+			{ID: "UBO-002", EntityType: "individual", FullName: "Grace Okafor", Nationality: "NG",
+				OwnershipPct: 30, VotingRightPct: 30, ControlType: "direct_ownership",
+				IsPEP: false, IsSanctioned: false, VerificationSt: "verified", IdentifiedAt: "2026-04-01T10:00:00Z"},
+		}},
+}
+
+// ── Persistence (wave-12 C3-P0-B7) ─────────────────────────────────────────
+// The beneficial-ownership register is Postgres-authoritative (typed table
+// register_entries, reusing this service's existing pool — b1 REUSE-POOL).
+// The in-memory register slice was removed: list reads and add-writes hit PG;
+// adds are idempotent on the natural key company_id (UNIQUE) — a replayed add
+// returns the stored row. Fail-closed 503 when PG is unavailable.
+const registerDDL = `
+CREATE TABLE IF NOT EXISTS register_entries (
+    id            text PRIMARY KEY,
+    tenant_id     text NOT NULL DEFAULT '',
+    company_id    text NOT NULL UNIQUE,
+    company_name  text NOT NULL DEFAULT '',
+    ubos          jsonb NOT NULL DEFAULT '[]'::jsonb,
+    total_ubos    integer NOT NULL DEFAULT 0,
+    threshold_pct double precision NOT NULL DEFAULT 25,
+    last_updated  text NOT NULL DEFAULT '',
+    next_review   text NOT NULL DEFAULT '',
+    status        text NOT NULL DEFAULT 'current',
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_register_entries_status ON register_entries (status);
+`
+
+func dbListRegister() ([]RegisterEntry, error) {
+	rows, err := db.Query(`SELECT id, company_id, company_name, ubos, total_ubos, threshold_pct, last_updated, next_review, status FROM register_entries ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
 	}
+	defer rows.Close()
+	out := []RegisterEntry{}
+	for rows.Next() {
+		var e RegisterEntry
+		var ubos []byte
+		if err := rows.Scan(&e.ID, &e.CompanyID, &e.CompanyName, &ubos, &e.TotalUBOs, &e.ThresholdPct, &e.LastUpdated, &e.NextReview, &e.Status); err != nil {
+			return nil, err
+		}
+		json.Unmarshal(ubos, &e.UBOs)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// dbAddRegisterEntry inserts idempotently on company_id. created=false means
+// the company already had an entry and the STORED row is returned (replay).
+func dbAddRegisterEntry(e *RegisterEntry) (created bool, err error) {
+	ubos, _ := json.Marshal(e.UBOs)
+	var id string
+	err = db.QueryRow(
+		`INSERT INTO register_entries (id, company_id, company_name, ubos, total_ubos, threshold_pct, last_updated, next_review, status)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 ON CONFLICT (company_id) DO NOTHING
+		 RETURNING id`,
+		e.ID, e.CompanyID, e.CompanyName, ubos, e.TotalUBOs, e.ThresholdPct, e.LastUpdated, e.NextReview, e.Status).Scan(&id)
+	if err == sql.ErrNoRows {
+		var ubosBytes []byte
+		err = db.QueryRow(
+			`SELECT id, company_name, ubos, total_ubos, threshold_pct, last_updated, next_review, status FROM register_entries WHERE company_id = $1`,
+			e.CompanyID).
+			Scan(&e.ID, &e.CompanyName, &ubosBytes, &e.TotalUBOs, &e.ThresholdPct, &e.LastUpdated, &e.NextReview, &e.Status)
+		if err != nil {
+			return false, err
+		}
+		json.Unmarshal(ubosBytes, &e.UBOs)
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+var (
+	mu     sync.Mutex
 	chains = []OwnershipChain{}
 	stats  = map[string]interface{}{
 		"totalEntries":    1,
@@ -263,10 +339,17 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleRegister(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "postgres unavailable — fail-closed"})
+		return
+	}
+	entries, err := dbListRegister()
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "list failed: " + err.Error()})
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
-		"entries": register, "total": len(register), "thresholdPct": 25.0,
+		"entries": entries, "total": len(entries), "thresholdPct": 25.0, "source": "postgres",
 	})
 }
 
@@ -385,10 +468,27 @@ func handleAddToRegister(w http.ResponseWriter, r *http.Request) {
 		Status:       "current",
 	}
 
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "postgres unavailable — register write refused (fail-closed)"})
+		return
+	}
+	created, err := dbAddRegisterEntry(&entry)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "persist failed: " + err.Error()})
+		return
+	}
 	mu.Lock()
-	register = append(register, entry)
-	stats["totalEntries"] = len(register)
+	if db != nil {
+		if n, cerr := dbListRegister(); cerr == nil {
+			stats["totalEntries"] = len(n)
+		}
+	}
 	mu.Unlock()
+	if !created {
+		w.Header().Set("X-Idempotent-Replayed", "true")
+		respondJSON(w, 200, entry)
+		return
+	}
 
 	// Persist to database
 	if db != nil {
@@ -558,7 +658,28 @@ func initDB() {
 		db = nil
 		return
 	}
-	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	if _, err = db.Exec(registerDDL); err != nil {
+		log.Fatalf("[%s] register_entries DDL failed: %v", serviceName, err)
+	}
+	// Idempotent boot seed of the demo fixture (never overwrites live rows).
+	tx, terr := db.Begin()
+	if terr != nil {
+		log.Fatalf("[%s] register seed tx begin: %v", serviceName, terr)
+	}
+	for _, e := range seedRegister {
+		ubos, _ := json.Marshal(e.UBOs)
+		if _, terr = tx.Exec(
+			`INSERT INTO register_entries (id, company_id, company_name, ubos, total_ubos, threshold_pct, last_updated, next_review, status)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (company_id) DO NOTHING`,
+			e.ID, e.CompanyID, e.CompanyName, ubos, e.TotalUBOs, e.ThresholdPct, e.LastUpdated, e.NextReview, e.Status); terr != nil {
+			tx.Rollback()
+			log.Fatalf("[%s] register seed %s: %v", serviceName, e.ID, terr)
+		}
+	}
+	if terr = tx.Commit(); terr != nil {
+		log.Fatalf("[%s] register seed tx commit: %v", serviceName, terr)
+	}
+	log.Printf("[%s] Postgres connected (pool: 25/5), register_entries authoritative", serviceName)
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -1135,8 +1256,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1144,10 +1272,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
+		"service_configs.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1184,7 +1322,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1192,25 +1337,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
+		"service_configs.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+		"service_configs.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1499,18 +1673,18 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "traverse", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "traverse", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/beneficial-ownership/register", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleRegister)))
-	mux.Handle("/v1/beneficial-ownership/traverse-chain", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleTraverseChain)))
-	mux.Handle("/v1/beneficial-ownership/identify-ubos", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleIdentifyUBOs)))
-	mux.Handle("/v1/beneficial-ownership/register/add", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAddToRegister)))
-	mux.Handle("/v1/beneficial-ownership/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/beneficial-ownership/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(beneficial_ownershipScoreHandler)))
-	mux.Handle("/v1/beneficial-ownership/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(beneficial_ownershipValidateRequestHandler)))
+	mux.Handle("/v1/beneficial-ownership/register", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "manage", http.HandlerFunc(handleRegister))))
+	mux.Handle("/v1/beneficial-ownership/traverse-chain", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "manage", http.HandlerFunc(handleTraverseChain))))
+	mux.Handle("/v1/beneficial-ownership/identify-ubos", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "manage", http.HandlerFunc(handleIdentifyUBOs))))
+	mux.Handle("/v1/beneficial-ownership/register/add", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "manage", http.HandlerFunc(handleAddToRegister))))
+	mux.Handle("/v1/beneficial-ownership/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "traverse", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/beneficial-ownership/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "manage", http.HandlerFunc(beneficial_ownershipScoreHandler))))
+	mux.Handle("/v1/beneficial-ownership/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "manage", http.HandlerFunc(beneficial_ownershipValidateRequestHandler))))
 	// APISIX rewrites /beneficial-ownership/v1/owners → /v1/owners
-	mux.Handle("/v1/owners", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleRegister)))
+	mux.Handle("/v1/owners", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("ubo_graph", "manage", http.HandlerFunc(handleRegister))))
 	log.Printf("Beneficial Ownership Register v2.0 (Go) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

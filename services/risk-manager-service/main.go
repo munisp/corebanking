@@ -496,7 +496,11 @@ func (s *RiskServer) listCreditRisksHandler(w http.ResponseWriter, r *http.Reque
 	tenantID := getTenantID(r)
 	rating := r.URL.Query().Get("rating")
 	watchlist := r.URL.Query().Get("watchlist")
-	risks := s.creditRiskService.ListRisks(tenantID, rating, watchlist)
+	risks, err := s.creditRiskService.ListRisks(tenantID, rating, watchlist)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"risks": risks})
 }
 
@@ -577,31 +581,51 @@ func (s *RiskServer) updateRiskRatingHandler(w http.ResponseWriter, r *http.Requ
 
 func (s *RiskServer) getPortfolioRiskHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	portfolio := s.creditRiskService.GetPortfolioRisk(tenantID)
+	portfolio, err := s.creditRiskService.GetPortfolioRisk(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, portfolio)
 }
 
 func (s *RiskServer) getConcentrationRiskHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	concentration := s.creditRiskService.GetConcentrationRisk(tenantID)
+	concentration, err := s.creditRiskService.GetConcentrationRisk(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, concentration)
 }
 
 func (s *RiskServer) getWatchlistHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	watchlist := s.creditRiskService.GetWatchlist(tenantID)
+	watchlist, err := s.creditRiskService.GetWatchlist(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"watchlist": watchlist})
 }
 
 func (s *RiskServer) getProvisionsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	provisions := s.creditRiskService.GetProvisions(tenantID)
+	provisions, err := s.creditRiskService.GetProvisions(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, provisions)
 }
 
 func (s *RiskServer) getNPLAnalysisHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	npl := s.creditRiskService.GetNPLAnalysis(tenantID)
+	npl, err := s.creditRiskService.GetNPLAnalysis(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, npl)
 }
 
@@ -610,7 +634,11 @@ func (s *RiskServer) listOperationalRisksHandler(w http.ResponseWriter, r *http.
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
 	eventType := r.URL.Query().Get("type")
-	risks := s.operationalRiskService.ListRisks(tenantID, status, eventType)
+	risks, err := s.operationalRiskService.ListRisks(tenantID, status, eventType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"risks": risks})
 }
 
@@ -718,13 +746,21 @@ func (s *RiskServer) resolveOperationalRiskHandler(w http.ResponseWriter, r *htt
 
 func (s *RiskServer) getOperationalRiskSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	summary := s.operationalRiskService.GetSummary(tenantID)
+	summary, err := s.operationalRiskService.GetSummary(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, summary)
 }
 
 func (s *RiskServer) getLossDistributionHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	distribution := s.operationalRiskService.GetLossDistribution(tenantID)
+	distribution, err := s.operationalRiskService.GetLossDistribution(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, distribution)
 }
 
@@ -732,13 +768,21 @@ func (s *RiskServer) getLossDistributionHandler(w http.ResponseWriter, r *http.R
 func (s *RiskServer) listMarketRisksHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	portfolio := r.URL.Query().Get("portfolio")
-	risks := s.marketRiskService.ListRisks(tenantID, portfolio)
+	risks, err := s.marketRiskService.ListRisks(tenantID, portfolio)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"risks": risks})
 }
 
 func (s *RiskServer) getVaRHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	var_ := s.marketRiskService.GetVaR(tenantID)
+	var_, err := s.marketRiskService.GetVaR(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, var_)
 }
 
@@ -770,7 +814,11 @@ func (s *RiskServer) getInterestRateRiskHandler(w http.ResponseWriter, r *http.R
 func (s *RiskServer) listLimitsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	limitType := r.URL.Query().Get("type")
-	limits := s.limitService.ListLimits(tenantID, limitType)
+	limits, err := s.limitService.ListLimits(tenantID, limitType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"limits": limits})
 }
 
@@ -830,13 +878,21 @@ func (s *RiskServer) updateLimitHandler(w http.ResponseWriter, r *http.Request) 
 
 func (s *RiskServer) getLimitUtilizationHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	utilization := s.limitService.GetUtilization(tenantID)
+	utilization, err := s.limitService.GetUtilization(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, utilization)
 }
 
 func (s *RiskServer) getLimitBreachesHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	breaches := s.limitService.GetBreaches(tenantID)
+	breaches, err := s.limitService.GetBreaches(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"breaches": breaches})
 }
 
@@ -844,7 +900,11 @@ func (s *RiskServer) getLimitBreachesHandler(w http.ResponseWriter, r *http.Requ
 func (s *RiskServer) listIndicatorsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	category := r.URL.Query().Get("category")
-	indicators := s.indicatorService.ListIndicators(tenantID, category)
+	indicators, err := s.indicatorService.ListIndicators(tenantID, category)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"indicators": indicators})
 }
 
@@ -903,13 +963,21 @@ func (s *RiskServer) updateIndicatorHandler(w http.ResponseWriter, r *http.Reque
 
 func (s *RiskServer) getKRIDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	dashboard := s.indicatorService.GetDashboard(tenantID)
+	dashboard, err := s.indicatorService.GetDashboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, dashboard)
 }
 
 func (s *RiskServer) getKRITrendsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	trends := s.indicatorService.GetTrends(tenantID)
+	trends, err := s.indicatorService.GetTrends(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, trends)
 }
 
@@ -917,7 +985,11 @@ func (s *RiskServer) getKRITrendsHandler(w http.ResponseWriter, r *http.Request)
 func (s *RiskServer) listStressTestsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	testType := r.URL.Query().Get("type")
-	tests := s.stressTestService.ListTests(tenantID, testType)
+	tests, err := s.stressTestService.ListTests(tenantID, testType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"tests": tests})
 }
 
@@ -976,7 +1048,11 @@ func (s *RiskServer) getScenariosHandler(w http.ResponseWriter, r *http.Request)
 
 func (s *RiskServer) getStressTestResultsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	results := s.stressTestService.GetResults(tenantID)
+	results, err := s.stressTestService.GetResults(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, results)
 }
 
@@ -984,7 +1060,11 @@ func (s *RiskServer) getStressTestResultsHandler(w http.ResponseWriter, r *http.
 func (s *RiskServer) listReportsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	reportType := r.URL.Query().Get("type")
-	reports := s.reportService.ListReports(tenantID, reportType)
+	reports, err := s.reportService.ListReports(tenantID, reportType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"reports": reports})
 }
 
@@ -1055,7 +1135,11 @@ func (s *RiskServer) submitReportHandler(w http.ResponseWriter, r *http.Request)
 
 func (s *RiskServer) getRegulatoryReportsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	reports := s.reportService.GetRegulatoryReports(tenantID)
+	reports, err := s.reportService.GetRegulatoryReports(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"reports": reports})
 }
 
@@ -1063,7 +1147,11 @@ func (s *RiskServer) getRegulatoryReportsHandler(w http.ResponseWriter, r *http.
 func (s *RiskServer) listOfficersHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	specialization := r.URL.Query().Get("specialization")
-	officers := s.officerService.ListOfficers(tenantID, specialization)
+	officers, err := s.officerService.ListOfficers(tenantID, specialization)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"officers": officers})
 }
 
@@ -1123,13 +1211,21 @@ func (s *RiskServer) updateOfficerHandler(w http.ResponseWriter, r *http.Request
 // Dashboard handlers
 func (s *RiskServer) getDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	dashboard := s.getDashboard(tenantID)
+	dashboard, err := s.getDashboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, dashboard)
 }
 
 func (s *RiskServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	dashboard := s.getDashboard(tenantID)
+	dashboard, err := s.getDashboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	summary := map[string]interface{}{
 		"totalExposure":        dashboard.TotalExposure,
 		"nplRatio":             dashboard.NPLRatio,
@@ -1142,7 +1238,11 @@ func (s *RiskServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http.R
 
 func (s *RiskServer) getAlertsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	alerts := s.getAlerts(tenantID)
+	alerts, err := s.getAlerts(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"alerts": alerts})
 }
 
@@ -1152,13 +1252,16 @@ func (s *RiskServer) getRiskAppetiteHandler(w http.ResponseWriter, r *http.Reque
 	respondJSON(w, http.StatusOK, appetite)
 }
 
-func (s *RiskServer) getDashboard(tenantID string) *RiskDashboard {
+func (s *RiskServer) getDashboard(tenantID string) (*RiskDashboard, error) {
 	dashboard := &RiskDashboard{
 		Date: time.Now(),
 	}
 
 	// Credit Risk
-	portfolio := s.creditRiskService.GetPortfolioRisk(tenantID)
+	portfolio, err := s.creditRiskService.GetPortfolioRisk(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if exposure, ok := portfolio["totalExposure"].(int64); ok {
 		dashboard.TotalExposure = exposure
 	}
@@ -1170,13 +1273,19 @@ func (s *RiskServer) getDashboard(tenantID string) *RiskDashboard {
 	}
 
 	// Market Risk
-	var_ := s.marketRiskService.GetVaR(tenantID)
+	var_, err := s.marketRiskService.GetVaR(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if totalVaR, ok := var_["totalVaR"].(int64); ok {
 		dashboard.TotalVaR = totalVaR
 	}
 
 	// Operational Risk
-	summary := s.operationalRiskService.GetSummary(tenantID)
+	summary, err := s.operationalRiskService.GetSummary(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if open, ok := summary["openEvents"].(int); ok {
 		dashboard.OpenIncidents = open
 	}
@@ -1185,7 +1294,10 @@ func (s *RiskServer) getDashboard(tenantID string) *RiskDashboard {
 	}
 
 	// KRI
-	kriDashboard := s.indicatorService.GetDashboard(tenantID)
+	kriDashboard, err := s.indicatorService.GetDashboard(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if breaches, ok := kriDashboard["redIndicators"].(int); ok {
 		dashboard.KRIBreaches = breaches
 	}
@@ -1194,14 +1306,17 @@ func (s *RiskServer) getDashboard(tenantID string) *RiskDashboard {
 	dashboard.CapitalAdequacyRatio = 18.5
 	dashboard.RiskAppetiteStatus = "within_appetite"
 
-	return dashboard
+	return dashboard, nil
 }
 
-func (s *RiskServer) getAlerts(tenantID string) []map[string]interface{} {
+func (s *RiskServer) getAlerts(tenantID string) ([]map[string]interface{}, error) {
 	var alerts []map[string]interface{}
 
 	// Check limit breaches
-	breaches := s.limitService.GetBreaches(tenantID)
+	breaches, err := s.limitService.GetBreaches(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if len(breaches) > 0 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "limit_breach",
@@ -1212,7 +1327,10 @@ func (s *RiskServer) getAlerts(tenantID string) []map[string]interface{} {
 	}
 
 	// Check KRI breaches
-	kriDashboard := s.indicatorService.GetDashboard(tenantID)
+	kriDashboard, err := s.indicatorService.GetDashboard(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if red, ok := kriDashboard["redIndicators"].(int); ok && red > 0 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "kri_breach",
@@ -1222,7 +1340,7 @@ func (s *RiskServer) getAlerts(tenantID string) []map[string]interface{} {
 		})
 	}
 
-	return alerts
+	return alerts, nil
 }
 
 func (s *RiskServer) getRiskAppetite(tenantID string) map[string]interface{} {

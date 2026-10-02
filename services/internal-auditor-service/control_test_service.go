@@ -11,7 +11,7 @@ import (
 // ControlTestService handles control test operations
 type ControlTestService struct {
 	tenantID string
-	tests    map[string]*ControlTest
+	tests    *repo[ControlTest]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type ControlTestService struct {
 func NewControlTestService(tenantID string) *ControlTestService {
 	svc := &ControlTestService{
 		tenantID: tenantID,
-		tests:    make(map[string]*ControlTest),
+		tests:    newRepo[ControlTest](serviceDB, "control_tests"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -30,7 +30,7 @@ func (s *ControlTestService) initializeDefaultData(tenantID string) {
 	reviewedAt := time.Now().AddDate(0, 0, -3)
 
 	// Effective control
-	s.tests["test-001"] = &ControlTest{
+	s.tests.seed(tenantID, "test-001", &ControlTest{
 		TestID:          "test-001",
 		TenantID:        tenantID,
 		EngagementID:    "eng-001",
@@ -52,10 +52,10 @@ func (s *ControlTestService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, 0, -10),
 		UpdatedAt:       time.Now().AddDate(0, 0, -3),
-	}
+	})
 
 	// Partially effective control
-	s.tests["test-002"] = &ControlTest{
+	s.tests.seed(tenantID, "test-002", &ControlTest{
 		TestID:          "test-002",
 		TenantID:        tenantID,
 		EngagementID:    "eng-001",
@@ -77,10 +77,10 @@ func (s *ControlTestService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, 0, -10),
 		UpdatedAt:       time.Now().AddDate(0, 0, -3),
-	}
+	})
 
 	// Ineffective control
-	s.tests["test-003"] = &ControlTest{
+	s.tests.seed(tenantID, "test-003", &ControlTest{
 		TestID:          "test-003",
 		TenantID:        tenantID,
 		EngagementID:    "eng-001",
@@ -100,10 +100,10 @@ func (s *ControlTestService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, 0, -8),
 		UpdatedAt:       time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// In progress control test
-	s.tests["test-004"] = &ControlTest{
+	s.tests.seed(tenantID, "test-004", &ControlTest{
 		TestID:          "test-004",
 		TenantID:        tenantID,
 		EngagementID:    "eng-001",
@@ -122,10 +122,10 @@ func (s *ControlTestService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, 0, -3),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
 	// Pending control test
-	s.tests["test-005"] = &ControlTest{
+	s.tests.seed(tenantID, "test-005", &ControlTest{
 		TestID:          "test-005",
 		TenantID:        tenantID,
 		EngagementID:    "eng-001",
@@ -143,16 +143,18 @@ func (s *ControlTestService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, 0, -2),
 		UpdatedAt:       time.Now().AddDate(0, 0, -2),
-	}
+	})
 }
 
 // ListControlTests returns control tests based on filters
-func (s *ControlTestService) ListControlTests(tenantID, status string) []*ControlTest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ControlTestService) ListControlTests(tenantID, status string) ([]*ControlTest, error) {
 
 	var result []*ControlTest
-	for _, test := range s.tests {
+	__ALL__, __ERR__ := s.tests.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, test := range __ALL__ {
 		if test.TenantID != tenantID {
 			continue
 		}
@@ -161,16 +163,14 @@ func (s *ControlTestService) ListControlTests(tenantID, status string) []*Contro
 		}
 		result = append(result, test)
 	}
-	return result
+	return result, nil
 }
 
 // GetControlTest retrieves a control test by ID
 func (s *ControlTestService) GetControlTest(tenantID, testID string) (*ControlTest, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	test, exists := s.tests[testID]
-	if !exists || test.TenantID != tenantID {
+	test, err := s.tests.get(tenantID, testID)
+	if err != nil {
 		return nil, errors.New("control test not found")
 	}
 	return test, nil
@@ -178,8 +178,6 @@ func (s *ControlTestService) GetControlTest(tenantID, testID string) (*ControlTe
 
 // CreateControlTest creates a new control test
 func (s *ControlTestService) CreateControlTest(tenantID string, test *ControlTest) (*ControlTest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	test.TestID = uuid.New().String()
 	test.TenantID = tenantID
@@ -190,79 +188,68 @@ func (s *ControlTestService) CreateControlTest(tenantID string, test *ControlTes
 	test.CreatedAt = time.Now()
 	test.UpdatedAt = time.Now()
 
-	s.tests[test.TestID] = test
+	if err := s.tests.put(tenantID, test.TestID, test); err != nil {
+		return nil, err
+	}
 	return test, nil
 }
 
 // UpdateControlTest updates a control test
 func (s *ControlTestService) UpdateControlTest(test *ControlTest) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.tests[test.TestID]
-	if !exists || existing.TenantID != test.TenantID {
+	existing, err := s.tests.get(test.TenantID, test.TestID)
+	if err != nil {
 		return errors.New("control test not found")
 	}
 
 	test.CreatedAt = existing.CreatedAt
 	test.UpdatedAt = time.Now()
-	s.tests[test.TestID] = test
-	return nil
+	return s.tests.put(test.TenantID, test.TestID, test)
 }
 
 // ExecuteTest executes a control test
 func (s *ControlTestService) ExecuteTest(tenantID, testID, auditorID string, sampleTested, exceptionsFound int, testResult, conclusion string) (*ControlTest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.tests.update(tenantID, testID, func(test *ControlTest) error {
+		now := time.Now()
+		test.SampleTested = sampleTested
+		test.ExceptionsFound = exceptionsFound
+		test.TestResult = testResult
+		test.Conclusion = conclusion
+		test.TestedBy = auditorID
+		test.TestedAt = &now
+		test.Status = "completed"
+		test.UpdatedAt = now
 
-	test, exists := s.tests[testID]
-	if !exists || test.TenantID != tenantID {
-		return nil, errors.New("control test not found")
-	}
-
-	now := time.Now()
-	test.SampleTested = sampleTested
-	test.ExceptionsFound = exceptionsFound
-	test.TestResult = testResult
-	test.Conclusion = conclusion
-	test.TestedBy = auditorID
-	test.TestedAt = &now
-	test.Status = "completed"
-	test.UpdatedAt = now
-
-	return test, nil
+		return nil
+	})
 }
 
 // ReviewTest reviews a control test
 func (s *ControlTestService) ReviewTest(tenantID, testID, reviewerID string) (*ControlTest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.tests.update(tenantID, testID, func(test *ControlTest) error {
+		if test.Status != "completed" {
+			return errors.New("control test is not completed")
+		}
 
-	test, exists := s.tests[testID]
-	if !exists || test.TenantID != tenantID {
-		return nil, errors.New("control test not found")
-	}
+		now := time.Now()
+		test.ReviewedBy = reviewerID
+		test.ReviewedAt = &now
+		test.Status = "reviewed"
+		test.UpdatedAt = now
 
-	if test.Status != "completed" {
-		return nil, errors.New("control test is not completed")
-	}
-
-	now := time.Now()
-	test.ReviewedBy = reviewerID
-	test.ReviewedAt = &now
-	test.Status = "reviewed"
-	test.UpdatedAt = now
-
-	return test, nil
+		return nil
+	})
 }
 
 // GetEngagementControls returns controls for an engagement
-func (s *ControlTestService) GetEngagementControls(tenantID, engagementID string) []*ControlTest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ControlTestService) GetEngagementControls(tenantID, engagementID string) ([]*ControlTest, error) {
 
 	var result []*ControlTest
-	for _, test := range s.tests {
+	__ALL__, __ERR__ := s.tests.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, test := range __ALL__ {
 		if test.TenantID != tenantID {
 			continue
 		}
@@ -270,17 +257,19 @@ func (s *ControlTestService) GetEngagementControls(tenantID, engagementID string
 			result = append(result, test)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetSummary returns control test summary
-func (s *ControlTestService) GetSummary(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ControlTestService) GetSummary(tenantID string) (map[string]interface{}, error) {
 
 	var total, effective, partiallyEffective, ineffective, pending int
 
-	for _, test := range s.tests {
+	__ALL__, __ERR__ := s.tests.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, test := range __ALL__ {
 		if test.TenantID != tenantID {
 			continue
 		}
@@ -312,5 +301,5 @@ func (s *ControlTestService) GetSummary(tenantID string) map[string]interface{} 
 		"pendingTests":        pending,
 		"effectiveness":       effectiveness,
 		"timestamp":           time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

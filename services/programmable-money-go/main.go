@@ -440,8 +440,8 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/api/v1/smart-transfer/create", createSmartTransfer)
-	mux.HandleFunc("/api/v1/smart-transfer/satisfy", satisfyCondition)
+	mux.HandleFunc("/api/v1/smart-transfer/create", permifyAuthzGuard("smart_transfer", "create", createSmartTransfer))
+	mux.HandleFunc("/api/v1/smart-transfer/satisfy", permifyAuthzGuard("smart_transfer", "satisfy", satisfyCondition))
 	srv := &http.Server{
 		Addr: ":" + port, Handler: jwtAuthMiddleware(mux),
 		ReadHeaderTimeout: 5 * time.Second,

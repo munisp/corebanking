@@ -15,12 +15,12 @@ import (
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -1483,7 +1483,7 @@ func main() {
 	}
 	defer hub.Close()
 
-	http.HandleFunc("/api/v1/send", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/send", permifyAuthzGuard("notification", "send", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("[API] Incoming send message request from %s\n", r.RemoteAddr)
 
 		if r.Method != http.MethodPost {
@@ -1518,9 +1518,9 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
-	})
+	}))
 
-	http.HandleFunc("/api/v1/broadcast", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/broadcast", permifyAuthzGuard("notification", "broadcast", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("[API] Incoming broadcast request from %s\n", r.RemoteAddr)
 
 		if r.Method != http.MethodPost {
@@ -1561,9 +1561,9 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(responses)
-	})
+	}))
 
-	http.HandleFunc("/api/v1/conversation", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/conversation", permifyAuthzGuard("notification", "conversation", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1581,9 +1581,9 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(messages)
-	})
+	}))
 
-	http.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/stats", permifyAuthzGuard("notification", "view", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1600,9 +1600,9 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(stats)
-	})
+	}))
 
-	http.HandleFunc("/api/v1/channel/config", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/channel/config", permifyAuthzGuard("notification", "config", func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.Header.Get("X-Tenant-ID")
 
 		if r.Method == http.MethodPut {
@@ -1622,9 +1622,9 @@ func main() {
 		}
 
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	})
+	}))
 
-	http.HandleFunc("/api/v1/messages/recent", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/messages/recent", permifyAuthzGuard("notification", "recent", func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.Header.Get("X-Tenant-ID")
 		if tenantID == "" {
 			tenantID = "default"
@@ -1652,9 +1652,9 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"messages": messages,
 		})
-	})
+	}))
 
-	http.HandleFunc("/api/v1/channels/config", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/channels/config", permifyAuthzGuard("notification", "config", func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.Header.Get("X-Tenant-ID")
 		if tenantID == "" {
 			tenantID = "default"
@@ -1691,9 +1691,9 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"configs": configs,
 		})
-	})
+	}))
 
-	http.HandleFunc("/api/v1/conversations", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/conversations", permifyAuthzGuard("notification", "conversations", func(w http.ResponseWriter, r *http.Request) {
 		tenantID := r.Header.Get("X-Tenant-ID")
 		if tenantID == "" {
 			tenantID = "default"
@@ -1705,7 +1705,7 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"conversations": []interface{}{},
 		})
-	})
+	}))
 
 	// USSD Callback endpoint for Africa's Talking
 	http.HandleFunc("/api/v1/ussd/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -1928,7 +1928,7 @@ func main() {
 	})
 
 	// SMS Delivery Report Callback endpoint for Africa's Talking
-	http.HandleFunc("/api/v1/sms/delivery", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/sms/delivery", permifyAuthzGuard("notification", "delivery", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("[SMS] Delivery report callback from %s\n", r.RemoteAddr)
 
 		if r.Method != http.MethodPost {
@@ -1982,7 +1982,7 @@ func main() {
 		// Send 200 OK response
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Delivery report received"))
-	})
+	}))
 
 	// WhatsApp Incoming Message Callback endpoint for Africa's Talking
 	// WhatsApp Incoming Message Callback endpoint for Africa's Talking & Meta Cloud API

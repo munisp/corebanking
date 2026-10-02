@@ -10,6 +10,122 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 import os
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(row.get(self.key, "")), row.get(self.tenant_key),
+                          json.dumps(row, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 @dataclass
 class BatchJob:
     id: str = ""
@@ -80,15 +196,21 @@ class DormancyCheck:
         return asdict(self)
 
 
-batch_jobs: list[BatchJob] = []
-accruals: list[InterestAccrual] = []
-statements: list[AccountStatement] = []
-dormancy_checks: list[DormancyCheck] = []
+# W12-C3P2B5: per-domain PG stores. `interest_accruals` holds computed accrual
+# OUTPUT records (audit trail of batch calculations), not balance/ledger state.
+BATCH_JOB_STORE = _W12Store("batch_jobs")
+ACCRUAL_STORE = _W12Store("interest_accruals")
+STATEMENT_STORE = _W12Store("account_statements")
+DORMANCY_STORE = _W12Store("dormancy_checks")
 
 
 def handle_batch_jobs(method: str, body: dict) -> tuple[int, dict]:
     if method == "GET":
-        return 200, {"items": [j.to_dict() for j in batch_jobs], "total": len(batch_jobs)}
+        try:
+            _items = BATCH_JOB_STORE.all()
+        except Exception as _e:
+            return 503, {"error": "persistence_unavailable", "detail": str(_e)}
+        return 200, {"items": _items, "total": len(_items)}
     if method == "POST":
         valid_types = ("eod_processing", "interest_accrual", "statement_generation", "dormancy_check", "gl_reconciliation", "regulatory_return")
         if body.get("job_type") not in valid_types:
@@ -108,15 +230,24 @@ def handle_batch_jobs(method: str, body: dict) -> tuple[int, dict]:
         if job.job_type == "interest_accrual":
             job.total_records = body.get("parameters", {}).get("account_count", 100)
             job.records_processed = job.total_records
-            _run_interest_accrual(body.get("parameters", {}))
+            try:
+                _run_interest_accrual(body.get("parameters", {}))
+            except Exception as _e:
+                return 503, {"error": "persistence_unavailable", "detail": str(_e)}
         elif job.job_type == "statement_generation":
             job.total_records = body.get("parameters", {}).get("account_count", 50)
             job.records_processed = job.total_records
-            _run_statement_generation(body.get("parameters", {}))
+            try:
+                _run_statement_generation(body.get("parameters", {}))
+            except Exception as _e:
+                return 503, {"error": "persistence_unavailable", "detail": str(_e)}
         elif job.job_type == "dormancy_check":
             job.total_records = body.get("parameters", {}).get("account_count", 200)
             job.records_processed = job.total_records
-            _run_dormancy_check(body.get("parameters", {}))
+            try:
+                _run_dormancy_check(body.get("parameters", {}))
+            except Exception as _e:
+                return 503, {"error": "persistence_unavailable", "detail": str(_e)}
         elif job.job_type == "eod_processing":
             job.total_records = 5
             job.records_processed = 5
@@ -130,7 +261,10 @@ def handle_batch_jobs(method: str, body: dict) -> tuple[int, dict]:
         job.status = "completed"
         job.completed_at = datetime.now(timezone.utc).isoformat()
         job.duration_seconds = 0.5
-        batch_jobs.append(job)
+        try:
+            BATCH_JOB_STORE.put(job.id, job.to_dict())
+        except Exception as _e:
+            return 503, {"error": "persistence_unavailable", "detail": str(_e)}
         return 201, job.to_dict()
     return 405, {"error": "method not allowed"}
 
@@ -155,7 +289,7 @@ def _run_interest_accrual(params: dict):
             period_days=period_days,
             method="daily",
         )
-        accruals.append(acc)
+        ACCRUAL_STORE.put(acc.id, acc.to_dict())
 
 
 def _run_statement_generation(params: dict):
@@ -183,7 +317,7 @@ def _run_statement_generation(params: dict):
             format=params.get("format", "pdf"),
             generated_at=now.isoformat(),
         )
-        statements.append(stmt)
+        STATEMENT_STORE.put(stmt.id, stmt.to_dict())
 
 
 def _run_dormancy_check(params: dict):
@@ -215,24 +349,36 @@ def _run_dormancy_check(params: dict):
             action_taken=action,
             check_date=now.strftime("%Y-%m-%d"),
         )
-        dormancy_checks.append(check)
+        DORMANCY_STORE.put(check.id, check.to_dict())
 
 
 def handle_accruals(method: str, body: dict) -> tuple[int, dict]:
     if method == "GET":
-        return 200, {"accruals": [a.to_dict() for a in accruals], "total": len(accruals)}
+        try:
+            _items = ACCRUAL_STORE.all()
+        except Exception as _e:
+            return 503, {"error": "persistence_unavailable", "detail": str(_e)}
+        return 200, {"accruals": _items, "total": len(_items)}
     return 405, {"error": "method not allowed"}
 
 
 def handle_statements(method: str, body: dict) -> tuple[int, dict]:
     if method == "GET":
-        return 200, {"statements": [s.to_dict() for s in statements], "total": len(statements)}
+        try:
+            _items = STATEMENT_STORE.all()
+        except Exception as _e:
+            return 503, {"error": "persistence_unavailable", "detail": str(_e)}
+        return 200, {"statements": _items, "total": len(_items)}
     return 405, {"error": "method not allowed"}
 
 
 def handle_dormancy(method: str, body: dict) -> tuple[int, dict]:
     if method == "GET":
-        return 200, {"checks": [d.to_dict() for d in dormancy_checks], "total": len(dormancy_checks)}
+        try:
+            _items = DORMANCY_STORE.all()
+        except Exception as _e:
+            return 503, {"error": "persistence_unavailable", "detail": str(_e)}
+        return 200, {"checks": _items, "total": len(_items)}
     return 405, {"error": "method not allowed"}
 
 
@@ -249,6 +395,20 @@ def handle_schedule(method: str, body: dict) -> tuple[int, dict]:
         ]
         return 200, {"schedule": schedule, "timezone": "Africa/Lagos"}
     return 405, {"error": "method not allowed"}
+
+
+def _w12_stats():
+    """W12-C3P2B5: counts from PG; degraded marker on PG failure."""
+    try:
+        for _s in (BATCH_JOB_STORE, ACCRUAL_STORE, STATEMENT_STORE):
+            _s.ensure()
+        return {
+            "jobs": _w12_run("SELECT COUNT(*) AS n FROM batch_jobs", fetch="one")["n"],
+            "accruals": _w12_run("SELECT COUNT(*) AS n FROM interest_accruals", fetch="one")["n"],
+            "statements": _w12_run("SELECT COUNT(*) AS n FROM account_statements", fetch="one")["n"],
+        }
+    except Exception as _e:
+        return {"degraded": f"persistence_unavailable: {_e}"}
 
 
 ROUTES = {
@@ -444,7 +604,7 @@ class Handler(BaseHTTPRequestHandler):
                 "lakehouse": {"status": "connected", "table": "batch_processing_iceberg"}
             },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "stats": {"jobs": len(batch_jobs), "accruals": len(accruals), "statements": len(statements)},
+                "stats": _w12_stats(),
             }).encode())
             return
         handler = ROUTES.get(self.path)

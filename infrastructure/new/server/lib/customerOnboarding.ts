@@ -25,6 +25,22 @@
  */
 
 import { randomInt } from "crypto";
+import { ensureTables, storeDDL, storeSeed, storeList, storeGet, storeInsert, storeReplace } from "./pgJsonStore";
+
+// W12-C3-P0: onboarding applications (incl. KYC gate state) were an in-memory
+// array — all progress vanished on restart. They are now Postgres-authoritative
+// (onboarding_applications) via the server's drizzle pool; the former in-memory
+// fixture rows are seeded once (ON CONFLICT DO NOTHING).
+const TABLE = "onboarding_applications";
+let ensured: Promise<void> | null = null;
+function ensure(): Promise<void> {
+  if (!ensured) {
+    ensured = ensureTables("customerOnboarding", storeDDL(TABLE))
+      .then(() => storeSeed(TABLE, APPLICATION_SEED, () => ""))
+      .catch((err) => { ensured = null; throw err; });
+  }
+  return ensured;
+}
 
 /** CSPRNG account number (540-prefixed, 10 digits) — never Math.random(). */
 function generateAccountNumber(): string {
@@ -67,7 +83,7 @@ export interface OnboardingApplication {
   kycGateLog: Array<{ step: string; result: string; timestamp: string }>;
 }
 
-const applications: OnboardingApplication[] = [
+const APPLICATION_SEED: OnboardingApplication[] = [
   {
     id: "OB-001", firstName: "Amina", lastName: "Yusuf", middleName: "Halima",
     dateOfBirth: "1992-03-15", gender: "female", email: "amina.yusuf@gmail.com", phone: "+2348012345678",
@@ -143,24 +159,31 @@ const applications: OnboardingApplication[] = [
   },
 ];
 
-export function getOnboardingApplications() { return applications; }
+export async function getOnboardingApplications(): Promise<OnboardingApplication[]> {
+  await ensure();
+  return storeList<OnboardingApplication>(TABLE);
+}
 
-export function getOnboardingById(id: string) {
-  return applications.find((a) => a.id === id);
+export async function getOnboardingById(id: string): Promise<OnboardingApplication | undefined> {
+  await ensure();
+  const app = await storeGet<OnboardingApplication>(TABLE, id);
+  return app ?? undefined;
 }
 
 // ── Onboarding creation with KYC kickoff ────────────────────────────────────
 
-export function createOnboardingApplication(data: {
+export async function createOnboardingApplication(data: {
   firstName: string; lastName: string; middleName?: string;
   dateOfBirth: string; gender: "male" | "female";
   email: string; phone: string; bvn: string; nin?: string;
   address: string; lga: string; state: string; nationality: string;
   employmentStatus: string; productType: string; tier?: string;
-}): { application: OnboardingApplication; kycAction: string } {
+}): Promise<{ application: OnboardingApplication; kycAction: string }> {
+  await ensure();
+  const existing = await storeList<OnboardingApplication>(TABLE);
   const tier = (data.tier || determineTier(data.productType)) as "Tier 1" | "Tier 2" | "Tier 3";
   const app: OnboardingApplication = {
-    id: `OB-${String(applications.length + 1).padStart(3, "0")}`,
+    id: `OB-${String(existing.length + 1).padStart(3, "0")}-${Date.now()}`,
     firstName: data.firstName, lastName: data.lastName, middleName: data.middleName,
     dateOfBirth: data.dateOfBirth, gender: data.gender,
     email: data.email, phone: data.phone, bvn: data.bvn, nin: data.nin,
@@ -174,7 +197,8 @@ export function createOnboardingApplication(data: {
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     kycGateLog: [{ step: "onboarding_started", result: `Tier ${tier} — KYC workflow initiated`, timestamp: new Date().toISOString() }],
   };
-  applications.push(app);
+  // W12-C3-P0: creation persists to Postgres (was memory-only).
+  await storeInsert(TABLE, "", app);
   return {
     application: app,
     kycAction: `BVN verification required — submit to /api/platform/onboarding/${app.id}/verify-bvn`,
@@ -183,11 +207,9 @@ export function createOnboardingApplication(data: {
 
 // ── Onboarding stage progression (KYC-gated) ────────────────────────────────
 
-export function advanceOnboarding(id: string, step: string, result: { passed: boolean; details?: string }): {
+function applyOnboardingStep(app: OnboardingApplication, step: string, result: { passed: boolean; details?: string }): {
   application?: OnboardingApplication; error?: string; nextStep?: string; kycBlocked?: boolean;
 } {
-  const app = applications.find((a) => a.id === id);
-  if (!app) return { error: "Application not found" };
 
   const now = new Date().toISOString();
   app.kycGateLog.push({ step, result: result.passed ? `passed${result.details ? ` (${result.details})` : ""}` : `failed${result.details ? ` — ${result.details}` : ""}`, timestamp: now });
@@ -260,6 +282,20 @@ export function advanceOnboarding(id: string, step: string, result: { passed: bo
   }
 }
 
+// ── Onboarding stage progression (KYC-gated, Postgres-persisted) ────────────
+
+export async function advanceOnboarding(id: string, step: string, result: { passed: boolean; details?: string }): Promise<{
+  application?: OnboardingApplication; error?: string; nextStep?: string; kycBlocked?: boolean;
+}> {
+  await ensure();
+  const app = await storeGet<OnboardingApplication>(TABLE, id);
+  if (!app) return { error: "Application not found" };
+  const out = applyOnboardingStep(app, step, result);
+  // W12-C3-P0: gate log + status transitions persist (were memory-only).
+  await storeReplace(TABLE, id, app);
+  return out;
+}
+
 // ── KYC requirement by tier ─────────────────────────────────────────────────
 
 export function getKYCRequirements(tier: string): { steps: string[]; level: string; description: string } {
@@ -275,7 +311,9 @@ export function getKYCRequirements(tier: string): { steps: string[]; level: stri
   }
 }
 
-export function getOnboardingStats() {
+export async function getOnboardingStats() {
+  await ensure();
+  const applications = await storeList<OnboardingApplication>(TABLE);
   const total = applications.length;
   const byStatus: Record<string, number> = {};
   const byTier: Record<string, number> = {};

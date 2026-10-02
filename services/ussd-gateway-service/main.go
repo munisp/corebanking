@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"shared/otel/go/otelkit"
 )
 
@@ -42,9 +43,40 @@ var sharedHTTPClient = &http.Client{
 var startTime = time.Now()
 
 const (
-	sessionTTL  = 120 * time.Second
-	maxBodySize = 1 << 20 // 1MB
+	// W12 C3-P1-B2 (c3-0844): USSD session state moved to redis
+	// (ussd:session:{id}, 900s sliding TTL — refreshed on every touch).
+	// Previously a per-process map with a 120s TTL enforced by a janitor
+	// goroutine; per-replica maps meant sessions were lost on restart and
+	// split across replicas behind a load balancer.
+	ussdSessionTTL    = 900 * time.Second
+	ussdSessionPrefix = "ussd:session:"
+	maxBodySize       = 1 << 20 // 1MB
 )
+
+// W12 C3-P1-B2: pooled go-redis client (canonical pattern per
+// services/cooperative-meetings-go/main.go). Session state now holds across
+// restarts and replicas.
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+)
+
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		addr := os.Getenv("REDIS_URL")
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         addr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
+}
 
 func getEnv(k, v string) string {
 	if val := os.Getenv(k); val != "" {
@@ -84,24 +116,10 @@ type USSDSummary struct {
 	PopularMenus    []string `json:"popularMenus"`
 }
 
-var (
-	mu      sync.RWMutex
-	counter = 1
-
-	sessions = map[string]*USSDSession{
-		"session-001": {
-			ID:           "USSD-001",
-			SessionID:    "session-001",
-			MSISDN:       "+2348012345678",
-			ServiceCode:  "*737#",
-			Text:         "1*1",
-			State:        "active",
-			MenuLevel:    2,
-			StartedAt:    time.Now().UTC(),
-			LastActivity: time.Now().UTC(),
-		},
-	}
-)
+// W12 C3-P1-B2 (c3-0844): the sessions map, its mutex and the in-process
+// counter (including the hardcoded demo session) are gone — session state
+// lives in redis (ussd:session:{sessionID}, 900s sliding) and the display-ID
+// sequence is a redis INCR (ussd:session:counter).
 
 // jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
 // (RS256 signature + required exp claim). Fail-closed: any verification
@@ -405,7 +423,8 @@ func main() {
 		IdleTimeout:       30 * time.Second,
 	}
 
-	go cleanupExpiredSessions()
+	// W12 C3-P1-B2 (c3-0844): no janitor goroutine — redis enforces the
+	// 900s sliding session TTL.
 
 	go func() {
 		log.Printf(
@@ -493,31 +512,69 @@ func ussdCallback(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 
-	mu.Lock()
+	// W12 C3-P1-B2 (c3-0844): session state in redis. New sessions are
+	// seeded atomically with SET NX (no lost-create races across replicas);
+	// existing sessions are updated and their 900s TTL refreshed (sliding).
+	// FAIL CLOSED: a USSD banking session carries transaction state — if
+	// redis is unreachable the request is refused rather than continuing
+	// with untracked state.
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
 
-	existing, exists := sessions[sessionID]
+	rc := getRedisClient()
+	sessionKey := ussdSessionPrefix + sessionID
 
-	if exists {
+	seq, err := rc.Incr(ctx, "ussd:session:counter").Result()
+	if err != nil {
+		log.Printf("[ussd-gateway] session counter unavailable — failing closed: %v", err)
+		http.Error(w, "session state unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	seed := USSDSession{
+		ID:           fmt.Sprintf("USSD-%03d", seq),
+		SessionID:    sessionID,
+		MSISDN:       msisdn,
+		ServiceCode:  serviceCode,
+		Text:         text,
+		State:        "active",
+		MenuLevel:    calculateMenuLevel(text),
+		StartedAt:    now,
+		LastActivity: now,
+	}
+	seedData, _ := json.Marshal(seed)
+
+	seeded, err := rc.SetNX(ctx, sessionKey, seedData, ussdSessionTTL).Result()
+	if err != nil {
+		log.Printf("[ussd-gateway] session seed failed — failing closed: %v", err)
+		http.Error(w, "session state unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	if !seeded {
+		raw, err := rc.Get(ctx, sessionKey).Bytes()
+		if err != nil {
+			log.Printf("[ussd-gateway] session load failed — failing closed: %v", err)
+			http.Error(w, "session state unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var existing USSDSession
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			log.Printf("[ussd-gateway] session decode failed for %s: %v", sessionID, err)
+			http.Error(w, "session state corrupt", http.StatusInternalServerError)
+			return
+		}
 		existing.Text = text
 		existing.LastActivity = now
 		existing.MenuLevel = calculateMenuLevel(text)
-	} else {
-		counter++
-
-		sessions[sessionID] = &USSDSession{
-			ID:           fmt.Sprintf("USSD-%03d", counter),
-			SessionID:    sessionID,
-			MSISDN:       msisdn,
-			ServiceCode:  serviceCode,
-			Text:         text,
-			State:        "active",
-			MenuLevel:    calculateMenuLevel(text),
-			StartedAt:    now,
-			LastActivity: now,
+		updated, _ := json.Marshal(existing)
+		// Sliding expiration: re-SET refreshes the 900s TTL on every touch.
+		if err := rc.Set(ctx, sessionKey, updated, ussdSessionTTL).Err(); err != nil {
+			log.Printf("[ussd-gateway] session persist failed — failing closed: %v", err)
+			http.Error(w, "session state unavailable", http.StatusServiceUnavailable)
+			return
 		}
 	}
-
-	mu.Unlock()
 
 	response := buildUSSDResponse(text)
 
@@ -539,15 +596,38 @@ func getSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.RLock()
+	// W12 C3-P1-B2 (c3-0844): sessions are listed from redis via SCAN
+	// (ussd:session:*) + per-key GET. FAIL CLOSED: on redis outage the
+	// listing is refused rather than silently reporting an empty fleet view.
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
 
-	sessionList := make([]USSDSession, 0, len(sessions))
+	rc := getRedisClient()
+	sessionList := make([]USSDSession, 0)
 
-	for _, session := range sessions {
-		sessionList = append(sessionList, *session)
+	var cursor uint64
+	for {
+		keys, next, err := rc.Scan(ctx, cursor, ussdSessionPrefix+"*", 100).Result()
+		if err != nil {
+			log.Printf("[ussd-gateway] session SCAN failed — failing closed: %v", err)
+			respondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session state unavailable"})
+			return
+		}
+		for _, key := range keys {
+			raw, err := rc.Get(ctx, key).Bytes()
+			if err != nil {
+				continue // expired between SCAN and GET — skip
+			}
+			var session USSDSession
+			if err := json.Unmarshal(raw, &session); err == nil {
+				sessionList = append(sessionList, session)
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
 	}
-
-	mu.RUnlock()
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"sessions": sessionList,
@@ -623,31 +703,31 @@ func buildUSSDResponse(text string) string {
 	}
 }
 
-func cleanupExpiredSessions() {
-	ticker := time.NewTicker(30 * time.Second)
-
-	defer ticker.Stop()
-
-	for range ticker.C {
-		now := time.Now().UTC()
-
-		mu.Lock()
-
-		for key, session := range sessions {
-			if now.Sub(session.LastActivity) > sessionTTL {
-				delete(sessions, key)
-			}
-		}
-
-		mu.Unlock()
-	}
-}
+// W12 C3-P1-B2 (c3-0844): the cleanupExpiredSessions janitor goroutine is
+// gone — redis enforces the 900s sliding TTL itself.
 
 func activeSessionCount() int {
-	mu.RLock()
-	defer mu.RUnlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-	return len(sessions)
+	rc := getRedisClient()
+	count := 0
+	var cursor uint64
+	for {
+		keys, next, err := rc.Scan(ctx, cursor, ussdSessionPrefix+"*", 200).Result()
+		if err != nil {
+			// Stats are observational, not a security control — degrade to a
+			// visible sentinel rather than failing the stats endpoint.
+			log.Printf("[ussd-gateway] activeSessionCount SCAN failed: %v", err)
+			return -1
+		}
+		count += len(keys)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return count
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {

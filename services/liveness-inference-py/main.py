@@ -23,6 +23,135 @@ import urllib.request
 import time
 import uuid
 import logging
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
+
+def _w12_append(store, rid, payload):
+    """Persist an inference result record. W12-DEGRADED: a persist failure is
+    logged (the computed inference result is still returned) — no in-memory
+    mirror is kept, so PG remains the only store."""
+    try:
+        store.put(rid, payload)
+    except Exception as _e:
+        logging.getLogger("liveness-inference").error(
+            "W12-DEGRADED %s persist failed: %s", store.table, _e)
 import math
 import hashlib
 from datetime import datetime, timezone
@@ -36,10 +165,33 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 from fastapi import FastAPI, HTTPException, Header, Request
+from permify_guard import permify_http_check, permission_for_path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+
+import redis as _redis_lib
+
+# Redis client for the multi-frame score buffer (c3-0934).
+# The previous in-process `_frame_buffers` dict lost per-session state on
+# restart and was per-replica; the buffer now lives in redis as a LIST.
+_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_redis_pool: Optional[_redis_lib.ConnectionPool] = None
+
+
+def _get_redis() -> _redis_lib.Redis:
+    """Lazy sync redis client backed by a shared ConnectionPool."""
+    global _redis_pool
+    if _redis_pool is None:
+        _redis_pool = _redis_lib.ConnectionPool.from_url(
+            _REDIS_URL, decode_responses=True, max_connections=20
+        )
+    return _redis_lib.Redis(connection_pool=_redis_pool)
+
+
+class FrameBufferUnavailable(Exception):
+    """Raised when the redis frame-score buffer cannot be reached (fail-closed)."""
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("liveness-inference-py")
@@ -442,8 +594,13 @@ def apply_noise_compensation(scores: dict, noise: NoiseAssessment) -> dict:
     return adjusted
 
 
-# Multi-frame buffer for noisy camera averaging
-_frame_buffers: dict = {}  # session_id -> list of (score, noise_level)
+# Multi-frame buffer for noisy camera averaging (c3-0934).
+# Redis LIST `liveness_frames:{session_id}` (RPUSH / LTRIM -5 / EXPIRE 900s
+# sliding, refreshed on every push, all in one pipeline).
+# DEVIATION: this flow carries no tenant_id — sessions are globally unique
+# UUIDs, so the key is namespaced by session only.
+_FRAME_BUFFER_TTL_SECONDS = 900
+_FRAME_BUFFER_KEY = "liveness_frames:{session_id}"
 
 
 # ─── Active Liveness Motion Analysis ─────────────────────────────────────────
@@ -663,15 +820,29 @@ def analyze_motion(reference_frame: bytes, action_frames: list, challenge_type: 
 
 
 def accumulate_frame_score(session_id: str, score: float, noise_level: float) -> dict:
-    """Accumulate frame scores for multi-frame averaging on noisy cameras."""
-    if session_id not in _frame_buffers:
-        _frame_buffers[session_id] = []
+    """Accumulate frame scores for multi-frame averaging on noisy cameras.
 
-    buf = _frame_buffers[session_id]
-    buf.append((score, noise_level))
+    Backed by a redis LIST (fail-closed): raises FrameBufferUnavailable if
+    the buffer store is unreachable; handlers answer 503 rather than
+    returning a verdict computed without multi-frame state.
+    """
+    key = _FRAME_BUFFER_KEY.format(session_id=session_id)
+    entry = json.dumps({"score": score, "noise": noise_level})
+    try:
+        pipe = _get_redis().pipeline(transaction=True)
+        pipe.rpush(key, entry)
+        pipe.ltrim(key, -MULTI_FRAME_WINDOW, -1)
+        pipe.expire(key, _FRAME_BUFFER_TTL_SECONDS)  # sliding window
+        pipe.lrange(key, 0, -1)
+        results = pipe.execute()
+        raw_entries = results[3]
+    except _redis_lib.RedisError as e:
+        logger.error(
+            "frame buffer unavailable (redis) for session %s: %s", session_id, e
+        )
+        raise FrameBufferUnavailable("frame buffer store unavailable") from e
 
-    if len(buf) > MULTI_FRAME_WINDOW:
-        buf[:] = buf[-MULTI_FRAME_WINDOW:]
+    buf = [(float(json.loads(e)["score"]), float(json.loads(e)["noise"])) for e in raw_entries]
 
     scores = [s for s, _ in buf]
     avg_score = sum(scores) / len(scores)
@@ -1139,10 +1310,10 @@ def match_faces(image1_data: bytes, image2_data: bytes) -> FaceMatchResult:
     )
 
 
-# ─── In-Memory Store (production uses Postgres) ─────────────────────────────
+# ─── PG Store (W12-C3P2B5; tables liveness_checks / face_match_results) ────
 
-liveness_checks: list = []
-face_match_results: list = []
+LIVENESS_STORE = _W12Store("liveness_checks")
+FACE_MATCH_STORE = _W12Store("face_match_results")
 stats = {
     "total_checks": 0, "passed": 0, "failed": 0,
     "spoofs_detected": 0, "deepfakes_detected": 0,
@@ -1456,19 +1627,33 @@ class Handler(BaseHTTPRequestHandler):
             page = int(params.get("page", ["1"])[0])
             limit = int(params.get("limit", ["25"])[0])
             start_idx = (page - 1) * limit
+            try:
+                _checks = LIVENESS_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             self._json(200, {
-                "checks": liveness_checks[start_idx:start_idx + limit],
-                "total": len(liveness_checks), "page": page, "limit": limit,
+                "checks": _checks[start_idx:start_idx + limit],
+                "total": len(_checks), "page": page, "limit": limit,
             })
         elif path.startswith("/v1/liveness/checks/"):
             check_id = path.split("/")[-1]
-            found = next((c for c in liveness_checks if c["id"] == check_id), None)
+            try:
+                found = LIVENESS_STORE.get(check_id)
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             if found:
                 self._json(200, found)
             else:
                 self._json(404, {"error": f"Check {check_id} not found"})
         elif path == "/v1/face-match/results":
-            self._json(200, {"results": face_match_results, "total": len(face_match_results)})
+            try:
+                _results = FACE_MATCH_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"results": _results, "total": len(_results)})
         elif path == "/v1/stats":
             self._json(200, stats)
         elif path == "/v1/pipeline-info":
@@ -1499,6 +1684,14 @@ class Handler(BaseHTTPRequestHandler):
         valid, err = validate_jwt(dict(self.headers))
         if not valid:
             self._json(401, {"error": "unauthorized", "detail": err})
+            return
+        # W12-B5-P1-D-E: real Permify authorization AFTER JWT verification,
+        # fail-closed (unreachable -> 502, denied -> 403). Subject = verified
+        # Bearer claims; entity = liveness_inference; permission from route.
+        _p_status, _p_body = permify_http_check(
+            self.headers, "liveness_inference", path, permission_for_path(path, "POST"))
+        if _p_status is not None:
+            self._json(_p_status, _p_body)
             return
         if not _rl_allow():
             self.send_response(429)
@@ -1590,7 +1783,7 @@ class Handler(BaseHTTPRequestHandler):
                 "customer_id": customer_id, "session_id": session_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            liveness_checks.append(result)
+            _w12_append(LIVENESS_STORE, result["id"], result)
             stats["total_checks"] += 1
             stats["failed"] += 1
             self._json(200, result)
@@ -1612,7 +1805,7 @@ class Handler(BaseHTTPRequestHandler):
                 "customer_id": customer_id, "session_id": session_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            liveness_checks.append(result)
+            _w12_append(LIVENESS_STORE, result["id"], result)
             stats["total_checks"] += 1
             stats["failed"] += 1
             self._json(200, result)
@@ -1652,7 +1845,15 @@ class Handler(BaseHTTPRequestHandler):
             deepfake_prob < DEEPFAKE_THRESHOLD
         )
 
-        frame_stats = accumulate_frame_score(session_id, overall_score, noise.noise_level)
+        try:
+            frame_stats = accumulate_frame_score(session_id, overall_score, noise.noise_level)
+        except FrameBufferUnavailable:
+            # fail-closed: never emit a liveness verdict without buffer state
+            self._json(503, {
+                "error": "frame_buffer_unavailable",
+                "detail": "multi-frame score store unavailable; retry",
+            })
+            return
         if noise.noise_category in ("medium", "high") and frame_stats["sufficient_frames"]:
             overall_score = frame_stats["weighted_avg_score"]
             is_live = overall_score >= adjusted_liveness_threshold and not anti_spoof.is_spoof
@@ -1688,7 +1889,7 @@ class Handler(BaseHTTPRequestHandler):
             "kafka_event": f"liveness.inference.events:{session_id}",
         }
 
-        liveness_checks.append(result)
+        _w12_append(LIVENESS_STORE, result["id"], result)
         stats["total_checks"] += 1
         if is_live:
             stats["passed"] += 1
@@ -1777,7 +1978,15 @@ class Handler(BaseHTTPRequestHandler):
         session_id = body.get("sessionId", "unknown")
         score = body.get("score", 0.0)
         noise_level = body.get("noiseLevel", 0.0)
-        result = accumulate_frame_score(session_id, score, noise_level)
+        try:
+            result = accumulate_frame_score(session_id, score, noise_level)
+        except FrameBufferUnavailable:
+            # fail-closed 503 rather than silently dropping frame state
+            self._json(503, {
+                "error": "frame_buffer_unavailable",
+                "detail": "multi-frame score store unavailable; retry",
+            })
+            return
         self._json(200, result)
 
     def _handle_face_detection(self, body: dict):
@@ -1850,7 +2059,7 @@ class Handler(BaseHTTPRequestHandler):
         result.customer_id = customer_id
         result_dict = asdict(result)
 
-        face_match_results.append(result_dict)
+        _w12_append(FACE_MATCH_STORE, result_dict["id"], result_dict)
         stats["total_face_matches"] += 1
         self._json(200, result_dict)
 

@@ -1,9 +1,28 @@
 // B10: Account Statement Enhancement — PDF, MT940, Email, Tax Certificate
+//
+// W12-C3-P2-MLIB (c3-1007): the statement-history store was module process
+// memory (lost on restart). Now Postgres-authoritative (table
+// `statement_history`) via lib/pgJsonStore.ts; fail-closed 503 on PG outage,
+// no degraded-memory fallback.
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeInsert, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const TABLE = "statement_history";
+
+async function ensureStatementHistoryStore(): Promise<void> {
+  await ensureTables("ensureStatementHistoryStore", storeDDL(TABLE));
+  await storeSeed(TABLE, STATEMENT_HISTORY_SEED, () => "");
+}
+
+async function loadStatementHistory(): Promise<StatementRequest[]> {
+  return pgGuard((async () => { await ensureStatementHistoryStore(); return storeList<StatementRequest>(TABLE); })());
+}
 
 interface StatementRequest { id: string; accountId: string; format: string; period: string; status: string; generatedAt: string; deliveryChannel: string; }
 
-const statementHistory: StatementRequest[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const STATEMENT_HISTORY_SEED: StatementRequest[] = [
   { id: "STM-001", accountId: "0012345678", format: "pdf", period: "2026-04", status: "delivered", generatedAt: "2026-05-01T06:00:00Z", deliveryChannel: "email" },
   { id: "STM-002", accountId: "0012345678", format: "mt940", period: "2026-04", status: "delivered", generatedAt: "2026-05-01T06:00:00Z", deliveryChannel: "sftp" },
   { id: "STM-003", accountId: "0098765432", format: "pdf", period: "2026-03", status: "delivered", generatedAt: "2026-04-01T06:00:00Z", deliveryChannel: "email" },
@@ -12,11 +31,12 @@ const statementHistory: StatementRequest[] = [
 ];
 
 export function registerAccountStatementEnhancement(app: Express) {
-  app.get("/api/platform/statements/history", (_: Request, res: Response) => {
+  app.get("/api/platform/statements/history", asyncRoute(async (_: Request, res: Response) => {
+    const statementHistory = await loadStatementHistory();
     res.json({ items: statementHistory, total: statementHistory.length });
-  });
+  }));
 
-  app.post("/api/platform/statements/generate", (req: Request, res: Response) => {
+  app.post("/api/platform/statements/generate", asyncRoute(async (req: Request, res: Response) => {
     const { accountId, format, startDate, endDate } = req.body || {};
     if (!accountId || !format) return res.status(400).json({ error: "accountId and format required" });
     const validFormats = ["pdf", "csv", "mt940", "excel", "tax_certificate"];
@@ -26,9 +46,9 @@ export function registerAccountStatementEnhancement(app: Express) {
       period: `${startDate || "2026-04-01"} to ${endDate || "2026-04-30"}`,
       status: "processing", generatedAt: new Date().toISOString(), deliveryChannel: "download",
     };
-    statementHistory.push(stmt);
+    await pgGuard((async () => { await ensureStatementHistoryStore(); await storeInsert(TABLE, "", stmt); })());
     res.json({ ...stmt, estimated_time_seconds: format === "pdf" ? 5 : format === "mt940" ? 3 : 2 });
-  });
+  }));
 
   app.get("/api/platform/statements/mt940-sample", (_: Request, res: Response) => {
     const mt940 = `:20:STMT260501

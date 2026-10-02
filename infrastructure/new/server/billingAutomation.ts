@@ -25,42 +25,70 @@ import {
   listBillingRevenueShareRules,
   listBillingUsageEvents,
 } from "./billingEngine";
+import { ensureTables, storeDDL, storeSeed, storeList, storeGet, storeInsert, storeReplace } from "./lib/pgJsonStore";
 
-const approvalMatrices = [...defaultBillingApprovalMatrices];
-const invoiceDisputes = [...defaultBillingInvoiceDisputes];
-const erpPostingAttempts: BillingErpPostingAttempt[] = [];
+// W12-C3-P0: approval matrices / invoice disputes / ERP posting attempts were
+// module-level in-memory arrays (lost on restart). They are now
+// Postgres-authoritative (billing_approval_matrices / invoice_disputes /
+// erp_posting_attempts) via the server's drizzle pool; the former in-memory
+// defaults are seeded once (ON CONFLICT DO NOTHING).
 
-const nextId = (prefix: string, length: number) => `${prefix}-${String(length + 1).padStart(3, "0")}`;
+let ensured: Promise<void> | null = null;
+function ensureBillingAutomationStore(): Promise<void> {
+  if (!ensured) {
+    ensured = ensureTables("billingAutomation", [
+      ...storeDDL("billing_approval_matrices"),
+      ...storeDDL("invoice_disputes"),
+      ...storeDDL("erp_posting_attempts"),
+    ])
+      .then(async () => {
+        await storeSeed("billing_approval_matrices", defaultBillingApprovalMatrices, (m: any) => m.tenantId ?? "");
+        await storeSeed("invoice_disputes", defaultBillingInvoiceDisputes, (d: any) => d.tenantId ?? "");
+      })
+      .catch((err) => { ensured = null; throw err; });
+  }
+  return ensured;
+}
+
+const nextId = (prefix: string, length: number) => `${prefix}-${String(length + 1).padStart(3, "0")}-${Date.now()}`;
 
 export async function listBillingApprovalMatrices() {
   await ensureBillingEngineSeed();
-  return approvalMatrices;
+  await ensureBillingAutomationStore();
+  return (await storeList<BillingApprovalMatrix>("billing_approval_matrices")).reverse();
 }
 
 export async function createBillingApprovalMatrix(input: Omit<BillingApprovalMatrix, "id" | "createdAt">) {
+  await ensureBillingAutomationStore();
+  const existing = await storeList<BillingApprovalMatrix>("billing_approval_matrices");
   const item: BillingApprovalMatrix = {
-    id: nextId("BAM", approvalMatrices.length),
+    id: nextId("BAM", existing.length),
     createdAt: new Date().toISOString(),
     ...input,
   };
-  approvalMatrices.unshift(item);
+  // W12-C3-P0: persists to Postgres (was memory-only unshift).
+  await storeInsert("billing_approval_matrices", item.tenantId ?? "", item);
   return item;
 }
 
 export async function listBillingInvoiceDisputes() {
   await ensureBillingEngineSeed();
-  return invoiceDisputes;
+  await ensureBillingAutomationStore();
+  return (await storeList<BillingInvoiceDispute>("invoice_disputes")).reverse();
 }
 
 export async function createBillingInvoiceDispute(input: Omit<BillingInvoiceDispute, "id" | "openedAt" | "updatedAt" | "status">) {
+  await ensureBillingAutomationStore();
+  const existing = await storeList<BillingInvoiceDispute>("invoice_disputes");
   const item: BillingInvoiceDispute = {
-    id: nextId("BID", invoiceDisputes.length),
+    id: nextId("BID", existing.length),
     status: "open",
     openedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     ...input,
   };
-  invoiceDisputes.unshift(item);
+  // W12-C3-P0: persists to Postgres (was memory-only unshift).
+  await storeInsert("invoice_disputes", item.tenantId ?? "", item);
   return item;
 }
 
@@ -69,11 +97,14 @@ export async function resolveBillingInvoiceDispute(input: {
   status: "under_review" | "resolved" | "rejected";
   resolutionNote?: string;
 }) {
-  const dispute = invoiceDisputes.find((item) => item.id === input.disputeId);
+  await ensureBillingAutomationStore();
+  const dispute = await storeGet<BillingInvoiceDispute>("invoice_disputes", input.disputeId);
   if (!dispute) return null;
   dispute.status = input.status;
   dispute.updatedAt = new Date().toISOString();
   dispute.resolutionNote = input.resolutionNote;
+  // W12-C3-P0: resolution persists (was memory-only).
+  await storeReplace("invoice_disputes", dispute.id, dispute);
   return dispute;
 }
 
@@ -101,8 +132,10 @@ export async function queueBillingInvoiceErpPosting(args: { invoiceId: string; e
   const invoice = invoices.find((item) => item.id === args.invoiceId);
   if (!invoice) return null;
   const account = accounts.find((item) => item.id === invoice.billingAccountId);
+  await ensureBillingAutomationStore();
+  const existingAttempts = await storeList<BillingErpPostingAttempt>("erp_posting_attempts");
   const attempt: BillingErpPostingAttempt = {
-    id: nextId("BEP", erpPostingAttempts.length),
+    id: nextId("BEP", existingAttempts.length),
     invoiceId: invoice.id,
     invoiceNumber: invoice.invoiceNumber,
     tenantId: invoice.tenantId,
@@ -117,20 +150,25 @@ export async function queueBillingInvoiceErpPosting(args: { invoiceId: string; e
     }),
     queuedAt: new Date().toISOString(),
   };
-  erpPostingAttempts.unshift(attempt);
+  // W12-C3-P0: persists to Postgres (was memory-only unshift).
+  await storeInsert("erp_posting_attempts", attempt.tenantId ?? "", attempt);
   return attempt;
 }
 
 export async function listBillingErpPostingAttempts() {
-  return erpPostingAttempts;
+  await ensureBillingAutomationStore();
+  return (await storeList<BillingErpPostingAttempt>("erp_posting_attempts")).reverse();
 }
 
 export async function markBillingErpPostingResult(args: { attemptId: string; status: "posted" | "failed"; errorMessage?: string }) {
-  const attempt = erpPostingAttempts.find((item) => item.id === args.attemptId);
+  await ensureBillingAutomationStore();
+  const attempt = await storeGet<BillingErpPostingAttempt>("erp_posting_attempts", args.attemptId);
   if (!attempt) return null;
   attempt.status = args.status;
   attempt.postedAt = new Date().toISOString();
   attempt.errorMessage = args.errorMessage;
+  // W12-C3-P0: posting result persists (was memory-only).
+  await storeReplace("erp_posting_attempts", attempt.id, attempt);
   return attempt;
 }
 

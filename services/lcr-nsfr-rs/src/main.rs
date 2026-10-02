@@ -281,7 +281,11 @@ fn handle_request(request: &str) -> (u16, String) {
     let path = parts[1];
 
     // N-2: fail-closed JWT auth on every route except health probes.
-    if let Err(e) = check_jwt(request, path) {
+    let jwt_claims = match check_jwt(request, path) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    if let Err(e) = permify::require_permify(&jwt_claims, path, "liquidity_report", "view") {
         return e;
     }
 
@@ -369,3 +373,6 @@ fn main() {
         }
     }
 }
+
+// Wave-12 B5-P1-D-D: Permify authorization guard module.
+mod permify;

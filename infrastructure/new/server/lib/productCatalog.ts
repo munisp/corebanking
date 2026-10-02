@@ -1,7 +1,24 @@
 /**
  * Product catalog — account products, loan products, card products, FX products.
  * CBN-approved product definitions with pricing, eligibility, features.
+ *
+ * W12-C3-P2-MLIB (c3-0987): the 'products' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `product_catalog`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "product_catalog";
+
+async function ensureProductsStore(): Promise<void> {
+  await ensureTables("ensureProductsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, PRODUCTS_SEED, () => "");
+}
+
 
 export interface BankProduct {
   id: string;
@@ -22,7 +39,8 @@ export interface BankProduct {
   customerCount: number;
 }
 
-const products: BankProduct[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const PRODUCTS_SEED: BankProduct[]  = [
   { id: "PRD-001", name: "54Save Basic", category: "deposit", subcategory: "Savings", description: "Entry-level savings account with competitive interest", currency: "NGN", minAmount: 1_000, maxAmount: 50_000, interestRate: 4.5, fees: [{ name: "Maintenance", amount: 0, type: "flat" }], eligibility: ["BVN required", "18+ years"], features: ["Zero maintenance fee", "Mobile banking", "Debit card"], kycTier: "Tier 1", status: "active", launchDate: "2024-01-01", customerCount: 1_250_000 },
   { id: "PRD-002", name: "54Save Premium", category: "deposit", subcategory: "Savings", description: "Premium savings with higher interest and priority service", currency: "NGN", minAmount: 100_000, maxAmount: 1_000_000_000, interestRate: 6.5, fees: [{ name: "Maintenance", amount: 500, type: "flat" }], eligibility: ["BVN + NIN", "18+ years", "Min balance ₦100K"], features: ["Priority banking", "Dedicated RM", "Concierge"], kycTier: "Tier 3", status: "active", launchDate: "2024-03-01", customerCount: 85_000 },
   { id: "PRD-003", name: "54Current Business", category: "deposit", subcategory: "Current", description: "Business current account with overdraft facility", currency: "NGN", minAmount: 0, maxAmount: 0, interestRate: 0, fees: [{ name: "COT", amount: 0.05, type: "percentage" }, { name: "Maintenance", amount: 2_000, type: "flat" }], eligibility: ["CAC registration", "BVN + NIN of directors", "Board resolution"], features: ["Cheque book", "Internet banking", "Bulk payments", "Overdraft eligible"], kycTier: "Corporate", status: "active", launchDate: "2024-01-01", customerCount: 42_000 },
@@ -33,9 +51,12 @@ const products: BankProduct[] = [
   { id: "PRD-008", name: "54Invest T-Bills", category: "investment", subcategory: "Treasury Bills", description: "FGN T-Bill investment from ₦50K", currency: "NGN", minAmount: 50_000, maxAmount: 1_000_000_000, interestRate: 12.5, fees: [{ name: "Management", amount: 0.1, type: "percentage" }], eligibility: ["Any account holder", "Tier 2+ KYC"], features: ["91/182/364 day tenors", "Auto-rollover", "Discounted yield"], kycTier: "Tier 2", status: "active", launchDate: "2025-06-01", customerCount: 48_000 },
 ];
 
-export function getProducts() { return products; }
+export async function getProducts(): Promise<BankProduct[]> {
+  return pgGuard((async () => { await ensureProductsStore(); return storeList<BankProduct>(TABLE); })());
+}
 
-export function getProductStats() {
+export async function getProductStats() {
+  const products = await getProducts();
   const byCategory: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
   let totalCustomers = 0;

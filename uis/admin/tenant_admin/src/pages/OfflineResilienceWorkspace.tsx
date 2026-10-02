@@ -12,7 +12,7 @@ export default function OfflineResilienceWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/sw-cache-strategies/count")
+    fetch("/api/db/sw-cache-strategies/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

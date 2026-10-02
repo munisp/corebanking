@@ -7,6 +7,124 @@ import json
 import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 REMITTANCE_CORRIDORS = [
     {"id": "RC-001", "corridor": "UK→NG", "sourceCurrency": "GBP", "targetCurrency": "NGN", "rate": 1950.00, "fee": 4.99, "feeCurrency": "GBP", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "15 minutes", "provider": "54link-dev Direct", "status": "active"},
     {"id": "RC-002", "corridor": "US→NG", "sourceCurrency": "USD", "targetCurrency": "NGN", "rate": 1500.00, "fee": 3.99, "feeCurrency": "USD", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "15 minutes", "provider": "54link-dev Direct", "status": "active"},
@@ -15,22 +133,29 @@ REMITTANCE_CORRIDORS = [
     {"id": "RC-005", "corridor": "AE→NG", "sourceCurrency": "AED", "targetCurrency": "NGN", "rate": 408.00, "fee": 15.00, "feeCurrency": "AED", "minAmount": 50, "maxAmount": 100000, "estimatedTime": "30 minutes", "provider": "54link-dev Direct", "status": "active"},
 ]
 
-DIASPORA_ACCOUNTS = [
+_ACCOUNT_SEED = [
     {"id": "DA-001", "customerId": "CUST-D001", "name": "Oluwaseun Bakare", "country": "United Kingdom", "accountType": "dual_currency", "ngnBalance": 15000000, "fxBalance": 5000, "fxCurrency": "GBP", "remittancesThisYear": 12, "totalRemittedNGN": 45000000, "status": "active", "kycLevel": 3, "products": ["remittance", "fixed_deposit_ngn", "property_investment"]},
     {"id": "DA-002", "customerId": "CUST-D002", "name": "Chibueze Okonkwo", "country": "United States", "accountType": "dual_currency", "ngnBalance": 28000000, "fxBalance": 12000, "fxCurrency": "USD", "remittancesThisYear": 8, "totalRemittedNGN": 72000000, "status": "active", "kycLevel": 3, "products": ["remittance", "property_investment", "target_savings"]},
     {"id": "DA-003", "customerId": "CUST-D003", "name": "Amaka Eze", "country": "Canada", "accountType": "remittance_only", "ngnBalance": 5000000, "fxBalance": 0, "fxCurrency": "CAD", "remittancesThisYear": 4, "totalRemittedNGN": 8800000, "status": "active", "kycLevel": 2, "products": ["remittance"]},
 ]
 
-PROPERTY_SCHEMES = [
+_SCHEME_SEED = [
     {"id": "PS-001", "name": "Lagos Smart City Apartments", "location": "Lekki Phase 2, Lagos", "type": "residential", "minInvestment": 15000000, "maxInvestment": 150000000, "expectedROI": 18.5, "tenorMonths": 24, "unitsAvailable": 45, "totalUnits": 120, "status": "open", "developer": "Landmark Africa"},
     {"id": "PS-002", "name": "Abuja Centenary Villas", "location": "Maitama Extension, Abuja", "type": "residential", "minInvestment": 25000000, "maxInvestment": 200000000, "expectedROI": 15.0, "tenorMonths": 36, "unitsAvailable": 12, "totalUnits": 50, "status": "open", "developer": "Brains & Hammers"},
     {"id": "PS-003", "name": "Port Harcourt Tech Hub", "location": "GRA Phase 2, PH", "type": "commercial", "minInvestment": 10000000, "maxInvestment": 80000000, "expectedROI": 22.0, "tenorMonths": 18, "unitsAvailable": 30, "totalUnits": 60, "status": "open", "developer": "PH Innovation Park"},
 ]
 
-REMITTANCES = [
+_REMIT_SEED = [
     {"id": "REM-001", "senderId": "CUST-D001", "senderName": "Oluwaseun Bakare", "recipientName": "Fatima Abdullahi", "recipientAccount": "0012345678", "corridor": "UK→NG", "sourceAmount": 500, "sourceCurrency": "GBP", "targetAmount": 975000, "targetCurrency": "NGN", "rate": 1950.00, "fee": 4.99, "status": "completed", "completedAt": "2026-01-15T10:30:00Z"},
     {"id": "REM-002", "senderId": "CUST-D002", "senderName": "Chibueze Okonkwo", "recipientName": "Ibrahim Musa", "recipientAccount": "3034567890", "corridor": "US→NG", "sourceAmount": 2000, "sourceCurrency": "USD", "targetAmount": 3000000, "targetCurrency": "NGN", "rate": 1500.00, "fee": 3.99, "status": "completed", "completedAt": "2026-01-14T16:20:00Z"},
 ]
+
+
+# W12-C3P2B5: diaspora accounts, remittances, property schemes in PG
+# (idempotent seeds; natural keys = record ids).
+ACCOUNT_STORE = _W12Store("diaspora_accounts", seed=_ACCOUNT_SEED)
+SCHEME_STORE = _W12Store("property_schemes", seed=_SCHEME_SEED)
+REMIT_STORE = _W12Store("remittances", seed=_REMIT_SEED)
 
 
 
@@ -227,12 +352,30 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/diaspora/corridors":
             return self._json({"items": REMITTANCE_CORRIDORS, "total": len(REMITTANCE_CORRIDORS)})
         if self.path == "/v1/diaspora/accounts":
-            return self._json({"items": DIASPORA_ACCOUNTS, "total": len(DIASPORA_ACCOUNTS)})
+            try:
+                _items = ACCOUNT_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
+            return self._json({"items": _items, "total": len(_items)})
         if self.path == "/v1/diaspora/remittances":
-            return self._json({"items": REMITTANCES, "total": len(REMITTANCES)})
+            try:
+                _items = REMIT_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
+            return self._json({"items": _items, "total": len(_items)})
         if self.path == "/v1/diaspora/property-schemes":
-            return self._json({"items": PROPERTY_SCHEMES, "total": len(PROPERTY_SCHEMES)})
+            try:
+                _items = SCHEME_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
+            return self._json({"items": _items, "total": len(_items)})
         if self.path == "/v1/diaspora/stats":
+            try:
+                DIASPORA_ACCOUNTS = ACCOUNT_STORE.all()
+                REMITTANCES = REMIT_STORE.all()
+                PROPERTY_SCHEMES = SCHEME_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             total_remitted = sum(r["targetAmount"] for r in REMITTANCES)
             return self._json({
                 "totalAccounts": len(DIASPORA_ACCOUNTS),
@@ -267,8 +410,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"maximum amount is {rate_info['maxAmount']} {rate_info['sourceCurrency']}"}, 400)
 
             target_amt = source_amt * rate_info["rate"]
+            try:
+                REMIT_STORE.ensure()
+                _n = _w12_run("SELECT COUNT(*) AS n FROM remittances", fetch="one")["n"]
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             rem = {
-                "id": f"REM-{len(REMITTANCES)+1:03d}",
+                "id": f"REM-{_n+1:03d}",
                 "senderId": body.get("senderId"),
                 "senderName": body.get("senderName"),
                 "recipientName": body.get("recipientName"),
@@ -282,12 +430,20 @@ class Handler(BaseHTTPRequestHandler):
                 "fee": rate_info["fee"],
                 "status": "processing",
             }
-            REMITTANCES.append(rem)
+            try:
+                REMIT_STORE.put(rem["id"], rem)
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             return self._json(rem, 201)
 
         if self.path == "/v1/diaspora/accounts":
+            try:
+                ACCOUNT_STORE.ensure()
+                _n = _w12_run("SELECT COUNT(*) AS n FROM diaspora_accounts", fetch="one")["n"]
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             acct = {
-                "id": f"DA-{len(DIASPORA_ACCOUNTS)+1:03d}",
+                "id": f"DA-{_n+1:03d}",
                 "customerId": body.get("customerId"),
                 "name": body.get("name"),
                 "country": body.get("country"),
@@ -301,7 +457,10 @@ class Handler(BaseHTTPRequestHandler):
                 "kycLevel": 1,
                 "products": ["remittance"],
             }
-            DIASPORA_ACCOUNTS.append(acct)
+            try:
+                ACCOUNT_STORE.put(acct["id"], acct)
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             return self._json(acct, 201)
 
         self._json({"error": "not found"}, 404)

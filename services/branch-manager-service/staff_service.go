@@ -11,7 +11,7 @@ import (
 // StaffService handles staff operations
 type StaffService struct {
 	tenantID string
-	staff    map[string]*BranchStaff
+	staff    *repo[BranchStaff]
 	mu       sync.RWMutex
 }
 
@@ -19,17 +19,19 @@ type StaffService struct {
 func NewStaffService(tenantID string) *StaffService {
 	return &StaffService{
 		tenantID: tenantID,
-		staff:    make(map[string]*BranchStaff),
+		staff:    newRepo[BranchStaff](serviceDB, "branch_staff"),
 	}
 }
 
 // ListStaff returns staff based on filters
-func (s *StaffService) ListStaff(tenantID, branchID, role, status string) []*BranchStaff {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *StaffService) ListStaff(tenantID, branchID, role, status string) ([]*BranchStaff, error) {
 
 	var result []*BranchStaff
-	for _, st := range s.staff {
+	__ALL__, __ERR__ := s.staff.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, st := range __ALL__ {
 		if st.TenantID != tenantID {
 			continue
 		}
@@ -44,16 +46,14 @@ func (s *StaffService) ListStaff(tenantID, branchID, role, status string) []*Bra
 		}
 		result = append(result, st)
 	}
-	return result
+	return result, nil
 }
 
 // GetStaff retrieves a staff member by ID
 func (s *StaffService) GetStaff(tenantID, staffID string) (*BranchStaff, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	st, exists := s.staff[staffID]
-	if !exists || st.TenantID != tenantID {
+	st, err := s.staff.get(tenantID, staffID)
+	if err != nil {
 		return nil, errors.New("staff not found")
 	}
 	return st, nil
@@ -61,8 +61,6 @@ func (s *StaffService) GetStaff(tenantID, staffID string) (*BranchStaff, error) 
 
 // CreateStaff creates a new staff member
 func (s *StaffService) CreateStaff(tenantID, branchID string, req *CreateStaffRequest) (*BranchStaff, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	st := &BranchStaff{
 		StaffID:        uuid.New().String(),
@@ -84,64 +82,59 @@ func (s *StaffService) CreateStaff(tenantID, branchID string, req *CreateStaffRe
 		UpdatedAt:      time.Now(),
 	}
 
-	s.staff[st.StaffID] = st
+	if err := s.staff.put(tenantID, st.StaffID, st); err != nil {
+		return nil, err
+	}
 	return st, nil
 }
 
 // UpdateStaff updates a staff member
 func (s *StaffService) UpdateStaff(st *BranchStaff) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.staff[st.StaffID]
-	if !exists || existing.TenantID != st.TenantID {
+	existing, err := s.staff.get(st.TenantID, st.StaffID)
+	if err != nil {
 		return errors.New("staff not found")
 	}
 
 	st.CreatedAt = existing.CreatedAt
 	st.JoinDate = existing.JoinDate
 	st.UpdatedAt = time.Now()
-	s.staff[st.StaffID] = st
-	return nil
+	return s.staff.put(st.TenantID, st.StaffID, st)
 }
 
 // UpdateStaffStatus updates staff status
 func (s *StaffService) UpdateStaffStatus(tenantID, staffID, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	st, exists := s.staff[staffID]
-	if !exists || st.TenantID != tenantID {
-		return errors.New("staff not found")
-	}
-
-	st.Status = status
-	st.UpdatedAt = time.Now()
-	return nil
+	_, err := s.staff.update(tenantID, staffID, func(st *BranchStaff) error {
+		st.Status = status
+		st.UpdatedAt = time.Now()
+		return nil
+	})
+	return err
 }
 
 // TransferStaff transfers staff to another branch
 func (s *StaffService) TransferStaff(tenantID, staffID, toBranchID, reason string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	st, exists := s.staff[staffID]
-	if !exists || st.TenantID != tenantID {
-		return errors.New("staff not found")
-	}
-
-	st.BranchID = toBranchID
-	st.UpdatedAt = time.Now()
-	return nil
+	_, err := s.staff.update(tenantID, staffID, func(st *BranchStaff) error {
+		st.BranchID = toBranchID
+		st.UpdatedAt = time.Now()
+		_ = reason // recorded by the audit layer (appendAudit); no free-text field on BranchStaff
+		return nil
+	})
+	return err
 }
 
 // GetStaffByBranch returns all staff for a branch
-func (s *StaffService) GetStaffByBranch(tenantID, branchID string) []*BranchStaff {
+func (s *StaffService) GetStaffByBranch(tenantID, branchID string) ([]*BranchStaff, error) {
 	return s.ListStaff(tenantID, branchID, "", "")
 }
 
 // GetActiveStaffCount returns count of active staff
-func (s *StaffService) GetActiveStaffCount(tenantID, branchID string) int {
-	staff := s.ListStaff(tenantID, branchID, "", "active")
-	return len(staff)
+func (s *StaffService) GetActiveStaffCount(tenantID, branchID string) (int, error) {
+	staff, err := s.ListStaff(tenantID, branchID, "", "active")
+	if err != nil {
+		return 0, err
+	}
+	return len(staff), nil
 }

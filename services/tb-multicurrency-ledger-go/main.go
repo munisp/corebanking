@@ -104,6 +104,14 @@ type NettingGroup struct {
 // Ledger IDs + decimals per currency in TigerBeetle. MidRate/Spread are the
 // LABELED static fallback (env FX_ALLOW_STATIC_RATES=true); the authoritative
 // rate source is FX_RATES_SOURCE (fx-service or db).
+//
+// TB ACCOUNT/LEDGER MAPPING (C3-P0-B1): one TigerBeetle ledger per currency —
+// NGN=100, USD=200, GBP=300, EUR=400, GHS=500, KES=600, ZAR=700, XOF=800.
+// All BALANCE state lives in the TigerBeetle cluster (conversions execute real
+// linked transfer pairs on those ledgers); this map is IMMUTABLE static
+// configuration (never mutated after package init) and is mirrored at boot
+// into the tb_currency_ledgers PG table for the "db" rate source. No ledger
+// state is held in process memory.
 var currencyLedgers = map[string]*CurrencyLedger{
 	"NGN": {LedgerID: 100, Currency: "NGN", Symbol: "₦", Decimals: 2, Country: "NG", MidRate: 1.0, Spread: 0},
 	"USD": {LedgerID: 200, Currency: "USD", Symbol: "$", Decimals: 2, Country: "US", MidRate: 1580.0, Spread: 50},
@@ -116,10 +124,8 @@ var currencyLedgers = map[string]*CurrencyLedger{
 }
 
 var (
-	db            *sql.DB
-	tbClient      *tbclient.Client
-	fxMu          sync.Mutex
-	nettingGroups map[string]*NettingGroup
+	db       *sql.DB
+	tbClient *tbclient.Client
 )
 
 // detID derives a deterministic TB Uint128 from a human-meaningful key
@@ -535,8 +541,9 @@ func fxConvertHandler(w http.ResponseWriter, r *http.Request) {
 		tbResult = "error: " + terr.Error()
 	} else {
 		for _, res := range results {
-			// TransferExists on either leg = idempotent retry of a prior execution.
-			if res.Status != tbclient.TransferExists {
+			// TransferCreated = fresh execution; TransferExists = idempotent
+			// retry of a prior execution (deterministic ids). Both are success.
+			if res.Status != tbclient.TransferCreated && res.Status != tbclient.TransferExists {
 				status = "failed"
 				tbResult = fmt.Sprintf("rejected: status=%d", uint32(res.Status))
 				break
@@ -577,30 +584,21 @@ func fxConvertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Netting analytics (derived from executed conversions only).
-	fxMu.Lock()
-	if nettingGroups == nil {
-		nettingGroups = make(map[string]*NettingGroup)
-	}
+	// Netting analytics (derived from executed conversions only): write-through
+	// UPSERT to the tb_netting_groups projection table — gross/txn_count are the
+	// durable counters; net/saved are derived at read time from corridor pairs,
+	// so restart never loses or double-counts netting state (C3-P0-B1).
 	corridor := fmt.Sprintf("%s→%s", fromLedger.Currency, toLedger.Currency)
-	ng, ok := nettingGroups[corridor]
-	if !ok {
-		ng = &NettingGroup{Corridor: corridor}
-		nettingGroups[corridor] = ng
+	if _, err := db.ExecContext(r.Context(), `INSERT INTO tb_netting_groups (corridor, gross_amount_kobo, txn_count)
+		VALUES ($1, $2, 1)
+		ON CONFLICT (corridor) DO UPDATE SET gross_amount_kobo = tb_netting_groups.gross_amount_kobo + EXCLUDED.gross_amount_kobo,
+			txn_count = tb_netting_groups.txn_count + 1`,
+		corridor, req.AmountKobo); err != nil {
+		// The conversion itself is already durable (TB + tb_fx_transfers); a
+		// failed analytics projection is logged, not fatal, and can be rebuilt
+		// from tb_fx_transfers.
+		log.Printf("[tb-multicurrency-ledger] netting projection update failed for %s: %v", corridor, err)
 	}
-	ng.GrossAmount += req.AmountKobo
-	ng.TxnCount++
-	reverse := fmt.Sprintf("%s→%s", toLedger.Currency, fromLedger.Currency)
-	if rev, ok := nettingGroups[reverse]; ok && rev.GrossAmount > 0 {
-		nettable := min64(ng.GrossAmount, rev.GrossAmount)
-		ng.NetAmount = ng.GrossAmount - nettable
-		rev.NetAmount = rev.GrossAmount - nettable
-		ng.Saved += nettable
-		rev.Saved += nettable
-	} else {
-		ng.NetAmount = ng.GrossAmount
-	}
-	fxMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -617,12 +615,45 @@ func min64(a, b int64) int64 {
 }
 
 func nettingReportHandler(w http.ResponseWriter, r *http.Request) {
-	fxMu.Lock()
-	groups := make([]*NettingGroup, 0)
-	for _, ng := range nettingGroups {
-		groups = append(groups, ng)
+	if db == nil {
+		jsonErr(w, "netting projection store unavailable", 503)
+		return
 	}
-	fxMu.Unlock()
+	rows, err := db.QueryContext(r.Context(), `SELECT corridor, gross_amount_kobo, txn_count FROM tb_netting_groups`)
+	if err != nil {
+		jsonErr(w, "netting projection query failed: "+err.Error(), 500)
+		return
+	}
+	gross := map[string]int64{}
+	count := map[string]int{}
+	for rows.Next() {
+		var corridor string
+		var g int64
+		var n int
+		if err := rows.Scan(&corridor, &g, &n); err != nil {
+			continue
+		}
+		gross[corridor], count[corridor] = g, n
+	}
+	rows.Close()
+	// net/saved are DERIVED from corridor pairs: nettable = min(gross, reverse
+	// gross). Deterministic, restart-safe, and free of the old double-counting
+	// accumulation in the in-memory map.
+	groups := make([]*NettingGroup, 0, len(gross))
+	for corridor, g := range gross {
+		parts := strings.Split(corridor, "→")
+		nettable := int64(0)
+		if len(parts) == 2 {
+			nettable = min64(g, gross[parts[1]+"→"+parts[0]])
+		}
+		groups = append(groups, &NettingGroup{
+			Corridor:    corridor,
+			GrossAmount: g,
+			NetAmount:   g - nettable,
+			Saved:       nettable,
+			TxnCount:    count[corridor],
+		})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"netting_groups": groups, "count": len(groups)})
 }
@@ -835,10 +866,9 @@ func main() {
 
 	initDB()
 	initTBClient()
-	nettingGroups = make(map[string]*NettingGroup)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/tb-multicurrency/convert", fxConvertHandler)
+	mux.HandleFunc("/v1/tb-multicurrency/convert", permifyAuthzGuard("fx_conversion", "convert", fxConvertHandler))
 	mux.HandleFunc("/v1/tb-multicurrency/netting", nettingReportHandler)
 	mux.HandleFunc("/v1/tb-multicurrency/ledgers", ledgersHandler)
 	mux.HandleFunc("/healthz", healthHandler)

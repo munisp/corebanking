@@ -8,6 +8,124 @@ from dataclasses import dataclass, asdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 
 @dataclass
 class FeedbackEntry:
@@ -37,7 +155,7 @@ class NPSTrend:
     nps: float
 
 
-FEEDBACK: list[FeedbackEntry] = [
+_FEEDBACK_SEED: list[FeedbackEntry] = [
     FeedbackEntry("FB-001", "CUST-001", "Aisha Mohammed", "mobile_app", "general", 5, 9, "Love the new mobile app redesign! Transfer speed is excellent.", "positive", None, "54Pay Mobile", True, None, "2026-05-09T10:00:00Z"),
     FeedbackEntry("FB-002", "CUST-005", "Fatimah Abdullahi", "branch", "service_quality", 2, 3, "Waited 45 minutes at Lekki branch. Only 2 tellers on duty at peak hours.", "negative", "Lekki", None, False, None, "2026-05-09T11:00:00Z"),
     FeedbackEntry("FB-003", "CUST-002", "Ibrahim Musa", "internet_banking", "feature_request", 4, 8, "Please add multi-currency dashboard view. Currently have to switch between accounts.", "neutral", None, "Internet Banking", True, "Feature added to Q3 roadmap — thank you for the suggestion!", "2026-05-08T14:00:00Z"),
@@ -47,6 +165,11 @@ FEEDBACK: list[FeedbackEntry] = [
     FeedbackEntry("FB-007", "CUST-008", "Farmgate Commodities Ltd", "branch", "product", 3, 5, "Warehouse receipt financing approval took too long. 3 weeks vs promised 5 days.", "negative", "Ikeja", "Agri Finance", False, None, "2026-05-04T10:00:00Z"),
     FeedbackEntry("FB-008", "CUST-012", "Dangote Cement PLC", "relationship_manager", "general", 5, 10, "Seamless syndicated facility arrangement. 54link-dev led the consortium efficiently.", "positive", "Head Office", "Institutional Banking", True, None, "2026-05-03T11:00:00Z"),
 ]
+
+# W12-C3P2B5: feedback entries persisted in PG (idempotent seed). NPS_TRENDS
+# stays a static reference series (not a register item).
+FEEDBACK_STORE = _W12Store("feedback", seed=[asdict(f) for f in _FEEDBACK_SEED])
+
 
 NPS_TRENDS: list[NPSTrend] = [
     NPSTrend("2026-01", 420, 180, 100, 700, 45.7),
@@ -238,10 +361,20 @@ class Handler(BaseHTTPRequestHandler):
             },
                              "middleware": ["Postgres", "Redis", "Kafka", "OpenSearch"]})
         elif self.path == "/v1/feedback/entries":
-            self._json(200, {"items": [asdict(f) for f in FEEDBACK], "total": len(FEEDBACK)})
+            try:
+                _items = FEEDBACK_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _items, "total": len(_items)})
         elif self.path == "/v1/feedback/nps-trend":
             self._json(200, {"items": [asdict(t) for t in NPS_TRENDS], "total": len(NPS_TRENDS)})
         elif self.path == "/v1/feedback/dashboard":
+            try:
+                FEEDBACK = [FeedbackEntry(**r) for r in FEEDBACK_STORE.all()]
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             total = len(FEEDBACK)
             avg_rating = sum(f.rating for f in FEEDBACK) / total if total else 0
             avg_nps = sum(f.nps_score for f in FEEDBACK) / total if total else 0
@@ -291,8 +424,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             sentiment = "positive" if nps >= 8 else "negative" if nps <= 4 else "neutral"
+            # W12-C3P2B5: submissions are now actually persisted (the old code
+            # acknowledged but silently dropped them).
+            try:
+                FEEDBACK_STORE.ensure()
+                _n = _w12_run("SELECT COUNT(*) AS n FROM feedback", fetch="one")["n"]
+                _fid = f"FB-{_n+1:03d}"
+                FEEDBACK_STORE.put(_fid, {
+                    "id": _fid, "customer_id": body.get("customerId", ""),
+                    "customer_name": body.get("customerName", ""),
+                    "channel": body.get("channel", "unknown"),
+                    "category": body.get("category", "general"),
+                    "rating": rating, "nps_score": nps, "comment": comment,
+                    "sentiment": sentiment, "branch": body.get("branch"),
+                    "product": body.get("product"), "resolved": False,
+                    "response": None, "submitted_at": body.get("submittedAt", ""),
+                })
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             self._json(201, {
-                "id": f"FB-{len(FEEDBACK)+1:03d}",
+                "id": _fid,
                 "rating": rating, "npsScore": nps, "comment": comment,
                 "sentiment": sentiment, "status": "received"
             })

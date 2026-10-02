@@ -150,20 +150,20 @@ type AuditEntry struct {
 
 // AuditTrailManager manages audit trail logging
 type AuditTrailManager struct {
-	db           *sql.DB
-	config       AuditTrailConfig
-	tenantConfig map[string]AuditTrailConfig
-	lastHash     string
-	mu           sync.RWMutex
-	logFile      *os.File
+	db       *sql.DB
+	config   AuditTrailConfig
+	lastHash string
+	mu       sync.RWMutex
+	logFile  *os.File
+	// tenantConfig moved to redis cache-aside `config:audit:{tenantID}`
+	// (c3-0764, see redis_store.go); mu still guards lastHash.
 }
 
 // NewAuditTrailManager creates a new audit trail manager
 func NewAuditTrailManager(db *sql.DB) *AuditTrailManager {
 	atm := &AuditTrailManager{
-		db:           db,
-		config:       DefaultAuditConfig,
-		tenantConfig: make(map[string]AuditTrailConfig),
+		db:     db,
+		config: DefaultAuditConfig,
 	}
 
 	// Load environment overrides
@@ -300,6 +300,9 @@ func (atm *AuditTrailManager) createTables() {
 	}
 }
 
+// loadTenantConfigs pre-warms the redis config cache (c3-0764). Reads at
+// runtime are cache-aside (redis -> PG -> default), so a pre-warm failure
+// only means the first lookup per tenant hits Postgres.
 func (atm *AuditTrailManager) loadTenantConfigs() {
 	rows, err := atm.db.Query(`SELECT tenant_id, config FROM audit_config WHERE tenant_id IS NOT NULL`)
 	if err != nil {
@@ -308,9 +311,6 @@ func (atm *AuditTrailManager) loadTenantConfigs() {
 	}
 	defer rows.Close()
 
-	atm.mu.Lock()
-	defer atm.mu.Unlock()
-
 	for rows.Next() {
 		var tenantID string
 		var configJSON []byte
@@ -318,13 +318,30 @@ func (atm *AuditTrailManager) loadTenantConfigs() {
 			continue
 		}
 
-		var config AuditTrailConfig
-		if err := json.Unmarshal(configJSON, &config); err != nil {
-			continue
-		}
-
-		atm.tenantConfig[tenantID] = config
+		configCacheSet(configAuditKey(tenantID), string(configJSON))
 	}
+}
+
+// lookupTenantConfig resolves a tenant's audit config cache-aside:
+// redis `config:audit:{tenantID}` -> Postgres audit_config -> not found.
+func (atm *AuditTrailManager) lookupTenantConfig(tenantID string) (AuditTrailConfig, bool) {
+	var config AuditTrailConfig
+	if raw, ok := configCacheGet(configAuditKey(tenantID)); ok {
+		if err := json.Unmarshal([]byte(raw), &config); err == nil {
+			return config, true
+		}
+		// undecodable entry: fall through to PG and refresh
+	}
+	var configJSON []byte
+	err := atm.db.QueryRow(`SELECT config FROM audit_config WHERE tenant_id = $1`, tenantID).Scan(&configJSON)
+	if err != nil {
+		return config, false
+	}
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		return config, false
+	}
+	configCacheSet(configAuditKey(tenantID), string(configJSON))
+	return config, true
 }
 
 func (atm *AuditTrailManager) loadLastHash() {
@@ -351,13 +368,10 @@ func (atm *AuditTrailManager) openLogFile() {
 	atm.logFile = file
 }
 
-// GetConfig returns the applicable audit config
+// GetConfig returns the applicable audit config (cache-aside via redis, c3-0764)
 func (atm *AuditTrailManager) GetConfig(tenantID string) AuditTrailConfig {
-	atm.mu.RLock()
-	defer atm.mu.RUnlock()
-
 	if tenantID != "" {
-		if config, ok := atm.tenantConfig[tenantID]; ok {
+		if config, ok := atm.lookupTenantConfig(tenantID); ok {
 			return config
 		}
 	}

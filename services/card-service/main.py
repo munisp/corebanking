@@ -20,6 +20,7 @@ from utils.errors import raise_http_exception_handler
 from utils.kafka_instance import KafkaClientInstance
 from utils.kafka_client import CardEventTypes
 from utils.coa_client import CoAClient
+from utils.permify_guard import require_permify
 
 load_dotenv()
 
@@ -325,7 +326,7 @@ async def health_check():
     return {"status": "healthy", "service": "card-service"}
 
 
-@app.post("/api/v1/cards/issue")
+@app.post("/api/v1/cards/issue", dependencies=[Depends(require_permify("card", "issue"))])
 async def issue_card(
     card: CardCreation,
     db=Depends(lambda: db_pool),
@@ -386,7 +387,7 @@ async def issue_card(
         )
 
 
-@app.post("/api/v1/cards/issue/admin")
+@app.post("/api/v1/cards/issue/admin", dependencies=[Depends(require_permify("card", "issue"))])
 async def issue_card_admin(
     card: CardCreation,
     db=Depends(lambda: db_pool),
@@ -496,7 +497,7 @@ async def list_customer_cards(
         return {"customer_id": customer_id, "cards": cards, "total": len(cards)}
 
 
-@app.post("/api/v1/cards/{card_id}/set-pin")
+@app.post("/api/v1/cards/{card_id}/set-pin", dependencies=[Depends(require_permify("card", "set_pin"))])
 async def set_pin(
     card_id: str,
     payload: SetPinSchema,
@@ -526,7 +527,7 @@ async def set_pin(
         )
 
 
-@app.post("/api/v1/cards/{card_id}/freeze")
+@app.post("/api/v1/cards/{card_id}/freeze", dependencies=[Depends(require_permify("card", "freeze"))])
 async def freeze_card(
     card_id: str,
     db=Depends(lambda: db_pool),
@@ -549,7 +550,7 @@ async def freeze_card(
         )
 
 
-@app.post("/api/v1/cards/{card_id}/unfreeze")
+@app.post("/api/v1/cards/{card_id}/unfreeze", dependencies=[Depends(require_permify("card", "unfreeze"))])
 async def unfreeze_card(
     card_id: str,
     db=Depends(lambda: db_pool),
@@ -572,7 +573,7 @@ async def unfreeze_card(
         )
 
 
-@app.post("/api/v1/cards/{card_id}/block")
+@app.post("/api/v1/cards/{card_id}/block", dependencies=[Depends(require_permify("card", "freeze"))])
 async def block_card(
     card_id: str,
     db=Depends(lambda: db_pool),
@@ -602,7 +603,7 @@ async def block_card(
         )
 
 
-@app.post("/api/v1/cards/{card_id}/unblock")
+@app.post("/api/v1/cards/{card_id}/unblock", dependencies=[Depends(require_permify("card", "unfreeze"))])
 async def unblock_card(
     card_id: str,
     db=Depends(lambda: db_pool),

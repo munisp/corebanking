@@ -9,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 // Database initialization

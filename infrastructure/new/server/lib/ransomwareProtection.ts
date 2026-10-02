@@ -2,7 +2,25 @@
  * Ransomware Protection Module
  * Implements multi-layer defense against ransomware, crypto-locker, and data exfiltration attacks.
  * Uses behavioral analysis, file integrity monitoring, and automated response.
+ *
+ * W12-C3-P2-MLIB (c3-1001): the immutable-backup snapshot registry was module
+ * process memory — a restart hid the true backup posture (the exact failure a
+ * ransomware response plan must not have). Now Postgres-authoritative (table
+ * `backup_snapshots`) via lib/pgJsonStore.ts; fail-closed 503 on PG outage,
+ * no degraded-memory fallback.
  */
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const BACKUPS_TABLE = "backup_snapshots";
+
+async function loadBackupSnapshots(): Promise<BackupSnapshot[]> {
+  return pgGuard((async () => {
+    await ensureTables("ransomwareProtection", storeDDL(BACKUPS_TABLE));
+    await storeSeed(BACKUPS_TABLE, BACKUP_SNAPSHOTS_SEED, () => "");
+    return storeList<BackupSnapshot>(BACKUPS_TABLE);
+  })());
+}
 
 interface FileIntegrityRecord {
   path: string;
@@ -42,7 +60,8 @@ const ransomwareIndicators: RansomwareIndicator[] = [
 ];
 
 // Immutable backup snapshots (air-gapped strategy)
-const backupSnapshots: BackupSnapshot[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const BACKUP_SNAPSHOTS_SEED: BackupSnapshot[] = [
   { id: "BK-001", timestamp: "2026-05-09T00:00:00Z", type: "full", status: "verified", size: "2.4 TB", encryptionKey: "AES-256-GCM", location: "air_gapped" },
   { id: "BK-002", timestamp: "2026-05-09T06:00:00Z", type: "incremental", status: "verified", size: "145 GB", encryptionKey: "AES-256-GCM", location: "offsite" },
   { id: "BK-003", timestamp: "2026-05-09T12:00:00Z", type: "incremental", status: "verified", size: "167 GB", encryptionKey: "AES-256-GCM", location: "primary" },
@@ -65,7 +84,8 @@ export function registerRansomwareProtection(app: any) {
   });
 
   // GET /api/security/ransomware/stats — protection dashboard
-  app.get("/api/security/ransomware/stats", (_req: any, res: any) => {
+  app.get("/api/security/ransomware/stats", asyncRoute(async (_req: any, res: any) => {
+    const backupSnapshots = await loadBackupSnapshots();
     res.json({
       protectionStatus: "active",
       threatsBlocked: 47,
@@ -83,10 +103,11 @@ export function registerRansomwareProtection(app: any) {
         backupLevel: "enabled",
       },
     });
-  });
+  }));
 
   // GET /api/security/ransomware/backups — immutable backup status
-  app.get("/api/security/ransomware/backups", (_req: any, res: any) => {
+  app.get("/api/security/ransomware/backups", asyncRoute(async (_req: any, res: any) => {
+    const backupSnapshots = await loadBackupSnapshots();
     res.json({
       items: backupSnapshots,
       total: backupSnapshots.length,
@@ -102,7 +123,7 @@ export function registerRansomwareProtection(app: any) {
         rtoMinutes: 60,
       },
     });
-  });
+  }));
 
   // GET /api/security/file-integrity — file integrity monitoring
   app.get("/api/security/file-integrity", (_req: any, res: any) => {

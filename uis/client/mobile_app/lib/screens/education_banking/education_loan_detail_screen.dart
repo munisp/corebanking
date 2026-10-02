@@ -281,6 +281,24 @@ class _EducationLoanDetailScreenState
                 ),
               ),
 
+            const SizedBox(height: 12),
+
+            // W12-A4P2MOBILE: wire EducationLoanUpdateScreen — it takes the
+            // application as a required arg, so it is reached from here
+            // (not from the more_actions dispatch table).
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                icon: const Icon(Icons.edit_outlined),
+                onPressed: () => Navigator.pushNamed(
+                  context,
+                  '/education-loan/update',
+                  arguments: widget.application,
+                ),
+                label: const Text("Update Application"),
+              ),
+            ),
+
             const SizedBox(height: 20),
 
             // ================= SCHEDULE =================

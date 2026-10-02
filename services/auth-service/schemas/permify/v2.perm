@@ -109,6 +109,336 @@ entity tenants {
   permission emergency_override = god_mode or compliance_officer
 }
 
+// ===========================================================================
+// Wave-12 B5-P0-D1: money-movement + ledger archetype entities.
+// Canonical home for money/ledger authorization; the kyc/compliance wave
+// (B5-P0-D2) ships its own entities in a separate fragment file.
+// Convention per entity:
+//   admin     — full control of the entity instance
+//   operator  — day-to-day money/ledger operations (create/execute actions)
+//   approver  — approval / reversal actions (maker-checker)
+//   auditor   — read-only visibility
+// ===========================================================================
+
+entity account {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin
+  permission debit  = admin or operator
+  permission credit = admin or operator
+}
+
+entity transfer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission create   = admin or operator
+  permission update   = admin or operator
+  permission delete   = admin
+  permission validate = admin or operator
+  permission approve  = admin or approver
+  permission reverse  = admin or approver
+}
+
+entity lien {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view    = admin or operator or approver or auditor
+  permission place   = admin or operator
+  permission release = admin or operator
+}
+
+entity journal_entry {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission create   = admin or operator
+  permission submit   = admin or operator
+  permission validate = admin or operator
+  permission approve  = admin or approver
+  permission reverse  = admin or approver
+}
+
+entity settlement {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission create   = admin or operator
+  permission update   = admin or operator
+  permission delete   = admin
+  permission transfer = admin or operator
+  permission net      = admin or operator
+}
+
+entity payment_order {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission route  = admin or operator
+  permission submit = admin or operator
+}
+
+entity cheque {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission issue    = admin or operator
+  permission approve  = admin or approver
+  permission dishonor = admin or operator
+}
+
+entity debt_case {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+}
+
+entity facility {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission create   = admin or operator
+  permission drawdown = admin or operator
+  permission repay    = admin or operator
+  permission accrue   = admin or operator
+}
+
+entity sweep {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission register = admin or operator
+  permission resolve  = admin or operator
+}
+
+entity terminal {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission manage = admin or operator
+}
+
+entity smart_transfer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view    = admin or operator or approver or auditor
+  permission create  = admin or operator
+  permission satisfy = admin or operator or approver
+}
+
+entity fx_conversion {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view    = admin or operator or approver or auditor
+  permission convert = admin or operator
+  permission manage  = admin
+}
+
+entity card {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view    = admin or operator or approver or auditor
+  permission issue   = admin or operator
+  permission set_pin = admin or operator
+  permission freeze  = admin or operator
+  permission unfreeze = admin or operator
+  permission manage  = admin
+}
+
+entity merchant {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission settle = admin or operator
+  permission payout = admin or operator
+  permission manage = admin
+}
+
+entity savings {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission create   = admin or operator
+  permission deposit  = admin or operator
+  permission withdraw = admin or operator
+  permission manage   = admin
+}
+
+entity ledger {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission assign   = admin or operator
+  permission eod      = admin or operator
+  permission report   = admin or operator or auditor
+  permission evaluate = admin or operator
+}
+
+entity interest_batch {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission accrue = admin or operator
+  permission sync   = admin or operator
+}
+
+entity reconciliation {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view     = admin or operator or approver or auditor
+  permission run      = admin or operator
+  permission resolve  = admin or operator
+  permission escalate = admin or operator
+}
+
+entity fiscal_period {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission close  = admin or operator
+  permission lock   = admin or operator
+  permission reopen = admin
+}
+
+entity coa_mapping {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission upsert = admin or operator
+  permission delete = admin
+}
+
+entity approval_workflow {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin
+}
+
+entity approval_request {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view    = admin or operator or approver or auditor
+  permission approve = admin or approver
+  permission reject  = admin or approver
+  permission cancel  = admin or operator
+}
+
+entity tenant_coa {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin
+  permission clone  = admin
+}
+
+entity service_config {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+}
+
+entity derivative {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission price  = admin or operator
+  permission manage = admin
+}
+
 entity esusu_group {
 
   // ===== ROLES =====

@@ -183,18 +183,15 @@ export default function ServiceCatalogWorkspace() {
   const handleSave = useCallback(async () => {
     setSaving(true);
     try {
-      await fetch("/api/db/tenant-feature-flags", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tenantId: tenant.id,
-          flags: tenant.enabledFlags.map((key) => ({
-            key,
-            enabled: true,
-            rolloutPct: 100,
-          })),
-        }),
-      });
+      await Promise.all(
+        tenant.enabledFlags.map((key) =>
+          fetch(`/api/db/tenant-feature-flags/${encodeURIComponent(key)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: true, rolloutPct: 100 }),
+          }),
+        ),
+      );
       setSaved(true);
     } catch {
       // Fallback: save to local state only

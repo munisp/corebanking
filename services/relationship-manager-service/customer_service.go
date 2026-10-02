@@ -12,7 +12,7 @@ import (
 // CustomerService handles customer operations
 type CustomerService struct {
 	tenantID  string
-	customers map[string]*Customer
+	customers *repo[Customer]
 	mu        sync.RWMutex
 }
 
@@ -20,7 +20,7 @@ type CustomerService struct {
 func NewCustomerService(tenantID string) *CustomerService {
 	svc := &CustomerService{
 		tenantID:  tenantID,
-		customers: make(map[string]*Customer),
+		customers: newRepo[Customer](serviceDB, "crm_customers"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -28,7 +28,7 @@ func NewCustomerService(tenantID string) *CustomerService {
 
 func (s *CustomerService) initializeDefaultData(tenantID string) {
 	// HNWI customer
-	s.customers["cust-001"] = &Customer{
+	s.customers.seed(tenantID, "cust-001", &Customer{
 		CustomerID:      "cust-001",
 		TenantID:        tenantID,
 		CustomerType:    "individual",
@@ -51,10 +51,10 @@ func (s *CustomerService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(-4, 0, 0),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
 	// Corporate customer
-	s.customers["cust-002"] = &Customer{
+	s.customers.seed(tenantID, "cust-002", &Customer{
 		CustomerID:      "cust-002",
 		TenantID:        tenantID,
 		CustomerType:    "corporate",
@@ -76,10 +76,10 @@ func (s *CustomerService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(-5, 0, 0),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
 	// SME customer
-	s.customers["cust-003"] = &Customer{
+	s.customers.seed(tenantID, "cust-003", &Customer{
 		CustomerID:      "cust-003",
 		TenantID:        tenantID,
 		CustomerType:    "sme",
@@ -101,10 +101,10 @@ func (s *CustomerService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(-2, 0, 0),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
 	// Affluent customer
-	s.customers["cust-004"] = &Customer{
+	s.customers.seed(tenantID, "cust-004", &Customer{
 		CustomerID:      "cust-004",
 		TenantID:        tenantID,
 		CustomerType:    "individual",
@@ -127,10 +127,10 @@ func (s *CustomerService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(-3, 0, 0),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
 	// At-risk customer (low NPS, declining balance)
-	s.customers["cust-005"] = &Customer{
+	s.customers.seed(tenantID, "cust-005", &Customer{
 		CustomerID:      "cust-005",
 		TenantID:        tenantID,
 		CustomerType:    "individual",
@@ -157,10 +157,10 @@ func (s *CustomerService) initializeDefaultData(tenantID string) {
 		},
 		CreatedAt: time.Now().AddDate(-1, -6, 0),
 		UpdatedAt: time.Now(),
-	}
+	})
 
 	// Dormant customer
-	s.customers["cust-006"] = &Customer{
+	s.customers.seed(tenantID, "cust-006", &Customer{
 		CustomerID:      "cust-006",
 		TenantID:        tenantID,
 		CustomerType:    "individual",
@@ -183,16 +183,18 @@ func (s *CustomerService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(-2, -6, 0),
 		UpdatedAt:       time.Now().AddDate(0, -3, 0),
-	}
+	})
 }
 
 // ListCustomers returns customers based on filters
-func (s *CustomerService) ListCustomers(tenantID, rmID, segment string) []*Customer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CustomerService) ListCustomers(tenantID, rmID, segment string) ([]*Customer, error) {
 
 	var result []*Customer
-	for _, customer := range s.customers {
+	__ALL__, __ERR__ := s.customers.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, customer := range __ALL__ {
 		if customer.TenantID != tenantID {
 			continue
 		}
@@ -204,16 +206,14 @@ func (s *CustomerService) ListCustomers(tenantID, rmID, segment string) []*Custo
 		}
 		result = append(result, customer)
 	}
-	return result
+	return result, nil
 }
 
 // GetCustomer retrieves a customer by ID
 func (s *CustomerService) GetCustomer(tenantID, customerID string) (*Customer, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	customer, exists := s.customers[customerID]
-	if !exists || customer.TenantID != tenantID {
+	customer, err := s.customers.get(tenantID, customerID)
+	if err != nil {
 		return nil, errors.New("customer not found")
 	}
 	return customer, nil
@@ -221,8 +221,6 @@ func (s *CustomerService) GetCustomer(tenantID, customerID string) (*Customer, e
 
 // CreateCustomer creates a new customer
 func (s *CustomerService) CreateCustomer(tenantID, rmID string, req *CreateCustomerRequest) (*Customer, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	customer := &Customer{
 		CustomerID:      uuid.New().String(),
@@ -248,24 +246,23 @@ func (s *CustomerService) CreateCustomer(tenantID, rmID string, req *CreateCusto
 		UpdatedAt:       time.Now(),
 	}
 
-	s.customers[customer.CustomerID] = customer
+	if err := s.customers.put(tenantID, customer.CustomerID, customer); err != nil {
+		return nil, err
+	}
 	return customer, nil
 }
 
 // UpdateCustomer updates a customer
 func (s *CustomerService) UpdateCustomer(customer *Customer) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.customers[customer.CustomerID]
-	if !exists || existing.TenantID != customer.TenantID {
+	existing, err := s.customers.get(customer.TenantID, customer.CustomerID)
+	if err != nil {
 		return errors.New("customer not found")
 	}
 
 	customer.CreatedAt = existing.CreatedAt
 	customer.UpdatedAt = time.Now()
-	s.customers[customer.CustomerID] = customer
-	return nil
+	return s.customers.put(customer.TenantID, customer.CustomerID, customer)
 }
 
 // GetCustomerProducts returns customer products
@@ -345,12 +342,14 @@ func (s *CustomerService) GetCustomerTransactions(tenantID, customerID string) [
 }
 
 // GetAtRiskCustomers returns at-risk customers
-func (s *CustomerService) GetAtRiskCustomers(tenantID, rmID string) []*Customer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CustomerService) GetAtRiskCustomers(tenantID, rmID string) ([]*Customer, error) {
 
 	var result []*Customer
-	for _, customer := range s.customers {
+	__ALL__, __ERR__ := s.customers.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, customer := range __ALL__ {
 		if customer.TenantID != tenantID {
 			continue
 		}
@@ -375,16 +374,18 @@ func (s *CustomerService) GetAtRiskCustomers(tenantID, rmID string) []*Customer 
 			}
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetDormantCustomers returns dormant customers
-func (s *CustomerService) GetDormantCustomers(tenantID, rmID string) []*Customer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CustomerService) GetDormantCustomers(tenantID, rmID string) ([]*Customer, error) {
 
 	var result []*Customer
-	for _, customer := range s.customers {
+	__ALL__, __ERR__ := s.customers.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, customer := range __ALL__ {
 		if customer.TenantID != tenantID {
 			continue
 		}
@@ -395,17 +396,19 @@ func (s *CustomerService) GetDormantCustomers(tenantID, rmID string) []*Customer
 			result = append(result, customer)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // SearchCustomers searches customers by name or email
-func (s *CustomerService) SearchCustomers(tenantID, query string) []*Customer {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CustomerService) SearchCustomers(tenantID, query string) ([]*Customer, error) {
 
 	query = strings.ToLower(query)
 	var result []*Customer
-	for _, customer := range s.customers {
+	__ALL__, __ERR__ := s.customers.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, customer := range __ALL__ {
 		if customer.TenantID != tenantID {
 			continue
 		}
@@ -416,5 +419,5 @@ func (s *CustomerService) SearchCustomers(tenantID, query string) []*Customer {
 			result = append(result, customer)
 		}
 	}
-	return result
+	return result, nil
 }

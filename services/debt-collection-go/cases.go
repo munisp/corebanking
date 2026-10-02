@@ -78,7 +78,7 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 }
 
 func registerCaseRoutes() {
-	http.HandleFunc("/api/debt-collection/cases", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/debt-collection/cases", permifyAuthzGuard("debt_case", "create", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
 			createCase(w, r)
@@ -87,8 +87,8 @@ func registerCaseRoutes() {
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET or POST required"})
 		}
-	})
-	http.HandleFunc("/api/debt-collection/cases/", caseSubroutes)
+	}))
+	http.HandleFunc("/api/debt-collection/cases/", permifyAuthzGuard("debt_case", "update", caseSubroutes))
 }
 
 // createCase opens a collection case from an arrears position. Amounts are

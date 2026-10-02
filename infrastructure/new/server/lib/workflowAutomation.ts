@@ -1,5 +1,29 @@
 // E6: Workflow Automation — Visual workflow builder, approval chains, SLA tracking
+//
+// W12-C3-P2-MLIB (c3-0977, c3-0978): workflow definitions and instances were
+// module process memory (a restart silently reset in-flight approval chains).
+// Now Postgres-authoritative (tables `workflow_definitions`,
+// `workflow_instances`) via lib/pgJsonStore.ts; fail-closed 503 on PG outage,
+// no degraded-memory fallback.
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeReplace, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const DEFINITIONS_TABLE = "workflow_definitions";
+const INSTANCES_TABLE = "workflow_instances";
+
+async function ensureWorkflowStores(): Promise<void> {
+  await ensureTables("workflowAutomation", [...storeDDL(DEFINITIONS_TABLE), ...storeDDL(INSTANCES_TABLE)]);
+  await storeSeed(DEFINITIONS_TABLE, WORKFLOWS_SEED, () => "");
+  await storeSeed(INSTANCES_TABLE, INSTANCES_SEED, () => "");
+}
+
+async function loadWorkflows(): Promise<WorkflowDefinition[]> {
+  await ensureWorkflowStores(); return storeList<WorkflowDefinition>(DEFINITIONS_TABLE);
+}
+async function loadInstances(): Promise<WorkflowInstance[]> {
+  await ensureWorkflowStores(); return storeList<WorkflowInstance>(INSTANCES_TABLE);
+}
 
 interface WorkflowDefinition {
   id: string; name: string; category: string; steps: WorkflowStep[];
@@ -17,7 +41,8 @@ interface WorkflowInstance {
   initiator: string; data: Record<string, unknown>;
 }
 
-const workflows: WorkflowDefinition[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const WORKFLOWS_SEED: WorkflowDefinition[] = [
   { id: "WF-001", name: "Loan Approval", category: "lending", version: 3, status: "active", createdBy: "system", slaHours: 48,
     steps: [
       { stepId: "S1", name: "Credit Assessment", type: "automated", assignee: "credit_engine", slaMinutes: 5, autoEscalate: true },
@@ -47,22 +72,26 @@ const workflows: WorkflowDefinition[] = [
     ] },
 ];
 
-const instances: WorkflowInstance[] = [
+const INSTANCES_SEED: WorkflowInstance[] = [
   { id: "WFI-001", workflowId: "WF-001", workflowName: "Loan Approval", currentStep: 2, status: "in_progress", startedAt: "2026-05-09T10:00:00Z", completedAt: null, initiator: "customer_360", data: { loanAmount: 5000000, customerId: "CUS-1001" } },
   { id: "WFI-002", workflowId: "WF-002", workflowName: "Account Opening", currentStep: 3, status: "completed", startedAt: "2026-05-09T09:00:00Z", completedAt: "2026-05-09T09:45:00Z", initiator: "onboarding_portal", data: { accountType: "savings", customerId: "CUS-2045" } },
   { id: "WFI-003", workflowId: "WF-003", workflowName: "International Transfer", currentStep: 1, status: "blocked", startedAt: "2026-05-09T11:30:00Z", completedAt: null, initiator: "teller_ops", data: { amount: 50000, currency: "USD", beneficiary: "Overseas Ltd" } },
 ];
 
 export function registerWorkflowAutomation(app: Express) {
-  app.get("/api/platform/workflows/definitions", (_: Request, res: Response) => {
+  app.get("/api/platform/workflows/definitions", asyncRoute(async (_: Request, res: Response) => {
+    const workflows = await pgGuard(loadWorkflows());
     res.json({ items: workflows, total: workflows.length });
-  });
+  }));
 
-  app.get("/api/platform/workflows/instances", (_: Request, res: Response) => {
+  app.get("/api/platform/workflows/instances", asyncRoute(async (_: Request, res: Response) => {
+    const instances = await pgGuard(loadInstances());
     res.json({ items: instances, total: instances.length });
-  });
+  }));
 
-  app.get("/api/platform/workflows/sla-dashboard", (_: Request, res: Response) => {
+  app.get("/api/platform/workflows/sla-dashboard", asyncRoute(async (_: Request, res: Response) => {
+    const workflows = await pgGuard(loadWorkflows());
+    const instances = await pgGuard(loadInstances());
     const active = instances.filter(i => i.status === "in_progress" || i.status === "blocked");
     const breached = active.filter(i => {
       const wf = workflows.find(w => w.id === i.workflowId);
@@ -75,9 +104,11 @@ export function registerWorkflowAutomation(app: Express) {
       sla_breached: breached.length, blocked: instances.filter(i => i.status === "blocked").length,
       avg_completion_time_hours: 2.5,
     });
-  });
+  }));
 
-  app.post("/api/platform/workflows/instances/:id/advance", (req: Request, res: Response) => {
+  app.post("/api/platform/workflows/instances/:id/advance", asyncRoute(async (req: Request, res: Response) => {
+    const workflows = await pgGuard(loadWorkflows());
+    const instances = await pgGuard(loadInstances());
     const inst = instances.find(i => i.id === req.params.id);
     if (!inst) return res.status(404).json({ error: "Instance not found" });
     const wf = workflows.find(w => w.id === inst.workflowId);
@@ -89,6 +120,8 @@ export function registerWorkflowAutomation(app: Express) {
       inst.currentStep++;
       if (inst.currentStep >= wf.steps.length) { inst.status = "completed"; inst.completedAt = new Date().toISOString(); }
     }
+    // Persist the advanced instance (read-modify-write; updated_at bumped).
+    await pgGuard(storeReplace(INSTANCES_TABLE, inst.id, inst));
     res.json(inst);
-  });
+  }));
 }

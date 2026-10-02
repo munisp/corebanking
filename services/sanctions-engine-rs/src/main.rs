@@ -6,6 +6,7 @@
 //! Middleware: Kafka, Postgres, Redis, Temporal, OpenSearch
 
 use actix_web::dev::Service;
+use actix_web::HttpMessage;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -75,9 +76,35 @@ struct BatchScreenRequest {
 
 struct AppState {
     start_time: Instant,
-    screenings: Mutex<Vec<Screening>>,
-    watchlist: Mutex<Vec<WatchlistEntry>>,
+    db: Option<sqlx::PgPool>,
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+}
+
+// Screening carries Vec<String> fields (no sqlx-postgres codec) => JSONB payload.
+async fn persist_screening(pool: &sqlx::PgPool, s: &Screening) -> Result<(), sqlx::Error> {
+    let payload = serde_json::to_value(s).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query("INSERT INTO sanctions_screenings (id, payload) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload")
+        .bind(&s.id)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn load_screenings(pool: &sqlx::PgPool) -> Result<Vec<Screening>, sqlx::Error> {
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM sanctions_screenings ORDER BY created_at")
+        .fetch_all(pool)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for v in rows {
+        let s: Screening = serde_json::from_value(v).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        out.push(s);
+    }
+    Ok(out)
+}
+
+fn persistence_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": detail}))
 }
 
 fn rand_id(prefix: &str) -> String {
@@ -125,14 +152,23 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests()
             .insert_header(("Retry-After", "1"))
             .json(serde_json::json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let screenings = state.screenings.lock().await;
-    let watchlist = state.watchlist.lock().await;
+    let watchlist = match &state.db_client {
+        Some(c) => load_watchlist(c).await,
+        None => Vec::new(),
+    };
+    let total_screenings: i64 = match &state.db {
+        Some(pool) => match sqlx::query_scalar("SELECT COUNT(*) FROM sanctions_screenings").fetch_one(pool).await {
+            Ok(c) => c,
+            Err(e) => return persistence_unavailable(&format!("sanctions_screenings count failed: {}", e)),
+        },
+        None => return persistence_unavailable("sanctions_screenings pool not configured"),
+    };
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
     {
@@ -159,7 +195,7 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "uptime_secs": state.start_time.elapsed().as_secs(),
         "domain": "Sanctions Screening Engine",
         "watchlist_entries": watchlist.len(),
-        "total_screenings": screenings.len(),
+        "total_screenings": total_screenings,
         "lists_loaded": loaded_lists(&watchlist),
         "capabilities": [
             "ofac_sdn_screening", "eu_consolidated_screening", "un_security_council",
@@ -188,12 +224,16 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
 
 async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "screening", &body.entity_name, "screen").await { return resp; }
     let _sanitized = sanitize_input("");
     let name = &body.entity_name;
     let entity_type = body.entity_type.as_deref().unwrap_or("individual");
     let screening_type = body.screening_type.as_deref().unwrap_or("customer_onboarding");
 
-    let watchlist = state.watchlist.lock().await;
+    let watchlist = match &state.db_client {
+        Some(c) => load_watchlist(c).await,
+        None => Vec::new(),
+    };
     if watchlist.is_empty() {
         // FAIL CLOSED: no real watchlist -> no safe-negative "clear" verdict.
         return HttpResponse::ServiceUnavailable().json(json!({
@@ -240,8 +280,14 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
         notes: None,
     };
 
-    let mut screenings = state.screenings.lock().await;
-    screenings.push(screening.clone());
+    match &state.db {
+        Some(pool) => {
+            if let Err(e) = persist_screening(pool, &screening).await {
+                return persistence_unavailable(&format!("sanctions_screenings persist failed: {}", e));
+            }
+        }
+        None => return persistence_unavailable("sanctions_screenings pool not configured"),
+    }
 
     db_persist(&state, "screen_entity", &json!({"action": "screen_entity"})).await;
     HttpResponse::Ok().json(json!({
@@ -258,26 +304,44 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
 
 async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let mut screenings = state.screenings.lock().await;
-    for s in screenings.iter_mut() {
-        if s.id == body.screening_id {
-            s.decision = body.decision.clone();
-            s.decision_by = Some(body.decided_by.clone());
-            s.decision_at = Some(now_str());
-            s.notes = body.notes.clone();
-            if body.decision == "false_positive" { s.status = "false_positive".into(); }
-            else if body.decision == "block" { s.status = "confirmed_match".into(); }
-            else if body.decision == "release" { s.status = "cleared".into(); }
-    db_persist(&state, "record_decision", &json!({"action": "record_decision"})).await;
-            return HttpResponse::Ok().json(json!({"decided": true, "screening": s.clone()}));
-        }
+    if let Err(resp) = permify_check(&req, "sanction_hit", &body.screening_id, "review").await { return resp; }
+    let pool = match &state.db {
+        Some(p) => p,
+        None => return persistence_unavailable("sanctions_screenings pool not configured"),
+    };
+    let row: Option<serde_json::Value> = match sqlx::query_scalar("SELECT payload FROM sanctions_screenings WHERE id = $1")
+        .bind(&body.screening_id).fetch_optional(pool).await {
+        Ok(r) => r,
+        Err(e) => return persistence_unavailable(&format!("sanctions_screenings read failed: {}", e)),
+    };
+    let mut s: Screening = match row {
+        Some(v) => match serde_json::from_value(v) {
+            Ok(s) => s,
+            Err(e) => return persistence_unavailable(&format!("sanctions_screenings decode failed: {}", e)),
+        },
+        None => return HttpResponse::NotFound().json(json!({"error": format!("Screening not found: {}", body.screening_id)})),
+    };
+    s.decision = body.decision.clone();
+    s.decision_by = Some(body.decided_by.clone());
+    s.decision_at = Some(now_str());
+    s.notes = body.notes.clone();
+    if body.decision == "false_positive" { s.status = "false_positive".into(); }
+    else if body.decision == "block" { s.status = "confirmed_match".into(); }
+    else if body.decision == "release" { s.status = "cleared".into(); }
+    if let Err(e) = persist_screening(pool, &s).await {
+        return persistence_unavailable(&format!("sanctions_screenings persist failed: {}", e));
     }
-    HttpResponse::NotFound().json(json!({"error": format!("Screening not found: {}", body.screening_id)}))
+    db_persist(&state, "record_decision", &json!({"action": "record_decision"})).await;
+    HttpResponse::Ok().json(json!({"decided": true, "screening": s}))
 }
 
 async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let watchlist = state.watchlist.lock().await;
+    if let Err(resp) = permify_check(&req, "screening", "batch-rescreen", "rescreen").await { return resp; }
+    let watchlist = match &state.db_client {
+        Some(c) => load_watchlist(c).await,
+        None => Vec::new(),
+    };
     if watchlist.is_empty() {
         return HttpResponse::ServiceUnavailable().json(json!({
             "error": "watchlist_unavailable",
@@ -303,11 +367,15 @@ async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<Ap
 
 async fn list_screenings(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let screenings = state.screenings.lock().await;
+    let pool = match &state.db { Some(p) => p, None => return persistence_unavailable("sanctions_screenings pool not configured") };
+    let screenings = match load_screenings(pool).await {
+        Ok(s) => s,
+        Err(e) => return persistence_unavailable(&format!("sanctions_screenings read failed: {}", e)),
+    };
     let pending = screenings.iter().filter(|s| s.decision_by.is_none()).count();
     db_persist(&state, "list_screenings", &json!({"action": "list_screenings"})).await;
     HttpResponse::Ok().json(json!({
-        "screenings": *screenings,
+        "screenings": screenings,
         "total": screenings.len(),
         "pending_decisions": pending,
     }))
@@ -315,8 +383,15 @@ async fn list_screenings(req: actix_web::HttpRequest, state: web::Data<AppState>
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let screenings = state.screenings.lock().await;
-    let watchlist = state.watchlist.lock().await;
+    let pool = match &state.db { Some(p) => p, None => return persistence_unavailable("sanctions_screenings pool not configured") };
+    let screenings = match load_screenings(pool).await {
+        Ok(s) => s,
+        Err(e) => return persistence_unavailable(&format!("sanctions_screenings read failed: {}", e)),
+    };
+    let watchlist = match &state.db_client {
+        Some(c) => load_watchlist(c).await,
+        None => Vec::new(),
+    };
     let total = screenings.len();
     let matches = screenings.iter().filter(|s| s.match_score >= 0.7).count();
     let false_positives = screenings.iter().filter(|s| s.status == "false_positive").count();
@@ -338,7 +413,11 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn get_false_positives(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let screenings = state.screenings.lock().await;
+    let pool = match &state.db { Some(p) => p, None => return persistence_unavailable("sanctions_screenings pool not configured") };
+    let screenings = match load_screenings(pool).await {
+        Ok(s) => s,
+        Err(e) => return persistence_unavailable(&format!("sanctions_screenings read failed: {}", e)),
+    };
     let fps: Vec<&Screening> = screenings.iter().filter(|s| s.status == "false_positive").collect();
     db_persist(&state, "get_false_positives", &json!({"action": "get_false_positives"})).await;
     HttpResponse::Ok().json(json!({
@@ -388,8 +467,6 @@ fn loaded_lists(watchlist: &[WatchlistEntry]) -> Vec<String> {
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -621,7 +698,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -804,20 +881,57 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:sanctions-engine-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:sanctions-engine-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -860,11 +974,11 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
                     if stream.read_exact(&mut payload).is_err() { return; }
                     let resp = if std::env::var("FAKE_GRPC_OK").ok().as_deref() == Some("1") {
                         // FAKE_GRPC_OK=1: legacy stub for local development only.
-                        format!(r#"{"status":"ok","service":"{}"}"#, service_name)
+                        format!(r#"{{"status":"ok","service":"{}"}}"#, service_name)
                     } else {
                         // gRPC UNIMPLEMENTED (status 12): never fabricate OK for
                         // an unimplemented handler.
-                        format!(r#"{"error":"unimplemented","grpcStatus":12,"service":"{}"}"#, service_name)
+                        format!(r#"{{"error":"unimplemented","grpcStatus":12,"service":"{}"}}"#, service_name)
                     };
                     let resp_bytes = resp.as_bytes();
                     let resp_len = (resp_bytes.len() as u32).to_be_bytes();
@@ -917,26 +1031,103 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+
+// --- Permify authorization (W12-B5-P0-D2) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = X-Tenant-Id header or
+// PERMIFY_DEFAULT_TENANT, resource = domain entity id, permission per action
+// (schema: services/auth-service/schemas/permify/v2-kyc-compliance.fragment).
+// FAIL-CLOSED: Permify unreachable/non-200 => 503; denied => 403.
+// Canonical pattern: services/permify-authz-go/main.go:428 (REST check) and
+// services/auth-service/adapters/permify.py check_permission.
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    let subject = {
+        let ext = req.extensions();
+        ext.get::<VerifiedClaims>()
+            .and_then(|c| c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = req.headers().get("X-Tenant-Id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8121".to_string());
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
     let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
+    let db_pool: Option<sqlx::PgPool> = if !db_url.is_empty() {
+        match sqlx::postgres::PgPoolOptions::new().max_connections(10).connect_lazy(&db_url) {
+            Ok(p) => Some(p),
+            Err(e) => { eprintln!("sanctions-engine-rs: pool init failed: {}", e); None }
+        }
+    } else { None };
+    if let Some(pool) = &db_pool {
+        if let Err(e) = sqlx::query(r#"CREATE TABLE IF NOT EXISTS sanctions_screenings (
+            id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#).execute(pool).await {
+            eprintln!("sanctions-engine-rs: sanctions_screenings schema init failed: {}", e);
+        }
+    }
+    match &_db_client {
+        Some(c) => {
+            let wl = load_watchlist(c).await;
+            println!("sanctions-engine-rs: loaded {} watchlist entries from database", wl.len());
+        }
+        None => println!("sanctions-engine-rs: DATABASE_URL not set — screening will fail closed (503 watchlist_unavailable)"),
+    }
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
         // No seeded/fake screenings: only real screening operations populate state.
-        screenings: Mutex::new(Vec::new()),
-        watchlist: Mutex::new(match &_db_client {
-            Some(c) => {
-                let wl = load_watchlist(c).await;
-                println!("sanctions-engine-rs: loaded {} watchlist entries from database", wl.len());
-                wl
-            }
-            None => {
-                println!("sanctions-engine-rs: DATABASE_URL not set — screening will fail closed (503 watchlist_unavailable)");
-                Vec::new()
-            }
-        }),
+        db: db_pool,
         db_client: _db_client.map(|c| std::sync::Arc::new(c)),
     });
     println!("Sanctions Screening Engine v3.0 (Rust) on :{} — OFAC/EU/UN/CBN/INTERPOL/NFIU/PEP", port);

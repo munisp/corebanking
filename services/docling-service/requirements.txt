@@ -10,6 +10,7 @@ pytesseract==0.3.13  # Fallback OCR
 # Web framework
 fastapi==0.115.12
 uvicorn[standard]==0.34.3
+psycopg2-binary>=2.9.9  # W12-C3P2B5: PG persistence
 python-multipart==0.0.12  # File upload support
 
 # Data validation

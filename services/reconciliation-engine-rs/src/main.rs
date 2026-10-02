@@ -6,6 +6,7 @@
 //! Middleware: Kafka, Postgres, Redis, Temporal, OpenSearch
 
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -13,6 +14,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 use chrono::Utc;
+use sqlx::PgPool;
 
 // MN-17: all money fields are integer kobo (i64). Float comparisons with
 // 0.01 tolerances were deleted — a discrepancy is any nonzero integer
@@ -73,8 +75,35 @@ struct RunSettlementReconRequest {
 
 struct AppState {
     start_time: Instant,
-    recons: Mutex<Vec<SettlementRecon>>,
+    db: Option<PgPool>,
     db_url: Option<String>,
+}
+
+// SettlementRecon carries u64 fields (no sqlx-postgres codec) => JSONB payload.
+async fn persist_recon(pool: &PgPool, recon: &SettlementRecon) -> Result<(), sqlx::Error> {
+    let payload = serde_json::to_value(recon).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query("INSERT INTO settlement_recons (recon_id, payload) VALUES ($1, $2) ON CONFLICT (recon_id) DO UPDATE SET payload = EXCLUDED.payload")
+        .bind(&recon.recon_id)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn load_recons(pool: &PgPool) -> Result<Vec<SettlementRecon>, sqlx::Error> {
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM settlement_recons ORDER BY created_at")
+        .fetch_all(pool)
+        .await?;
+    let mut recons = Vec::with_capacity(rows.len());
+    for v in rows {
+        let r: SettlementRecon = serde_json::from_value(v).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        recons.push(r);
+    }
+    Ok(recons)
+}
+
+fn persistence_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({"error": "source_unavailable", "detail": detail}))
 }
 
 fn rand_id(prefix: &str) -> String {
@@ -139,6 +168,7 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
 
 async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSettlementReconRequest>, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "reconciliation", "run").await { return resp; } // W12-B5D1
     let recon_type = body.recon_type.clone().unwrap_or_else(|| "nostro".into());
     let biz_date = body.business_date.clone().unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
 
@@ -259,7 +289,14 @@ async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSe
                 "net_uncleared_kobo": nostro_positions.iter().map(|n| n.uncleared_credits_kobo - n.uncleared_debits_kobo).sum::<i64>(),
                 "cbn_reserve_balanced": nostro_positions.iter().find(|n| n.gl_code == "1101").map(|n| n.difference_kobo == 0),
             });
-            state.recons.lock().unwrap().push(recon.clone());
+            match &state.db {
+                Some(pool) => {
+                    if let Err(e) = persist_recon(pool, &recon).await {
+                        return persistence_unavailable(&format!("settlement_recons persist failed: {}", e));
+                    }
+                }
+                None => return persistence_unavailable("settlement_recons pool not configured"),
+            }
             HttpResponse::Ok().json(json!({
                 "recon": recon,
                 "nostro_positions": nostro_positions,
@@ -279,7 +316,11 @@ async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSe
                 reconciled_at: now_str(),
                 error: Some("source_unavailable".into()),
             };
-            state.recons.lock().unwrap().push(recon.clone());
+            if let Some(pool) = &state.db {
+                if let Err(pe) = persist_recon(pool, &recon).await {
+                    eprintln!("[reconciliation-engine-rs] failed-recon persist error: {}", pe);
+                }
+            }
             HttpResponse::ServiceUnavailable().json(json!({"recon": recon, "error": "source_unavailable", "detail": e}))
         }
     }
@@ -349,8 +390,14 @@ async fn get_suspense(req: actix_web::HttpRequest, state: web::Data<AppState>) -
 
 async fn list_recons(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let recons = state.recons.lock().unwrap();
-    HttpResponse::Ok().json(json!({"recons": *recons, "total": recons.len()}))
+    let recons = match &state.db {
+        Some(pool) => match load_recons(pool).await {
+            Ok(r) => r,
+            Err(e) => return persistence_unavailable(&format!("settlement_recons read failed: {}", e)),
+        },
+        None => return persistence_unavailable("settlement_recons pool not configured"),
+    };
+    HttpResponse::Ok().json(json!({"recons": recons, "total": recons.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
@@ -359,7 +406,13 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
         Some(u) => u.clone(),
         None => return source_unavailable("DATABASE_URL not configured; refusing to fabricate reconciliation statistics"),
     };
-    let recons = state.recons.lock().unwrap().clone();
+    let recons = match &state.db {
+        Some(pool) => match load_recons(pool).await {
+            Ok(r) => r,
+            Err(e) => return persistence_unavailable(&format!("settlement_recons read failed: {}", e)),
+        },
+        None => return persistence_unavailable("settlement_recons pool not configured"),
+    };
     let total_items: u64 = recons.iter().map(|r| r.items_reconciled + r.items_outstanding).sum();
     let auto_matched: u64 = recons.iter().map(|r| r.auto_matched).sum();
     let auto_match_rate = if total_items > 0 { auto_matched as f64 / total_items as f64 * 100.0 } else { 0.0 };
@@ -438,7 +491,13 @@ async fn eod_report(req: actix_web::HttpRequest, state: web::Data<AppState>) -> 
     let suspense_cleared = suspense.iter().filter(|i| i.status == "resolved").count();
     let clearance_rate = if suspense_total > 0 { suspense_cleared as f64 / suspense_total as f64 * 100.0 } else { 0.0 };
 
-    let recons = state.recons.lock().unwrap().clone();
+    let recons = match &state.db {
+        Some(pool) => match load_recons(pool).await {
+            Ok(r) => r,
+            Err(e) => return persistence_unavailable(&format!("settlement_recons read failed: {}", e)),
+        },
+        None => return persistence_unavailable("settlement_recons pool not configured"),
+    };
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let todays: Vec<&SettlementRecon> = recons.iter().filter(|r| r.business_date == today).collect();
     let nostro_reconciled = todays.iter().filter(|r| r.recon_type == "nostro" && r.status.starts_with("completed")).count();
@@ -766,9 +825,24 @@ async fn main() -> std::io::Result<()> {
             Err(e) => eprintln!("[reconciliation-engine-rs] migration connect failed: {e}"),
         }
     }
+    let db_pool: Option<PgPool> = db_url.as_ref().and_then(|u| {
+        match sqlx::postgres::PgPoolOptions::new().max_connections(10).connect_lazy(u) {
+            Ok(p) => Some(p),
+            Err(e) => { eprintln!("[reconciliation-engine-rs] pool init failed: {}", e); None }
+        }
+    });
+    if let Some(pool) = &db_pool {
+        if let Err(e) = sqlx::query(r#"CREATE TABLE IF NOT EXISTS settlement_recons (
+            recon_id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#).execute(pool).await {
+            eprintln!("[reconciliation-engine-rs] settlement_recons schema init failed: {}", e);
+        }
+    }
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        recons: Mutex::new(Vec::new()),
+        db: db_pool,
         db_url,
     });
     println!("Settlement Reconciliation Engine v3.0 (Rust) on :{}", port);
@@ -815,3 +889,6 @@ mod tests {
         DB_AVAILABLE.store(true, AtomicOrdering::Relaxed);
     }
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

@@ -1,8 +1,34 @@
 /**
  * Multi-Currency with Real FX Engine — Live exchange rates, position management,
  * revaluation P&L, nostro account management, and trade settlement.
+ *
+ * W12-C3-P2-MLIB (c3-0991, c3-0992): the FX rate board and position store were
+ * module process memory (lost on restart, divergent across replicas). Now
+ * Postgres-authoritative (tables `fx_rates`, `fx_positions`) via
+ * lib/pgJsonStore.ts. These are RECORDS, not balances-of-record — TigerBeetle
+ * remains the balance authority (W12-C3-P0-B1). Fail-closed: a PG outage
+ * fails the request (503) — a currency conversion is never computed on a
+ * stale in-memory rate board. (NOSTRO_ACCOUNTS is out of this batch's scope.)
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const RATES_TABLE = "fx_rates";
+const POSITIONS_TABLE = "fx_positions";
+
+async function ensureFxStores(): Promise<void> {
+  await ensureTables("multiCurrencyFx", [...storeDDL(RATES_TABLE), ...storeDDL(POSITIONS_TABLE)]);
+  await storeSeed(RATES_TABLE, RATES_SEED, () => "");
+  await storeSeed(POSITIONS_TABLE, POSITIONS_SEED, () => "");
+}
+
+async function loadRates(): Promise<FXRate[]> {
+  await ensureFxStores(); return storeList<FXRate>(RATES_TABLE);
+}
+async function loadPositions(): Promise<FXPosition[]> {
+  await ensureFxStores(); return storeList<FXPosition>(POSITIONS_TABLE);
+}
 
 interface FXRate {
   id: string;
@@ -41,7 +67,8 @@ interface NostroAccount {
   status: "active" | "dormant" | "blocked";
 }
 
-const RATES: FXRate[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const RATES_SEED: FXRate[] = [
   { id: "FX-NGN-USD", baseCurrency: "USD", quoteCurrency: "NGN", buyRate: 1575, sellRate: 1585, midRate: 1580, spread: 10, source: "CBN-NAFEM", effectiveAt: "2026-05-09T09:00:00Z", expiresAt: "2026-05-09T17:00:00Z" },
   { id: "FX-NGN-GBP", baseCurrency: "GBP", quoteCurrency: "NGN", buyRate: 1990, sellRate: 2010, midRate: 2000, spread: 20, source: "CBN-NAFEM", effectiveAt: "2026-05-09T09:00:00Z", expiresAt: "2026-05-09T17:00:00Z" },
   { id: "FX-NGN-EUR", baseCurrency: "EUR", quoteCurrency: "NGN", buyRate: 1720, sellRate: 1740, midRate: 1730, spread: 20, source: "CBN-NAFEM", effectiveAt: "2026-05-09T09:00:00Z", expiresAt: "2026-05-09T17:00:00Z" },
@@ -52,7 +79,7 @@ const RATES: FXRate[] = [
   { id: "FX-NGN-KES", baseCurrency: "KES", quoteCurrency: "NGN", buyRate: 12.0, sellRate: 12.4, midRate: 12.2, spread: 0.4, source: "AfriExchange", effectiveAt: "2026-05-09T09:00:00Z", expiresAt: "2026-05-09T17:00:00Z" },
 ];
 
-const POSITIONS: FXPosition[] = [
+const POSITIONS_SEED: FXPosition[] = [
   { id: "POS-USD", currency: "USD", longPosition: 5200000, shortPosition: 4800000, netPosition: 400000, avgCost: 1570, marketValue: 632000000, unrealizedPnl: 4000000, limit: 2000000, utilization: 20 },
   { id: "POS-GBP", currency: "GBP", longPosition: 1500000, shortPosition: 1600000, netPosition: -100000, avgCost: 1985, marketValue: -199000000, unrealizedPnl: -1500000, limit: 500000, utilization: 20 },
   { id: "POS-EUR", currency: "EUR", longPosition: 800000, shortPosition: 750000, netPosition: 50000, avgCost: 1715, marketValue: 86500000, unrealizedPnl: 750000, limit: 1000000, utilization: 5 },
@@ -68,19 +95,28 @@ const NOSTRO_ACCOUNTS: NostroAccount[] = [
 ];
 
 export function registerMultiCurrencyFx(app: Express) {
-  app.get("/api/fx/v1/rates", (_req: Request, res: Response) => { res.json({ items: RATES, total: RATES.length, source: "CBN-NAFEM + Reuters", lastUpdated: "2026-05-09T09:00:00Z" }); });
-  app.get("/api/fx/v1/positions", (_req: Request, res: Response) => { res.json({ items: POSITIONS, total: POSITIONS.length, totalUnrealizedPnl: POSITIONS.reduce((s, p) => s + p.unrealizedPnl, 0) }); });
+  app.get("/api/fx/v1/rates", asyncRoute(async (_req: Request, res: Response) => {
+    const rates = await pgGuard(loadRates());
+    res.json({ items: rates, total: rates.length, source: "CBN-NAFEM + Reuters", lastUpdated: "2026-05-09T09:00:00Z" });
+  }));
+  app.get("/api/fx/v1/positions", asyncRoute(async (_req: Request, res: Response) => {
+    const positions = await pgGuard(loadPositions());
+    res.json({ items: positions, total: positions.length, totalUnrealizedPnl: positions.reduce((s, p) => s + p.unrealizedPnl, 0) });
+  }));
   app.get("/api/fx/v1/nostro", (_req: Request, res: Response) => { res.json({ items: NOSTRO_ACCOUNTS, total: NOSTRO_ACCOUNTS.length }); });
-  app.post("/api/fx/v1/convert", (req: Request, res: Response) => {
+  app.post("/api/fx/v1/convert", asyncRoute(async (req: Request, res: Response) => {
     const { fromCurrency, toCurrency, amount } = req.body ?? {};
-    const rate = RATES.find((r) => (r.baseCurrency === fromCurrency && r.quoteCurrency === toCurrency) || (r.baseCurrency === toCurrency && r.quoteCurrency === fromCurrency));
+    const rates = await pgGuard(loadRates());
+    const rate = rates.find((r) => (r.baseCurrency === fromCurrency && r.quoteCurrency === toCurrency) || (r.baseCurrency === toCurrency && r.quoteCurrency === fromCurrency));
     if (!rate) return res.status(400).json({ error: "Currency pair not supported" });
     const converted = rate.baseCurrency === fromCurrency ? amount * rate.sellRate : amount / rate.buyRate;
     res.json({ fromCurrency, toCurrency, amount, rate: rate.sellRate, converted: Math.round(converted * 100) / 100, timestamp: new Date().toISOString() });
-  });
-  app.get("/api/fx/v1/stats", (_req: Request, res: Response) => {
-    res.json({ currencies: RATES.length, positions: POSITIONS.length, nostroAccounts: NOSTRO_ACCOUNTS.length,
-      totalUnrealizedPnl: POSITIONS.reduce((s, p) => s + p.unrealizedPnl, 0), dailyTradingVolume: 2500000000,
-      openOrders: 12, avgSpread: RATES.reduce((s, r) => s + r.spread, 0) / RATES.length });
-  });
+  }));
+  app.get("/api/fx/v1/stats", asyncRoute(async (_req: Request, res: Response) => {
+    const rates = await pgGuard(loadRates());
+    const positions = await pgGuard(loadPositions());
+    res.json({ currencies: rates.length, positions: positions.length, nostroAccounts: NOSTRO_ACCOUNTS.length,
+      totalUnrealizedPnl: positions.reduce((s, p) => s + p.unrealizedPnl, 0), dailyTradingVolume: 2500000000,
+      openOrders: 12, avgSpread: rates.reduce((s, r) => s + r.spread, 0) / rates.length });
+  }));
 }

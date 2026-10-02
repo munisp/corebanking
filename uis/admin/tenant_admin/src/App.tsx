@@ -204,6 +204,10 @@ const CorporateDocVerifyWorkspace = lazy(() => import("./pages/CorporateDocVerif
 const CorporateMonitoringWorkspace = lazy(() => import("./pages/CorporateMonitoringWorkspace"));
 const CorrespondentBankingWorkspace = lazy(() => import("./pages/CorrespondentBankingWorkspace"));
 const CreditBureauWorkspace = lazy(() => import("./pages/CreditBureauWorkspace"));
+const CreditOperationsWorkspace = lazy(() => import("./pages/CreditOperationsWorkspace"));
+const MerchantSettlementsWorkspace = lazy(() => import("./pages/MerchantSettlementsWorkspace"));
+const ClearingOpsWorkspace = lazy(() => import("./pages/ClearingOpsWorkspace"));
+const OpsPipelineWorkspace = lazy(() => import("./pages/OpsPipelineWorkspace"));
 const CreditFacilitiesWorkspace = lazy(() => import("./pages/CreditFacilitiesWorkspace"));
 const CreditRiskWorkspace = lazy(() => import("./pages/CreditRiskWorkspace"));
 const CreditScoringWorkspace = lazy(() => import("./pages/CreditScoringWorkspace"));
@@ -420,6 +424,7 @@ const TreasuryLiquidityWorkspace = lazy(() => import("./pages/TreasuryLiquidityW
 const TreasuryWorkspace = lazy(() => import("./pages/TreasuryWorkspace"));
 const TrustEstateWorkspace = lazy(() => import("./pages/TrustEstateWorkspace"));
 const TxnMonitoringRulesWorkspace = lazy(() => import("./pages/TxnMonitoringRulesWorkspace"));
+const TxnMonitoringCasesWorkspace = lazy(() => import("./pages/TxnMonitoringCasesWorkspace"));
 const TxnPatternAnalyzerWorkspace = lazy(() => import("./pages/TxnPatternAnalyzerWorkspace"));
 const TypologyDetectorWorkspace = lazy(() => import("./pages/TypologyDetectorWorkspace"));
 const UBOOwnershipGraphWorkspace = lazy(() => import("./pages/UBOOwnershipGraphWorkspace"));
@@ -855,6 +860,10 @@ function Router() {
           <Route path="/corporate-monitoring" component={CorporateMonitoringWorkspace} />
           <Route path="/correspondent-banking" component={CorrespondentBankingWorkspace} />
           <Route path="/credit-bureau" component={CreditBureauWorkspace} />
+          <Route path="/credit-operations" component={CreditOperationsWorkspace} />
+          <Route path="/merchant-settlements" component={MerchantSettlementsWorkspace} />
+          <Route path="/clearing-ops" component={ClearingOpsWorkspace} />
+          <Route path="/ops-pipeline" component={OpsPipelineWorkspace} />
           <Route path="/credit-facilities" component={CreditFacilitiesWorkspace} />
           <Route path="/credit-risk" component={CreditRiskWorkspace} />
           <Route path="/credit-scoring" component={CreditScoringWorkspace} />
@@ -1069,6 +1078,7 @@ function Router() {
           <Route path="/treasury" component={TreasuryWorkspace} />
           <Route path="/trust-estate" component={TrustEstateWorkspace} />
           <Route path="/txn-monitoring-rules" component={TxnMonitoringRulesWorkspace} />
+          <Route path="/txn-monitoring-cases" component={TxnMonitoringCasesWorkspace} />
           <Route path="/txn-pattern-analyzer" component={TxnPatternAnalyzerWorkspace} />
           <Route path="/typology-detector" component={TypologyDetectorWorkspace} />
           <Route path="/ubo-ownership-graph" component={UBOOwnershipGraphWorkspace} />

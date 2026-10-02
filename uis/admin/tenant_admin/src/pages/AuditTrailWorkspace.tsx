@@ -12,7 +12,7 @@ export default function AuditTrailWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/audit-trail/count")
+    fetch("/api/db/audit-trail/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

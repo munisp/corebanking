@@ -1,0 +1,241 @@
+// ============================================================================
+// Wave-12 B5-P1-D-A: workflow archetype schema FRAGMENT (Permify wave 2).
+// Merged into the canonical v2.perm by the integrator; kept in a separate
+// file so the canonical-schema owner (B5-P0-D1) and the kyc fragment owner
+// (B5-P0-D2) never share an edit surface with this batch. Syntax identical
+// to v2.perm; the `user` entity is declared in the canonical file and
+// referenced here by type only.
+//
+// Convention: every mutating handler in the workflow fleet checks
+//   subject = verified JWT identity, resource = <entity>:<domain-id>,
+//   permission = <entity>.<action> as defined below. Checks fail closed
+//   (Permify unreachable -> 502, denied -> 403) via permify_guard.go.
+// ============================================================================
+
+entity approval_flow {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity batch_aggregator {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity billing_orchestrator {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity e2e_orchestrator {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity eod_processor {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission pipeline = admin or operator
+  permission trigger = admin or operator
+}
+
+entity erpnext_bridge {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission coa_discovery = admin or operator
+  permission coa_sync = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity erpnext_integration_service {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission auto = admin or operator
+  permission auto_match = admin or operator
+  permission bulk = admin or operator
+  permission loan = admin or operator
+  permission lpo = admin or operator
+  permission manual = admin or operator
+  permission match = admin or operator
+  permission mortgage = admin or operator
+  permission payment = admin or operator
+  permission refresh = admin or operator
+  permission sync = admin or operator
+  permission test = admin or operator
+  permission token = admin or operator
+  permission transaction = admin or operator
+}
+
+entity maker_checker {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity pentest_orchestrator {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity salary_processing {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+}
+
+entity standing_orders {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission pause = admin or operator
+  permission resume = admin or operator
+  permission revoke = admin or operator
+}
+
+entity temporal_memoizer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity temporal_sagas {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}
+
+entity temporal_worker {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission view   = admin or operator or approver or auditor
+  permission create = admin or operator
+  permission update = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission validate = admin or operator
+}

@@ -12,7 +12,7 @@ export default function EmbeddedFinanceWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/billing-accounts/count")
+    fetch("/api/db/billing-accounts/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

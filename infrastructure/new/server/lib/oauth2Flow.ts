@@ -8,6 +8,7 @@
 import type { Express, Request, Response } from "express";
 import crypto from "crypto";
 import { logger } from "./logger";
+import { kvSetNX, kvGetJson, kvDel } from "./redisKv";
 
 const KEYCLOAK_URL = process.env.KEYCLOAK_URL || "http://localhost:8080";
 const KEYCLOAK_REALM = process.env.KEYCLOAK_REALM || "54bank";
@@ -17,8 +18,20 @@ const REDIRECT_URI = process.env.OAUTH2_REDIRECT_URI || "http://localhost:3000/a
 
 const oidcBase = `${KEYCLOAK_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect`;
 
-// In-memory PKCE + state storage (use Redis in production)
-const pendingFlows = new Map<string, { codeVerifier: string; redirectTo: string; expiresAt: number }>();
+// PKCE + state storage — redis-backed (W12 C3-P1-B2, c3-1035).
+// Key: oauth2:pkce:{state}, TTL 600s (preserving the previous 10-minute
+// in-memory expiresAt). PKCE verifiers now survive restarts and are visible to
+// every replica; previously a restart (or a different replica serving the
+// callback) invalidated in-flight logins with "State expired or invalid".
+// FAIL MODE: redis down => authorize/callback fail closed (503) — a PKCE
+// verifier that cannot be persisted or verified must not be bypassed.
+const PKCE_FLOW_TTL_SECONDS = 600; // 10 min
+
+interface PkceFlow {
+  codeVerifier: string;
+  redirectTo: string;
+  expiresAt: number;
+}
 
 function generatePKCE() {
   const verifier = crypto.randomBytes(32).toString("base64url");
@@ -26,26 +39,24 @@ function generatePKCE() {
   return { verifier, challenge };
 }
 
-// Cleanup expired PKCE flows
-setInterval(() => {
-  const now = Date.now();
-  pendingFlows.forEach((flow, key) => {
-    if (flow.expiresAt < now) pendingFlows.delete(key);
-  });
-}, 60_000);
-
 export function registerOAuth2Endpoints(app: Express) {
   // Step 1: Initiate OAuth2 Authorization Code flow
-  app.get("/api/auth/oauth2/authorize", (req: Request, res: Response) => {
+  app.get("/api/auth/oauth2/authorize", async (req: Request, res: Response) => {
     const state = crypto.randomBytes(16).toString("hex");
     const { verifier, challenge } = generatePKCE();
     const redirectTo = (req.query.redirect as string) || "/";
 
-    pendingFlows.set(state, {
-      codeVerifier: verifier,
-      redirectTo,
-      expiresAt: Date.now() + 10 * 60 * 1000, // 10 min
-    });
+    try {
+      await kvSetNX(`oauth2:pkce:${state}`, JSON.stringify({
+        codeVerifier: verifier,
+        redirectTo,
+        expiresAt: Date.now() + PKCE_FLOW_TTL_SECONDS * 1000,
+      } satisfies PkceFlow), PKCE_FLOW_TTL_SECONDS);
+    } catch (err) {
+      // FAIL CLOSED: cannot persist the PKCE verifier => cannot safely start the flow.
+      logger.error("[OAuth2] failed to persist PKCE state — failing closed", { error: String(err) });
+      return res.status(503).json({ error: "oauth2_state_unavailable", message: "SSO state store unreachable; cannot start login." });
+    }
 
     const params = new URLSearchParams({
       response_type: "code",
@@ -85,11 +96,18 @@ export function registerOAuth2Endpoints(app: Express) {
       return res.status(400).json({ error: "missing_params", message: "code and state required" });
     }
 
-    const flow = pendingFlows.get(state as string);
-    if (!flow) {
+    let flow: PkceFlow | null;
+    try {
+      flow = await kvGetJson<PkceFlow>(`oauth2:pkce:${state as string}`);
+    } catch (err) {
+      // FAIL CLOSED: cannot verify the PKCE state => reject the callback.
+      logger.error("[OAuth2] failed to read PKCE state — failing closed", { error: String(err) });
+      return res.status(503).json({ error: "oauth2_state_unavailable", message: "SSO state store unreachable; cannot complete login." });
+    }
+    if (!flow || flow.expiresAt < Date.now()) {
       return res.status(400).json({ error: "invalid_state", message: "State expired or invalid" });
     }
-    pendingFlows.delete(state as string);
+    await kvDel(`oauth2:pkce:${state as string}`).catch((err) => logger.warn("[OAuth2] PKCE state cleanup failed", { error: String(err) }));
 
     try {
       // Exchange authorization code for tokens

@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Mutex;
@@ -43,6 +44,10 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>) -
 
 async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    let permify_entity = body.get("id").and_then(|v| v.as_str())
+        .or_else(|| body.get("transactionRef").and_then(|v| v.as_str()))
+        .unwrap_or("wire-transfer-monitor");
+    if let Err(resp) = permify_check(&req, "monitoring_rule", permify_entity, "manage").await { return resp; }
     let mut records = state.records.lock().unwrap_or_else(|e| e.into_inner());
     let id = format!("REC-{:03}", records.len() + 1);
     let rec = WireTransferRecord {
@@ -262,6 +267,71 @@ fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
         .map(String::from)
 }
 
+// --- Permify authorization (W12-B5-P0-D3) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = X-Tenant-Id header or
+// PERMIFY_DEFAULT_TENANT, resource = domain entity id, permission per action
+// (schema: services/auth-service/schemas/permify/v2-kyc-compliance.fragment).
+// FAIL-CLOSED: Permify unreachable/non-200 => 503; denied => 403.
+// Canonical pattern: services/permify-authz-go/main.go:428 (REST check) and
+// services/auth-service/adapters/permify.py check_permission.
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    let subject = {
+        let ext = req.extensions();
+        ext.get::<VerifiedClaims>()
+            .and_then(|c| c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = req.headers().get("X-Tenant-Id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "9325".to_string());
@@ -280,44 +350,8 @@ async fn main() -> std::io::Result<()> {
     }).bind(format!("0.0.0.0:{}", port))?.run().await
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE payments SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("payments.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE payments SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("payments.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
-}
+// W12-B5-P0-D3: removed the generator-emitted update_record/delete_record
+// stubs that trailed this file. They were never registered in main() above
+// (unreachable dead code) and referenced a nonexistent CreateRequest type and
+// AppState.db field, so the crate did not compile. The only routed mutating
+// handler is create_record, now Permify-gated.

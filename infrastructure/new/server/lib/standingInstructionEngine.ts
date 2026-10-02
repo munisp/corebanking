@@ -1,7 +1,24 @@
 /**
  * Standing instruction engine — scheduled payments, recurring transfers,
  * sweep instructions, auto-debit mandates, payment reminders.
+ *
+ * W12-C3-P2-MLIB (c3-0995): the 'instructions' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `standing_instructions`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "standing_instructions";
+
+async function ensureInstructionsStore(): Promise<void> {
+  await ensureTables("ensureInstructionsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, INSTRUCTIONS_SEED, () => "");
+}
+
 
 export interface StandingInstruction {
   id: string;
@@ -26,7 +43,8 @@ export interface StandingInstruction {
   description: string;
 }
 
-const instructions: StandingInstruction[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const INSTRUCTIONS_SEED: StandingInstruction[]  = [
   { id: "SI-001", customerId: "CUST-001", customerName: "Aisha Mohammed", type: "recurring_transfer", sourceAccount: "5400001234", destinationAccount: "0123456789", destinationBank: "GTBank", amount: 150_000, currency: "NGN", frequency: "monthly", nextExecutionDate: "2026-06-01", lastExecutionDate: "2026-05-01", executionCount: 5, totalExecuted: 750_000, startDate: "2026-01-01", status: "active", description: "Monthly rent payment" },
   { id: "SI-002", customerId: "CUST-002", customerName: "Ibrahim Musa", type: "loan_repayment", sourceAccount: "5400005678", destinationAccount: "INTERNAL-LN-002", amount: 2_500_000, currency: "NGN", frequency: "monthly", nextExecutionDate: "2026-06-15", lastExecutionDate: "2026-05-15", executionCount: 8, totalExecuted: 20_000_000, maxExecutions: 36, startDate: "2025-10-15", status: "active", description: "Term loan EMI — 36 months" },
   { id: "SI-003", customerId: "CUST-010", customerName: "Pinnacle Holdings Ltd", type: "salary_payment", sourceAccount: "5400100200", destinationAccount: "BATCH-SALARY", amount: 85_000_000, currency: "NGN", frequency: "monthly", nextExecutionDate: "2026-05-28", lastExecutionDate: "2026-04-28", executionCount: 12, totalExecuted: 1_020_000_000, startDate: "2025-05-28", status: "active", description: "Monthly payroll — 450 employees" },
@@ -36,9 +54,12 @@ const instructions: StandingInstruction[] = [
   { id: "SI-007", customerId: "CUST-015", customerName: "Amara Okonkwo", type: "recurring_transfer", sourceAccount: "5400007890", destinationAccount: "2098765432", destinationBank: "Access Bank", amount: 50_000, currency: "NGN", frequency: "monthly", nextExecutionDate: "2026-05-10", lastExecutionDate: "2026-04-10", executionCount: 2, totalExecuted: 100_000, startDate: "2026-03-10", status: "failed", failureReason: "Insufficient funds — balance ₦32,400", description: "Monthly contribution to family fund" },
 ];
 
-export function getStandingInstructions() { return instructions; }
+export async function getStandingInstructions(): Promise<StandingInstruction[]> {
+  return pgGuard((async () => { await ensureInstructionsStore(); return storeList<StandingInstruction>(TABLE); })());
+}
 
-export function getStandingInstructionStats() {
+export async function getStandingInstructionStats() {
+  const instructions = await getStandingInstructions();
   const byType: Record<string, number> = {};
   const byFrequency: Record<string, number> = {};
   const byStatus: Record<string, number> = {};

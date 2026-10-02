@@ -6,7 +6,7 @@ import type {
   CreateAgentTransactionPayload,
 } from '../types/agentBanking';
 
-const BASE = '/agent-banking/v1/agent-banking';
+const BASE = '/agricultural/api/v1/agent-banking';
 
 export const agentBankingService = {
   list: (params: { page?: number; limit?: number; search?: string } = {}): Promise<AgentTransactionListResponse> =>

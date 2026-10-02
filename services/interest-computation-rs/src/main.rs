@@ -66,6 +66,11 @@ fn generate_accrual_schedule(principal: f64, rate: f64, days: u32, freq: &str) -
 
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use serde_json::json;
+use std::time::Instant;
+use actix_web::HttpMessage;
 
 static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
@@ -92,10 +97,32 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
 }
 
 
+// W12-RUSTFIX-2: domain request types synthesized from use sites below
+// (generator emitted handlers taking them but never the definitions; E0425).
+// Field types inferred from compute_* signatures (f64/u32) and as_deref() uses.
+#[derive(Debug, Deserialize)]
+struct InterestCalcRequest {
+    principal: f64,
+    rate_percent: f64,
+    tenor_days: u32,
+    #[serde(default)]
+    day_count_convention: Option<String>,
+    #[serde(default)]
+    compounding: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccrualSchedule {
+    account_id: String,
+    principal: f64,
+    rate: f64,
+    frequency: String,
+}
+
 async fn calculate_interest(req: actix_web::HttpRequest, body: web::Json<InterestCalcRequest>, state: web::Data<AppState>) -> HttpResponse {
     let _sanitized = sanitize_input("");
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let convention = body.day_count_convention.as_deref().unwrap_or("ACT/365");
     let day_basis = get_day_basis(convention);
     let compounding = body.compounding.as_deref().unwrap_or("simple");
@@ -117,14 +144,14 @@ async fn calculate_interest(req: actix_web::HttpRequest, body: web::Json<Interes
 
 async fn accrual_schedule(req: actix_web::HttpRequest, body: web::Json<AccrualSchedule>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let schedule = generate_accrual_schedule(body.principal, body.rate, 365, &body.frequency);
     HttpResponse::Ok().json(json!({"account_id": body.account_id, "schedule": schedule}))
 }
 
 async fn effective_rate(req: actix_web::HttpRequest, body: web::Json<InterestCalcRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let nominal = body.rate_percent / 100.0;
     let n = match body.compounding.as_deref().unwrap_or("monthly") {
         "daily" => 365.0, "monthly" => 12.0, "quarterly" => 4.0, "semi-annual" => 2.0, _ => 12.0,
@@ -137,8 +164,6 @@ async fn effective_rate(req: actix_web::HttpRequest, body: web::Json<InterestCal
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -353,7 +378,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -373,7 +398,7 @@ async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
@@ -541,20 +566,57 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:interest-computation-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:interest-computation-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -779,23 +841,33 @@ mod tests {
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "service_config", "update").await { return resp; } // W12-B5D1
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -804,19 +876,132 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "service_config", "delete").await { return resp; } // W12-B5D1
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }
+
+// W12-RUSTFIX-2: synthesized canonical handlers — route registrations in main()
+// referenced metrics/list_records/create_record/get_record but the generator
+// never emitted them (baseline did not compile). Fleet-canonical shape against
+// this service's own service_records table + outbox (same pattern as
+// W12-RUSTFIX's synthesized handlers, e.g. fx-rates-engine-rs, minus permify
+// wiring which is not part of this crate's baseline).
+async fn metrics() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "service": "interest-computation-rs",
+        "requests_total": _REQ_COUNT.load(AtomicOrdering::Relaxed),
+        "errors_total": _ERR_COUNT.load(AtomicOrdering::Relaxed),
+    }))
+}
+
+async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
+    let offset = (page - 1) * limit;
+    match sqlx::query(
+        "SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+    )
+    .bind("interest_computation_rs")
+    .bind(limit as i64)
+    .bind(offset as i64)
+    .fetch_all(&state.db)
+    .await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows.iter().map(|r| {
+                json!({
+                    "id": r.get::<String, _>(0),
+                    "service": r.get::<String, _>(1),
+                    "type": r.get::<String, _>(2),
+                    "status": r.get::<String, _>(3),
+                    "data": r.get::<serde_json::Value, _>(4),
+                })
+            }).collect();
+            let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_records WHERE service = $1")
+                .bind("interest_computation_rs").fetch_one(&state.db).await.unwrap_or(0);
+            HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "database"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let tenant_id = body.tenant_id.clone().unwrap_or_else(|| "platform".to_string());
+    let id = Uuid::new_v4().to_string();
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    let result = sqlx::query("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)")
+        .bind(&id)
+        .bind("interest_computation_rs")
+        .bind("record")
+        .bind(&status)
+        .bind(serde_json::json!({"tenant_id": &tenant_id}))
+        .execute(&mut *tx)
+        .await;
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status, "tenant_id": &tenant_id});
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_records.created")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
+            HttpResponse::Created().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_records WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<String, _>("id"),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

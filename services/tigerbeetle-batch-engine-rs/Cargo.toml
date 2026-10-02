@@ -10,7 +10,12 @@ otelkit = { path = "../../shared/otel/rust", features = ["actix-web"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 tokio-postgres = { version = "0.7.13", features = ["default"] }
-sqlx = { version = "0.8.3", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+sqlx = { version = "0.8.3", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+# Wave-12 (C3-P0-B5): redis-backed sliding-window rate limiter (replaces the
+# process-local _RL_TOKENS/_RL_LAST atomics). deadpool-redis re-exports the
+# matching redis crate (deadpool_redis::redis), so versions cannot drift.
+deadpool-redis = { version = "0.22.1", features = ["rt_tokio_1"] }
+redis = { version = "0.32.7", features = ["tokio-comp", "script"] }
 actix-web = "4.9.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

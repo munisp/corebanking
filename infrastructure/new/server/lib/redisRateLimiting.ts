@@ -4,6 +4,8 @@
  * with real-time monitoring and automatic throttling.
  */
 import type { Express, Request, Response } from "express";
+import { logger } from "./logger";
+import { getRedis, kvGetJson, kvGetJsonSliding, kvSetNX } from "./redisKv";
 
 interface RateLimitTier {
   name: string;
@@ -61,30 +63,104 @@ const WINDOWS: RateLimitWindow[] = [
   { tenantId: "TEN-MUTUAL-MFB", endpoint: "/api/loans", windowStart: "2026-05-09T15:00:00Z", windowEnd: "2026-05-09T15:01:00Z", requestCount: 85, limit: 1000, remaining: 915, resetAt: "2026-05-09T15:01:00Z" },
 ];
 
+// W12 C3-P1-B2 (c3-0969/c3-0970): violation and window state is redis-backed.
+// Keys (register patterns): ratelimit:violations:{subject} and
+// ratelimit:windows:{subject} (subject = violation id / tenantId), TTL 60s
+// sliding for windows (they model the current limiter window) and 24h for
+// violation records. Seed records are inserted once with SET NX; index sets
+// ratelimit:violations:index / ratelimit:windows:index track keys for listing.
+// State now survives restarts and is consistent across replicas.
+// FAIL MODE: these are monitoring reads — on redis outage endpoints return
+// 503 (no fabricated in-memory numbers).
+const WINDOW_TTL_SECONDS = 60;
+const VIOLATION_TTL_SECONDS = 24 * 3600;
+const VIOLATIONS_INDEX = "ratelimit:violations:index";
+const WINDOWS_INDEX = "ratelimit:windows:index";
+
+async function seedRateLimitState(): Promise<void> {
+  for (const v of VIOLATIONS) {
+    try {
+      const key = `ratelimit:violations:${v.id}`;
+      if (await kvSetNX(key, JSON.stringify(v), VIOLATION_TTL_SECONDS)) {
+        await getRedis().sadd(VIOLATIONS_INDEX, key);
+      }
+    } catch (err) {
+      logger.warn("[RateLimit] violation seed failed", { error: String(err), id: v.id });
+    }
+  }
+  for (const w of WINDOWS) {
+    try {
+      const key = `ratelimit:windows:${w.tenantId}`;
+      if (await kvSetNX(key, JSON.stringify(w), WINDOW_TTL_SECONDS)) {
+        await getRedis().sadd(WINDOWS_INDEX, key);
+      }
+    } catch (err) {
+      logger.warn("[RateLimit] window seed failed", { error: String(err), tenantId: w.tenantId });
+    }
+  }
+}
+
+async function readIndex<T>(indexKey: string, slidingTtlSeconds?: number): Promise<T[]> {
+  const keys = await getRedis().smembers(indexKey);
+  const items: T[] = [];
+  for (const key of keys) {
+    const item = slidingTtlSeconds
+      ? await kvGetJsonSliding<T>(key, slidingTtlSeconds)
+      : await kvGetJson<T>(key);
+    if (item) items.push(item);
+    else await getRedis().srem(indexKey, key); // prune expired
+  }
+  return items;
+}
+
 export function registerRedisRateLimiting(app: Express) {
+  // Seed once at registration (idempotent: SET NX + SADD).
+  void seedRateLimitState().catch((err) => logger.warn("[RateLimit] seed error", { error: String(err) }));
+
   app.get("/api/rate-limits/v1/tiers", (_req: Request, res: Response) => {
     res.json({ items: TIERS, total: TIERS.length });
   });
-  app.get("/api/rate-limits/v1/violations", (_req: Request, res: Response) => {
-    res.json({ items: VIOLATIONS, total: VIOLATIONS.length });
+  app.get("/api/rate-limits/v1/violations", async (_req: Request, res: Response) => {
+    try {
+      const items = await readIndex<RateLimitViolation>(VIOLATIONS_INDEX);
+      res.json({ items, total: items.length });
+    } catch (err) {
+      res.status(503).json({ error: "Rate-limit state unavailable", code: "RATELIMIT_STATE_UNAVAILABLE" });
+    }
   });
-  app.get("/api/rate-limits/v1/windows", (_req: Request, res: Response) => {
-    res.json({ items: WINDOWS, total: WINDOWS.length });
+  app.get("/api/rate-limits/v1/windows", async (_req: Request, res: Response) => {
+    try {
+      const items = await readIndex<RateLimitWindow>(WINDOWS_INDEX, WINDOW_TTL_SECONDS);
+      res.json({ items, total: items.length });
+    } catch (err) {
+      res.status(503).json({ error: "Rate-limit state unavailable", code: "RATELIMIT_STATE_UNAVAILABLE" });
+    }
   });
-  app.get("/api/rate-limits/v1/check/:tenantId", (req: Request, res: Response) => {
+  app.get("/api/rate-limits/v1/check/:tenantId", async (req: Request, res: Response) => {
     const tid = req.params.tenantId;
     const tier = TIERS.find((t) => t.tenants.includes(tid));
-    const window = WINDOWS.find((w) => w.tenantId === tid);
+    let window: RateLimitWindow | null = null;
+    try {
+      window = await kvGetJsonSliding<RateLimitWindow>(`ratelimit:windows:${tid}`, WINDOW_TTL_SECONDS);
+    } catch (err) {
+      return res.status(503).json({ error: "Rate-limit state unavailable", code: "RATELIMIT_STATE_UNAVAILABLE" });
+    }
     res.json({ tenantId: tid, tier: tier?.name ?? "sandbox", remaining: window?.remaining ?? tier?.requestsPerMinute ?? 100, limit: tier?.requestsPerMinute ?? 100, resetAt: window?.resetAt ?? new Date(Date.now() + 60000).toISOString() });
   });
-  app.get("/api/rate-limits/v1/stats", (_req: Request, res: Response) => {
-    res.json({
-      totalTiers: TIERS.length, totalViolationsToday: VIOLATIONS.length,
-      throttled: VIOLATIONS.filter((v) => v.action === "throttled").length,
-      blocked: VIOLATIONS.filter((v) => v.action === "blocked").length,
-      activeWindows: WINDOWS.length,
-      redisLatencyMs: 0.8, slidingWindowPrecision: "1s",
-      topEndpoints: ["/api/transfers", "/api/accounts", "/api/payments"],
-    });
+  app.get("/api/rate-limits/v1/stats", async (_req: Request, res: Response) => {
+    try {
+      const violations = await readIndex<RateLimitViolation>(VIOLATIONS_INDEX);
+      const windows = await readIndex<RateLimitWindow>(WINDOWS_INDEX, WINDOW_TTL_SECONDS);
+      res.json({
+        totalTiers: TIERS.length, totalViolationsToday: violations.length,
+        throttled: violations.filter((v) => v.action === "throttled").length,
+        blocked: violations.filter((v) => v.action === "blocked").length,
+        activeWindows: windows.length,
+        redisLatencyMs: 0.8, slidingWindowPrecision: "1s",
+        topEndpoints: ["/api/transfers", "/api/accounts", "/api/payments"],
+      });
+    } catch (err) {
+      res.status(503).json({ error: "Rate-limit state unavailable", code: "RATELIMIT_STATE_UNAVAILABLE" });
+    }
   });
 }

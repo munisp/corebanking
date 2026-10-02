@@ -4,6 +4,7 @@ Production-ready implementation with failover, caching, and rate aggregation
 """
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from permify_guard import require_permify
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -791,7 +792,7 @@ class ExchangeRequest(BaseModel):
     idempotency_key: Optional[str] = None
     margin_percent: Optional[Decimal] = Decimal("0")
 
-@app.post("/api/v1/fx/exchange")
+@app.post("/api/v1/fx/exchange", dependencies=[Depends(require_permify("fx_conversion", "convert"))])
 async def exchange_currency(req: ExchangeRequest, db=Depends(lambda: db_pool)):
     """Execute currency exchange with aggregated rate"""
     

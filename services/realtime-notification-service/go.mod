@@ -1,3 +1,5 @@
 module github.com/54link-dev/platform/services/realtime-notification-service
 
-go 1.23.0
+go 1.22
+
+require github.com/lib/pq v1.10.9

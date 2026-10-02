@@ -3,7 +3,7 @@ Complete Fraud Detection Service - ML-based fraud scoring, pattern detection, re
 Production-ready implementation with comprehensive fraud prevention
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks, Header
+from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from audit_middleware import AuditMiddleware
 from pydantic import BaseModel
@@ -27,6 +27,11 @@ except ImportError:
     LakehousePublisher = None
 
 from rust_risk_evaluator import build_risk_input, evaluate_risk, initialize_cli
+
+# W12 B5-P1-F: real OpenSearch search for fraud alerts / blocked entities
+# (replaces ILIKE substring scans). Stdlib-only client; sync calls are run
+# via asyncio.to_thread. Import is side-effect free (env-only).
+import opensearch_search as _os_search
 
 app = FastAPI(
     title="54link-dev Fraud Detection Service",
@@ -245,6 +250,69 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
 
 
 app.add_middleware(JWTAuthMiddleware)
+# --- Permify authorization (W12-B5-P0-D2) ---
+# Every mutating handler performs a REAL Permify permission check AFTER
+# JWTAuthMiddleware has authenticated the caller. Subject = verified JWT sub,
+# tenant = verified tenant claim, resource = domain entity id, permission per
+# action (schema entities: services/auth-service/schemas/permify/
+# v2-kyc-compliance.fragment). FAIL-CLOSED: Permify unreachable/non-200 => 503;
+# denied => 403. Canonical pattern: services/auth-service/adapters/permify.py
+# check_permission (REST /v1/tenants/{tenant}/permissions/check).
+import logging as _permify_logging
+import json as _permify_json
+
+import requests as _permify_requests
+
+
+def _permify_http_post(url, payload):
+    """POST a Permify check; returns (status, json_body) or None on transport error."""
+    try:
+        resp = _permify_requests.post(url, json=payload, timeout=5)
+        try:
+            return resp.status_code, resp.json()
+        except Exception:
+            return resp.status_code, None
+    except Exception as exc:
+        _permify_logger.error("permify check unreachable: %s", exc)
+        return None
+
+_PERMIFY_URL = os.getenv("PERMIFY_URL", "http://permify:3476").rstrip("/")
+_PERMIFY_DEFAULT_TENANT = os.getenv("PERMIFY_DEFAULT_TENANT", "bpmgd")
+_permify_logger = _permify_logging.getLogger(__name__)
+
+
+def permify_authorize(request, entity_type, entity_id, permission):
+    """Enforce <permission> on entity_type:entity_id for the JWT-verified caller.
+
+    Raises HTTPException(403) on denial and HTTPException(503) when Permify is
+    unreachable or errors (fail-closed). Returns True when allowed.
+    """
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    subject = claims.get("sub") or claims.get("keycloak_id") or ""
+    tenant_id = claims.get("tenant_id") or claims.get("tenant") or _PERMIFY_DEFAULT_TENANT
+    entity_id = str(entity_id or "")
+    if not subject or not entity_id:
+        raise HTTPException(status_code=403, detail="authorization context incomplete")
+    payload = {
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    }
+    url = f"{_PERMIFY_URL}/v1/tenants/{tenant_id}/permissions/check"
+    resp = _permify_http_post(url, payload)
+    if resp is None:
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify unreachable (fail-closed)")
+    status, body = resp
+    if status != 200:
+        _permify_logger.error("permify check %s on %s:%s http=%s", permission, entity_type, entity_id, status)
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify check failed (fail-closed)")
+    can = (body or {}).get("can")
+    allowed = can == "CHECK_RESULT_ALLOWED" or can is True
+    if not allowed:
+        raise HTTPException(status_code=403, detail=f"permify: {permission} denied on {entity_type}:{entity_id}")
+    return True
+
 
 
 allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "https://app.54link-dev.internal,https://admin.54link-dev.internal,https://pwa.54link-dev.internal").split(",") if origin.strip()]
@@ -494,9 +562,97 @@ async def startup():
         """)
 
         print("Fraud detection service started successfully")
+
+        # W12 B5-P1-F: backfill the OpenSearch fraud-alerts / blocked-entities
+        # indices from Postgres (source of truth) in the background. Failure
+        # is not fatal: search endpoints lazily re-sync and fail closed (503)
+        # when a search is requested and the cluster is unreachable.
+        asyncio.create_task(_boot_opensearch_sync())
     except Exception as exc:
         print(f"WARNING: DB initialisation failed: {exc}", file=sys.stderr)
         print("Service will start without DB — endpoints will return 503 until DB is reachable", file=sys.stderr)
+
+
+# ── W12 B5-P1-F: OpenSearch fraud-alerts / blocked-entities sync ──
+_os_sync_state: dict = {"synced_at": None, "alerts": 0, "blocked": 0}
+_os_sync_lock = asyncio.Lock()
+
+
+async def sync_fraud_indices(force: bool = False) -> dict:
+    """Bulk-index real fraud_alerts / blocked_entities rows into OpenSearch.
+
+    Source of truth: the Postgres tables (the exact data the retired ILIKE
+    queries read). Idempotent via natural _ids (alert_id;
+    tenant:entity_type:entity_id). Runs once per process unless forced
+    (POST /api/v1/fraud/opensearch/reindex). Raises on cluster failure."""
+    if not force and _os_sync_state["synced_at"]:
+        return {"status": "already_synced",
+                "alerts": _os_sync_state["alerts"],
+                "blocked": _os_sync_state["blocked"],
+                "syncedAt": _os_sync_state["synced_at"].isoformat()}
+    async with _os_sync_lock:
+        if not force and _os_sync_state["synced_at"]:
+            return {"status": "already_synced",
+                    "alerts": _os_sync_state["alerts"],
+                    "blocked": _os_sync_state["blocked"],
+                    "syncedAt": _os_sync_state["synced_at"].isoformat()}
+        if not db_pool:
+            raise _os_search.OpenSearchUnavailable(
+                "database pool unavailable — cannot read source tables for sync")
+        await asyncio.to_thread(_os_search.ensure_index, _os_search.ALERTS_INDEX)
+        await asyncio.to_thread(_os_search.ensure_index, _os_search.BLOCKED_INDEX)
+        async with db_pool.acquire() as conn:
+            alert_rows = await conn.fetch(
+                "SELECT alert_id, tenant_id, customer_id, alert_type, severity, "
+                "description, related_entities, status, assigned_to, "
+                "resolution_notes, created_at, resolved_at FROM fraud_alerts")
+            blocked_rows = await conn.fetch(
+                "SELECT entity_id, entity_type, tenant_id, reason, blocked_by, "
+                "blocked_until, is_permanent, created_at FROM blocked_entities")
+        alert_docs = [_os_search.alert_doc(
+            r["alert_id"], r["tenant_id"], r["customer_id"], r["alert_type"],
+            r["severity"], r["description"], r["related_entities"], r["status"],
+            r["assigned_to"], r["resolution_notes"], r["created_at"], r["resolved_at"])
+            for r in alert_rows]
+        blocked_docs = [_os_search.blocked_doc(
+            r["entity_id"], r["entity_type"], r["tenant_id"], r["reason"],
+            r["blocked_by"], r["blocked_until"], r["is_permanent"], r["created_at"])
+            for r in blocked_rows]
+        if alert_docs:
+            await asyncio.to_thread(
+                _os_search.bulk_index, _os_search.ALERTS_INDEX, alert_docs)
+        if blocked_docs:
+            await asyncio.to_thread(
+                _os_search.bulk_index, _os_search.BLOCKED_INDEX, blocked_docs)
+        _os_sync_state["synced_at"] = datetime.now()
+        _os_sync_state["alerts"] = len(alert_docs)
+        _os_sync_state["blocked"] = len(blocked_docs)
+        return {"status": "synced", "alerts": len(alert_docs),
+                "blocked": len(blocked_docs),
+                "syncedAt": _os_sync_state["synced_at"].isoformat()}
+
+
+async def _ensure_fraud_indices_synced() -> None:
+    if not _os_sync_state["synced_at"]:
+        await sync_fraud_indices()
+
+
+async def _boot_opensearch_sync():
+    try:
+        print(f"[fraud-service] opensearch sync: {await sync_fraud_indices()}")
+    except Exception as e:
+        print(f"[fraud-service] opensearch boot sync deferred: {e}", file=sys.stderr)
+
+
+@app.post("/api/v1/fraud/opensearch/reindex")
+async def reindex_fraud_opensearch():
+    """W12 B5-P1-F admin endpoint: force a full fraud_alerts + blocked_entities
+    -> OpenSearch resync (idempotent, natural _id). Fail closed: 503 when the
+    cluster or the source tables are unavailable."""
+    try:
+        return await sync_fraud_indices(force=True)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"fraud opensearch reindex failed: {e}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -506,7 +662,17 @@ async def shutdown():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "fraud-service"}
+    """W12 B5-P1-F: report REAL OpenSearch cluster reachability (alert/blocked
+    search depends on it) instead of a static payload."""
+    os_ok, os_detail = await asyncio.to_thread(_os_search.ping)
+    return {
+        "status": "healthy" if os_ok else "degraded",
+        "service": "fraud-service",
+        "components": {
+            "opensearch": {"status": "connected" if os_ok else "unavailable",
+                           **({"detail": os_detail} if os_detail else {})},
+        },
+    }
 
 @app.get("/ready")
 async def readiness_check():
@@ -515,11 +681,13 @@ async def readiness_check():
 # Fraud Check Endpoints
 @app.post("/api/v1/fraud/check")
 async def check_transaction(
+    request: Request,
     check: TransactionCheck,
     background_tasks: BackgroundTasks,
     db=Depends(lambda: db_pool)
 ):
     """Perform real-time fraud check on transaction"""
+    permify_authorize(request, "fraud_case", check.transaction_id, "score")
     start_time = datetime.now()
     check_id = f"FRD{int(start_time.timestamp())}"
     
@@ -675,7 +843,26 @@ async def check_transaction(
                     "check_id": check_id,
                     "indicators": fraud_indicators
                 }))
-        
+
+            # W12 B5-P1-F: dual-write the alert into the fraud-alerts
+            # OpenSearch index in the same flow (natural _id = alert_id).
+            # Postgres stays the source of truth; a failed index write is
+            # logged and backfilled by the boot sync / reindex endpoint.
+            try:
+                doc_id, doc = _os_search.alert_doc(
+                    alert_id, check.tenant_id, check.customer_id,
+                    "high_risk_transaction", risk_level,
+                    f"High-risk transaction detected (score: {fraud_score})",
+                    {"transaction_id": check.transaction_id,
+                     "check_id": check_id, "indicators": fraud_indicators},
+                    "open", created_at=datetime.now())
+                await asyncio.to_thread(_os_search.ensure_index, _os_search.ALERTS_INDEX)
+                await asyncio.to_thread(
+                    _os_search.index_doc, _os_search.ALERTS_INDEX, doc_id, doc)
+            except Exception as _os_exc:
+                print(f"[fraud-service] alert dual-write to opensearch failed "
+                      f"(resync will backfill): {_os_exc}", file=sys.stderr)
+
         # Update ML features in background
         background_tasks.add_task(update_ml_features, check.customer_id, check)
 
@@ -791,6 +978,7 @@ async def get_transaction_checks(
 
 @app.post("/api/v1/fraud/check/{check_id}/decide")
 async def make_fraud_decision(
+    request: Request,
     check_id: str,
     decision: ActionType,
     decided_by: str,
@@ -798,6 +986,7 @@ async def make_fraud_decision(
     db=Depends(lambda: db_pool)
 ):
     """Make final decision on fraud check"""
+    permify_authorize(request, "fraud_case", check_id, "decide")
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE fraud_checks
@@ -830,10 +1019,12 @@ async def make_fraud_decision(
 # Fraud Rules Endpoints
 @app.post("/api/v1/fraud/rules")
 async def create_fraud_rule(
+    request: Request,
     rule: FraudRule,
     db=Depends(lambda: db_pool)
 ):
     """Create fraud detection rule"""
+    permify_authorize(request, "fraud_rule", rule.tenant_id, "manage")
     rule_id = f"FRDR{int(datetime.now().timestamp())}"
     
     async with db.acquire() as conn:
@@ -934,10 +1125,12 @@ async def list_card_fraud_rules(
 
 @app.post("/api/v1/fraud/rules/card")
 async def create_card_fraud_rule(
+    request: Request,
     rule: CardFraudRulePayload,
     db=Depends(lambda: db_pool),
     tenant_id: str = Query(..., alias="tenantId"),
 ):
+    permify_authorize(request, "fraud_rule", tenant_id, "manage")
     rule_id = f"CFR{int(datetime.now().timestamp())}"
     async with db.acquire() as conn:
         await conn.execute(
@@ -955,11 +1148,13 @@ async def create_card_fraud_rule(
 
 @app.put("/api/v1/fraud/rules/card/{rule_id}")
 async def update_card_fraud_rule(
+    request: Request,
     rule_id: str,
     rule: CardFraudRulePayload,
     db=Depends(lambda: db_pool),
     tenant_id: str = Query(..., alias="tenantId"),
 ):
+    permify_authorize(request, "fraud_rule", rule_id, "manage")
     async with db.acquire() as conn:
         row = await conn.fetchrow(
             """UPDATE fraud_rules
@@ -976,10 +1171,12 @@ async def update_card_fraud_rule(
 
 @app.delete("/api/v1/fraud/rules/card/{rule_id}")
 async def delete_card_fraud_rule(
+    request: Request,
     rule_id: str,
     db=Depends(lambda: db_pool),
     tenant_id: str = Query(..., alias="tenantId"),
 ):
+    permify_authorize(request, "fraud_rule", rule_id, "manage")
     async with db.acquire() as conn:
         await conn.execute(
             "DELETE FROM fraud_rules WHERE rule_id=$1 AND tenant_id=$2",
@@ -1012,11 +1209,13 @@ async def list_fraud_rules(
 
 @app.post("/api/v1/fraud/rules/{rule_id}/toggle")
 async def toggle_fraud_rule(
+    request: Request,
     rule_id: str,
     is_active: bool,
     db=Depends(lambda: db_pool)
 ):
     """Toggle fraud rule active status"""
+    permify_authorize(request, "fraud_rule", rule_id, "toggle")
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE fraud_rules
@@ -1047,10 +1246,12 @@ async def toggle_fraud_rule(
 # Device Management Endpoints
 @app.post("/api/v1/fraud/devices/register")
 async def register_device(
+    request: Request,
     device: DeviceFingerprint,
     db=Depends(lambda: db_pool)
 ):
     """Register device fingerprint"""
+    permify_authorize(request, "fraud_device", device.device_id, "register")
     fingerprint_id = f"DEV{int(datetime.now().timestamp())}"
     
     async with db.acquire() as conn:
@@ -1138,11 +1339,13 @@ async def list_customer_devices(
 
 @app.post("/api/v1/fraud/devices/{fingerprint_id}/trust")
 async def trust_device(
+    request: Request,
     fingerprint_id: str,
     is_trusted: bool,
     db=Depends(lambda: db_pool)
 ):
     """Mark device as trusted/untrusted"""
+    permify_authorize(request, "fraud_device", fingerprint_id, "trust")
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE device_fingerprints
@@ -1171,28 +1374,68 @@ async def list_fraud_alerts(
     limit: int = Query(20, ge=1, le=100),
     db=Depends(lambda: db_pool)
 ):
-    """List fraud alerts"""
+    """List fraud alerts.
+
+    W12 B5-P1-F: the `search` parameter is served by a real OpenSearch query
+    (multi-field match + fuzziness=AUTO over customer_id / description /
+    alert_type, tenant-filtered, SCREENING_MIN_SCORE threshold) instead of
+    ILIKE substring scans. Search returns relevance-ordered alert_ids which
+    are hydrated from Postgres (source of truth), so the response contract is
+    unchanged. Fail closed: 503 when search is requested and the cluster is
+    unreachable — never a silent unfiltered/substring fallback."""
+    if search:
+        try:
+            await _ensure_fraud_indices_synced()
+            alert_ids = await asyncio.to_thread(
+                _os_search.search_alert_ids, tenant_id, search)
+        except _os_search.OpenSearchUnavailable as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"fraud alert search backend unavailable: {e}")
+        if not alert_ids:
+            return {"tenant_id": tenant_id, "alerts": [], "total": 0}
+
+        query = "SELECT * FROM fraud_alerts WHERE tenant_id = $1 AND alert_id = ANY($2::varchar[])"
+        params: list = [tenant_id, alert_ids]
+        param_count = 3
+        if status:
+            query += f" AND status = ${param_count}"
+            params.append(status)
+            param_count += 1
+        if severity:
+            query += f" AND severity = ${param_count}"
+            params.append(severity)
+            param_count += 1
+        async with db.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+        # Relevance order from OpenSearch, then the same page contract
+        # (skip/limit, total = page size) as the SQL path.
+        order = {aid: i for i, aid in enumerate(alert_ids)}
+        rows = sorted(rows, key=lambda r: order.get(r["alert_id"], len(order)))
+        page = rows[skip:skip + limit]
+        return {
+            "tenant_id": tenant_id,
+            "alerts": [dict(row) for row in page],
+            "total": len(page)
+        }
+
     query = "SELECT * FROM fraud_alerts WHERE tenant_id = $1"
     params = [tenant_id]
     param_count = 2
-    
+
     if status:
         query += f" AND status = ${param_count}"
         params.append(status)
         param_count += 1
-    
+
     if severity:
         query += f" AND severity = ${param_count}"
         params.append(severity)
         param_count += 1
-    if search:
-        query += f" AND (customer_id ILIKE ${param_count} OR description ILIKE ${param_count} OR alert_type ILIKE ${param_count})"
-        params.append(f"%{search}%")
-        param_count += 1
-    
+
     query += f" ORDER BY created_at DESC LIMIT ${param_count} OFFSET ${param_count + 1}"
     params.extend([limit, skip])
-    
+
     async with db.acquire() as conn:
         rows = await conn.fetch(query, *params)
         return {
@@ -1203,12 +1446,14 @@ async def list_fraud_alerts(
 
 @app.post("/api/v1/fraud/alerts/{alert_id}/resolve")
 async def resolve_fraud_alert(
+    request: Request,
     alert_id: str,
     assigned_to: str,
     resolution_notes: str,
     db=Depends(lambda: db_pool)
 ):
     """Resolve fraud alert"""
+    permify_authorize(request, "fraud_case", alert_id, "resolve")
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE fraud_alerts
@@ -1217,15 +1462,30 @@ async def resolve_fraud_alert(
                 resolution_notes = $2,
                 resolved_at = CURRENT_TIMESTAMP
             WHERE alert_id = $3 AND status = 'open'
-            RETURNING alert_id
+            RETURNING alert_id, tenant_id, customer_id, alert_type, severity, description, related_entities, created_at
         """, assigned_to, resolution_notes, alert_id)
-        
+
         if not row:
             raise HTTPException(
                 status_code=400,
                 detail="Alert not found or already resolved"
             )
-        
+
+        # W12 B5-P1-F: dual-write the resolved status into the fraud-alerts
+        # index in the same flow (natural _id = alert_id; upsert semantics).
+        try:
+            resolved_at = datetime.now()
+            doc_id, doc = _os_search.alert_doc(
+                alert_id, row["tenant_id"], row["customer_id"], row["alert_type"],
+                row["severity"], row["description"], row["related_entities"],
+                "resolved", assigned_to, resolution_notes,
+                row["created_at"], resolved_at)
+            await asyncio.to_thread(
+                _os_search.index_doc, _os_search.ALERTS_INDEX, doc_id, doc)
+        except Exception as _os_exc:
+            print(f"[fraud-service] alert-resolve dual-write to opensearch "
+                  f"failed (resync will backfill): {_os_exc}", file=sys.stderr)
+
         return {
             "status": "resolved",
             "alert_id": alert_id,
@@ -1236,6 +1496,7 @@ async def resolve_fraud_alert(
 # Blocked Entities Endpoints
 @app.post("/api/v1/fraud/block")
 async def block_entity(
+    request: Request,
     entity_id: str,
     entity_type: str,
     tenant_id: str,
@@ -1245,6 +1506,7 @@ async def block_entity(
     db=Depends(lambda: db_pool)
 ):
     """Block entity (customer, IP, device, etc.)"""
+    permify_authorize(request, "fraud_case", entity_id, "block")
     blocked_until = None
     is_permanent = True
     
@@ -1260,6 +1522,21 @@ async def block_entity(
             ) VALUES ($1, $2, $3, $4, $5, $6, $7)
         """, entity_id, entity_type, tenant_id, reason, blocked_by,
             blocked_until, is_permanent)
+
+    # W12 B5-P1-F: dual-write into the fraud-blocked-entities OpenSearch
+    # index in the same flow (natural _id = tenant:entity_type:entity_id).
+    # Postgres stays the source of truth; failures are logged and backfilled
+    # by the boot sync / reindex endpoint.
+    try:
+        doc_id, doc = _os_search.blocked_doc(
+            entity_id, entity_type, tenant_id, reason, blocked_by,
+            blocked_until, is_permanent, datetime.now())
+        await asyncio.to_thread(_os_search.ensure_index, _os_search.BLOCKED_INDEX)
+        await asyncio.to_thread(
+            _os_search.index_doc, _os_search.BLOCKED_INDEX, doc_id, doc)
+    except Exception as _os_exc:
+        print(f"[fraud-service] blocked-entity dual-write to opensearch "
+              f"failed (resync will backfill): {_os_exc}", file=sys.stderr)
 
     publish_lakehouse_event(
         "ENTITY_BLOCKED",
@@ -1323,16 +1600,44 @@ async def list_blocked_entities(
     search: Optional[str] = None,
     db=Depends(lambda: db_pool)
 ):
+    """List blocked entities.
+
+    W12 B5-P1-F: the `search` parameter is served by a real OpenSearch query
+    (match + fuzziness=AUTO on entity_id, tenant-filtered) instead of an
+    ILIKE substring scan; hits are hydrated from Postgres (source of truth)
+    preserving the response contract. Fail closed: 503 when search is
+    requested and the cluster is unreachable."""
+    if search:
+        try:
+            await _ensure_fraud_indices_synced()
+            keys = await asyncio.to_thread(
+                _os_search.search_blocked_entity_keys, tenant_id, search)
+        except _os_search.OpenSearchUnavailable as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"blocked-entity search backend unavailable: {e}")
+        if not keys:
+            return {"tenant_id": tenant_id, "blocked_entities": [], "total": 0}
+        if entity_type:
+            keys = [k for k in keys if k[0] == entity_type]
+        keyset = set(keys)
+        order = {k: i for i, k in enumerate(keys)}
+        async with db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM blocked_entities WHERE tenant_id = $1", tenant_id)
+        rows = [r for r in rows
+                if (r["entity_type"], r["entity_id"]) in keyset]
+        rows.sort(key=lambda r: order.get((r["entity_type"], r["entity_id"]), len(order)))
+        return {"tenant_id": tenant_id,
+                "blocked_entities": [dict(row) for row in rows],
+                "total": len(rows)}
+
     query = "SELECT * FROM blocked_entities WHERE tenant_id = $1"
     params = [tenant_id]
     param_count = 2
     if entity_type:
         query += f" AND entity_type = ${param_count}"
         params.append(entity_type)
-        param_count += 1
-    if search:
-        query += f" AND entity_id ILIKE ${param_count}"
-        params.append(f"%{search}%")
         param_count += 1
     query += " ORDER BY created_at DESC"
     async with db.acquire() as conn:
@@ -1341,21 +1646,39 @@ async def list_blocked_entities(
 
 @app.post("/api/v1/fraud/unblock")
 async def unblock_entity(
+    request: Request,
     entity_id: str,
     entity_type: str,
     unblocked_by: str,
     db=Depends(lambda: db_pool)
 ):
     """Unblock entity"""
+    permify_authorize(request, "fraud_case", entity_id, "block")
+    unblocked_at = datetime.now()
     async with db.acquire() as conn:
         # Set blocked_until to now to effectively unblock
-        result = await conn.execute("""
+        updated_rows = await conn.fetch("""
             UPDATE blocked_entities
             SET blocked_until = CURRENT_TIMESTAMP
             WHERE entity_id = $1 AND entity_type = $2
                 AND (blocked_until IS NULL OR blocked_until > CURRENT_TIMESTAMP)
+            RETURNING tenant_id, reason, blocked_by, is_permanent, created_at
         """, entity_id, entity_type)
-        
+
+        # W12 B5-P1-F: dual-write the unblocked state (blocked_until=now) into
+        # the fraud-blocked-entities index for every updated row.
+        for row in updated_rows:
+            try:
+                doc_id, doc = _os_search.blocked_doc(
+                    entity_id, entity_type, row["tenant_id"], row["reason"],
+                    row["blocked_by"], unblocked_at, row["is_permanent"],
+                    row["created_at"])
+                await asyncio.to_thread(
+                    _os_search.index_doc, _os_search.BLOCKED_INDEX, doc_id, doc)
+            except Exception as _os_exc:
+                print(f"[fraud-service] unblock dual-write to opensearch "
+                      f"failed (resync will backfill): {_os_exc}", file=sys.stderr)
+
         return {
             "status": "unblocked",
             "entity_id": entity_id,
@@ -1366,6 +1689,7 @@ async def unblock_entity(
 
 @app.post("/api/v1/fraud/cases")
 async def create_case(
+    request: Request,
     tenant_id: str,
     summary: str,
     customer_id: Optional[str] = None,
@@ -1375,6 +1699,7 @@ async def create_case(
     assigned_to: Optional[str] = None,
     db=Depends(lambda: db_pool)
 ):
+    permify_authorize(request, "fraud_case", tenant_id, "create")
     case_id = f"FRDC{int(datetime.now().timestamp())}"
     async with db.acquire() as conn:
         await conn.execute(
@@ -1440,12 +1765,14 @@ async def list_cases(
 
 @app.post("/api/v1/fraud/cases/{case_id}/findings")
 async def append_case_finding(
+    request: Request,
     case_id: str,
     actor: str,
     finding: str,
     close_case: bool = False,
     db=Depends(lambda: db_pool)
 ):
+    permify_authorize(request, "fraud_case", case_id, "decide")
     async with db.acquire() as conn:
         row = await conn.fetchrow("SELECT findings, status FROM fraud_cases WHERE case_id = $1", case_id)
         if not row:

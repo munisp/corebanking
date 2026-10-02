@@ -17,11 +17,16 @@ class AppConfig {
   static const String loanEndpoint = '/loan/api/v1'; // Matching web app
   static const String lpoEndpoint = '/lpo/api/v1'; // Matching web app
   static const String chequeEndpoint = '/payment-processing/cheques';
-  static const String scheduledPaymentEndpoint = '/payment-processing/scheduled-payments';
+  // W12-A4B: scheduled payments are served by standing-orders-go
+  // (gateway /standing-orders/* -> /v1/standing-orders*); payment-processing
+  // never had a scheduled-payments route.
+  static const String scheduledPaymentEndpoint = '/standing-orders/v1/standing-orders';
   static const String transactionEndpoint = '/ledger/txn'; // Matching web app
   static const String savingsEndpoint = '/savings/api/v1';
   static const String disputeEndpoint = '/dispute/api/v1/disputes'; // Matching web app
-  static const String fxEndpoint = '/payment-processing/fx';
+  // W12-A4B: fx-service is gateway-exposed at /fx/* with rewrite
+  // /fx/v1/(.*) -> /api/v1/fx/$1 (rates/exchange/transactions).
+  static const String fxEndpoint = '/fx/v1';
   static const String pensionEndpoint = '/orchestrator/pensions';
   static const String carbonEndpoint = '/carbon';
   static const String cardEndpoint = '/card/api/v1/cards';
@@ -34,7 +39,9 @@ class AppConfig {
   static const String orchestratorEndpoint = '/orchestrator';
   static const String rewardEndpoint = '/orchestrator/rewards';
   static const String investmentEndpoint = '/investments'; // Matching web app
-  static const String billEndpoint = '/payment-processing/bills'; // Matching web app
+  // W12-A4B: bills/billers are served by mobile-bff
+  // (/mobile-bff/* -> /api/v1/*; routes /api/v1/bills/pay|validate, /api/v1/billers).
+  static const String billEndpoint = '/mobile-bff/api/v1/bills';
   static const String agricultureEndpoint = '/agricultural/api/v1/agriculture'; // Corrected to match backend endpoints
   static const String voiceBankingEndpoint = '/voice-banking'; // Matching web app
   static const String mortgageEndpoint = '/mortgage/api/v1/mortgages'; // Matching web app

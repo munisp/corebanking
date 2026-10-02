@@ -10,6 +10,7 @@ use std::env;
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicI64, AtomicI32, AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
+use actix_web::HttpMessage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ThresholdRule {
@@ -73,6 +74,7 @@ fn degradation_mode() -> &'static str {
 
 async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(AtomicOrdering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(AtomicOrdering::Relaxed),
@@ -99,6 +101,7 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
 
 async fn list_thresholds(state: web::Data<AppState>, query: web::Query<ListParams>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
     let thresholds = state.thresholds.read().unwrap();
     let mut filtered: Vec<&ThresholdRule> = thresholds.iter().collect();
 
@@ -126,6 +129,7 @@ async fn list_thresholds(state: web::Data<AppState>, query: web::Query<ListParam
 
 async fn list_alerts(state: web::Data<AppState>, query: web::Query<ListParams>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
     let alerts = state.alerts.read().unwrap();
     let mut filtered: Vec<&KpiAlert> = alerts.iter().collect();
 
@@ -156,10 +160,11 @@ async fn list_alerts(state: web::Data<AppState>, query: web::Query<ListParams>, 
 }
 
 async fn evaluate_thresholds(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "evaluate").await { return resp; } // W12-B5P1DF
     // Evaluate all enabled thresholds against current DB values.
     // A metric source failure is LOUD: it produces a data_unavailable alert,
     // never a silently simulated KPI value.
@@ -245,6 +250,7 @@ async fn evaluate_thresholds(req: actix_web::HttpRequest, state: web::Data<AppSt
 
 async fn acknowledge_alert(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "acknowledge").await { return resp; } // W12-B5P1DF
     let alert_id = path.into_inner();
     let mut alerts = state.alerts.write().unwrap();
     if let Some(alert) = alerts.iter_mut().find(|a| a.id == alert_id) {
@@ -258,6 +264,7 @@ async fn acknowledge_alert(state: web::Data<AppState>, path: web::Path<String>, 
 
 async fn resolve_alert(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "resolve").await { return resp; } // W12-B5P1DF
     let alert_id = path.into_inner();
     let mut alerts = state.alerts.write().unwrap();
     if let Some(alert) = alerts.iter_mut().find(|a| a.id == alert_id) {
@@ -271,6 +278,7 @@ async fn resolve_alert(state: web::Data<AppState>, path: web::Path<String>, req:
 
 async fn dashboard_summary(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
     let alerts = state.alerts.read().unwrap();
     let thresholds = state.thresholds.read().unwrap();
 
@@ -381,6 +389,7 @@ static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -576,7 +585,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -601,20 +610,57 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:kpi-threshold-monitor-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:kpi-threshold-monitor-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -648,11 +694,11 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
                     if stream.read_exact(&mut payload).is_err() { return; }
                     let resp = if std::env::var("FAKE_GRPC_OK").ok().as_deref() == Some("1") {
                         // FAKE_GRPC_OK=1: legacy stub for local development only.
-                        format!(r#"{"status":"ok","service":"{}"}"#, service_name)
+                        format!(r#"{{"status":"ok","service":"{}"}}"#, service_name)
                     } else {
                         // gRPC UNIMPLEMENTED (status 12): never fabricate OK for
                         // an unimplemented handler.
-                        format!(r#"{"error":"unimplemented","grpcStatus":12,"service":"{}"}"#, service_name)
+                        format!(r#"{{"error":"unimplemented","grpcStatus":12,"service":"{}"}}"#, service_name)
                     };
                     let resp_bytes = resp.as_bytes();
                     let resp_len = (resp_bytes.len() as u32).to_be_bytes();
@@ -753,3 +799,6 @@ mod tests {
         DB_AVAILABLE.store(true, AtomicOrdering::Relaxed);
     }
 }
+
+// Wave-12 B5-P1-D-F: Permify authorization guard module.
+mod permify;

@@ -1,0 +1,59 @@
+{
+  "_readme": "W12 B5-P1-F: OpenSearch index mapping for the sanctions watchlist (replaces name ILIKE ANY(...) candidate narrowing in kyc-aml-screening-py service.py). Analyzer note: the compose image is opensearchproject/opensearch:2.19.0 (docker-compose.yml:58-66) with NO external plugins, so the phonetic plugin is NOT available. Fuzzy name matching is delivered by the built-in edge_ngram tokenizer (prefix matching at index time) plus match queries with fuzziness=AUTO (edit-distance, built-in) at query time. asciifolding + lowercase are built-in filters. max_ngram_diff must be >= (max_gram - min_gram) or index creation is rejected.",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "max_ngram_diff": 9,
+    "analysis": {
+      "tokenizer": {
+        "name_edge_tokenizer": {
+          "type": "edge_ngram",
+          "min_gram": 3,
+          "max_gram": 12,
+          "token_chars": ["letter", "digit"]
+        }
+      },
+      "analyzer": {
+        "name_index_analyzer": {
+          "type": "custom",
+          "tokenizer": "name_edge_tokenizer",
+          "filter": ["lowercase", "asciifolding"]
+        },
+        "name_search_analyzer": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "_meta": {
+      "owner": "kyc-aml-screening-py",
+      "source_table": "screening_watchlist (list_type='sanctions')",
+      "natural_id": "wl-{screening_watchlist.id}",
+      "wave": "W12-B5-P1-F"
+    },
+    "properties": {
+      "watchlist_id": {"type": "long"},
+      "list_type": {"type": "keyword"},
+      "name": {
+        "type": "text",
+        "analyzer": "name_index_analyzer",
+        "search_analyzer": "name_search_analyzer",
+        "fields": {
+          "raw": {"type": "keyword"},
+          "std": {"type": "text", "analyzer": "standard"}
+        }
+      },
+      "name_normalized": {"type": "keyword"},
+      "category": {"type": "keyword"},
+      "country": {"type": "keyword"},
+      "reason": {"type": "text", "analyzer": "standard"},
+      "risk": {"type": "keyword"},
+      "list_name": {"type": "keyword"},
+      "source": {"type": "keyword"},
+      "loaded_at": {"type": "date"}
+    }
+  }
+}

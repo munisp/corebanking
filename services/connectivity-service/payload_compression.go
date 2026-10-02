@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,8 +12,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/klauspost/compress/lz4"
+	// W12-C3-P0-B6 build fix: klauspost/compress removed its lz4 package in
+	// v1.17.0, but go.mod requires compress v1.18.0 (needed by
+	// prometheus/client_golang v1.23.2) — the baseline module set was
+	// unsatisfiable. pierrec/lz4/v4 is the fleet-standard LZ4 binding
+	// (same Writer/Reader API used below).
 	"github.com/klauspost/compress/zstd"
+	lz4 "github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )

@@ -12,7 +12,7 @@ import (
 // RMService handles relationship manager operations
 type RMService struct {
 	tenantID string
-	rms      map[string]*RelationshipManager
+	rms      *repo[RelationshipManager]
 	mu       sync.RWMutex
 }
 
@@ -20,7 +20,7 @@ type RMService struct {
 func NewRMService(tenantID string) *RMService {
 	svc := &RMService{
 		tenantID: tenantID,
-		rms:      make(map[string]*RelationshipManager),
+		rms:      newRepo[RelationshipManager](serviceDB, "relationship_managers"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -28,7 +28,7 @@ func NewRMService(tenantID string) *RMService {
 
 func (s *RMService) initializeDefaultData(tenantID string) {
 	// Senior RM - Corporate
-	s.rms["rm-001"] = &RelationshipManager{
+	s.rms.seed(tenantID, "rm-001", &RelationshipManager{
 		RMID:          "rm-001",
 		TenantID:      tenantID,
 		EmployeeID:    "EMP-RM-001",
@@ -45,10 +45,10 @@ func (s *RMService) initializeDefaultData(tenantID string) {
 		Status:        "active",
 		CreatedAt:     time.Now().AddDate(-3, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// RM - SME
-	s.rms["rm-002"] = &RelationshipManager{
+	s.rms.seed(tenantID, "rm-002", &RelationshipManager{
 		RMID:          "rm-002",
 		TenantID:      tenantID,
 		EmployeeID:    "EMP-RM-002",
@@ -65,10 +65,10 @@ func (s *RMService) initializeDefaultData(tenantID string) {
 		Status:        "active",
 		CreatedAt:     time.Now().AddDate(-2, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Senior RM - HNWI/Private
-	s.rms["rm-003"] = &RelationshipManager{
+	s.rms.seed(tenantID, "rm-003", &RelationshipManager{
 		RMID:          "rm-003",
 		TenantID:      tenantID,
 		EmployeeID:    "EMP-RM-003",
@@ -85,10 +85,10 @@ func (s *RMService) initializeDefaultData(tenantID string) {
 		Status:        "active",
 		CreatedAt:     time.Now().AddDate(-4, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Team Lead - Retail
-	s.rms["rm-004"] = &RelationshipManager{
+	s.rms.seed(tenantID, "rm-004", &RelationshipManager{
 		RMID:          "rm-004",
 		TenantID:      tenantID,
 		EmployeeID:    "EMP-RM-004",
@@ -105,10 +105,10 @@ func (s *RMService) initializeDefaultData(tenantID string) {
 		Status:        "active",
 		CreatedAt:     time.Now().AddDate(-5, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// RM - Retail
-	s.rms["rm-005"] = &RelationshipManager{
+	s.rms.seed(tenantID, "rm-005", &RelationshipManager{
 		RMID:          "rm-005",
 		TenantID:      tenantID,
 		EmployeeID:    "EMP-RM-005",
@@ -125,16 +125,18 @@ func (s *RMService) initializeDefaultData(tenantID string) {
 		Status:        "active",
 		CreatedAt:     time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 }
 
 // ListRMs returns RMs based on filters
-func (s *RMService) ListRMs(tenantID, segment string) []*RelationshipManager {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *RMService) ListRMs(tenantID, segment string) ([]*RelationshipManager, error) {
 
 	var result []*RelationshipManager
-	for _, rm := range s.rms {
+	__ALL__, __ERR__ := s.rms.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, rm := range __ALL__ {
 		if rm.TenantID != tenantID {
 			continue
 		}
@@ -143,16 +145,14 @@ func (s *RMService) ListRMs(tenantID, segment string) []*RelationshipManager {
 		}
 		result = append(result, rm)
 	}
-	return result
+	return result, nil
 }
 
 // GetRM retrieves an RM by ID
 func (s *RMService) GetRM(tenantID, rmID string) (*RelationshipManager, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	rm, exists := s.rms[rmID]
-	if !exists || rm.TenantID != tenantID {
+	rm, err := s.rms.get(tenantID, rmID)
+	if err != nil {
 		return nil, errors.New("RM not found")
 	}
 	return rm, nil
@@ -160,8 +160,6 @@ func (s *RMService) GetRM(tenantID, rmID string) (*RelationshipManager, error) {
 
 // RegisterRM registers a new RM
 func (s *RMService) RegisterRM(tenantID string, rm *RelationshipManager) (*RelationshipManager, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	rm.RMID = uuid.New().String()
 	rm.TenantID = tenantID
@@ -171,33 +169,30 @@ func (s *RMService) RegisterRM(tenantID string, rm *RelationshipManager) (*Relat
 	rm.CreatedAt = time.Now()
 	rm.UpdatedAt = time.Now()
 
-	s.rms[rm.RMID] = rm
+	if err := s.rms.put(tenantID, rm.RMID, rm); err != nil {
+		return nil, err
+	}
 	return rm, nil
 }
 
 // UpdateRM updates an RM
 func (s *RMService) UpdateRM(rm *RelationshipManager) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.rms[rm.RMID]
-	if !exists || existing.TenantID != rm.TenantID {
+	existing, err := s.rms.get(rm.TenantID, rm.RMID)
+	if err != nil {
 		return errors.New("RM not found")
 	}
 
 	rm.CreatedAt = existing.CreatedAt
 	rm.UpdatedAt = time.Now()
-	s.rms[rm.RMID] = rm
-	return nil
+	return s.rms.put(rm.TenantID, rm.RMID, rm)
 }
 
 // GetRMPerformance returns RM performance metrics
 func (s *RMService) GetRMPerformance(tenantID, rmID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	rm, exists := s.rms[rmID]
-	if !exists || rm.TenantID != tenantID {
+	rm, err := s.rms.get(tenantID, rmID)
+	if err != nil {
 		return map[string]interface{}{"error": "RM not found"}
 	}
 
@@ -227,9 +222,7 @@ func (s *RMService) GetRMPerformance(tenantID, rmID string) map[string]interface
 }
 
 // GetLeaderboard returns RM leaderboard
-func (s *RMService) GetLeaderboard(tenantID string) []map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *RMService) GetLeaderboard(tenantID string) ([]map[string]interface{}, error) {
 
 	type rmScore struct {
 		rm          *RelationshipManager
@@ -237,7 +230,11 @@ func (s *RMService) GetLeaderboard(tenantID string) []map[string]interface{} {
 	}
 
 	var scores []rmScore
-	for _, rm := range s.rms {
+	__ALL__, __ERR__ := s.rms.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, rm := range __ALL__ {
 		if rm.TenantID != tenantID {
 			continue
 		}
@@ -267,5 +264,5 @@ func (s *RMService) GetLeaderboard(tenantID string) []map[string]interface{} {
 		})
 	}
 
-	return leaderboard
+	return leaderboard, nil
 }

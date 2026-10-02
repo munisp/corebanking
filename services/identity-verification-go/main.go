@@ -321,18 +321,31 @@ func persistVerification(v VerificationResult) {
 	if v.Verified != nil {
 		verified = *v.Verified
 	}
-	if _, err := db.ExecContext(ctx,
+	// Domain write + outbox row in ONE transaction: either both are recorded
+	// or neither is. An outbox error aborts the tx (fail closed); the row is
+	// published only by the relay after a confirmed Kafka produce.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("[%s] persist tx begin failed: %v", serviceName, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO identity_verifications (id, type, masked_id, verified, status, provider, payload)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 		v.ID, v.Type, v.MaskedID, verified, v.Status, v.Provider, string(payload)); err != nil {
 		log.Printf("[%s] persist verification failed: %v", serviceName, err)
 		return
 	}
-	// Outbox row; published only by the relay after a confirmed Kafka produce.
-	if _, err := db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
 		"identity."+v.Type+".verified", v.ID, string(payload)); err != nil {
-		log.Printf("[%s] outbox insert failed: %v", serviceName, err)
+		log.Printf("[%s] outbox insert failed (verification rolled back): %v", serviceName, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[%s] persist tx commit failed: %v", serviceName, err)
+		return
 	}
 }
 
@@ -826,10 +839,10 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	// Domain endpoints (JWT-protected, fail-closed provider-backed)
-	mux.HandleFunc("/v1/verify/bvn", handleVerifyBVN)
-	mux.HandleFunc("/v1/verify/nin", handleVerifyNIN)
-	mux.HandleFunc("/v1/liveness/check", handleLivenessCheck)
-	mux.HandleFunc("/v1/verifications", listHandler)
+	mux.HandleFunc("/v1/verify/bvn", permifyAuthzGuard("identity_verification", "verify", handleVerifyBVN))
+	mux.HandleFunc("/v1/verify/nin", permifyAuthzGuard("identity_verification", "verify", handleVerifyNIN))
+	mux.HandleFunc("/v1/liveness/check", permifyAuthzGuard("identity_verification", "liveness_check", handleLivenessCheck))
+	mux.HandleFunc("/v1/verifications", permifyAuthzGuard("identity_verification", "view", listHandler))
 
 	server := &http.Server{
 		Addr:              ":" + getEnv("PORT", "8480"),

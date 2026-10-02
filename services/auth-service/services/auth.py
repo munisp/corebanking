@@ -5,6 +5,7 @@ from schemas.v1 import (
     ForgotPassword,
     ResetPassword,
     ChangePassword,
+    UpdateUser,
     Context,
 )
 from repositories import AuthRepository, DeviceRepository
@@ -16,6 +17,7 @@ from utils import (
     PermissionManager,
     UserRole,
     get_otp_service,
+    get_pin_service,
 )
 from adapters import KeycloakAdapter
 from definitions import CreateKeycloakUser
@@ -397,6 +399,200 @@ class AuthService:
 
     def get_auth_by_api_key(self, key: str, secret: str, context: Context):
         return self._auth_repository.get_auth_by_api_key(key, secret, context.tenant_id)
+
+    # ────────────────────────────────────────────────────────────────────
+    # W12-A4A: UI-called session endpoints created for the mobile/web2 auth
+    # family (verify-otp, verify-email, resend-otp, resend-verification,
+    # logout, me, create-pin, update user). All mirror the existing handler
+    # patterns: tenant-scoped repository lookups, Redis OTP/PIN services,
+    # Keycloak admin operations via the adapter.
+    # ────────────────────────────────────────────────────────────────────
+
+    def _resolve_auth_for_otp(self, keycloak_id: str, context: Context):
+        """Resolve the auth profile behind an OTP flow or raise 404."""
+        auth = self._auth_repository.get_auth_by_keycloak_id(keycloak_id, context.tenant_id)
+        if not auth:
+            raise_http_exception_handler(
+                status_code=404,
+                message="User not found.",
+                code="AUTH-AUTH-OTP-4041",
+            )
+        return auth
+
+    def verify_otp(self, keycloak_id: str, otp_code: str, context: Context) -> dict:
+        """Verify a login OTP against the Redis OTP store (single-use,
+        attempt-throttled, TTL-bound — see utils/otp_service.py)."""
+        auth = self._resolve_auth_for_otp(keycloak_id, context)
+
+        otp_service = get_otp_service()
+        otp_result = otp_service.verify_otp(
+            keycloak_id=auth.keycloak_id,
+            tenant_id=context.tenant_id,
+            otp_code=otp_code,
+        )
+
+        if not otp_result.get("valid"):
+            raise_http_exception_handler(
+                status_code=401,
+                message=otp_result.get("message", "Invalid OTP code."),
+                code="AUTH-AUTH-OTP-4011",
+            )
+
+        return {
+            "valid": True,
+            "keycloak_id": auth.keycloak_id,
+            "email": auth.email,
+        }
+
+    def verify_email(self, keycloak_id: str, token: str, context: Context) -> dict:
+        """Verify the emailed verification token (same Redis OTP machinery),
+        then flip emailVerified on the Keycloak identity (best-effort)."""
+        result = self.verify_otp(keycloak_id, token, context)
+
+        try:
+            keycloak = KeycloakAdapter(realm=context.keycloak_realm)
+            keycloak.update_user_profile(result["keycloak_id"], email_verified=True)
+        except Exception as e:
+            # Fail-soft: the OTP verification already succeeded; a Keycloak
+            # attribute sync issue must not fail the user's verification.
+            logger.warning(
+                f"emailVerified flag sync failed for {result['keycloak_id']}: {e}"
+            )
+
+        return result
+
+    def resend_otp(self, keycloak_id: str, context: Context) -> dict:
+        """Generate a fresh login OTP for an existing user (mirrors
+        forgot_password's generate path)."""
+        auth = self._resolve_auth_for_otp(keycloak_id, context)
+
+        otp_service = get_otp_service()
+        otp_data = otp_service.generate_otp(
+            keycloak_id=auth.keycloak_id,
+            tenant_id=context.tenant_id,
+            email=auth.email,
+        )
+
+        return {
+            "message": "OTP regenerated.",
+            "keycloak_id": auth.keycloak_id,
+            "otp_expires_at": otp_data["expires_at"],
+        }
+
+    def resend_verification(self, keycloak_id: str, context: Context) -> dict:
+        """Resend the email-verification OTP for an existing user."""
+        result = self.resend_otp(keycloak_id, context)
+        result["message"] = "Verification email regenerated."
+        return result
+
+    def logout(self, keycloak_id: str, context: Context) -> None:
+        """Server-side logout: revoke every Keycloak session for the user and
+        drop any pending OTP state. Best-effort on the identity revocation —
+        the client discards its tokens regardless."""
+        otp_service = get_otp_service()
+        try:
+            otp_service.invalidate_otp(keycloak_id, context.tenant_id)
+        except Exception as e:
+            logger.warning(f"OTP invalidation on logout failed for {keycloak_id}: {e}")
+
+        try:
+            keycloak = KeycloakAdapter(realm=context.keycloak_realm)
+            keycloak.logout_user(keycloak_id)
+        except Exception as e:
+            logger.warning(f"Keycloak session revocation on logout failed for {keycloak_id}: {e}")
+
+    def get_me(self, keycloak_id: str, context: Context) -> dict:
+        """Return the authenticated user's auth profile (PG-backed)."""
+        auth = self._auth_repository.get_auth_by_keycloak_id(keycloak_id, context.tenant_id)
+        if not auth:
+            raise_http_exception_handler(
+                status_code=404,
+                message="User not found.",
+                code="AUTH-AUTH-USER-4043",
+            )
+
+        profile = auth.to_dict()
+        # Never expose credential material.
+        profile.pop("api_secret", None)
+        profile.pop("api_key", None)
+        return profile
+
+    def create_pin(
+        self,
+        keycloak_id: str,
+        new_pin: str,
+        current_pin: str,
+        context: Context,
+    ) -> dict:
+        """Create/rotate the transaction PIN for an authenticated user
+        (salted hash in Redis — see utils/pin_service.py)."""
+        auth = self._resolve_auth_for_otp(keycloak_id, context)
+
+        pin_service = get_pin_service()
+        result = pin_service.create_pin(
+            keycloak_id=auth.keycloak_id,
+            tenant_id=context.tenant_id,
+            new_pin=new_pin,
+            current_pin=current_pin,
+        )
+
+        if not result.get("success"):
+            raise_http_exception_handler(
+                status_code=400,
+                message=result.get("message", "Failed to create PIN."),
+                code="AUTH-AUTH-PIN-4001",
+            )
+
+        return result
+
+    def update_user(
+        self,
+        keycloak_id: str,
+        payload: UpdateUser,
+        context: Context,
+    ) -> dict:
+        """Update the authenticated user's profile.
+
+        Auth-owned field (email) is persisted on the PG auth record; identity
+        attributes (name, phone) are forwarded to the Keycloak user."""
+        auth = self._auth_repository.get_auth_by_keycloak_id(keycloak_id, context.tenant_id)
+        if not auth:
+            raise_http_exception_handler(
+                status_code=404,
+                message="User not found.",
+                code="AUTH-AUTH-USER-4044",
+            )
+
+        if payload.email and payload.email != auth.email:
+            existing = self._auth_repository.get_auth_by_email(payload.email, context.tenant_id)
+            if existing and existing.keycloak_id != auth.keycloak_id:
+                raise_http_exception_handler(
+                    status_code=409,
+                    message="Email already in use.",
+                    code="AUTH-AUTH-USER-4091",
+                )
+            auth.email = payload.email
+            self._db.commit()
+
+        keycloak = KeycloakAdapter(realm=context.keycloak_realm)
+        keycloak.update_user_profile(
+            auth.keycloak_id,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            email=payload.email,
+            phone_number=payload.phone_number,
+        )
+
+        profile = auth.to_dict()
+        profile.pop("api_secret", None)
+        profile.pop("api_key", None)
+        if payload.first_name is not None:
+            profile["first_name"] = payload.first_name
+        if payload.last_name is not None:
+            profile["last_name"] = payload.last_name
+        if payload.phone_number is not None:
+            profile["phone_number"] = payload.phone_number
+        return profile
 
     def _assign_initial_permissions(
         self,

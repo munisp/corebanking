@@ -9,6 +9,9 @@ use std::time::Instant;
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use actix_web::HttpMessage;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -30,12 +33,39 @@ struct CreateRequest {
 
 struct AppState {
     start_time: Instant,
-    matches: Mutex<Vec<FaceMatchResult>>,
     stats: Mutex<MatchStats>,
+    db: Option<PgPool>,
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+// FaceMatchResult carries Option<u32> (no sqlx-postgres codec) => JSONB payload.
+async fn persist_face_match(pool: &PgPool, m: &FaceMatchResult) -> Result<(), sqlx::Error> {
+    let payload = serde_json::to_value(m).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query("INSERT INTO face_matches (id, payload) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload")
+        .bind(&m.id)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn load_face_matches(pool: &PgPool) -> Result<Vec<FaceMatchResult>, sqlx::Error> {
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM face_matches ORDER BY created_at")
+        .fetch_all(pool)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for v in rows {
+        let m: FaceMatchResult = serde_json::from_value(v).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        out.push(m);
+    }
+    Ok(out)
+}
+
+fn persistence_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": detail}))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct FaceMatchResult {
     id: String,
     customer_id: String,
@@ -110,7 +140,7 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests()
             .insert_header(("Retry-After", "1"))
             .json(serde_json::json!({"error": "rate_limit_exceeded"}));
@@ -168,6 +198,7 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
 
 async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "face_match", "collection", "compare").await { return resp; }
     let _sanitized = sanitize_input("");
     let start = Instant::now();
 
@@ -222,9 +253,13 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
         timestamp: chrono_now(),
     };
 
-    {
-        let mut matches = state.matches.lock().await;
-        matches.push(result.clone());
+    match &state.db {
+        Some(pool) => {
+            if let Err(e) = persist_face_match(pool, &result).await {
+                return persistence_unavailable(&format!("face_matches persist failed: {}", e));
+            }
+        }
+        None => return persistence_unavailable("face_matches pool not configured"),
     }
     {
         let mut st = state.stats.lock().await;
@@ -248,17 +283,29 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
 
 async fn get_matches(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let matches = state.matches.lock().await;
+    let pool = match &state.db { Some(p) => p, None => return persistence_unavailable("face_matches pool not configured") };
+    let matches = match load_face_matches(pool).await {
+        Ok(m) => m,
+        Err(e) => return persistence_unavailable(&format!("face_matches read failed: {}", e)),
+    };
     db_persist(&state, "get_matches", &json!({"action": "get_matches"})).await;
-    HttpResponse::Ok().json(json!({"matches": *matches, "total": matches.len()}))
+    HttpResponse::Ok().json(json!({"matches": matches, "total": matches.len()}))
 }
 
 async fn get_match_by_id(path: web::Path<String>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
-    let matches = state.matches.lock().await;
-    match matches.iter().find(|m| m.id == id) {
-        Some(m) => HttpResponse::Ok().json(m),
+    let pool = match &state.db { Some(p) => p, None => return persistence_unavailable("face_matches pool not configured") };
+    let row: Option<serde_json::Value> = match sqlx::query_scalar("SELECT payload FROM face_matches WHERE id = $1")
+        .bind(&id).fetch_optional(pool).await {
+        Ok(r) => r,
+        Err(e) => return persistence_unavailable(&format!("face_matches read failed: {}", e)),
+    };
+    match row {
+        Some(v) => match serde_json::from_value::<FaceMatchResult>(v) {
+            Ok(m) => HttpResponse::Ok().json(m),
+            Err(e) => persistence_unavailable(&format!("face_matches decode failed: {}", e)),
+        },
         None => HttpResponse::NotFound().json(json!({"error": format!("Match {} not found", id)})),
     }
 }
@@ -309,8 +356,6 @@ async fn deepface_info(req: actix_web::HttpRequest) -> HttpResponse {
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -534,7 +579,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -717,20 +762,57 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:face-match-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:face-match-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -830,13 +912,126 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = verified JWT tenant claim
+// (fallback: X-Tenant-Id header, PERMIFY_DEFAULT_TENANT, "bpmgd"), resource =
+// domain entity id, permission per action (schema: canonical v2.perm
+// service_config entity + services/auth-service/schemas/permify/
+// v2-core-domain-rs.fragment). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (services/risk-scoring-rs/src/main.rs).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    use actix_web::HttpMessage as _;
+    let (subject, claim_tenant) = {
+        let ext = req.extensions();
+        match ext.get::<VerifiedClaims>() {
+            Some(c) => (
+                c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ),
+            None => (None, None),
+        }
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8227".to_string());
+    let db_url_env = std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty());
+    let db_pool: Option<PgPool> = db_url_env.as_ref().and_then(|u| {
+        match PgPoolOptions::new().max_connections(10).connect_lazy(u) {
+            Ok(p) => Some(p),
+            Err(e) => { eprintln!("face-match-rs: pool init failed: {}", e); None }
+        }
+    });
+    if let Some(pool) = &db_pool {
+        if let Err(e) = sqlx::query(r#"CREATE TABLE IF NOT EXISTS face_matches (
+            id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#).execute(pool).await {
+            eprintln!("face-match-rs: face_matches schema init failed: {}", e);
+        }
+    }
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        matches: Mutex::new(Vec::new()),
         stats: Mutex::new(MatchStats::default()),
+        db: db_pool,
             db_client: {
             let db_url = std::env::var("DATABASE_URL").ok();
             if let Some(url) = db_url {

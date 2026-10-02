@@ -3,34 +3,40 @@ package main
 import (
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// InterbankService handles interbank money market operations
+// InterbankService handles interbank money market operations.
+// Postgres (table interbank_deals) is the system of record; a partial unique
+// index on (tenant_id, deal_number) guards against deal-number replay.
 type InterbankService struct {
 	tenantID string
-	deals    map[string]*InterbankDeal
-	counter  int
-	mu       sync.RWMutex
+	deals    *repo[InterbankDeal]
+}
+
+// interbankDealNumber generates a collision-resistant deal number without
+// relying on process-local counters (which reset on restart).
+func interbankDealNumber() string {
+	return fmt.Sprintf("IB-%s-%d", time.Now().Format("20060102"), time.Now().UnixNano()%1000000000)
 }
 
 // NewInterbankService creates a new interbank service
 func NewInterbankService(tenantID string) *InterbankService {
 	svc := &InterbankService{
 		tenantID: tenantID,
-		deals:    make(map[string]*InterbankDeal),
-		counter:  2000,
+		deals: newRepo[InterbankDeal](serviceDB, "interbank_deals",
+			`CREATE UNIQUE INDEX IF NOT EXISTS interbank_deals_tenant_dealnumber
+				ON interbank_deals (tenant_id, ((doc->>'dealNumber')))`),
 	}
 	svc.initializeDefaultDeals(tenantID)
 	return svc
 }
 
 func (s *InterbankService) initializeDefaultDeals(tenantID string) {
-	// Active placement
-	s.deals["ib-001"] = &InterbankDeal{
+	// Active placement (idempotent seed)
+	s.deals.seed(tenantID, "ib-001", &InterbankDeal{
 		DealID:         "ib-001",
 		TenantID:       tenantID,
 		DealNumber:     "IB-20260215-2001",
@@ -50,10 +56,10 @@ func (s *InterbankService) initializeDefaultDeals(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, 0, -7),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
-	// Active takings
-	s.deals["ib-002"] = &InterbankDeal{
+	// Active takings (idempotent seed)
+	s.deals.seed(tenantID, "ib-002", &InterbankDeal{
 		DealID:         "ib-002",
 		TenantID:       tenantID,
 		DealNumber:     "IB-20260210-2002",
@@ -73,19 +79,17 @@ func (s *InterbankService) initializeDefaultDeals(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, 0, -12),
 		UpdatedAt:      time.Now(),
-	}
+	})
 }
 
 // ListInterbankDeals returns interbank deals based on filters
-func (s *InterbankService) ListInterbankDeals(tenantID, status, dealType string) []*InterbankDeal {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *InterbankService) ListInterbankDeals(tenantID, status, dealType string) ([]*InterbankDeal, error) {
+	all, err := s.deals.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	var result []*InterbankDeal
-	for _, deal := range s.deals {
-		if deal.TenantID != tenantID {
-			continue
-		}
+	for _, deal := range all {
 		if status != "" && deal.Status != status {
 			continue
 		}
@@ -94,16 +98,13 @@ func (s *InterbankService) ListInterbankDeals(tenantID, status, dealType string)
 		}
 		result = append(result, deal)
 	}
-	return result
+	return result, nil
 }
 
 // GetInterbankDeal retrieves an interbank deal by ID
 func (s *InterbankService) GetInterbankDeal(tenantID, dealID string) (*InterbankDeal, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
+	deal, err := s.deals.get(tenantID, dealID)
+	if err != nil {
 		return nil, errors.New("interbank deal not found")
 	}
 	return deal, nil
@@ -111,12 +112,6 @@ func (s *InterbankService) GetInterbankDeal(tenantID, dealID string) (*Interbank
 
 // CreateInterbankDeal creates a new interbank deal
 func (s *InterbankService) CreateInterbankDeal(tenantID, dealerID string, req *CreateInterbankDealRequest) (*InterbankDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.counter++
-	dealNumber := fmt.Sprintf("IB-%s-%d", time.Now().Format("20060102"), s.counter)
-
 	startDate, _ := time.Parse("2006-01-02", req.StartDate)
 	maturityDate, _ := time.Parse("2006-01-02", req.MaturityDate)
 	tenor := int(maturityDate.Sub(startDate).Hours() / 24)
@@ -127,7 +122,7 @@ func (s *InterbankService) CreateInterbankDeal(tenantID, dealerID string, req *C
 	deal := &InterbankDeal{
 		DealID:         uuid.New().String(),
 		TenantID:       tenantID,
-		DealNumber:     dealNumber,
+		DealNumber:     interbankDealNumber(),
 		DealType:       req.DealType,
 		CounterParty:   req.CounterParty,
 		CounterPartyID: req.CounterPartyID,
@@ -146,111 +141,101 @@ func (s *InterbankService) CreateInterbankDeal(tenantID, dealerID string, req *C
 		UpdatedAt:      time.Now(),
 	}
 
-	s.deals[deal.DealID] = deal
+	if err := s.deals.put(tenantID, deal.DealID, deal); err != nil {
+		return nil, err
+	}
 	return deal, nil
 }
 
 // UpdateInterbankDeal updates an interbank deal
 func (s *InterbankService) UpdateInterbankDeal(deal *InterbankDeal) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	existing, exists := s.deals[deal.DealID]
-	if !exists || existing.TenantID != deal.TenantID {
+	existing, err := s.deals.get(deal.TenantID, deal.DealID)
+	if err != nil {
 		return errors.New("interbank deal not found")
 	}
 
 	deal.CreatedAt = existing.CreatedAt
 	deal.DealNumber = existing.DealNumber
 	deal.UpdatedAt = time.Now()
-	s.deals[deal.DealID] = deal
-	return nil
+	return s.deals.put(deal.TenantID, deal.DealID, deal)
 }
 
-// ApproveInterbankDeal approves an interbank deal
+// ApproveInterbankDeal approves an interbank deal (transactional transition)
 func (s *InterbankService) ApproveInterbankDeal(tenantID, dealID, approverID string) (*InterbankDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
-		return nil, errors.New("interbank deal not found")
-	}
-
-	if deal.Status != "pending" {
-		return nil, errors.New("can only approve pending deals")
-	}
-
-	now := time.Now()
-	deal.Status = "active"
-	deal.ApprovedBy = approverID
-	deal.ApprovedAt = &now
-	deal.UpdatedAt = time.Now()
-
-	return deal, nil
+	return s.deals.update(tenantID, dealID, func(deal *InterbankDeal) error {
+		if deal.Status != "pending" {
+			return errors.New("can only approve pending deals")
+		}
+		now := time.Now()
+		deal.Status = "active"
+		deal.ApprovedBy = approverID
+		deal.ApprovedAt = &now
+		deal.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
-// RolloverDeal rolls over a maturing deal
+// RolloverDeal rolls over a maturing deal. The old deal is transitioned
+// inside a transaction; the replacement deal is then inserted (its
+// tenant-scoped deal number is protected by the unique index).
 func (s *InterbankService) RolloverDeal(tenantID, dealID, newMaturityDate string, newRate float64) (*InterbankDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	var newDeal *InterbankDeal
+	_, err := s.deals.update(tenantID, dealID, func(deal *InterbankDeal) error {
+		// Mark old deal as rolled over
+		deal.Status = "rolled_over"
+		deal.UpdatedAt = time.Now()
 
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
-		return nil, errors.New("interbank deal not found")
+		maturity, _ := time.Parse("2006-01-02", newMaturityDate)
+		startDate := deal.MaturityDate
+		tenor := int(maturity.Sub(startDate).Hours() / 24)
+		interest := int64(float64(deal.Principal) * newRate / 100 * float64(tenor) / 365)
+
+		newDeal = &InterbankDeal{
+			DealID:         uuid.New().String(),
+			TenantID:       tenantID,
+			DealNumber:     interbankDealNumber(),
+			DealType:       deal.DealType,
+			CounterParty:   deal.CounterParty,
+			CounterPartyID: deal.CounterPartyID,
+			Principal:      deal.Principal,
+			Currency:       deal.Currency,
+			InterestRate:   newRate,
+			StartDate:      startDate,
+			MaturityDate:   maturity,
+			Tenor:          tenor,
+			Interest:       interest,
+			TotalAmount:    deal.Principal + interest,
+			Status:         "active",
+			DealerID:       deal.DealerID,
+			Metadata: map[string]interface{}{
+				"rolledOverFrom": deal.DealID,
+			},
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// Mark old deal as rolled over
-	deal.Status = "rolled_over"
-	deal.UpdatedAt = time.Now()
-
-	// Create new deal
-	s.counter++
-	newDealNumber := fmt.Sprintf("IB-%s-%d", time.Now().Format("20060102"), s.counter)
-
-	maturity, _ := time.Parse("2006-01-02", newMaturityDate)
-	startDate := deal.MaturityDate
-	tenor := int(maturity.Sub(startDate).Hours() / 24)
-	interest := int64(float64(deal.Principal) * newRate / 100 * float64(tenor) / 365)
-
-	newDeal := &InterbankDeal{
-		DealID:         uuid.New().String(),
-		TenantID:       tenantID,
-		DealNumber:     newDealNumber,
-		DealType:       deal.DealType,
-		CounterParty:   deal.CounterParty,
-		CounterPartyID: deal.CounterPartyID,
-		Principal:      deal.Principal,
-		Currency:       deal.Currency,
-		InterestRate:   newRate,
-		StartDate:      startDate,
-		MaturityDate:   maturity,
-		Tenor:          tenor,
-		Interest:       interest,
-		TotalAmount:    deal.Principal + interest,
-		Status:         "active",
-		DealerID:       deal.DealerID,
-		Metadata: map[string]interface{}{
-			"rolledOverFrom": deal.DealID,
-		},
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+	if err := s.deals.put(tenantID, newDeal.DealID, newDeal); err != nil {
+		return nil, err
 	}
-
-	s.deals[newDeal.DealID] = newDeal
 	return newDeal, nil
 }
 
 // GetInterbankPosition returns net interbank position
-func (s *InterbankService) GetInterbankPosition(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *InterbankService) GetInterbankPosition(tenantID string) (map[string]interface{}, error) {
+	all, err := s.deals.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 
 	var placements, takings int64
 	var placementCount, takingsCount int
 
-	for _, deal := range s.deals {
-		if deal.TenantID != tenantID || deal.Status != "active" {
+	for _, deal := range all {
+		if deal.Status != "active" {
 			continue
 		}
 		if deal.DealType == "placement" {
@@ -269,7 +254,7 @@ func (s *InterbankService) GetInterbankPosition(tenantID string) map[string]inte
 		"takingsCount":   takingsCount,
 		"netPosition":    placements - takings,
 		"timestamp":      time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetInterbankRates returns current interbank rates

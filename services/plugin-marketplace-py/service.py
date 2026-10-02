@@ -6,13 +6,131 @@ import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 PORT = int(os.environ.get("PORT", "8240"))
 
 MIDDLEWARE = ["kafka", "dapr", "fluvio", "temporal", "postgres", "keycloak",
               "permify", "redis", "mojaloop", "opensearch", "openappsec",
               "apisix", "tigerbeetle", "lakehouse"]
 
-plugins = [
+_PLUGIN_SEED = [
     {"id": "PLG-001", "name": "Paystack Payment Gateway", "vendor": "Paystack", "category": "payments", "version": "3.2.1", "status": "published", "installs": 342, "rating": 4.8, "pricing": "free", "description": "Accept payments via Paystack inline, popup, or redirect"},
     {"id": "PLG-002", "name": "Flutterwave Payments", "vendor": "Flutterwave", "category": "payments", "version": "2.8.0", "status": "published", "installs": 287, "rating": 4.6, "pricing": "free", "description": "Multi-currency payments with Flutterwave Rave"},
     {"id": "PLG-003", "name": "Termii SMS/OTP", "vendor": "Termii", "category": "communications", "version": "1.5.0", "status": "published", "installs": 198, "rating": 4.3, "pricing": "usage_based", "description": "SMS notifications and OTP delivery via Termii"},
@@ -25,7 +143,7 @@ plugins = [
     {"id": "PLG-010", "name": "Zoho Books Accounting", "vendor": "Zoho", "category": "accounting", "version": "6.2.0", "status": "published", "installs": 112, "rating": 4.4, "pricing": "monthly", "description": "Accounting integration with Zoho Books"},
 ]
 
-tenant_installs = [
+_INSTALL_SEED = [
     {"tenantId": "54link-dev-retail", "pluginId": "PLG-001", "status": "active", "installedAt": "2026-01-15T00:00:00Z", "config": {"apiKey": "pk_***", "environment": "production"}},
     {"tenantId": "54link-dev-retail", "pluginId": "PLG-003", "status": "active", "installedAt": "2026-02-01T00:00:00Z", "config": {"senderId": "54link-dev", "channel": "generic"}},
     {"tenantId": "54link-dev-retail", "pluginId": "PLG-005", "status": "active", "installedAt": "2026-01-20T00:00:00Z", "config": {"partnerId": "SID-54B", "environment": "production"}},
@@ -36,6 +154,13 @@ tenant_installs = [
     {"tenantId": "paystack-embed", "pluginId": "PLG-004", "status": "active", "installedAt": "2026-02-15T00:00:00Z", "config": {"appId": "mono_***"}},
     {"tenantId": "paystack-embed", "pluginId": "PLG-010", "status": "inactive", "installedAt": "2026-03-01T00:00:00Z", "config": {"orgId": "zoho_***"}},
 ]
+
+
+# W12-C3P2B5: PG-backed stores. tenant_installs natural key = tenantId:pluginId
+# (idempotent re-install via ON CONFLICT upsert).
+PLUGIN_STORE = _W12Store("plugins", seed=_PLUGIN_SEED)
+INSTALL_STORE = _W12Store("tenant_installs", seed=[
+    {**r, "_rid": f"{r['tenantId']}:{r['pluginId']}"} for r in _INSTALL_SEED])
 
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
@@ -220,16 +345,27 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/v1/plugins":
             category = qs.get("category", [None])[0]
-            items = [p for p in plugins if not category or p["category"] == category]
+            try:
+                items = _w12_all_by(PLUGIN_STORE, "category", category) if category else PLUGIN_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             return self._json({"items": items, "total": len(items)})
 
         if path == "/v1/tenant-installs":
             tid = qs.get("tenantId", [None])[0]
-            items = [i for i in tenant_installs if not tid or i["tenantId"] == tid]
+            try:
+                items = _w12_all_by(INSTALL_STORE, "tenantId", tid) if tid else INSTALL_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             active = sum(1 for i in items if i["status"] == "active")
             return self._json({"items": items, "total": len(items), "active": active})
 
         if path == "/v1/stats":
+            try:
+                plugins = PLUGIN_STORE.all()
+                tenant_installs = INSTALL_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             categories = list(set(p["category"] for p in plugins))
             total_installs = sum(p["installs"] for p in plugins)
             active_tenant_installs = sum(1 for i in tenant_installs if i["status"] == "active")

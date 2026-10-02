@@ -2216,6 +2216,14 @@ export async function getBillingDashboard() {
   return requestJson<BillingDashboardResponse>("/billings/dashboard");
 }
 
+/** W12 A4-P1-A: PUT /billing/ — create-or-get the tenant billing profile. */
+export async function upsertBillingProfile(payload?: { plan?: string; billingPeriod?: string }) {
+  return requestJson<{ billing_profile: unknown }>("/billings/", {
+    method: "PUT",
+    body: JSON.stringify(payload ?? {}),
+  });
+}
+
 export async function getBillingRateCards() {
   return requestJson<{ asOf: string; items: BillingRateCardRecord[]; total: number }>("/billings/rate-cards");
 }

@@ -1,17 +1,142 @@
 """biometric-service — API handlers."""
 import json
+import os
 from http.server import BaseHTTPRequestHandler
 
-_FACE_MATCHES = [
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
+_FM_SEED = [
     {"id": "FM-001", "sessionId": "SES-A001", "customerId": "CUST-001", "customerName": "Fatima Abdullahi", "similarityScore": 0.942, "threshold": 0.65, "matched": True, "model": "arcface-r100", "embeddingDim": 512, "faceQualityScore": 0.96, "glassesDetected": False, "maskDetected": False, "landmarksDetected": 68, "processingTimeMs": 145, "createdAt": "2026-05-09T10:30:00Z"},
     {"id": "FM-002", "sessionId": "SES-A002", "customerId": "CUST-002", "customerName": "Ibrahim Musa", "similarityScore": 0.871, "threshold": 0.65, "matched": True, "model": "arcface-r100", "embeddingDim": 512, "faceQualityScore": 0.91, "glassesDetected": True, "maskDetected": False, "landmarksDetected": 68, "processingTimeMs": 158, "createdAt": "2026-05-09T11:00:00Z"},
     {"id": "FM-003", "sessionId": "SES-A003", "customerId": "CUST-003", "customerName": "Grace Okafor", "similarityScore": 0.412, "threshold": 0.65, "matched": False, "model": "arcface-r100", "embeddingDim": 512, "faceQualityScore": 0.78, "glassesDetected": False, "maskDetected": False, "landmarksDetected": 68, "processingTimeMs": 142, "createdAt": "2026-05-09T12:00:00Z"},
 ]
 
-_LIVENESS_CHECKS = [
+_LIV_SEED = [
     {"id": "LIV-001", "sessionId": "SES-L001", "customerId": "CUST-001", "method": "challenge_response", "overallScore": 0.96, "passed": True, "challengeType": "blink_left_eye", "challengeResponseCorrect": True, "deepfakeProbability": 0.02, "spoofTypeDetected": None, "processingTimeMs": 2145, "createdAt": "2026-05-09T10:29:00Z"},
     {"id": "LIV-002", "sessionId": "SES-L002", "customerId": "CUST-003", "method": "passive_3d", "overallScore": 0.28, "passed": False, "challengeType": "smile", "challengeResponseCorrect": False, "deepfakeProbability": 0.0, "spoofTypeDetected": "printed_photo", "processingTimeMs": 512, "createdAt": "2026-05-09T12:05:00Z"},
 ]
+
+# W12-C3P2B5: face-match + liveness result records persisted in PG
+# (idempotent seeds). _LIVENESS_METHODS stays static config.
+FM_STORE = _W12Store("face_matches", seed=_FM_SEED)
+LIV_STORE = _W12Store("liveness_checks", seed=_LIV_SEED)
+
 
 _LIVENESS_METHODS = [
     {"name": "passive_3d", "weight": 0.25, "latencyMs": 45, "description": "Single-frame micro-texture and monocular depth analysis."},
@@ -184,17 +309,31 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "service": "biometric-service", "capabilities": ["face-match", "liveness-detection"]})
 
         elif path == "/v1/face/matches":
-            self._send_json(200, {"items": _FACE_MATCHES, "total": len(_FACE_MATCHES)})
+            try:
+                _items = FM_STORE.all()
+            except Exception as _e:
+                self._send_json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._send_json(200, {"items": _items, "total": len(_items)})
 
         elif path.startswith("/v1/face/matches/"):
             mid = path[len("/v1/face/matches/"):]
-            item = next((m for m in _FACE_MATCHES if m["id"] == mid), None)
+            try:
+                item = FM_STORE.get(mid)
+            except Exception as _e:
+                self._send_json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             if item:
                 self._send_json(200, item)
             else:
                 self._send_json(404, {"error": "not found"})
 
         elif path == "/v1/face/stats":
+            try:
+                _FACE_MATCHES = FM_STORE.all()
+            except Exception as _e:
+                self._send_json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             total = len(_FACE_MATCHES)
             matched = sum(1 for m in _FACE_MATCHES if m["matched"])
             avg_sim = sum(m["similarityScore"] for m in _FACE_MATCHES) / total if total else 0
@@ -206,11 +345,20 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         elif path == "/v1/liveness/checks":
-            self._send_json(200, {"items": _LIVENESS_CHECKS, "total": len(_LIVENESS_CHECKS)})
+            try:
+                _items = LIV_STORE.all()
+            except Exception as _e:
+                self._send_json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._send_json(200, {"items": _items, "total": len(_items)})
 
         elif path.startswith("/v1/liveness/checks/"):
             cid = path[len("/v1/liveness/checks/"):]
-            item = next((c for c in _LIVENESS_CHECKS if c["id"] == cid), None)
+            try:
+                item = LIV_STORE.get(cid)
+            except Exception as _e:
+                self._send_json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             if item:
                 self._send_json(200, item)
             else:
@@ -220,6 +368,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"methods": _LIVENESS_METHODS, "ensembleThreshold": 0.85, "ibetaCompliance": "Level 2"})
 
         elif path == "/v1/liveness/stats":
+            try:
+                _LIVENESS_CHECKS = LIV_STORE.all()
+            except Exception as _e:
+                self._send_json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             total = len(_LIVENESS_CHECKS)
             passed = sum(1 for c in _LIVENESS_CHECKS if c["passed"])
             avg_score = sum(c["overallScore"] for c in _LIVENESS_CHECKS) / total if total else 0

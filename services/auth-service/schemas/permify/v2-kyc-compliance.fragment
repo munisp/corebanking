@@ -1,0 +1,249 @@
+// ============================================================================
+// W12-B5-P0-D2: kyc/compliance schema FRAGMENT (32 GAP services, wave 1).
+// This fragment is merged into the canonical v2.perm by the integrator; it is
+// kept in a separate file so the canonical-schema owner (B5-P0-D1) and this
+// batch never edit the same file. Syntax is identical to v2.perm. The `user`
+// entity is declared in the canonical file and referenced here by type only.
+//
+// Convention: every mutating handler in the kyc/compliance GAP fleet checks
+//   subject = verified JWT sub (user), resource = <entity>:<domain-id>,
+//   permission = <entity>.<action> as defined below. Checks fail closed.
+// ============================================================================
+
+// KYC case lifecycle (perpetual-kyc-go, kyc engines, video-kyc)
+entity kyc_case {
+  relation assignee            @user
+  relation reviewer            @user
+  relation compliance_officer  @user
+
+  permission evaluate = compliance_officer or reviewer or assignee
+  permission review   = compliance_officer or reviewer
+  permission approve  = compliance_officer
+  permission reject   = compliance_officer
+  permission override = compliance_officer
+  // W12-B5-P0-D3: CBN tier-upgrade assessments (cbn-tiered-kyc-rs).
+  permission tier_upgrade = compliance_officer
+}
+
+// KYB / business onboarding applications (kyb-service)
+entity kyb_application {
+  relation applicant           @user
+  relation reviewer            @user
+  relation compliance_officer  @user
+
+  permission submit  = applicant or compliance_officer
+  permission update  = applicant or compliance_officer
+  permission review  = reviewer or compliance_officer
+  permission approve = compliance_officer
+  permission reject  = compliance_officer
+}
+
+// Identity verification checks (bvn-nin-verification-go, verification-service)
+entity identity_verification {
+  relation operator            @user
+  relation compliance_officer  @user
+
+  permission initiate = operator or compliance_officer
+  permission verify   = operator or compliance_officer
+  permission override = compliance_officer
+}
+
+// Sanctions/AML screening runs (sanctions-streaming-go, sanctions-screening-rs,
+// sanctions-engine-rs, sanctions-batch-rescreener-rs, kyc-aml-screening)
+entity screening {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission screen   = analyst or compliance_officer
+  permission rescreen = analyst or compliance_officer
+  permission override = compliance_officer
+}
+
+// Individual sanction hits produced by screening (sanctions-* services)
+entity sanction_hit {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission review   = analyst or compliance_officer
+  permission dismiss  = compliance_officer
+  permission escalate = analyst or compliance_officer
+}
+
+// PEP enhanced due-diligence reviews (pep-enhanced-dd-py, cbn-tiered-kyc-rs)
+entity pep_review {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission review   = analyst or compliance_officer
+  permission approve  = compliance_officer
+  permission reject   = compliance_officer
+  permission escalate = analyst or compliance_officer
+}
+
+// AML cases and transaction-monitoring output (aml-engine-rs, aml-risk-scoring-rs,
+// txn-monitoring-rules-rs, wire-transfer-monitor-rs)
+entity aml_case {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission create   = analyst or compliance_officer
+  permission assign   = compliance_officer
+  permission escalate = analyst or compliance_officer
+  permission close    = compliance_officer
+  // W12-B5-P0-D3: status-transition approval on AML cases (aml-engine-rs).
+  permission approve  = compliance_officer
+}
+
+// Transaction-monitoring rules (txn-monitoring-rules-rs, compliance-service)
+entity monitoring_rule {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission create   = compliance_officer
+  permission update   = compliance_officer
+  permission toggle   = compliance_officer
+  permission evaluate = analyst or compliance_officer
+  // W12-B5-P0-D3: manage permission for monitor record administration
+  // (wire-transfer-monitor-rs).
+  permission manage   = compliance_officer
+}
+
+// Regulatory reports (compliance-service, regulatory-reporting-py)
+entity compliance_report {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission generate = analyst or compliance_officer
+  permission submit   = compliance_officer
+}
+
+// Compliance alerts (compliance-service, flag-audit-rs)
+entity compliance_alert {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission create  = analyst or compliance_officer
+  permission resolve = compliance_officer
+  permission flag    = analyst or compliance_officer
+  permission clear   = compliance_officer
+}
+
+// SAR/STR/CTR regulatory filings (compliance-service, nfiu-ctr-str-filing-py)
+entity regulatory_filing {
+  relation filer               @user
+  relation approver            @user
+  relation compliance_officer  @user
+
+  permission file       = filer or compliance_officer
+  permission approve    = approver or compliance_officer
+  permission submit     = compliance_officer
+  permission legal_hold = compliance_officer
+}
+
+// Fraud cases, rules, devices (fraud-service, fraudfusion, fraud-detection-rs,
+// fraudfusion-ensemble-rs)
+entity fraud_case {
+  relation fraud_analyst       @user
+  relation risk_manager        @user
+
+  permission create  = fraud_analyst or risk_manager
+  permission score   = fraud_analyst or risk_manager
+  permission decide  = fraud_analyst or risk_manager
+  permission resolve = fraud_analyst or risk_manager
+  permission block   = fraud_analyst or risk_manager
+}
+
+entity fraud_rule {
+  relation fraud_analyst       @user
+  relation risk_manager        @user
+
+  permission manage = risk_manager
+  permission toggle = risk_manager
+}
+
+// Device fingerprints (fraud-service devices register/trust)
+entity fraud_device {
+  relation fraud_analyst       @user
+  relation risk_manager        @user
+
+  permission register = fraud_analyst or risk_manager
+  permission trust    = risk_manager
+}
+
+// Customer disputes (dispute-service)
+entity dispute {
+  relation agent               @user
+  relation operations_manager  @user
+
+  permission create  = agent or operations_manager
+  permission resolve = operations_manager
+}
+
+// UBO discovery/traversal (ubo-service, ubo-ownership-graph-rs, ubo-traversal-rs)
+entity ubo_graph {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission identify = analyst or compliance_officer
+  permission traverse = analyst or compliance_officer
+  permission manage   = compliance_officer
+}
+
+// Watchlists (watchlist-manager-rs, adverse-media-*)
+entity watchlist {
+  relation analyst             @user
+  relation compliance_officer  @user
+
+  permission manage = compliance_officer
+  permission add    = analyst or compliance_officer
+  permission remove = compliance_officer
+}
+
+// Signature verification overrides (signature-verification-rs)
+entity signature_verification {
+  relation operator            @user
+  relation compliance_officer  @user
+
+  permission verify   = operator or compliance_officer
+  permission override = compliance_officer
+}
+
+// Regulatory scenario engines (basel-engine-rs, ifrs9-engine-rs,
+// stress-testing-rs, lcr-nsfr-rs)
+entity regulatory_scenario {
+  relation analyst             @user
+  relation risk_manager        @user
+
+  permission run     = analyst or risk_manager
+  permission approve = risk_manager
+}
+
+// Risk scores (risk-scoring-rs, aml-risk-scoring-rs)
+entity risk_score {
+  relation analyst             @user
+  relation risk_manager        @user
+
+  permission compute  = analyst or risk_manager
+  permission override = risk_manager
+}
+
+// Telegram KYC bot sessions (telegram-kyc-bot-rs)
+entity kyc_bot_session {
+  relation operator            @user
+  relation compliance_officer  @user
+
+  permission initiate = operator or compliance_officer
+  permission approve  = compliance_officer
+}
+
+// W12-B5-P0-D3: Regulatory ledger replication (tb-regulatory-ledger-go).
+// The /v1/tb-regulatory/replicate endpoint appends GL mirror entries to the
+// read-only audit cluster; gated by this entity's `replicate` permission.
+entity regulatory_ledger {
+  relation operator            @user
+  relation compliance_officer  @user
+  relation auditor             @user
+
+  permission replicate = operator or compliance_officer
+  permission audit     = auditor or compliance_officer
+}

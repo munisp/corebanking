@@ -394,9 +394,9 @@ func main() {
 	http.HandleFunc("/healthz", svc.healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/expense-mgmt-go/list", svc.listItems)
-	http.HandleFunc("/v1/expense-mgmt-go/stats", svc.getStats)
-	http.HandleFunc("/v1/expense-mgmt-go", svc.createItem)
+	http.HandleFunc("/v1/expense-mgmt-go/list", permifyAuthzGuard("expense_mgmt", "view", svc.listItems))
+	http.HandleFunc("/v1/expense-mgmt-go/stats", permifyAuthzGuard("expense_mgmt", "view", svc.getStats))
+	http.HandleFunc("/v1/expense-mgmt-go", permifyAuthzGuard("expense_mgmt", "expense_mgmt_go", svc.createItem))
 
 	port := envOr("PORT", "8192")
 	fmt.Printf("Expense Management Service running on port %s\n", port)

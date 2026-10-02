@@ -1,17 +1,25 @@
-// 54Bank Db Migrations — Go
-// Domain: Infrastructure/Data
-// Full domain-specific implementation with business logic
-// Middleware: Kafka, Postgres, Redis, Temporal, Permify, OpenSearch
+// 54Bank db-migrations — platform schema migration runner (B5 P1-C rewrite).
+//
+// Was: a 614-line in-memory stub with fabricated Record CRUD and ZERO
+// CREATE TABLE. Now: the real, single owned migration path for the platform
+// template tables (outbox, service_records, service_configs — see
+// migrations/V2026*.sql) and the registration point for future
+// service-specific migrations (see README.md).
+//
+// Endpoint contract preserved from the stub: /healthz /readyz /livez
+// /metrics keep their paths and response shapes (now truthful), and the
+// /v1/db-migrations/* routes now serve real ledger data instead of the
+// fabricated in-memory store. Non-probe routes remain behind the Keycloak
+// JWKS JWT middleware (fail-closed), unchanged from the stub.
 package main
 
 import (
 	"context"
 	"crypto"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,7 +27,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,8 +34,7 @@ import (
 	"time"
 )
 
-// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
-// (replaces per-call &http.Client{} construction).
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls.
 var sharedHTTPClient = &http.Client{
 	Timeout: 10 * time.Second,
 	Transport: &http.Transport{
@@ -36,17 +42,6 @@ var sharedHTTPClient = &http.Client{
 		MaxIdleConnsPerHost: 25,
 		IdleConnTimeout:     90 * time.Second,
 	},
-}
-
-// cryptoRandUint32 returns a cryptographically secure random uint32 for
-// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
-// predictable and collision-prone).
-func cryptoRandUint32() uint32 {
-	var b [4]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		log.Fatalf("crypto/rand unavailable: %v", err)
-	}
-	return binary.BigEndian.Uint32(b[:])
 }
 
 var startTime = time.Now()
@@ -76,122 +71,6 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// ─── Domain Types ───────────────────────────────────────────────────────────
-
-type Record struct {
-	ID        string                 `json:"id"`
-	Type      string                 `json:"type"`
-	Status    string                 `json:"status"`
-	Data      map[string]interface{} `json:"data"`
-	CreatedAt string                 `json:"createdAt"`
-	UpdatedAt string                 `json:"updatedAt"`
-	CreatedBy string                 `json:"createdBy,omitempty"`
-	TenantID  string                 `json:"tenantId,omitempty"`
-	Version   int                    `json:"version"`
-}
-
-type AuditEntry struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	RecordID  string `json:"recordId"`
-	Actor     string `json:"actor"`
-	Timestamp string `json:"timestamp"`
-	Details   string `json:"details"`
-}
-
-type DomainStats struct {
-	TotalRecords   int                    `json:"totalRecords"`
-	ActiveRecords  int                    `json:"activeRecords"`
-	PendingRecords int                    `json:"pendingRecords"`
-	ProcessedToday int                    `json:"processedToday"`
-	Domain         string                 `json:"domain"`
-	Metrics        map[string]interface{} `json:"metrics"`
-}
-
-var (
-	mu      sync.RWMutex
-	records = []Record{
-		{ID: "DB--001", Type: "primary", Status: "active", Data: map[string]interface{}{"domain": "Infrastructure/Data", "priority": "high", "region": "lagos"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1},
-		{ID: "DB--002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Infrastructure/Data", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
-		{ID: "DB--003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Infrastructure/Data", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
-	}
-	auditLog    = []AuditEntry{}
-	domainStats = DomainStats{
-		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
-		Domain: "Infrastructure/Data",
-		Metrics: map[string]interface{}{
-			"avgProcessingMs": 245, "successRate": 98.5, "errorRate": 1.5,
-			"peakHour": "14:00", "throughput": 156,
-		},
-	}
-)
-
-const (
-	maxInMemoryRecords = 5000
-	maxAuditEntries    = 2000
-)
-
-// appendRecord appends to the in-memory store, evicting the oldest entries
-// once the store exceeds maxInMemoryRecords (bounded store, GPT-06).
-func appendRecord(rec Record) {
-	records = append(records, rec)
-	if len(records) > maxInMemoryRecords {
-		copy(records, records[len(records)-maxInMemoryRecords:])
-		records = records[:maxInMemoryRecords]
-	}
-}
-
-// appendAudit appends to the audit log, evicting the oldest entries once the
-// log exceeds maxAuditEntries (bounded store, GPT-06).
-func appendAudit(e AuditEntry) {
-	auditLog = append(auditLog, e)
-	if len(auditLog) > maxAuditEntries {
-		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
-		auditLog = auditLog[:maxAuditEntries]
-	}
-}
-
-// parsePageParams extracts limit/offset query params with a hard cap (GPT-07).
-func parsePageParams(r *http.Request, defLimit, maxLimit int) (limit, offset int) {
-	limit = defLimit
-	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
-		limit = l
-	}
-	if limit > maxLimit {
-		limit = maxLimit
-	}
-	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o > 0 {
-		offset = o
-	}
-	return
-}
-
-// paginateRecords bounds list responses (default 100, max 500 per page).
-func paginateRecords(all []Record, r *http.Request) []Record {
-	limit, offset := parsePageParams(r, 100, 500)
-	if offset >= len(all) {
-		return []Record{}
-	}
-	end := offset + limit
-	if end > len(all) {
-		end = len(all)
-	}
-	return all[offset:end]
-}
-
-// paginateAudit bounds audit responses (default 100, max 500 per page).
-func paginateAudit(all []AuditEntry, r *http.Request) []AuditEntry {
-	limit, offset := parsePageParams(r, 100, 500)
-	if offset >= len(all) {
-		return []AuditEntry{}
-	}
-	end := offset + limit
-	if end > len(all) {
-		end = len(all)
-	}
-	return all[offset:end]
-}
-
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Service", "db-migrations")
@@ -199,151 +78,205 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
+// ─── Runner state (real, ledger-backed) ─────────────────────────────────────
+
+var (
+	dbHandle *sql.DB
+	stateMu  sync.RWMutex
+	state    = &runnerState{LastError: "migrations not yet run"}
+)
+
+func currentState() runnerState {
+	stateMu.RLock()
+	defer stateMu.RUnlock()
+	return *state
+}
+
+func setState(s *runnerState, runErr error) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if runErr != nil && s.LastError == "" {
+		s.LastError = runErr.Error()
+	}
+	if runErr == nil {
+		s.LastError = ""
+	}
+	state = s
+}
+
+// dbReady reports probe truth: DB reachable, no dirty ledger rows, no pending
+// migrations, no run error.
+func dbReady() (bool, string) {
+	if dbHandle == nil {
+		return false, "database not connected"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := dbHandle.PingContext(ctx); err != nil {
+		return false, "database unreachable: " + err.Error()
+	}
+	s := currentState()
+	if len(s.Dirty) > 0 {
+		return false, "dirty schema_migrations versions present"
+	}
+	if len(s.Pending) > 0 {
+		return false, "pending migrations: " + strings.Join(s.Pending, ",")
+	}
+	if s.LastError != "" {
+		return false, s.LastError
+	}
+	return true, ""
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	s := currentState()
+	status := "healthy"
+	if s.LastError != "" || len(s.Dirty) > 0 {
+		status = "degraded"
+	}
 	respondJSON(w, 200, map[string]interface{}{
-		"service": "db-migrations", "status": "healthy", "version": "2.0.0",
+		"service": "db-migrations", "status": status, "version": "2.1.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
 		"domain":      "Db Migrations — Infrastructure/Data",
-		"middleware": map[string]string{
-			"kafka":      "db-migrations.events, db-migrations.audit",
-			"postgres":   "db_migrations_records",
-			"redis":      "db-migrations_cache",
-			"temporal":   "DbMigrationsWorkflow",
-			"permify":    "db-migrations:manage, db-migrations:view",
-			"opensearch": "db-migrations-2026",
+		"migrations": map[string]interface{}{
+			"applied": s.Applied,
+			"pending": s.Pending,
+			"dirty":   s.Dirty,
+			"lastRun": s.LastRun,
 		},
 	})
 }
 
-func handleList(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	status := r.URL.Query().Get("status")
-	filtered := []Record{}
-	for _, rec := range records {
-		if status == "" || rec.Status == status {
-			filtered = append(filtered, rec)
-		}
+func handleReadyz(w http.ResponseWriter, r *http.Request) {
+	ok, reason := dbReady()
+	if !ok {
+		respondJSON(w, 503, map[string]interface{}{
+			"ready": false, "service": "db-migrations", "reason": reason,
+		})
+		return
 	}
-	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(filtered, r), "total": len(filtered), "domain": "Infrastructure/Data"})
+	respondJSON(w, 200, map[string]interface{}{"ready": true, "service": "db-migrations"})
 }
 
-func handleCreate(w http.ResponseWriter, r *http.Request) {
+// ledgerEntry is the JSON view of one schema_migrations row.
+type ledgerEntry struct {
+	Version         int64  `json:"version"`
+	Script          string `json:"script"`
+	AppliedAt       string `json:"appliedAt"`
+	Checksum        string `json:"checksum,omitempty"`
+	ExecutionTimeMs int64  `json:"executionTimeMs,omitempty"`
+	Runner          string `json:"runner"`
+	Dirty           bool   `json:"dirty"`
+}
+
+func ledgerEntries(rows []ledgerRow) []ledgerEntry {
+	out := make([]ledgerEntry, 0, len(rows))
+	for _, r := range rows {
+		e := ledgerEntry{
+			Version:   r.Version,
+			Script:    r.Script,
+			AppliedAt: r.AppliedAt.Format(time.RFC3339),
+			Runner:    r.Runner.String,
+			Dirty:     r.Dirty,
+		}
+		if r.Checksum.Valid {
+			e.Checksum = r.Checksum.String
+		}
+		if r.ExecutionTimeMs.Valid {
+			e.ExecutionTimeMs = r.ExecutionTimeMs.Int64
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// handleStatus is the k8s/operator source of truth: applied count, pending
+// migrations, dirty flag, and the full ledger.
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	s := currentState()
+	respondJSON(w, 200, map[string]interface{}{
+		"service": "db-migrations",
+		"applied": s.Applied,
+		"pending": s.Pending,
+		"dirty":   s.Dirty,
+		"ok":      s.LastError == "" && len(s.Dirty) == 0 && len(s.Pending) == 0,
+		"lastRun": s.LastRun,
+		"error":   s.LastError,
+		"ledger":  ledgerEntries(s.Entries),
+	})
+}
+
+// handleList replaces the stub's fabricated in-memory record list with the
+// real applied-migration list.
+func handleList(w http.ResponseWriter, r *http.Request) {
+	s := currentState()
+	respondJSON(w, 200, map[string]interface{}{
+		"migrations": ledgerEntries(s.Entries),
+		"total":      len(s.Entries),
+		"domain":     "Infrastructure/Data",
+	})
+}
+
+// handleStats replaces the stub's fabricated DomainStats with real counts.
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	s := currentState()
+	respondJSON(w, 200, map[string]interface{}{
+		"domain":         "Infrastructure/Data",
+		"appliedCount":   s.Applied,
+		"pendingCount":   len(s.Pending),
+		"dirtyCount":     len(s.Dirty),
+		"ledgerRowCount": len(s.Entries),
+		"lastRun":        s.LastRun,
+		"uptime_secs":    int(time.Since(startTime).Seconds()),
+	})
+}
+
+// handleAudit serves the ledger as the audit trail (append-only record of
+// what ran, when, how long, with checksums).
+func handleAudit(w http.ResponseWriter, r *http.Request) {
+	s := currentState()
+	respondJSON(w, 200, map[string]interface{}{
+		"auditLog": ledgerEntries(s.Entries), "total": len(s.Entries),
+	})
+}
+
+// handleRun re-runs pending migrations on demand (operator action). No-op
+// when nothing is pending. Refuses (fail-closed) while dirty.
+func handleRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		respondJSON(w, 405, map[string]string{"error": "POST required"})
 		return
 	}
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	rec := Record{
-		ID:        fmt.Sprintf("DB--%08X", cryptoRandUint32()),
-		Type:      getString(body, "type"),
-		Status:    "pending",
-		Data:      body,
-		CreatedAt: time.Now().Format(time.RFC3339),
-		UpdatedAt: time.Now().Format(time.RFC3339),
-		CreatedBy: getString(body, "createdBy"),
-		TenantID:  getString(body, "tenantId"),
-		Version:   1,
-	}
-	if rec.Type == "" {
-		rec.Type = "primary"
-	}
-	appendRecord(rec)
-	domainStats.TotalRecords = len(records)
-
-	appendAudit(AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
-		RecordID: rec.ID, Actor: rec.CreatedBy,
-		Timestamp: rec.CreatedAt, Details: "Record created",
-	})
-
-	respondJSON(w, 201, map[string]interface{}{"created": true, "record": rec})
-}
-
-func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" {
-		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+	if dbHandle == nil {
+		respondJSON(w, 503, map[string]string{"error": "database not connected"})
 		return
 	}
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" {
-				records[i].Status = s
-			}
-			for k, v := range body {
-				if k != "id" {
-					records[i].Data[k] = v
-				}
-			}
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
-			appendAudit(AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
-				RecordID: id, Actor: getString(body, "updatedBy"),
-				Timestamp: records[i].UpdatedAt, Details: "Record updated",
-			})
-			respondJSON(w, 200, map[string]interface{}{"updated": true, "record": records[i]})
-			return
-		}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	s, err := applyMigrations(ctx, dbHandle)
+	setState(s, err)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": err.Error()})
+		return
 	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found: " + id})
+	respondJSON(w, 200, map[string]interface{}{"ok": true, "applied": s.Applied})
 }
 
-func handleProcess(w http.ResponseWriter, r *http.Request) {
-	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
-	// (processingResult="success" and a random score via math/rand). Real domain
-	// processing must be implemented before this endpoint is enabled.
-	// Fail fast; never fabricate.
-	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
-}
-
-func handleAudit(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
-}
-
-func handleStats(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-	domainStats.TotalRecords = len(records)
-	active := 0
-	pending := 0
-	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" {
-			active++
-		}
-		if r.Status == "pending" || r.Status == "processing" {
-			pending++
-		}
-	}
-	domainStats.ActiveRecords = active
-	domainStats.PendingRecords = pending
-	respondJSON(w, 200, domainStats)
-}
-
-func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
+// goneHandler replaces the stub's fabricated in-memory create/update/process
+// routes. They returned invented data; there is no real operation behind
+// them, so they fail honestly (mirrors the stub's own handleProcess 501).
+func goneHandler(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, 501, map[string]string{
+		"error": "not_implemented",
+		"detail": "the in-memory record store was fabricated and has been removed; " +
+			"see /v1/db-migrations/status for real migration state",
+	})
 }
 
 // --- JWT Validation (Keycloak JWKS, RS256, fail-closed) ---
+// Unchanged from the stub: non-probe routes require a verified Bearer token.
 
 type jwksCache struct {
 	mu      sync.RWMutex
@@ -446,9 +379,7 @@ func tenantFromClaims(claims map[string]interface{}) string {
 
 // jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
 // (RS256 signature + required exp claim). Fail-closed: any verification
-// problem yields 401. Identity headers (X-User-Id, X-Keycloak-ID, X-Tenant-ID,
-// X-User-Role) are overwritten from verified claims — caller-supplied values
-// are never trusted.
+// problem yields 401. Identity headers are overwritten from verified claims.
 func jwtAuthMiddleware(next http.Handler) http.Handler {
 	ensureJWKSRefresh()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -528,8 +459,6 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
-		// Identity headers come ONLY from verified claims; overwrite or drop any
-		// caller-supplied values before invoking the handler.
 		if sub, ok := claims["sub"].(string); ok && sub != "" {
 			r.Header.Set("X-User-Id", sub)
 			r.Header.Set("X-Keycloak-ID", sub)
@@ -561,33 +490,87 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// runMigrationsAtBoot connects (with retry — the DB may still be coming up in
+// the same compose group) and applies pending migrations once.
+func runMigrationsAtBoot() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	var db *sql.DB
+	var err error
+	for attempt := 1; attempt <= 5; attempt++ {
+		db, err = connectDB(ctx)
+		if err == nil {
+			break
+		}
+		log.Printf("[db-migrations] connect attempt %d/5 failed: %v", attempt, err)
+		time.Sleep(time.Duration(attempt) * 3 * time.Second)
+	}
+	if err != nil {
+		setState(&runnerState{LastRun: time.Now().UTC(), LastError: err.Error()}, err)
+		return err
+	}
+	dbHandle = db
+
+	s, err := applyMigrations(ctx, db)
+	setState(s, err)
+	return err
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9345"
 	}
+
+	bootErr := runMigrationsAtBoot()
+	if bootErr != nil {
+		// Fail-closed: the process keeps serving so probes/operators can read
+		// the real state, but /readyz stays 503 until the dirty state is
+		// resolved. Job mode exits non-zero instead (below).
+		log.Printf("[db-migrations] BOOT MIGRATION FAILED (serving degraded): %v", bootErr)
+	} else {
+		log.Printf("[db-migrations] all migrations applied")
+	}
+
+	// Job mode: run migrations and exit (k8s Job / initContainer usage).
+	if os.Getenv("MIGRATIONS_EXIT_AFTER_RUN") == "true" {
+		if bootErr != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	http.HandleFunc("/healthz", handleHealthz)
-	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		respondJSON(w, 200, map[string]interface{}{"ready": true, "service": "db-migrations"})
-	})
+	http.HandleFunc("/readyz", handleReadyz)
 	http.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 200, map[string]interface{}{"alive": true})
 	})
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		reqs := atomic.LoadUint64(&_reqCount)
 		errs := atomic.LoadUint64(&_errCount)
+		s := currentState()
+		dirty := 0
+		if len(s.Dirty) > 0 {
+			dirty = 1
+		}
 		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"db-migrations\"} %d\n", reqs)
-		fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"db-migrations\"} %d\n", errs)
-		fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"db-migrations\"} %.0f\n", time.Since(startTime).Seconds())
+		printfText(w, "# TYPE requests_total counter\nrequests_total{service=\"db-migrations\"} %d\n", reqs)
+		printfText(w, "# TYPE errors_total counter\nerrors_total{service=\"db-migrations\"} %d\n", errs)
+		printfText(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"db-migrations\"} %.0f\n", time.Since(startTime).Seconds())
+		printfText(w, "# TYPE db_migrations_applied gauge\ndb_migrations_applied %d\n", s.Applied)
+		printfText(w, "# TYPE db_migrations_pending gauge\ndb_migrations_pending %d\n", len(s.Pending))
+		printfText(w, "# TYPE db_migrations_dirty gauge\ndb_migrations_dirty %d\n", dirty)
 	})
+	http.HandleFunc("/v1/db-migrations/status", handleStatus)
 	http.HandleFunc("/v1/db-migrations/list", handleList)
-	http.HandleFunc("/v1/db-migrations/create", handleCreate)
-	http.HandleFunc("/v1/db-migrations/update", handleUpdate)
-	http.HandleFunc("/v1/db-migrations/process", handleProcess)
 	http.HandleFunc("/v1/db-migrations/audit", handleAudit)
 	http.HandleFunc("/v1/db-migrations/stats", handleStats)
-	log.Printf("Db Migrations v2.0 (Infrastructure/Data) on :%s", port)
+	http.HandleFunc("/v1/db-migrations/run", handleRun)
+	http.HandleFunc("/v1/db-migrations/create", goneHandler)
+	http.HandleFunc("/v1/db-migrations/update", goneHandler)
+	http.HandleFunc("/v1/db-migrations/process", goneHandler)
+	log.Printf("db-migrations v2.1 (platform migration runner) on :%s", port)
 	server := &http.Server{
 		Addr:              ":" + port,
 		Handler:           countingMiddleware(jwtAuthMiddleware(http.DefaultServeMux)),
@@ -610,5 +593,16 @@ func main() {
 	if err := server.Shutdown(ctx); err != nil {
 		log.Fatalf("Forced shutdown: %v", err)
 	}
+	if dbHandle != nil {
+		dbHandle.Close()
+	}
 	log.Println("[db-migrations] Server stopped")
+}
+
+// printfText writes a formatted metrics line, logging write failures
+// (fmt.Fprintf return value must not be silently dropped — errcheck hygiene).
+func printfText(w http.ResponseWriter, format string, args ...interface{}) {
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		log.Printf("[db-migrations] metrics write failed: %v", err)
+	}
 }

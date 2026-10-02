@@ -3,32 +3,31 @@ package main
 import (
 	"errors"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// InvestmentService handles investment operations
+// InvestmentService handles investment operations.
+// Postgres (table treasury_investments) is the system of record.
 type InvestmentService struct {
 	tenantID    string
-	investments map[string]*Investment
-	mu          sync.RWMutex
+	investments *repo[Investment]
 }
 
 // NewInvestmentService creates a new investment service
 func NewInvestmentService(tenantID string) *InvestmentService {
 	svc := &InvestmentService{
 		tenantID:    tenantID,
-		investments: make(map[string]*Investment),
+		investments: newRepo[Investment](serviceDB, "treasury_investments"),
 	}
 	svc.initializeDefaultInvestments(tenantID)
 	return svc
 }
 
 func (s *InvestmentService) initializeDefaultInvestments(tenantID string) {
-	// Treasury Bills
-	s.investments["inv-001"] = &Investment{
+	// Treasury Bills (idempotent seed)
+	s.investments.seed(tenantID, "inv-001", &Investment{
 		InvestmentID:   "inv-001",
 		TenantID:       tenantID,
 		InvestmentType: "treasury_bill",
@@ -48,10 +47,10 @@ func (s *InvestmentService) initializeDefaultInvestments(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, -2, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 
-	// FGN Bonds
-	s.investments["inv-002"] = &Investment{
+	// FGN Bonds (idempotent seed)
+	s.investments.seed(tenantID, "inv-002", &Investment{
 		InvestmentID:    "inv-002",
 		TenantID:        tenantID,
 		InvestmentType:  "bond",
@@ -72,10 +71,10 @@ func (s *InvestmentService) initializeDefaultInvestments(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
-	// Commercial Paper
-	s.investments["inv-003"] = &Investment{
+	// Commercial Paper (idempotent seed)
+	s.investments.seed(tenantID, "inv-003", &Investment{
 		InvestmentID:   "inv-003",
 		TenantID:       tenantID,
 		InvestmentType: "commercial_paper",
@@ -95,19 +94,17 @@ func (s *InvestmentService) initializeDefaultInvestments(tenantID string) {
 		Metadata:       make(map[string]interface{}),
 		CreatedAt:      time.Now().AddDate(0, -1, 0),
 		UpdatedAt:      time.Now(),
-	}
+	})
 }
 
 // ListInvestments returns investments based on filters
-func (s *InvestmentService) ListInvestments(tenantID, investmentType, status string) []*Investment {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *InvestmentService) ListInvestments(tenantID, investmentType, status string) ([]*Investment, error) {
+	all, err := s.investments.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	var result []*Investment
-	for _, inv := range s.investments {
-		if inv.TenantID != tenantID {
-			continue
-		}
+	for _, inv := range all {
 		if investmentType != "" && inv.InvestmentType != investmentType {
 			continue
 		}
@@ -116,16 +113,13 @@ func (s *InvestmentService) ListInvestments(tenantID, investmentType, status str
 		}
 		result = append(result, inv)
 	}
-	return result
+	return result, nil
 }
 
 // GetInvestment retrieves an investment by ID
 func (s *InvestmentService) GetInvestment(tenantID, investmentID string) (*Investment, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	inv, exists := s.investments[investmentID]
-	if !exists || inv.TenantID != tenantID {
+	inv, err := s.investments.get(tenantID, investmentID)
+	if err != nil {
 		return nil, errors.New("investment not found")
 	}
 	return inv, nil
@@ -133,9 +127,6 @@ func (s *InvestmentService) GetInvestment(tenantID, investmentID string) (*Inves
 
 // CreateInvestment creates a new investment
 func (s *InvestmentService) CreateInvestment(tenantID string, req *CreateInvestmentRequest) (*Investment, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	purchaseDate, _ := time.Parse("2006-01-02", req.PurchaseDate)
 	maturityDate, _ := time.Parse("2006-01-02", req.MaturityDate)
 
@@ -161,55 +152,50 @@ func (s *InvestmentService) CreateInvestment(tenantID string, req *CreateInvestm
 		UpdatedAt:      time.Now(),
 	}
 
-	s.investments[inv.InvestmentID] = inv
+	if err := s.investments.put(tenantID, inv.InvestmentID, inv); err != nil {
+		return nil, err
+	}
 	return inv, nil
 }
 
 // UpdateInvestment updates an investment
 func (s *InvestmentService) UpdateInvestment(inv *Investment) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	existing, exists := s.investments[inv.InvestmentID]
-	if !exists || existing.TenantID != inv.TenantID {
+	existing, err := s.investments.get(inv.TenantID, inv.InvestmentID)
+	if err != nil {
 		return errors.New("investment not found")
 	}
 
 	inv.CreatedAt = existing.CreatedAt
 	inv.UpdatedAt = time.Now()
-	s.investments[inv.InvestmentID] = inv
-	return nil
+	return s.investments.put(inv.TenantID, inv.InvestmentID, inv)
 }
 
-// SellInvestment sells an investment
+// SellInvestment sells an investment (transactional status transition)
 func (s *InvestmentService) SellInvestment(tenantID, investmentID string, salePrice int64) (*Investment, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	inv, exists := s.investments[investmentID]
-	if !exists || inv.TenantID != tenantID {
-		return nil, errors.New("investment not found")
-	}
-
-	if inv.Status != "active" {
-		return nil, errors.New("can only sell active investments")
-	}
-
-	inv.Status = "sold"
-	inv.CurrentValue = salePrice
-	inv.UnrealizedPnL = 0
-	inv.Metadata["salePrice"] = salePrice
-	inv.Metadata["realizedPnL"] = salePrice - inv.PurchasePrice
-	inv.Metadata["saleDate"] = time.Now().Format(time.RFC3339)
-	inv.UpdatedAt = time.Now()
-
-	return inv, nil
+	return s.investments.update(tenantID, investmentID, func(inv *Investment) error {
+		if inv.Status != "active" {
+			return errors.New("can only sell active investments")
+		}
+		inv.Status = "sold"
+		inv.CurrentValue = salePrice
+		inv.UnrealizedPnL = 0
+		if inv.Metadata == nil {
+			inv.Metadata = make(map[string]interface{})
+		}
+		inv.Metadata["salePrice"] = salePrice
+		inv.Metadata["realizedPnL"] = salePrice - inv.PurchasePrice
+		inv.Metadata["saleDate"] = time.Now().Format(time.RFC3339)
+		inv.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
 // GetPortfolioSummary returns portfolio summary
-func (s *InvestmentService) GetPortfolioSummary(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *InvestmentService) GetPortfolioSummary(tenantID string) (map[string]interface{}, error) {
+	all, err := s.investments.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 
 	var totalValue, totalPurchasePrice, totalUnrealizedPnL, totalAccruedInterest int64
 	var totalYield float64
@@ -218,8 +204,8 @@ func (s *InvestmentService) GetPortfolioSummary(tenantID string) map[string]inte
 	byType := make(map[string]int64)
 	byPortfolio := make(map[string]int64)
 
-	for _, inv := range s.investments {
-		if inv.TenantID != tenantID || inv.Status != "active" {
+	for _, inv := range all {
+		if inv.Status != "active" {
 			continue
 		}
 		count++
@@ -248,14 +234,11 @@ func (s *InvestmentService) GetPortfolioSummary(tenantID string) map[string]inte
 		"byType":               byType,
 		"byPortfolio":          byPortfolio,
 		"timestamp":            time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetMaturingInvestments returns investments maturing within specified days
-func (s *InvestmentService) GetMaturingInvestments(tenantID, daysStr string) []*Investment {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *InvestmentService) GetMaturingInvestments(tenantID, daysStr string) ([]*Investment, error) {
 	days := 30
 	if daysStr != "" {
 		if d, err := strconv.Atoi(daysStr); err == nil {
@@ -263,30 +246,37 @@ func (s *InvestmentService) GetMaturingInvestments(tenantID, daysStr string) []*
 		}
 	}
 
+	all, err := s.investments.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
+
 	cutoff := time.Now().AddDate(0, 0, days)
 	var result []*Investment
 
-	for _, inv := range s.investments {
-		if inv.TenantID != tenantID || inv.Status != "active" {
+	for _, inv := range all {
+		if inv.Status != "active" {
 			continue
 		}
 		if inv.MaturityDate.Before(cutoff) {
 			result = append(result, inv)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetPortfolioYield returns portfolio yield analysis
-func (s *InvestmentService) GetPortfolioYield(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *InvestmentService) GetPortfolioYield(tenantID string) (map[string]interface{}, error) {
+	all, err := s.investments.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 
 	yieldByType := make(map[string]float64)
 	countByType := make(map[string]int)
 
-	for _, inv := range s.investments {
-		if inv.TenantID != tenantID || inv.Status != "active" {
+	for _, inv := range all {
+		if inv.Status != "active" {
 			continue
 		}
 		yieldByType[inv.InvestmentType] += inv.YieldRate
@@ -303,5 +293,5 @@ func (s *InvestmentService) GetPortfolioYield(tenantID string) map[string]interf
 		"benchmarkRate":       18.0, // CBN MPR
 		"spreadOverBenchmark": 2.5,
 		"timestamp":           time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

@@ -93,6 +93,32 @@ var (
 	}
 )
 
+const (
+	maxInMemoryRecords = 5000
+	maxAuditEntries    = 2000
+)
+
+// appendRecord appends to the in-memory write-through cache, evicting the
+// oldest entries once the cache exceeds maxInMemoryRecords (bounded store,
+// W12-C3-P0). Postgres (service_records) is the authoritative store.
+func appendRecord(rec Record) {
+	records = append(records, rec)
+	if len(records) > maxInMemoryRecords {
+		copy(records, records[len(records)-maxInMemoryRecords:])
+		records = records[:maxInMemoryRecords]
+	}
+}
+
+// appendAudit appends to the bounded in-memory audit cache. The authoritative
+// audit trail is the audit_log table (W12-C3-P0).
+func appendAudit(e AuditEntry) {
+	auditLog = append(auditLog, e)
+	if len(auditLog) > maxAuditEntries {
+		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
+		auditLog = auditLog[:maxAuditEntries]
+	}
+}
+
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Service", "whatsapp-payment-integration-go")
@@ -181,7 +207,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if rec.Type == "" {
 		rec.Type = "primary"
 	}
-	records = append(records, rec)
+	appendRecord(rec) // write-through cache; authoritative row via dbInsert below
 	domainStats.TotalRecords = len(records)
 
 	// Persist to database
@@ -191,11 +217,15 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	auditLog = append(auditLog, AuditEntry{
+	createAudit := AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
-	})
+	}
+	appendAudit(createAudit)
+	if dbErr := dbAuditInsert(createAudit); dbErr != nil {
+		log.Printf("[%s] dbAuditInsert failed: %v", serviceName, dbErr)
+	}
 
 	respondJSON(w, 201, map[string]interface{}{"created": true, "record": rec})
 }
@@ -224,11 +254,21 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
-			auditLog = append(auditLog, AuditEntry{
+			updateAudit := AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
-			})
+			}
+			appendAudit(updateAudit)
+			// W12-C3-P0: updates must hit Postgres (previously memory-only).
+			if dataBytes, mErr := json.Marshal(records[i].Data); mErr == nil {
+				if dbErr := dbUpdate(records[i].ID, serviceName, records[i].Status, dataBytes); dbErr != nil {
+					log.Printf("[%s] dbUpdate failed: %v", serviceName, dbErr)
+				}
+			}
+			if dbErr := dbAuditInsert(updateAudit); dbErr != nil {
+				log.Printf("[%s] dbAuditInsert failed: %v", serviceName, dbErr)
+			}
 			respondJSON(w, 200, map[string]interface{}{"updated": true, "record": records[i]})
 			return
 		}
@@ -245,9 +285,20 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
+	// W12-C3-P0: audit trail is served from Postgres (authoritative); the
+	// bounded in-memory slice is a write-through cache used only when the
+	// database is unavailable (degraded mode).
+	if db != nil {
+		entries, err := dbAuditList(serviceName, 500)
+		if err == nil {
+			respondJSON(w, 200, map[string]interface{}{"auditLog": entries, "total": len(entries), "source": "database"})
+			return
+		}
+		log.Printf("[%s] audit DB query failed, falling back to in-memory cache: %v", serviceName, err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog)})
+	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog), "source": "in-memory-cache"})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -400,6 +451,21 @@ func initDB() {
 		return
 	}
 	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
+	// W12-C3-P0: authoritative audit trail (was in-memory only).
+	db.Exec(`CREATE TABLE IF NOT EXISTS audit_log (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, action TEXT NOT NULL,
+		record_id TEXT DEFAULT '', actor TEXT DEFAULT '', details TEXT DEFAULT '',
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_svc ON audit_log(service, created_at DESC)`)
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -1006,8 +1072,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO payments (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1015,10 +1088,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"payments.created", id, string(payload))
+		"payments.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1055,7 +1138,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE payments SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1063,25 +1153,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"payments.updated", id, string(payload))
+		"payments.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE payments SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"payments.deleted", id, `{"id":"`+id+`"}`)
+		"payments.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1361,17 +1480,17 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "view", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/whatsapp-payment-integration/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
-	mux.Handle("/v1/whatsapp-payment-integration/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
-	mux.Handle("/v1/whatsapp-payment-integration/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
-	mux.Handle("/v1/whatsapp-payment-integration/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
-	mux.Handle("/v1/whatsapp-payment-integration/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
-	mux.Handle("/v1/whatsapp-payment-integration/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/whatsapp-payment-integration/compute-fee", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(whatsapp_payment_integrationFeeHandler)))
-	mux.Handle("/v1/whatsapp-payment-integration/route", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(whatsapp_payment_integrationRouteHandler)))
+	mux.Handle("/v1/whatsapp-payment-integration/list", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "view", http.HandlerFunc(handleList))))
+	mux.Handle("/v1/whatsapp-payment-integration/create", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "create", http.HandlerFunc(handleCreate))))
+	mux.Handle("/v1/whatsapp-payment-integration/update", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "update", http.HandlerFunc(handleUpdate))))
+	mux.Handle("/v1/whatsapp-payment-integration/process", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "create", http.HandlerFunc(handleProcess))))
+	mux.Handle("/v1/whatsapp-payment-integration/audit", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "create", http.HandlerFunc(handleAudit))))
+	mux.Handle("/v1/whatsapp-payment-integration/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "view", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/whatsapp-payment-integration/compute-fee", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "create", http.HandlerFunc(whatsapp_payment_integrationFeeHandler))))
+	mux.Handle("/v1/whatsapp-payment-integration/route", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("payment_order", "route", http.HandlerFunc(whatsapp_payment_integrationRouteHandler))))
 	log.Printf("Whatsapp Payment Integration v2.0 (Payments) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1486,4 +1605,52 @@ func sanitizeInput(s string) string {
 		s = s[:10000]
 	}
 	return s
+}
+
+// dbUpdate persists a record mutation to Postgres (W12-C3-P0: updates were
+// previously memory-only and silently lost on restart).
+func dbUpdate(id, service, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	res, err := db.Exec("UPDATE service_records SET status=$1, data=$2, updated_at=NOW() WHERE id=$3 AND service=$4", status, string(data), id, service)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Row absent (e.g. created before this wave, or cache/DB divergence):
+		// upsert so the authoritative store converges with the mutation.
+		_, err = db.Exec("INSERT INTO service_records (id, service, status, data) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET status=$3, data=$4, updated_at=NOW()", id, service, status, string(data))
+	}
+	return err
+}
+
+// dbAuditInsert appends an entry to the authoritative audit_log table.
+func dbAuditInsert(e AuditEntry) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO audit_log (id, service, action, record_id, actor, details, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+		e.ID, serviceName, e.Action, e.RecordID, e.Actor, e.Details, e.Timestamp)
+	return err
+}
+
+// dbAuditList serves the audit trail from Postgres (authoritative).
+func dbAuditList(service string, limit int) ([]map[string]interface{}, error) {
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
+	rows, err := db.Query("SELECT id, action, record_id, actor, details, created_at FROM audit_log WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []map[string]interface{}{}
+	for rows.Next() {
+		var id, action, recordID, actor, details, ts string
+		if rows.Scan(&id, &action, &recordID, &actor, &details, &ts) == nil {
+			items = append(items, map[string]interface{}{"id": id, "action": action, "recordId": recordID, "actor": actor, "details": details, "timestamp": ts})
+		}
+	}
+	return items, nil
 }

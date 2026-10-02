@@ -12,6 +12,7 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { decodeJWT, isTokenExpired, getJwksKeys, verifyTokenSignature } from "./jwtAuthMiddleware";
 import { logger } from "./logger";
+import { getRedis, kvGetJsonSliding, kvSetJson, kvSetNX } from "./redisKv";
 
 interface JWTConfig {
   issuer: string;
@@ -125,28 +126,82 @@ const KEYCLOAK_ROLES = [
   { name: "agent_manager", description: "Agent onboarding, commission management, territory assignment", users: 10 },
 ];
 
+// W12 C3-P1-B2 (c3-0985): the session registry is redis-backed.
+// Keys (register pattern): session:{tenant}:{session_id}, TTL 900s SLIDING
+// (re-expired on read). The full key is tracked in the auth:v1:sessions index
+// set for listing. Seed records below are inserted once with SET NX, so
+// revocations (DELETE below) survive restarts and are consistent across
+// replicas — previously a restart silently resurrected revoked sessions.
+// FAIL MODE: redis down => session reads/writes fail closed (503); a
+// revocation is never silently skipped.
+const SESSION_REGISTRY_TTL_SECONDS = 900;
+const SESSION_INDEX_KEY = "auth:v1:sessions";
+
+async function seedSessionRegistry(): Promise<void> {
+  for (const s of ACTIVE_SESSIONS) {
+    const key = `session:${s.tenantId}:${s.sessionId}`;
+    try {
+      const created = await kvSetNX(key, JSON.stringify(s), SESSION_REGISTRY_TTL_SECONDS);
+      if (created) await getRedis().sadd(SESSION_INDEX_KEY, key);
+    } catch (err) {
+      logger.warn("[AUTH-V1] session registry seed failed", { error: String(err), sessionId: s.sessionId });
+    }
+  }
+}
+
+async function listSessionRegistry(): Promise<UserSession[]> {
+  const keys = await getRedis().smembers(SESSION_INDEX_KEY);
+  const sessions: UserSession[] = [];
+  for (const key of keys) {
+    const s = await kvGetJsonSliding<UserSession>(key, SESSION_REGISTRY_TTL_SECONDS);
+    if (s) sessions.push(s);
+    else await getRedis().srem(SESSION_INDEX_KEY, key); // prune expired
+  }
+  return sessions;
+}
+
 export function registerJWTAuthEnforcement(app: Express) {
+  // Seed once at registration (idempotent: SET NX + SADD).
+  void seedSessionRegistry().catch((err) => logger.warn("[AUTH-V1] session registry seed error", { error: String(err) }));
+
   // Auth health
-  app.get("/api/auth/v1/health", (_req: Request, res: Response) => {
-    res.json({
-      status: "enforced",
-      keycloak: { issuer: JWT_CONFIG.issuer, realm: JWT_CONFIG.realm, algorithms: JWT_CONFIG.algorithms },
-      activeSessions: ACTIVE_SESSIONS.filter((s) => s.status === "active").length,
-      protectedRoutes: ROUTE_PROTECTIONS.length,
-      roles: KEYCLOAK_ROLES.length,
-      mfaEnforced: ROUTE_PROTECTIONS.filter((r) => r.mfaRequired).length,
-    });
+  app.get("/api/auth/v1/health", async (_req: Request, res: Response) => {
+    try {
+      const sessions = await listSessionRegistry();
+      res.json({
+        status: "enforced",
+        keycloak: { issuer: JWT_CONFIG.issuer, realm: JWT_CONFIG.realm, algorithms: JWT_CONFIG.algorithms },
+        activeSessions: sessions.filter((s) => s.status === "active").length,
+        protectedRoutes: ROUTE_PROTECTIONS.length,
+        roles: KEYCLOAK_ROLES.length,
+        mfaEnforced: ROUTE_PROTECTIONS.filter((r) => r.mfaRequired).length,
+      });
+    } catch (err) {
+      res.status(503).json({ error: "Session registry unavailable", code: "SESSION_STATE_UNAVAILABLE" });
+    }
   });
 
   // Active sessions
-  app.get("/api/auth/v1/sessions", (_req: Request, res: Response) => {
-    res.json({ items: ACTIVE_SESSIONS, total: ACTIVE_SESSIONS.length, active: ACTIVE_SESSIONS.filter((s) => s.status === "active").length });
+  app.get("/api/auth/v1/sessions", async (_req: Request, res: Response) => {
+    try {
+      const sessions = await listSessionRegistry();
+      res.json({ items: sessions, total: sessions.length, active: sessions.filter((s) => s.status === "active").length });
+    } catch (err) {
+      res.status(503).json({ error: "Session registry unavailable", code: "SESSION_STATE_UNAVAILABLE" });
+    }
   });
-  app.delete("/api/auth/v1/sessions/:id", (req: Request, res: Response) => {
-    const s = ACTIVE_SESSIONS.find((x) => x.sessionId === req.params.id);
-    if (!s) return res.status(404).json({ error: "Session not found" });
-    s.status = "revoked";
-    res.json({ ...s, message: "Session revoked" });
+  app.delete("/api/auth/v1/sessions/:id", async (req: Request, res: Response) => {
+    try {
+      const sessions = await listSessionRegistry();
+      const s = sessions.find((x) => x.sessionId === req.params.id);
+      if (!s) return res.status(404).json({ error: "Session not found" });
+      const revoked = { ...s, status: "revoked" as const };
+      await kvSetJson(`session:${s.tenantId}:${s.sessionId}`, revoked, SESSION_REGISTRY_TTL_SECONDS);
+      res.json({ ...revoked, message: "Session revoked" });
+    } catch (err) {
+      // FAIL CLOSED: a revocation that cannot be persisted must not pretend success.
+      res.status(503).json({ error: "Session revocation unavailable", code: "REVOCATION_UNAVAILABLE" });
+    }
   });
 
   // Protected routes registry
@@ -208,9 +263,15 @@ export function registerJWTAuthEnforcement(app: Express) {
   });
 
   // Stats
-  app.get("/api/auth/v1/stats", (_req: Request, res: Response) => {
+  app.get("/api/auth/v1/stats", async (_req: Request, res: Response) => {
+    let activeCount = 0;
+    try {
+      activeCount = (await listSessionRegistry()).filter((s) => s.status === "active").length;
+    } catch (err) {
+      return res.status(503).json({ error: "Session registry unavailable", code: "SESSION_STATE_UNAVAILABLE" });
+    }
     res.json({
-      activeSessions: ACTIVE_SESSIONS.filter((s) => s.status === "active").length,
+      activeSessions: activeCount,
       protectedRoutes: ROUTE_PROTECTIONS.length,
       roles: KEYCLOAK_ROLES.length,
       totalUsers: KEYCLOAK_ROLES.reduce((s, r) => s + r.users, 0),

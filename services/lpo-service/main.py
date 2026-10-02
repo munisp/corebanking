@@ -3,6 +3,8 @@ Complete LPO Financing Service - Local Purchase Order financing with verificatio
 """
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header, Request, Query
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from audit_middleware import AuditMiddleware
 from fastapi.responses import JSONResponse
@@ -473,7 +475,7 @@ async def health_check():
     return {"status": "healthy", "service": "lpo-service"}
 
 
-@app.get("/api/v1/lpo")
+@app.get("/api/v1/lpo", dependencies=[Depends(require_permify("lpo_financing", "view"))])
 async def get_lpos(
     db=Depends(lambda: db_pool),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -491,7 +493,7 @@ async def get_lpos(
         return [dict(row) for row in rows]
 
 
-@app.get("/api/v1/lpo/administration")
+@app.get("/api/v1/lpo/administration", dependencies=[Depends(require_permify("lpo_financing", "view"))])
 async def get_lpos_administration(
     db=Depends(lambda: db_pool),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -510,7 +512,7 @@ async def get_lpos_administration(
         return {"data": [dict(row) for row in rows], "total": total, "page": page, "limit": limit}
 
 
-@app.post("/api/v1/lpo/apply")
+@app.post("/api/v1/lpo/apply", dependencies=[Depends(require_permify("lpo_financing", "create"))])
 async def apply_for_lpo_financing(
     application: LPOApplication,
     background_tasks: BackgroundTasks,
@@ -646,7 +648,7 @@ async def assess_lpo_risk(
         )
 
 
-@app.get("/api/v1/lpo/{lpo_id}")
+@app.get("/api/v1/lpo/{lpo_id}", dependencies=[Depends(require_permify("lpo_financing", "view"))])
 async def get_lpo(
     lpo_id: str,
     db=Depends(lambda: db_pool),
@@ -666,7 +668,7 @@ async def get_lpo(
         return dict(row)
 
 
-@app.post("/api/v1/lpo/{lpo_id}/verify")
+@app.post("/api/v1/lpo/{lpo_id}/verify", dependencies=[Depends(require_permify("lpo_financing", "manage"))])
 async def verify_lpo(
     lpo_id: str,
     verification: LPOVerification,
@@ -714,7 +716,7 @@ async def verify_lpo(
     }
 
 
-@app.post("/api/v1/lpo/{lpo_id}/approve")
+@app.post("/api/v1/lpo/{lpo_id}/approve", dependencies=[Depends(require_permify("lpo_financing", "manage"))])
 async def approve_lpo(
     lpo_id: str,
     approval: LPOApproval,
@@ -764,7 +766,7 @@ async def approve_lpo(
     }
 
 
-@app.post("/api/v1/lpo/{lpo_id}/decline")
+@app.post("/api/v1/lpo/{lpo_id}/decline", dependencies=[Depends(require_permify("lpo_financing", "manage"))])
 async def decline_lpo(
     lpo_id: str,
     approval: LPORejection,
@@ -804,7 +806,7 @@ async def decline_lpo(
     }
 
 
-@app.post("/api/v1/lpo/{lpo_id}/disburse")
+@app.post("/api/v1/lpo/{lpo_id}/disburse", dependencies=[Depends(require_permify("lpo_financing", "manage"))])
 async def disburse_lpo_funds(
     lpo_id: str,
     disbursal: LPODisbursal,
@@ -935,7 +937,7 @@ async def disburse_lpo_funds(
     }
 
 
-@app.post("/api/v1/lpo/{lpo_id}/record-payment")
+@app.post("/api/v1/lpo/{lpo_id}/record-payment", dependencies=[Depends(require_permify("lpo_financing", "manage"))])
 async def record_lpo_repayment(
     lpo_id: str,
     payload: LPORepayment,
@@ -1019,7 +1021,7 @@ async def record_lpo_repayment(
     }
 
 
-@app.get("/api/v1/lpo/{lpo_id}/repayments")
+@app.get("/api/v1/lpo/{lpo_id}/repayments", dependencies=[Depends(require_permify("lpo_financing", "view"))])
 async def list_lpo_repayments(lpo_id: str, db=Depends(lambda: db_pool)):
     """List repayments for LPO"""
     async with db.acquire() as conn:
@@ -1042,7 +1044,7 @@ async def list_lpo_repayments(lpo_id: str, db=Depends(lambda: db_pool)):
         }
 
 
-@app.get("/api/v1/lpo/supplier/{supplier_id}")
+@app.get("/api/v1/lpo/supplier/{supplier_id}", dependencies=[Depends(require_permify("lpo_supplier", "view"))])
 async def list_supplier_lpos(
     supplier_id: str,
     status: Optional[LPOStatus] = None,
@@ -1068,7 +1070,7 @@ async def list_supplier_lpos(
         }
 
 
-@app.post("/api/v1/lpo/supplier/register")
+@app.post("/api/v1/lpo/supplier/register", dependencies=[Depends(require_permify("lpo_supplier", "create"))])
 async def register_supplier(
     supplier_id: str,
     business_name: str,
@@ -1096,7 +1098,7 @@ async def register_supplier(
     }
 
 
-@app.get("/api/v1/suppliers")
+@app.get("/api/v1/suppliers", dependencies=[Depends(require_permify("lpo_supplier", "view"))])
 async def get_suppliers(db=Depends(lambda: db_pool)):
     """Get suppliers"""
     async with db.acquire() as conn:
@@ -1108,7 +1110,7 @@ async def get_suppliers(db=Depends(lambda: db_pool)):
         return [dict(row) for row in rows]
 
 
-@app.get("/api/v1/lpo/supplier/{supplier_id}/profile")
+@app.get("/api/v1/lpo/supplier/{supplier_id}/profile", dependencies=[Depends(require_permify("lpo_supplier", "view"))])
 async def get_supplier_profile(supplier_id: str, db=Depends(lambda: db_pool)):
     """Get supplier profile"""
     async with db.acquire() as conn:

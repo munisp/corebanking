@@ -93,29 +93,29 @@ func (s *ChatbotServer) setupRoutes() {
 	api := s.router.PathPrefix("/api/v1").Subrouter()
 
 	// Chat endpoints
-	api.HandleFunc("/chatbot/chat", s.chatHandler).Methods("POST")
-	api.HandleFunc("/chatbot/session/{sessionId}", s.getSessionHandler).Methods("GET")
-	api.HandleFunc("/chatbot/session/{sessionId}/end", s.endSessionHandler).Methods("POST")
-	api.HandleFunc("/chatbot/session/{sessionId}/history", s.getHistoryHandler).Methods("GET")
+	api.HandleFunc("/chatbot/chat", permifyAuthzGuard("chat_session", "chat", s.chatHandler)).Methods("POST")
+	api.HandleFunc("/chatbot/session/{sessionId}", permifyAuthzGuard("chat_session", "view", s.getSessionHandler)).Methods("GET")
+	api.HandleFunc("/chatbot/session/{sessionId}/end", permifyAuthzGuard("chat_session", "end", s.endSessionHandler)).Methods("POST")
+	api.HandleFunc("/chatbot/session/{sessionId}/history", permifyAuthzGuard("chat_session", "view", s.getHistoryHandler)).Methods("GET")
 
 	// Intent management
-	api.HandleFunc("/chatbot/intents", s.getIntentsHandler).Methods("GET")
-	api.HandleFunc("/chatbot/intents", s.createIntentHandler).Methods("POST")
-	api.HandleFunc("/chatbot/intents/{intentId}", s.updateIntentHandler).Methods("PUT")
-	api.HandleFunc("/chatbot/intents/{intentId}", s.deleteIntentHandler).Methods("DELETE")
+	api.HandleFunc("/chatbot/intents", permifyAuthzGuard("chat_session", "view", s.getIntentsHandler)).Methods("GET")
+	api.HandleFunc("/chatbot/intents", permifyAuthzGuard("chat_session", "intents", s.createIntentHandler)).Methods("POST")
+	api.HandleFunc("/chatbot/intents/{intentId}", permifyAuthzGuard("chat_session", "update", s.updateIntentHandler)).Methods("PUT")
+	api.HandleFunc("/chatbot/intents/{intentId}", permifyAuthzGuard("chat_session", "delete", s.deleteIntentHandler)).Methods("DELETE")
 
 	// Training
-	api.HandleFunc("/chatbot/train", s.trainHandler).Methods("POST")
-	api.HandleFunc("/chatbot/train/status", s.getTrainingStatusHandler).Methods("GET")
+	api.HandleFunc("/chatbot/train", permifyAuthzGuard("chat_session", "train", s.trainHandler)).Methods("POST")
+	api.HandleFunc("/chatbot/train/status", permifyAuthzGuard("chat_session", "view", s.getTrainingStatusHandler)).Methods("GET")
 
 	// Analytics
-	api.HandleFunc("/chatbot/analytics/conversations", s.getConversationAnalyticsHandler).Methods("GET")
-	api.HandleFunc("/chatbot/analytics/intents", s.getIntentAnalyticsHandler).Methods("GET")
-	api.HandleFunc("/chatbot/analytics/satisfaction", s.getSatisfactionHandler).Methods("GET")
+	api.HandleFunc("/chatbot/analytics/conversations", permifyAuthzGuard("chat_session", "view", s.getConversationAnalyticsHandler)).Methods("GET")
+	api.HandleFunc("/chatbot/analytics/intents", permifyAuthzGuard("chat_session", "view", s.getIntentAnalyticsHandler)).Methods("GET")
+	api.HandleFunc("/chatbot/analytics/satisfaction", permifyAuthzGuard("chat_session", "view", s.getSatisfactionHandler)).Methods("GET")
 
 	// Handoff to human
-	api.HandleFunc("/chatbot/handoff", s.requestHandoffHandler).Methods("POST")
-	api.HandleFunc("/chatbot/handoff/{sessionId}/accept", s.acceptHandoffHandler).Methods("POST")
+	api.HandleFunc("/chatbot/handoff", permifyAuthzGuard("chat_session", "handoff", s.requestHandoffHandler)).Methods("POST")
+	api.HandleFunc("/chatbot/handoff/{sessionId}/accept", permifyAuthzGuard("chat_session", "accept", s.acceptHandoffHandler)).Methods("POST")
 
 	// Webhooks for external channels
 	api.Handle("/chatbot/webhook/whatsapp", webhookAuthMiddleware(http.HandlerFunc(s.whatsappWebhookHandler))).Methods("POST")

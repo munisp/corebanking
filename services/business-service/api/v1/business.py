@@ -2,6 +2,8 @@
 import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, Request, HTTPException
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from sqlalchemy.orm import Session
 
 from database import get_session
@@ -27,7 +29,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/businesses", tags=["business"])
 
 
-@router.get("", response_model=BusinessListResponse)
+@router.get("", response_model=BusinessListResponse, dependencies=[Depends(require_permify("business", "view"))])
 def list_businesses(
     request: Request,
     skip: int = 0,
@@ -59,7 +61,7 @@ def list_businesses(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("", response_model=BusinessResponse, status_code=201)
+@router.post("", response_model=BusinessResponse, status_code=201, dependencies=[Depends(require_permify("business", "create"))])
 def create_business(
     request: Request,
     payload: CreateBusinessRequest,
@@ -99,7 +101,7 @@ def create_business(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.get("/{business_id}", response_model=BusinessResponse)
+@router.get("/{business_id}", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "view"))])
 def get_business(
     request: Request,
     business_id: str,
@@ -122,7 +124,7 @@ def get_business(
 
 
 
-@router.put("/{business_id}", response_model=BusinessResponse)
+@router.put("/{business_id}", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "update"))])
 def update_business(
     request: Request,
     business_id: str,
@@ -156,7 +158,7 @@ def update_business(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.delete("/{business_id}", response_model=BusinessResponse)
+@router.delete("/{business_id}", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "delete"))])
 def delete_business(
     request: Request,
     business_id: str,
@@ -177,7 +179,7 @@ def delete_business(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/{business_id}/verify", response_model=BusinessResponse)
+@router.post("/{business_id}/verify", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "manage"))])
 def initiate_verification(
     request: Request,
     business_id: str,
@@ -208,7 +210,7 @@ def initiate_verification(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/{business_id}/approve-verification", response_model=BusinessResponse)
+@router.post("/{business_id}/approve-verification", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "manage"))])
 def approve_verification(
     request: Request,
     business_id: str,
@@ -238,7 +240,7 @@ def approve_verification(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/{business_id}/reject-verification", response_model=BusinessResponse)
+@router.post("/{business_id}/reject-verification", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "manage"))])
 def reject_verification(
     request: Request,
     business_id: str,
@@ -269,7 +271,7 @@ def reject_verification(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/{business_id}/suspend", response_model=BusinessResponse)
+@router.post("/{business_id}/suspend", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "manage"))])
 def suspend_business(
     request: Request,
     business_id: str,
@@ -298,7 +300,7 @@ def suspend_business(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.post("/{business_id}/activate", response_model=BusinessResponse)
+@router.post("/{business_id}/activate", response_model=BusinessResponse, dependencies=[Depends(require_permify("business", "manage"))])
 def activate_business(
     request: Request,
     business_id: str,
@@ -327,7 +329,7 @@ def activate_business(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.put("/{business_id}/settings")
+@router.put("/{business_id}/settings", dependencies=[Depends(require_permify("business", "update"))])
 def update_settings(
     request: Request,
     business_id: str,
@@ -356,7 +358,7 @@ def update_settings(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.put("/{business_id}/metadata")
+@router.put("/{business_id}/metadata", dependencies=[Depends(require_permify("business", "update"))])
 def update_metadata(
     request: Request,
     business_id: str,

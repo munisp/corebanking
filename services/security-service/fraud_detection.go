@@ -314,10 +314,11 @@ type TriggeredRule struct {
 
 // FraudDetectionEngine manages fraud detection
 type FraudDetectionEngine struct {
-	db           *sql.DB
-	config       FraudDetectionConfig
-	tenantConfig map[string]FraudDetectionConfig
-	mu           sync.RWMutex
+	db     *sql.DB
+	config FraudDetectionConfig
+	mu     sync.RWMutex
+	// tenantConfig moved to redis cache-aside `config:fraud:{tenantID}`
+	// (c3-0765, see redis_store.go).
 
 	// patternCh feeds the bounded worker pool that applies user-pattern
 	// updates (GPT-29) — replaces unbounded fire-and-forget goroutines.
@@ -327,10 +328,9 @@ type FraudDetectionEngine struct {
 // NewFraudDetectionEngine creates a new fraud detection engine
 func NewFraudDetectionEngine(db *sql.DB) *FraudDetectionEngine {
 	fde := &FraudDetectionEngine{
-		db:           db,
-		config:       DefaultFraudConfig,
-		tenantConfig: make(map[string]FraudDetectionConfig),
-		patternCh:    make(chan FraudCheckRequest, 1024),
+		db:        db,
+		config:    DefaultFraudConfig,
+		patternCh: make(chan FraudCheckRequest, 1024),
 	}
 
 	// Load environment overrides
@@ -456,6 +456,9 @@ func (fde *FraudDetectionEngine) createTables() {
 	}
 }
 
+// loadTenantConfigs pre-warms the redis config cache (c3-0765). Reads at
+// runtime are cache-aside (redis -> PG -> default), so a pre-warm failure
+// only means the first lookup per tenant hits Postgres.
 func (fde *FraudDetectionEngine) loadTenantConfigs() {
 	rows, err := fde.db.Query(`SELECT tenant_id, config FROM fraud_config WHERE tenant_id IS NOT NULL`)
 	if err != nil {
@@ -464,9 +467,6 @@ func (fde *FraudDetectionEngine) loadTenantConfigs() {
 	}
 	defer rows.Close()
 
-	fde.mu.Lock()
-	defer fde.mu.Unlock()
-
 	for rows.Next() {
 		var tenantID string
 		var configJSON []byte
@@ -474,22 +474,36 @@ func (fde *FraudDetectionEngine) loadTenantConfigs() {
 			continue
 		}
 
-		var config FraudDetectionConfig
-		if err := json.Unmarshal(configJSON, &config); err != nil {
-			continue
-		}
-
-		fde.tenantConfig[tenantID] = config
+		configCacheSet(configFraudKey(tenantID), string(configJSON))
 	}
 }
 
-// GetConfig returns the applicable fraud detection config
-func (fde *FraudDetectionEngine) GetConfig(tenantID string) FraudDetectionConfig {
-	fde.mu.RLock()
-	defer fde.mu.RUnlock()
+// lookupTenantConfig resolves a tenant's fraud config cache-aside:
+// redis `config:fraud:{tenantID}` -> Postgres fraud_config -> not found.
+func (fde *FraudDetectionEngine) lookupTenantConfig(tenantID string) (FraudDetectionConfig, bool) {
+	var config FraudDetectionConfig
+	if raw, ok := configCacheGet(configFraudKey(tenantID)); ok {
+		if err := json.Unmarshal([]byte(raw), &config); err == nil {
+			return config, true
+		}
+		// undecodable entry: fall through to PG and refresh
+	}
+	var configJSON []byte
+	err := fde.db.QueryRow(`SELECT config FROM fraud_config WHERE tenant_id = $1`, tenantID).Scan(&configJSON)
+	if err != nil {
+		return config, false
+	}
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		return config, false
+	}
+	configCacheSet(configFraudKey(tenantID), string(configJSON))
+	return config, true
+}
 
+// GetConfig returns the applicable fraud detection config (cache-aside via redis, c3-0765)
+func (fde *FraudDetectionEngine) GetConfig(tenantID string) FraudDetectionConfig {
 	if tenantID != "" {
-		if config, ok := fde.tenantConfig[tenantID]; ok {
+		if config, ok := fde.lookupTenantConfig(tenantID); ok {
 			return config
 		}
 	}

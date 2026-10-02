@@ -2,14 +2,21 @@
  * Open Banking API — CBN Regulatory Sandbox compliant.
  * PSD2-style API gateway for third-party fintech integrations,
  * consent management, TPP registration, and API marketplace.
+ *
+ * W12-C3-P0: TPP registrations and customer consents were in-memory arrays —
+ * consent state (a regulatory artifact) vanished on restart. They are now
+ * Postgres-authoritative (ob_tpps / ob_consents) via the server's drizzle
+ * pool. The endpoint catalogue remains static configuration (not state).
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeSeed, storeList, storeInsert } from "./pgJsonStore";
+import { logger } from "./logger";
 
 interface TPPRegistration { id: string; name: string; type: string; cbnLicense: string; status: string; apiKeys: number; consentCount: number; registeredAt: string; contactEmail: string; }
 interface Consent { id: string; customerId: string; tppId: string; tppName: string; permissions: string[]; status: string; grantedAt: string; expiresAt: string; lastAccessedAt: string; }
 interface OpenBankingEndpoint { path: string; method: string; description: string; scope: string; rateLimit: number; version: string; }
 
-const TPPS: TPPRegistration[] = [
+const TPP_SEED: TPPRegistration[] = [
   { id: "TPP-001", name: "Paystack", type: "PISP", cbnLicense: "CBN/OB/PISP/001", status: "active", apiKeys: 3, consentCount: 45000, registeredAt: "2026-01-15T00:00:00Z", contactEmail: "api@paystack.com" },
   { id: "TPP-002", name: "Flutterwave", type: "PISP", cbnLicense: "CBN/OB/PISP/002", status: "active", apiKeys: 2, consentCount: 38000, registeredAt: "2026-01-20T00:00:00Z", contactEmail: "developers@flutterwave.com" },
   { id: "TPP-003", name: "Carbon (formerly Paylater)", type: "AISP", cbnLicense: "CBN/OB/AISP/001", status: "active", apiKeys: 2, consentCount: 12000, registeredAt: "2026-02-01T00:00:00Z", contactEmail: "api@carbon.ng" },
@@ -18,7 +25,7 @@ const TPPS: TPPRegistration[] = [
   { id: "TPP-006", name: "Kuda Bank", type: "PISP_AISP", cbnLicense: "CBN/OB/PISP-AISP/001", status: "sandbox", apiKeys: 1, consentCount: 500, registeredAt: "2026-04-01T00:00:00Z", contactEmail: "engineering@kuda.com" },
 ];
 
-const CONSENTS: Consent[] = [
+const CONSENT_SEED: Consent[] = [
   { id: "CON-001", customerId: "CUST-GT-001", tppId: "TPP-001", tppName: "Paystack", permissions: ["accounts:read", "payments:initiate"], status: "active", grantedAt: "2026-03-01T10:00:00Z", expiresAt: "2026-09-01T10:00:00Z", lastAccessedAt: "2026-05-09T14:00:00Z" },
   { id: "CON-002", customerId: "CUST-GT-001", tppId: "TPP-005", tppName: "Mono", permissions: ["accounts:read", "transactions:read", "balance:read"], status: "active", grantedAt: "2026-02-15T08:00:00Z", expiresAt: "2026-08-15T08:00:00Z", lastAccessedAt: "2026-05-09T12:00:00Z" },
   { id: "CON-003", customerId: "CUST-FB-001", tppId: "TPP-004", tppName: "PiggyVest", permissions: ["accounts:read", "payments:initiate"], status: "active", grantedAt: "2026-04-01T09:00:00Z", expiresAt: "2026-10-01T09:00:00Z", lastAccessedAt: "2026-05-08T16:00:00Z" },
@@ -36,19 +43,54 @@ const ENDPOINTS: OpenBankingEndpoint[] = [
   { path: "/open-banking/v1/identity/verify", method: "POST", description: "Verify customer identity (BVN/NIN)", scope: "identity:verify", rateLimit: 10, version: "1.0" },
 ];
 
-export function registerOpenBankingApi(app: Express) {
-  app.get("/api/open-banking/v1/tpps", (_req: Request, res: Response) => { res.json({ items: TPPS, total: TPPS.length }); });
-  app.get("/api/open-banking/v1/consents", (_req: Request, res: Response) => { res.json({ items: CONSENTS, total: CONSENTS.length, active: CONSENTS.filter((c) => c.status === "active").length }); });
-  app.get("/api/open-banking/v1/endpoints", (_req: Request, res: Response) => { res.json({ items: ENDPOINTS, total: ENDPOINTS.length }); });
-  app.post("/api/open-banking/v1/consents", (req: Request, res: Response) => {
-    const { customerId, tppId, permissions } = req.body ?? {};
-    const consent: Consent = { id: `CON-${String(CONSENTS.length + 1).padStart(3, "0")}`, customerId: customerId ?? "CUST-NEW", tppId: tppId ?? "TPP-001", tppName: TPPS.find((t) => t.id === tppId)?.name ?? "Unknown", permissions: permissions ?? ["accounts:read"], status: "active", grantedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 180 * 86400000).toISOString(), lastAccessedAt: new Date().toISOString() };
-    CONSENTS.push(consent);
-    res.status(201).json(consent);
+function ensure(): Promise<void> {
+  return ensureTables("openBankingApi", [
+    ...storeDDL("ob_tpps"),
+    ...storeDDL("ob_consents"),
+  ]).then(async () => {
+    await storeSeed("ob_tpps", TPP_SEED, () => "");
+    await storeSeed("ob_consents", CONSENT_SEED, () => "");
   });
-  app.get("/api/open-banking/v1/stats", (_req: Request, res: Response) => {
-    res.json({ registeredTpps: TPPS.length, activeTpps: TPPS.filter((t) => t.status === "active").length, totalConsents: CONSENTS.length,
-      activeConsents: CONSENTS.filter((c) => c.status === "active").length, endpoints: ENDPOINTS.length,
-      apiCallsToday: 125000, avgResponseTimeMs: 45, complianceStatus: "CBN-sandbox-approved" });
+}
+
+function dbUnavailable(res: Response, err: unknown) {
+  logger.error("openBankingApi: database unavailable", { error: String(err) });
+  return res.status(503).json({ error: "open_banking_store_unavailable", message: "Open-banking store (Postgres) unavailable; refusing to serve in-memory data" });
+}
+
+export function registerOpenBankingApi(app: Express) {
+  app.get("/api/open-banking/v1/tpps", async (_req: Request, res: Response) => {
+    try { await ensure(); const items = await storeList<TPPRegistration>("ob_tpps"); res.json({ items, total: items.length }); }
+    catch (err) { dbUnavailable(res, err); }
+  });
+  app.get("/api/open-banking/v1/consents", async (_req: Request, res: Response) => {
+    try {
+      await ensure();
+      const consents = await storeList<Consent>("ob_consents");
+      res.json({ items: consents, total: consents.length, active: consents.filter((c) => c.status === "active").length });
+    } catch (err) { dbUnavailable(res, err); }
+  });
+  app.get("/api/open-banking/v1/endpoints", (_req: Request, res: Response) => { res.json({ items: ENDPOINTS, total: ENDPOINTS.length }); });
+  app.post("/api/open-banking/v1/consents", async (req: Request, res: Response) => {
+    try {
+      await ensure();
+      const { customerId, tppId, permissions } = req.body ?? {};
+      const existing = await storeList<Consent>("ob_consents");
+      const tpps = await storeList<TPPRegistration>("ob_tpps");
+      const consent: Consent = { id: `CON-${String(existing.length + 1).padStart(3, "0")}-${Date.now()}`, customerId: customerId ?? "CUST-NEW", tppId: tppId ?? "TPP-001", tppName: tpps.find((t) => t.id === tppId)?.name ?? "Unknown", permissions: permissions ?? ["accounts:read"], status: "active", grantedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 180 * 86400000).toISOString(), lastAccessedAt: new Date().toISOString() };
+      // W12-C3-P0: consent creation now persists (was memory-only).
+      await storeInsert("ob_consents", "", consent);
+      res.status(201).json(consent);
+    } catch (err) { dbUnavailable(res, err); }
+  });
+  app.get("/api/open-banking/v1/stats", async (_req: Request, res: Response) => {
+    try {
+      await ensure();
+      const tpps = await storeList<TPPRegistration>("ob_tpps");
+      const consents = await storeList<Consent>("ob_consents");
+      res.json({ registeredTpps: tpps.length, activeTpps: tpps.filter((t) => t.status === "active").length, totalConsents: consents.length,
+        activeConsents: consents.filter((c) => c.status === "active").length, endpoints: ENDPOINTS.length,
+        apiCallsToday: 125000, avgResponseTimeMs: 45, complianceStatus: "CBN-sandbox-approved" });
+    } catch (err) { dbUnavailable(res, err); }
   });
 }

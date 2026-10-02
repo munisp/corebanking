@@ -1,4 +1,11 @@
+import { AppConfig } from '../config/app_config';
 import { apiService } from './api_service';
+
+// W12-A4B: scheduled payments are served by standing-orders-go
+// (AppConfig.scheduledPaymentEndpoint = /standing-orders/v1/standing-orders).
+// The backend model is a recurring StandingOrder { accountId, beneficiaryId,
+// beneficiaryName, amount, frequency, startDate, endDate, maxExecutions,
+// narration } — payload mapping happens here, not in the backend.
 
 export interface ScheduledPayment {
   id: string;
@@ -36,31 +43,31 @@ export class ScheduledPaymentService {
   }): Promise<{ success: boolean; message: string; data?: ScheduledPayment }> {
     try {
       const requestData: Record<string, unknown> = {
-        account_id: data.accountId,
-        recipient_name: data.recipientName,
-        recipient_account: data.recipientAccount,
-        recipient_bank: data.recipientBank,
+        accountId: data.accountId,
+        beneficiaryName: data.recipientName,
+        beneficiaryId: data.recipientAccount,
         amount: data.amount,
-        frequency: data.frequency,
-        start_date: data.startDate.toISOString(),
+        // standing-orders-go accepts daily|weekly|biweekly|monthly|quarterly|annually
+        frequency: data.frequency === 'yearly' ? 'annually' : data.frequency,
+        startDate: data.startDate.toISOString().slice(0, 10),
+        narration: data.description || `Scheduled payment to ${data.recipientName}`,
       };
 
-      if (data.endDate) requestData.end_date = data.endDate.toISOString();
-      if (data.description) requestData.description = data.description;
-      if (data.maxExecutions) requestData.max_executions = data.maxExecutions;
+      if (data.endDate) requestData.endDate = data.endDate.toISOString().slice(0, 10);
+      if (data.maxExecutions) requestData.maxExecutions = data.maxExecutions;
 
-      const response = await apiService.post('/payment-processing/scheduled-payments', requestData);
-      const respData = response.data as { success: boolean; message?: string; data?: ScheduledPayment };
-      if (respData.success === true) {
+      const response = await apiService.post(AppConfig.scheduledPaymentEndpoint, requestData);
+      const respData = response.data as Record<string, unknown>;
+      if (response.status === 201 && respData && respData.id) {
         return {
           success: true,
-          message: respData.message || 'Scheduled payment created successfully',
-          data: respData.data,
+          message: 'Scheduled payment created successfully',
+          data: this.parseScheduledPayment(respData),
         };
       } else {
         return {
           success: false,
-          message: respData.message || 'Failed to create scheduled payment',
+          message: (respData?.error as string) || 'Failed to create scheduled payment',
         };
       }
     } catch (error: unknown) {
@@ -74,22 +81,16 @@ export class ScheduledPaymentService {
   // Get all scheduled payments
   async getScheduledPayments(accountId?: string, status?: string): Promise<ScheduledPayment[]> {
     try {
-      let endpoint = '/payment-processing/scheduled-payments';
-      const params: string[] = [];
-
-      if (accountId) params.push(`account_id=${accountId}`);
-      if (status) params.push(`status=${status}`);
-
-      if (params.length > 0) {
-        endpoint += `?${params.join('&')}`;
-      }
-
-      const response = await apiService.get(endpoint);
-      const data = response.data as { success: boolean; data?: Record<string, unknown>[] };
-      if (data.success === true && Array.isArray(data.data)) {
-        return data.data.map((json) => this.parseScheduledPayment(json));
-      }
-      return [];
+      // W12-A4B: standing-orders-go GET /v1/standing-orders ->
+      // { items: [...], total }. It does not filter server-side; filter the
+      // real result set client-side by accountId/status when requested.
+      const response = await apiService.get(AppConfig.scheduledPaymentEndpoint);
+      const data = response.data as { items?: Record<string, unknown>[]; data?: Record<string, unknown>[] };
+      const items = data.items || data.data || [];
+      let payments = items.map((json) => this.parseScheduledPayment(json));
+      if (accountId) payments = payments.filter((p) => p.accountId === accountId);
+      if (status) payments = payments.filter((p) => p.status === status);
+      return payments;
     } catch {
       return [];
     }
@@ -98,10 +99,12 @@ export class ScheduledPaymentService {
   // Get scheduled payment by ID
   async getScheduledPaymentById(id: string): Promise<ScheduledPayment | null> {
     try {
-      const response = await apiService.get(`/payment-processing/scheduled-payments/${id}`);
-      const data = response.data as { success: boolean; data?: Record<string, unknown> };
-      if (data.success === true && data.data) {
-        return this.parseScheduledPayment(data.data);
+      // W12-A4B: item fetch via the new standing-orders-go
+      // GET /v1/standing-orders/order?id=... handler (raw StandingOrder JSON).
+      const response = await apiService.get(`${AppConfig.scheduledPaymentEndpoint}/order`, { id });
+      const data = response.data as Record<string, unknown>;
+      if (response.status === 200 && data && data.id) {
+        return this.parseScheduledPayment(data);
       }
       return null;
     } catch {
@@ -121,24 +124,27 @@ export class ScheduledPaymentService {
     }
   ): Promise<{ success: boolean; message: string }> {
     try {
-      const updateData: Record<string, unknown> = {};
+      // W12-A4B: update via the new standing-orders-go
+      // PUT /v1/standing-orders/order handler (id in the body; returns the
+      // updated StandingOrder).
+      const updateData: Record<string, unknown> = { id };
       if (data.amount !== undefined) updateData.amount = data.amount;
-      if (data.frequency) updateData.frequency = data.frequency;
-      if (data.endDate) updateData.end_date = data.endDate.toISOString();
-      if (data.description) updateData.description = data.description;
-      if (data.maxExecutions) updateData.max_executions = data.maxExecutions;
+      if (data.frequency) updateData.frequency = data.frequency === 'yearly' ? 'annually' : data.frequency;
+      if (data.endDate) updateData.endDate = data.endDate.toISOString().slice(0, 10);
+      if (data.description) updateData.narration = data.description;
+      if (data.maxExecutions) updateData.maxExecutions = data.maxExecutions;
 
-      const response = await apiService.put(`/payment-processing/scheduled-payments/${id}`, updateData);
-      const respData = response.data as { success: boolean; message?: string };
-      if (respData.success === true) {
+      const response = await apiService.put(`${AppConfig.scheduledPaymentEndpoint}/order`, updateData);
+      const respData = response.data as Record<string, unknown>;
+      if (response.status === 200 && respData && respData.id) {
         return {
           success: true,
-          message: respData.message || 'Scheduled payment updated successfully',
+          message: 'Scheduled payment updated successfully',
         };
       } else {
         return {
           success: false,
-          message: respData.message || 'Failed to update scheduled payment',
+          message: (respData?.error as string) || 'Failed to update scheduled payment',
         };
       }
     } catch (error: unknown) {
@@ -152,17 +158,19 @@ export class ScheduledPaymentService {
   // Pause scheduled payment
   async pauseScheduledPayment(id: string): Promise<{ success: boolean; message: string }> {
     try {
-      const response = await apiService.post(`/payment-processing/scheduled-payments/${id}/pause`);
-      const data = response.data as { success: boolean; message?: string };
-      if (data.success === true) {
+      // W12-A4B: standing-orders-go POST /v1/standing-orders/pause takes the
+      // id in the body ({orderId}) and returns {id, status}.
+      const response = await apiService.post(`${AppConfig.scheduledPaymentEndpoint}/pause`, { orderId: id });
+      const data = response.data as { status?: string; error?: string };
+      if (response.status === 200 && data.status === 'paused') {
         return {
           success: true,
-          message: data.message || 'Scheduled payment paused successfully',
+          message: 'Scheduled payment paused successfully',
         };
       } else {
         return {
           success: false,
-          message: data.message || 'Failed to pause scheduled payment',
+          message: data.error || 'Failed to pause scheduled payment',
         };
       }
     } catch (error: unknown) {
@@ -176,17 +184,19 @@ export class ScheduledPaymentService {
   // Resume scheduled payment
   async resumeScheduledPayment(id: string): Promise<{ success: boolean; message: string }> {
     try {
-      const response = await apiService.post(`/payment-processing/scheduled-payments/${id}/resume`);
-      const data = response.data as { success: boolean; message?: string };
-      if (data.success === true) {
+      // W12-A4B: standing-orders-go POST /v1/standing-orders/resume,
+      // {orderId} body -> {id, status}.
+      const response = await apiService.post(`${AppConfig.scheduledPaymentEndpoint}/resume`, { orderId: id });
+      const data = response.data as { status?: string; error?: string };
+      if (response.status === 200 && data.status === 'active') {
         return {
           success: true,
-          message: data.message || 'Scheduled payment resumed successfully',
+          message: 'Scheduled payment resumed successfully',
         };
       } else {
         return {
           success: false,
-          message: data.message || 'Failed to resume scheduled payment',
+          message: data.error || 'Failed to resume scheduled payment',
         };
       }
     } catch (error: unknown) {
@@ -200,17 +210,20 @@ export class ScheduledPaymentService {
   // Cancel scheduled payment
   async cancelScheduledPayment(id: string): Promise<{ success: boolean; message: string }> {
     try {
-      const response = await apiService.delete(`/payment-processing/scheduled-payments/${id}`);
-      const data = response.data as { success: boolean; message?: string };
-      if (data.success === true) {
+      // W12-A4B: cancel via the new standing-orders-go
+      // DELETE /v1/standing-orders/order?id=... handler (soft-cancel,
+      // status='cancelled' — same pattern as the pause handler).
+      const response = await apiService.delete(`${AppConfig.scheduledPaymentEndpoint}/order`, { id });
+      const data = response.data as { status?: string; error?: string };
+      if (response.status === 200 && data.status === 'cancelled') {
         return {
           success: true,
-          message: data.message || 'Scheduled payment cancelled successfully',
+          message: 'Scheduled payment cancelled successfully',
         };
       } else {
         return {
           success: false,
-          message: data.message || 'Failed to cancel scheduled payment',
+          message: data.error || 'Failed to cancel scheduled payment',
         };
       }
     } catch (error: unknown) {
@@ -227,16 +240,18 @@ export class ScheduledPaymentService {
       id: (json.id || json.payment_id) as string,
       userId: (json.user_id || json.userId) as string,
       accountId: (json.account_id || json.accountId) as string,
-      recipientName: (json.recipient_name || json.recipientName) as string,
-      recipientAccount: (json.recipient_account || json.recipientAccount) as string,
+      // W12-A4B: standing-orders-go uses beneficiaryName/beneficiaryId/
+      // narration/nextExecutionAt and the 'annually' frequency token.
+      recipientName: (json.recipient_name || json.recipientName || json.beneficiaryName) as string,
+      recipientAccount: (json.recipient_account || json.recipientAccount || json.beneficiaryId) as string,
       recipientBank: (json.recipient_bank || json.recipientBank) as string,
       amount: json.amount as number,
-      frequency: json.frequency as ScheduledPayment['frequency'],
+      frequency: (json.frequency === 'annually' ? 'yearly' : json.frequency) as ScheduledPayment['frequency'],
       startDate: new Date((json.start_date || json.startDate) as string),
       endDate: json.end_date || json.endDate ? new Date((json.end_date || json.endDate) as string) : undefined,
-      description: json.description as string | undefined,
+      description: (json.description ?? json.narration) as string | undefined,
       status: json.status as ScheduledPayment['status'],
-      nextExecutionDate: new Date((json.next_execution_date || json.nextExecutionDate) as string),
+      nextExecutionDate: new Date((json.next_execution_date || json.nextExecutionDate || json.nextExecutionAt) as string),
       executionCount: (json.execution_count || json.executionCount || 0) as number,
       maxExecutions: (json.max_executions || json.maxExecutions) as number | undefined,
       createdAt: new Date((json.created_at || json.createdAt) as string),

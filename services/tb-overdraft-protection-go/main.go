@@ -1006,13 +1006,13 @@ func main() {
 	initTBClient()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/tb-overdraft/create", createFacilityHandler)
-	mux.HandleFunc("/v1/tb-overdraft/drawdown", drawdownHandler)
-	mux.HandleFunc("/v1/tb-overdraft/repay", repayHandler)
+	mux.HandleFunc("/v1/tb-overdraft/create", permifyAuthzGuard("facility", "create", createFacilityHandler))
+	mux.HandleFunc("/v1/tb-overdraft/drawdown", permifyAuthzGuard("facility", "drawdown", drawdownHandler))
+	mux.HandleFunc("/v1/tb-overdraft/repay", permifyAuthzGuard("facility", "repay", repayHandler))
 	mux.HandleFunc("/v1/tb-overdraft/status", statusHandler)
 	// MN-08: debit-path authorization + interest accrual contracts.
 	mux.HandleFunc("/v1/overdraft/check", checkHandler)
-	mux.HandleFunc("/v1/overdraft/accrue", accrueHandler)
+	mux.HandleFunc("/v1/overdraft/accrue", permifyAuthzGuard("facility", "accrue", accrueHandler))
 	mux.HandleFunc("/healthz", healthHandler)
 
 	port := os.Getenv("PORT")

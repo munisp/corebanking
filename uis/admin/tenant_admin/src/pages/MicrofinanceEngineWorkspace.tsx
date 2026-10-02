@@ -12,7 +12,7 @@ export default function MicrofinanceEngineWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/esusu-groups/count")
+    fetch("/api/db/esusu-groups/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

@@ -11,7 +11,7 @@ import (
 // CrossSellService handles cross-sell recommendation operations
 type CrossSellService struct {
 	tenantID        string
-	recommendations map[string]*CrossSellRecommendation
+	recommendations *repo[CrossSellRecommendation]
 	mu              sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type CrossSellService struct {
 func NewCrossSellService(tenantID string) *CrossSellService {
 	svc := &CrossSellService{
 		tenantID:        tenantID,
-		recommendations: make(map[string]*CrossSellRecommendation),
+		recommendations: newRepo[CrossSellRecommendation](serviceDB, "crosssell_recommendations"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewCrossSellService(tenantID string) *CrossSellService {
 
 func (s *CrossSellService) initializeDefaultData(tenantID string) {
 	// Credit card recommendation
-	s.recommendations["rec-001"] = &CrossSellRecommendation{
+	s.recommendations.seed(tenantID, "rec-001", &CrossSellRecommendation{
 		RecommendationID: "rec-001",
 		TenantID:         tenantID,
 		CustomerID:       "cust-001",
@@ -41,10 +41,10 @@ func (s *CrossSellService) initializeDefaultData(tenantID string) {
 		AssignedRM:       "rm-001",
 		CreatedAt:        time.Now().AddDate(0, 0, -5),
 		UpdatedAt:        time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// Investment recommendation
-	s.recommendations["rec-002"] = &CrossSellRecommendation{
+	s.recommendations.seed(tenantID, "rec-002", &CrossSellRecommendation{
 		RecommendationID: "rec-002",
 		TenantID:         tenantID,
 		CustomerID:       "cust-002",
@@ -58,10 +58,10 @@ func (s *CrossSellService) initializeDefaultData(tenantID string) {
 		AssignedRM:       "rm-001",
 		CreatedAt:        time.Now().AddDate(0, 0, -10),
 		UpdatedAt:        time.Now().AddDate(0, 0, -3),
-	}
+	})
 
 	// Insurance recommendation
-	s.recommendations["rec-003"] = &CrossSellRecommendation{
+	s.recommendations.seed(tenantID, "rec-003", &CrossSellRecommendation{
 		RecommendationID: "rec-003",
 		TenantID:         tenantID,
 		CustomerID:       "cust-003",
@@ -75,10 +75,10 @@ func (s *CrossSellService) initializeDefaultData(tenantID string) {
 		AssignedRM:       "rm-001",
 		CreatedAt:        time.Now().AddDate(0, 0, -7),
 		UpdatedAt:        time.Now().AddDate(0, 0, -7),
-	}
+	})
 
 	// Loan recommendation
-	s.recommendations["rec-004"] = &CrossSellRecommendation{
+	s.recommendations.seed(tenantID, "rec-004", &CrossSellRecommendation{
 		RecommendationID: "rec-004",
 		TenantID:         tenantID,
 		CustomerID:       "cust-004",
@@ -92,10 +92,10 @@ func (s *CrossSellService) initializeDefaultData(tenantID string) {
 		AssignedRM:       "rm-001",
 		CreatedAt:        time.Now().AddDate(0, 0, -3),
 		UpdatedAt:        time.Now().AddDate(0, 0, -3),
-	}
+	})
 
 	// Converted recommendation
-	s.recommendations["rec-005"] = &CrossSellRecommendation{
+	s.recommendations.seed(tenantID, "rec-005", &CrossSellRecommendation{
 		RecommendationID: "rec-005",
 		TenantID:         tenantID,
 		CustomerID:       "cust-001",
@@ -109,16 +109,18 @@ func (s *CrossSellService) initializeDefaultData(tenantID string) {
 		AssignedRM:       "rm-001",
 		CreatedAt:        time.Now().AddDate(0, -1, 0),
 		UpdatedAt:        time.Now().AddDate(0, 0, -5),
-	}
+	})
 }
 
 // ListRecommendations returns recommendations based on filters
-func (s *CrossSellService) ListRecommendations(tenantID, rmID, status string) []*CrossSellRecommendation {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CrossSellService) ListRecommendations(tenantID, rmID, status string) ([]*CrossSellRecommendation, error) {
 
 	var result []*CrossSellRecommendation
-	for _, rec := range s.recommendations {
+	__ALL__, __ERR__ := s.recommendations.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, rec := range __ALL__ {
 		if rec.TenantID != tenantID {
 			continue
 		}
@@ -130,28 +132,28 @@ func (s *CrossSellService) ListRecommendations(tenantID, rmID, status string) []
 		}
 		result = append(result, rec)
 	}
-	return result
+	return result, nil
 }
 
 // GetRecommendation retrieves a recommendation by ID
 func (s *CrossSellService) GetRecommendation(tenantID, recommendationID string) (*CrossSellRecommendation, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	rec, exists := s.recommendations[recommendationID]
-	if !exists || rec.TenantID != tenantID {
+	rec, err := s.recommendations.get(tenantID, recommendationID)
+	if err != nil {
 		return nil, errors.New("recommendation not found")
 	}
 	return rec, nil
 }
 
 // GetCustomerRecommendations returns recommendations for a customer
-func (s *CrossSellService) GetCustomerRecommendations(tenantID, customerID string) []*CrossSellRecommendation {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CrossSellService) GetCustomerRecommendations(tenantID, customerID string) ([]*CrossSellRecommendation, error) {
 
 	var result []*CrossSellRecommendation
-	for _, rec := range s.recommendations {
+	__ALL__, __ERR__ := s.recommendations.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, rec := range __ALL__ {
 		if rec.TenantID != tenantID {
 			continue
 		}
@@ -159,70 +161,50 @@ func (s *CrossSellService) GetCustomerRecommendations(tenantID, customerID strin
 			result = append(result, rec)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // AcceptRecommendation accepts a recommendation
 func (s *CrossSellService) AcceptRecommendation(tenantID, recommendationID string) (*CrossSellRecommendation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	rec, exists := s.recommendations[recommendationID]
-	if !exists || rec.TenantID != tenantID {
-		return nil, errors.New("recommendation not found")
-	}
-
-	if rec.Status != "pending" {
-		return nil, errors.New("recommendation is not pending")
-	}
-
-	rec.Status = "accepted"
-	rec.UpdatedAt = time.Now()
-	return rec, nil
+	return s.recommendations.update(tenantID, recommendationID, func(rec *CrossSellRecommendation) error {
+		if rec.Status != "pending" {
+			return errors.New("recommendation is not pending")
+		}
+		rec.Status = "accepted"
+		rec.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
 // RejectRecommendation rejects a recommendation
 func (s *CrossSellService) RejectRecommendation(tenantID, recommendationID string) (*CrossSellRecommendation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	rec, exists := s.recommendations[recommendationID]
-	if !exists || rec.TenantID != tenantID {
-		return nil, errors.New("recommendation not found")
-	}
-
-	if rec.Status != "pending" {
-		return nil, errors.New("recommendation is not pending")
-	}
-
-	rec.Status = "rejected"
-	rec.UpdatedAt = time.Now()
-	return rec, nil
+	return s.recommendations.update(tenantID, recommendationID, func(rec *CrossSellRecommendation) error {
+		if rec.Status != "pending" {
+			return errors.New("recommendation is not pending")
+		}
+		rec.Status = "rejected"
+		rec.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
 // ConvertRecommendation converts a recommendation to sale
 func (s *CrossSellService) ConvertRecommendation(tenantID, recommendationID string) (*CrossSellRecommendation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	rec, exists := s.recommendations[recommendationID]
-	if !exists || rec.TenantID != tenantID {
-		return nil, errors.New("recommendation not found")
-	}
-
-	if rec.Status != "accepted" {
-		return nil, errors.New("recommendation must be accepted before conversion")
-	}
-
-	rec.Status = "converted"
-	rec.UpdatedAt = time.Now()
-	return rec, nil
+	return s.recommendations.update(tenantID, recommendationID, func(rec *CrossSellRecommendation) error {
+		if rec.Status != "accepted" {
+			return errors.New("recommendation must be accepted before conversion")
+		}
+		rec.Status = "converted"
+		rec.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
 // CreateRecommendation creates a new recommendation
 func (s *CrossSellService) CreateRecommendation(tenantID string, rec *CrossSellRecommendation) (*CrossSellRecommendation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	rec.RecommendationID = uuid.New().String()
 	rec.TenantID = tenantID
@@ -230,19 +212,23 @@ func (s *CrossSellService) CreateRecommendation(tenantID string, rec *CrossSellR
 	rec.CreatedAt = time.Now()
 	rec.UpdatedAt = time.Now()
 
-	s.recommendations[rec.RecommendationID] = rec
+	if err := s.recommendations.put(tenantID, rec.RecommendationID, rec); err != nil {
+		return nil, err
+	}
 	return rec, nil
 }
 
 // GetAnalytics returns cross-sell analytics
-func (s *CrossSellService) GetAnalytics(tenantID, rmID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CrossSellService) GetAnalytics(tenantID, rmID string) (map[string]interface{}, error) {
 
 	var totalRecs, pending, accepted, rejected, converted int
 	var totalValue, convertedValue int64
 
-	for _, rec := range s.recommendations {
+	__ALL__, __ERR__ := s.recommendations.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, rec := range __ALL__ {
 		if rec.TenantID != tenantID {
 			continue
 		}
@@ -281,5 +267,5 @@ func (s *CrossSellService) GetAnalytics(tenantID, rmID string) map[string]interf
 		"convertedValue":       convertedValue,
 		"conversionRate":       conversionRate,
 		"timestamp":            time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

@@ -26,6 +26,22 @@ import { desc, eq } from "drizzle-orm";
 import { getDb } from "../db";
 import { kycEnforcementVerifications, kybEnforcementVerifications } from "../../drizzle/schema";
 import { logger } from "./logger";
+// W12-C3-P2-MLIB (c3-1028): the enforcement event log was a capped module
+// array — a restart (or >10k events) destroyed the KYC-gate audit trail and
+// reset the id counter. Now Postgres-authoritative (table
+// `kyc_enforcement_events`) via lib/pgJsonStore.ts. Enforcement decisions are
+// fail-closed on log-persistence failure (the middleware's existing catch
+// returns 503): an enforcement action is never taken without a durable
+// record. No degraded-memory fallback.
+import { randomUUID } from "crypto";
+import { ensureTables, storeDDL, storeInsert, storeList } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const ENFORCEMENT_TABLE = "kyc_enforcement_events";
+
+async function ensureEnforcementStore(): Promise<void> {
+  await ensureTables("kycEnforcementMiddleware.enforcementLog", storeDDL(ENFORCEMENT_TABLE));
+}
 
 // ── Gate Configuration ──────────────────────────────────────────────────────
 
@@ -438,17 +454,20 @@ interface EnforcementEvent {
   requiredLevel?: string;
 }
 
-const enforcementLog: EnforcementEvent[] = [];
 let enforcementMode: "enforcing" | "monitoring" | "disabled" = "enforcing";
 
-function logEnforcement(event: Omit<EnforcementEvent, "id" | "timestamp">) {
+async function logEnforcement(event: Omit<EnforcementEvent, "id" | "timestamp">): Promise<void> {
   const entry: EnforcementEvent = {
     ...event,
-    id: `ENF-${String(enforcementLog.length + 1).padStart(6, "0")}`,
+    // Collision-resistant id (the per-process counter reset on restart).
+    id: `ENF-${randomUUID()}`,
     timestamp: new Date().toISOString(),
   };
-  enforcementLog.push(entry);
-  if (enforcementLog.length > 10000) enforcementLog.splice(0, 5000);
+  // Fail-closed: the enforcement event is persisted BEFORE the decision is
+  // acted on — a PG outage aborts the gated request (503 via the middleware
+  // catch), it never proceeds unrecorded.
+  await ensureEnforcementStore();
+  await storeInsert(ENFORCEMENT_TABLE, "", entry);
 
   if (entry.decision === "blocked") {
     logger.warn(`[KYC-GATE] BLOCKED ${entry.method} ${entry.path} — ${entry.reason} (customer: ${entry.customerId || "N/A"}, service: ${entry.serviceId})`);
@@ -489,7 +508,7 @@ async function kycEnforcementHandler(req: Request, res: Response, next: NextFunc
 
   // No customerId in request — allow but log
   if (!customerId && matchedRule.kycRequired) {
-    logEnforcement({
+    await logEnforcement({
       serviceId: matchedRule.serviceId, path: req.path, method: req.method,
       decision: enforcementMode === "enforcing" ? "blocked" : "monitored",
       reason: "No customerId provided in request body",
@@ -522,7 +541,7 @@ async function kycEnforcementHandler(req: Request, res: Response, next: NextFunc
           : kyc.sanctionsCleared !== true
             ? "Sanctions screening not cleared"
             : `KYC expired at ${kyc.expiresAt}`;
-      logEnforcement({
+      await logEnforcement({
         serviceId: matchedRule.serviceId, path: req.path, method: req.method,
         customerId, decision: enforcementMode === "enforcing" ? "blocked" : "monitored",
         reason,
@@ -548,7 +567,7 @@ async function kycEnforcementHandler(req: Request, res: Response, next: NextFunc
     // Check level hierarchy (reaching here means isCleared(kyc) === true)
     if (!kyc) return next();
     if (LEVEL_HIERARCHY[kyc.level] < LEVEL_HIERARCHY[matchedRule.minimumLevel]) {
-      logEnforcement({
+      await logEnforcement({
         serviceId: matchedRule.serviceId, path: req.path, method: req.method,
         customerId, decision: enforcementMode === "enforcing" ? "blocked" : "monitored",
         reason: `KYC level insufficient: has ${kyc.level}, needs ${matchedRule.minimumLevel}`,
@@ -583,7 +602,7 @@ async function kycEnforcementHandler(req: Request, res: Response, next: NextFunc
           : kyb.sanctionsCleared !== true
             ? "Sanctions screening not cleared"
             : `KYB expired at ${kyb.expiresAt}`;
-      logEnforcement({
+      await logEnforcement({
         serviceId: matchedRule.serviceId, path: req.path, method: req.method,
         customerId, companyId, decision: enforcementMode === "enforcing" ? "blocked" : "monitored",
         reason,
@@ -607,7 +626,7 @@ async function kycEnforcementHandler(req: Request, res: Response, next: NextFunc
   }
 
   // All checks passed
-  logEnforcement({
+  await logEnforcement({
     serviceId: matchedRule.serviceId, path: req.path, method: req.method,
     customerId, companyId, decision: "allowed",
     reason: "KYC/KYB verification passed",
@@ -628,6 +647,7 @@ export function registerKYCEnforcementRoutes(app: import("express").Express) {
 
   // Enforcement status & mode
   app.get("/api/platform/kyc-enforcement/status", async (_req: Request, res: Response) => {
+    const enforcementLog = await pgGuard((async () => { await ensureEnforcementStore(); return storeList<EnforcementEvent>(ENFORCEMENT_TABLE); })());
     const blocked = enforcementLog.filter(e => e.decision === "blocked").length;
     const allowed = enforcementLog.filter(e => e.decision === "allowed").length;
     const monitored = enforcementLog.filter(e => e.decision === "monitored").length;
@@ -669,14 +689,14 @@ export function registerKYCEnforcementRoutes(app: import("express").Express) {
   });
 
   // Enforcement log
-  app.get("/api/platform/kyc-enforcement/log", (req: Request, res: Response) => {
+  app.get("/api/platform/kyc-enforcement/log", asyncRoute(async (req: Request, res: Response) => {
     const decision = req.query.decision as string | undefined;
     const serviceId = req.query.serviceId as string | undefined;
-    let filtered = enforcementLog;
+    let filtered = await pgGuard((async () => { await ensureEnforcementStore(); return storeList<EnforcementEvent>(ENFORCEMENT_TABLE); })());
     if (decision) filtered = filtered.filter(e => e.decision === decision);
     if (serviceId) filtered = filtered.filter(e => e.serviceId === serviceId);
     res.json({ events: filtered.slice(-200), total: filtered.length });
-  });
+  }));
 
   // Manual KYC record management
   app.get("/api/platform/kyc-enforcement/records", async (_req: Request, res: Response) => {

@@ -8,6 +8,124 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from statistics import mean
 from typing import Any
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 
 @dataclass
 class AccrualPoint:
@@ -34,7 +152,7 @@ class RevenueReport:
     currency: str
 
 
-ACCRUALS: list[AccrualPoint] = [
+_ACCRUAL_SEED: list[AccrualPoint] = [
     AccrualPoint("BA-001", "54link-dev-platform-prod", "2026-01", 6_200_000, "NGN", "transfer_posted", "nip_payments", 248_000, "finalized"),
     AccrualPoint("BA-002", "54link-dev-platform-prod", "2026-02", 7_500_000, "NGN", "transfer_posted", "nip_payments", 300_000, "finalized"),
     AccrualPoint("BA-003", "54link-dev-platform-prod", "2026-03", 7_800_000, "NGN", "transfer_posted", "nip_payments", 312_000, "finalized"),
@@ -47,6 +165,10 @@ ACCRUALS: list[AccrualPoint] = [
     AccrualPoint("BA-010", "54link-dev-platform-prod", "2026-05", 2_600_000, "NGN", "sms_sent", "notifications", 650_000, "provisional"),
 ]
 
+# W12-C3P2B5: billing accrual points persisted in PG (seed idempotent).
+ACCRUAL_STORE = _W12Store("billing_accruals", seed=[asdict(a) for a in _ACCRUAL_SEED])
+
+
 REVENUE_REPORTS: list[RevenueReport] = [
     RevenueReport("RR-001", "2026-Q1", 45_500_000_000, 12_300_000_000, 25_800_000_000, 4_200_000_000, 3_200_000_000, "NGN"),
     RevenueReport("RR-002", "2026-Q2", 48_200_000_000, 13_100_000_000, 27_200_000_000, 4_500_000_000, 3_400_000_000, "NGN"),
@@ -54,7 +176,7 @@ REVENUE_REPORTS: list[RevenueReport] = [
 
 
 def detect_spikes(meter_key: str, spike_ratio: float = 1.4) -> list[dict[str, Any]]:
-    series = [a for a in ACCRUALS if a.meter_key == meter_key]
+    series = [AccrualPoint(**r) for r in _w12_all_by(ACCRUAL_STORE, "meter_key", meter_key)]
     if len(series) < 2:
         return []
     baseline = mean(a.accrued_amount for a in series[:-1])
@@ -251,10 +373,20 @@ class Handler(BaseHTTPRequestHandler):
                 "lakehouse": {"status": "connected", "table": "billing_analytics_iceberg"}
             }, "middleware": ["Lakehouse", "OpenSearch", "Kafka", "Redis"]})
         elif self.path == "/v1/billing/accruals":
-            self._json(200, {"items": [asdict(a) for a in ACCRUALS], "total": len(ACCRUALS)})
+            try:
+                _items = ACCRUAL_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _items, "total": len(_items)})
         elif self.path == "/v1/billing/revenue-reports":
             self._json(200, {"items": [asdict(r) for r in REVENUE_REPORTS], "total": len(REVENUE_REPORTS)})
         elif self.path == "/v1/billing/summary":
+            try:
+                ACCRUALS = [AccrualPoint(**r) for r in ACCRUAL_STORE.all()]
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             total_accrued = sum(a.accrued_amount for a in ACCRUALS)
             by_meter: dict[str, float] = {}
             for a in ACCRUALS:

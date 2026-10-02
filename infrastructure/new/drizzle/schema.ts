@@ -11,6 +11,7 @@ import {
   text,
   timestamp,
   uniqueIndex,
+  uuid,
   varchar,
 } from "drizzle-orm/pg-core";
 
@@ -5657,4 +5658,66 @@ export const openappsecLearningData = pgTable("openappsecLearningData", {
   createdAt: timestamp("createdAt").defaultNow(),
 }, (t) => [
   index("openappsec_learning_data_endpoint_idx").on(t.endpoint),
+]);
+
+// ─── Platform template tables (B5 P1-C, wave-12) ────────────────────────────
+// Canonical service-owned tables. AUTHORITATIVE DDL lives in
+// services/db-migrations/migrations/V2026000{1,2,3}__*.sql (applied by the
+// db-migrations runner) and is mirrored for psql environments in
+// drizzle/migrations/006_platform_template_tables.sql. These declarations keep
+// drizzle-kit aware of the tables (schema source of truth per
+// infrastructure/new/drizzle.config.ts); run `npm run db:generate` to emit the
+// matching snapshot when regenerating. Provenance per column: see the
+// V2026 migration headers and work/w12/schema-harvest.json.
+
+export const outbox = pgTable("outbox", {
+  // TEXT (not uuid): gl-engine-go inserts 'OBX-' string ids
+  // (services/gl-engine-go/main.go:442,459); default keeps UUID behaviour.
+  id: text("id").primaryKey(),
+  eventType: text("event_type"),
+  topic: text("topic"),
+  key: text("key"),
+  aggregateId: text("aggregate_id"),
+  payload: jsonb("payload").notNull().default({}),
+  published: boolean("published").notNull().default(false),
+  publishedAt: timestamp("published_at"),
+  status: text("status").notNull().default("pending"),
+  idempotencyKey: text("idempotency_key"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+}, (t) => [
+  index("idx_outbox_unpublished").on(t.published, t.createdAt),
+  index("idx_outbox_status_pending").on(t.status, t.createdAt),
+  uniqueIndex("idx_outbox_idempotency_key").on(t.idempotencyKey),
+]);
+
+export const serviceRecords = pgTable("service_records", {
+  id: text("id").primaryKey(),
+  service: text("service").notNull(),
+  type: text("type").default("default"),
+  status: text("status").default("active"),
+  data: jsonb("data").default({}),
+  createdBy: text("created_by").default(""),
+  tenantId: text("tenant_id").default(""),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (t) => [
+  index("idx_service_records_service_created").on(t.service, t.createdAt),
+]);
+
+export const serviceConfigs = pgTable("service_configs", {
+  id: uuid("id").primaryKey(), // DEFAULT gen_random_uuid() applied by runner DDL
+  configKey: varchar("config_key", { length: 128 }),
+  configValue: jsonb("config_value"),
+  environment: varchar("environment", { length: 20 }).notNull().default("production"),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  version: integer("version").notNull().default(1),
+  description: text("description"),
+  isActive: boolean("is_active").notNull().default(true),
+  updatedBy: uuid("updated_by"),
+  tenantId: uuid("tenant_id"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_service_configs_key_env_tenant").on(t.configKey, t.environment, t.tenantId),
+  index("idx_service_configs_tenant").on(t.tenantId),
 ]);

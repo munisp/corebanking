@@ -11,7 +11,7 @@ import (
 // ReportService handles audit report operations
 type ReportService struct {
 	tenantID string
-	reports  map[string]*AuditReport
+	reports  *repo[AuditReport]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type ReportService struct {
 func NewReportService(tenantID string) *ReportService {
 	svc := &ReportService{
 		tenantID: tenantID,
-		reports:  make(map[string]*AuditReport),
+		reports:  newRepo[AuditReport](serviceDB, "audit_reports"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -29,7 +29,7 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 	issuedDate := time.Now().AddDate(0, -1, 0)
 
 	// Draft report
-	s.reports["report-001"] = &AuditReport{
+	s.reports.seed(tenantID, "report-001", &AuditReport{
 		ReportID:         "report-001",
 		TenantID:         tenantID,
 		EngagementID:     "eng-003",
@@ -47,10 +47,10 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, 0, -10),
 		UpdatedAt:        time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// Issued report
-	s.reports["report-002"] = &AuditReport{
+	s.reports.seed(tenantID, "report-002", &AuditReport{
 		ReportID:         "report-002",
 		TenantID:         tenantID,
 		EngagementID:     "eng-004",
@@ -71,10 +71,10 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, -1, -15),
 		UpdatedAt:        time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// Report in review
-	s.reports["report-003"] = &AuditReport{
+	s.reports.seed(tenantID, "report-003", &AuditReport{
 		ReportID:         "report-003",
 		TenantID:         tenantID,
 		EngagementID:     "eng-001",
@@ -93,16 +93,18 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now().AddDate(0, 0, -3),
 		UpdatedAt:        time.Now().AddDate(0, 0, -1),
-	}
+	})
 }
 
 // ListReports returns reports based on filters
-func (s *ReportService) ListReports(tenantID, status string) []*AuditReport {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ReportService) ListReports(tenantID, status string) ([]*AuditReport, error) {
 
 	var result []*AuditReport
-	for _, report := range s.reports {
+	__ALL__, __ERR__ := s.reports.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, report := range __ALL__ {
 		if report.TenantID != tenantID {
 			continue
 		}
@@ -111,16 +113,14 @@ func (s *ReportService) ListReports(tenantID, status string) []*AuditReport {
 		}
 		result = append(result, report)
 	}
-	return result
+	return result, nil
 }
 
 // GetReport retrieves a report by ID
 func (s *ReportService) GetReport(tenantID, reportID string) (*AuditReport, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	report, exists := s.reports[reportID]
-	if !exists || report.TenantID != tenantID {
+	report, err := s.reports.get(tenantID, reportID)
+	if err != nil {
 		return nil, errors.New("report not found")
 	}
 	return report, nil
@@ -128,8 +128,6 @@ func (s *ReportService) GetReport(tenantID, reportID string) (*AuditReport, erro
 
 // CreateReport creates a new report
 func (s *ReportService) CreateReport(tenantID, auditorID string, report *AuditReport) (*AuditReport, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	report.ReportID = uuid.New().String()
 	report.TenantID = tenantID
@@ -140,87 +138,68 @@ func (s *ReportService) CreateReport(tenantID, auditorID string, report *AuditRe
 	report.CreatedAt = time.Now()
 	report.UpdatedAt = time.Now()
 
-	s.reports[report.ReportID] = report
+	if err := s.reports.put(tenantID, report.ReportID, report); err != nil {
+		return nil, err
+	}
 	return report, nil
 }
 
 // UpdateReport updates a report
 func (s *ReportService) UpdateReport(report *AuditReport) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.reports[report.ReportID]
-	if !exists || existing.TenantID != report.TenantID {
+	existing, err := s.reports.get(report.TenantID, report.ReportID)
+	if err != nil {
 		return errors.New("report not found")
 	}
 
 	report.CreatedAt = existing.CreatedAt
 	report.UpdatedAt = time.Now()
-	s.reports[report.ReportID] = report
-	return nil
+	return s.reports.put(report.TenantID, report.ReportID, report)
 }
 
 // ReviewReport marks report as reviewed
 func (s *ReportService) ReviewReport(tenantID, reportID, reviewerID string) (*AuditReport, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.reports.update(tenantID, reportID, func(report *AuditReport) error {
+		if report.Status != "draft" {
+			return errors.New("report is not in draft status")
+		}
 
-	report, exists := s.reports[reportID]
-	if !exists || report.TenantID != tenantID {
-		return nil, errors.New("report not found")
-	}
+		report.ReviewedBy = reviewerID
+		report.Status = "review"
+		report.UpdatedAt = time.Now()
 
-	if report.Status != "draft" {
-		return nil, errors.New("report is not in draft status")
-	}
-
-	report.ReviewedBy = reviewerID
-	report.Status = "review"
-	report.UpdatedAt = time.Now()
-
-	return report, nil
+		return nil
+	})
 }
 
 // ApproveReport approves a report
 func (s *ReportService) ApproveReport(tenantID, reportID, approverID string) (*AuditReport, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.reports.update(tenantID, reportID, func(report *AuditReport) error {
+		if report.Status != "review" {
+			return errors.New("report is not in review status")
+		}
 
-	report, exists := s.reports[reportID]
-	if !exists || report.TenantID != tenantID {
-		return nil, errors.New("report not found")
-	}
+		report.ApprovedBy = approverID
+		report.ReportType = "final"
+		report.Status = "approved"
+		report.UpdatedAt = time.Now()
 
-	if report.Status != "review" {
-		return nil, errors.New("report is not in review status")
-	}
-
-	report.ApprovedBy = approverID
-	report.ReportType = "final"
-	report.Status = "approved"
-	report.UpdatedAt = time.Now()
-
-	return report, nil
+		return nil
+	})
 }
 
 // IssueReport issues a report
 func (s *ReportService) IssueReport(tenantID, reportID string) (*AuditReport, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.reports.update(tenantID, reportID, func(report *AuditReport) error {
+		if report.Status != "approved" {
+			return errors.New("report is not approved")
+		}
 
-	report, exists := s.reports[reportID]
-	if !exists || report.TenantID != tenantID {
-		return nil, errors.New("report not found")
-	}
+		now := time.Now()
+		report.IssuedDate = &now
+		report.Status = "issued"
+		report.UpdatedAt = now
 
-	if report.Status != "approved" {
-		return nil, errors.New("report is not approved")
-	}
-
-	now := time.Now()
-	report.IssuedDate = &now
-	report.Status = "issued"
-	report.UpdatedAt = now
-
-	return report, nil
+		return nil
+	})
 }

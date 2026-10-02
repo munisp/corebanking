@@ -12,10 +12,12 @@ export class PaymentService {
     pin: string;
   }): Promise<{ success: boolean; message: string; data?: any }> {
     try {
+      // W12-A4B: InitiatePaymentSchema (payment-processing schemas/payment.py:50)
+      // requires integer amount_kobo — convert from major units here.
       const response = await apiService.post(`${AppConfig.paymentEndpoint}/payment/transfer`, {
         payer: Number(localStorage.getItem('account_id')),
         payee: Number(params.payeeAccountId),
-        amount: params.amount,
+        amount_kobo: Math.round(params.amount * 100),
         note: params.note,
         pin: params.pin,
       });
@@ -50,12 +52,14 @@ export class PaymentService {
     recipientBank?: string;
   }) {
     try {
+      // W12-A4B: map to InitiatePaymentSchema (payer/payee/amount_kobo/note/pin).
+      // pin is schema-required; this screen collects none, so send empty string.
       const response = await apiService.post(`${AppConfig.paymentEndpoint}/payment/transfer`, {
-        recipient_account: params.recipientAccount,
-        amount: params.amount,
-        narration: params.narration,
-        recipient_name: params.recipientName,
-        recipient_bank: params.recipientBank,
+        payer: Number(localStorage.getItem('account_id')),
+        payee: params.recipientAccount,
+        amount_kobo: Math.round(params.amount * 100),
+        note: params.narration,
+        pin: '',
       });
 
       if (response.status === 200 || response.status === 201) {
@@ -72,14 +76,17 @@ export class PaymentService {
   // =================== VERIFY ACCOUNT ===================
   async verifyAccount(accountNumber: string, bankCode?: string) {
     try {
-      const response = await apiService.post(`${AppConfig.paymentEndpoint}/verify-account`, {
-        account_number: accountNumber,
-        bank_code: bankCode,
+      // W12-A4B: account verification = name enquiry, served by
+      // beneficiary-management-go POST /v1/beneficiaries/verify
+      // (camelCase body; returns the enquiry object directly, no envelope).
+      const response = await apiService.post('/beneficiaries/v1/beneficiaries/verify', {
+        accountNumber: accountNumber,
+        bankCode: bankCode,
       });
 
       if (response.status === 200) {
         const data = response.data as { data?: any };
-        return data.data;
+        return data.data ?? data;
       } else {
         throw new Error('Account verification failed');
       }
@@ -91,11 +98,13 @@ export class PaymentService {
   // =================== GET BANKS ===================
   async getBanks() {
     try {
-      const response = await apiService.get(`${AppConfig.paymentEndpoint}/banks`);
+      // W12-A4B: bank directory is served by beneficiary-management-go
+      // GET /v1/beneficiaries/banks -> { banks: [{code,name}], total }.
+      const response = await apiService.get('/beneficiaries/v1/beneficiaries/banks');
 
       if (response.status === 200) {
-        const data = response.data as { data?: any[] };
-        return data.data || [];
+        const data = response.data as { data?: any[]; banks?: any[] };
+        return data.banks || data.data || [];
       }
       return [];
     } catch (error) {
@@ -107,11 +116,26 @@ export class PaymentService {
   // =================== GET BILLER CATEGORIES ===================
   async getBillerCategories() {
     try {
-      const response = await apiService.get(`${AppConfig.paymentEndpoint}/billers/categories`);
+      // W12-A4B: no categories endpoint exists; mobile-bff
+      // GET /api/v1/billers returns billers tagged with `category`, so the
+      // category list is derived client-side from the real biller list.
+      const response = await apiService.get('/mobile-bff/api/v1/billers');
 
       if (response.status === 200) {
-        const data = response.data as { data?: any[] };
-        return data.data || [];
+        const data = response.data as { data?: any[]; billers?: any[] } | any[];
+        const billers: any[] = Array.isArray(data)
+          ? data
+          : data.billers || data.data || [];
+        const seen = new Set<string>();
+        const categories: { id: string; name: string }[] = [];
+        for (const b of billers) {
+          const c = String(b?.category ?? '').trim();
+          if (c && !seen.has(c)) {
+            seen.add(c);
+            categories.push({ id: c, name: c });
+          }
+        }
+        return categories;
       }
       return [];
     } catch (error) {
@@ -123,11 +147,20 @@ export class PaymentService {
   // =================== GET BILLERS BY CATEGORY ===================
   async getBillers(categoryId: string) {
     try {
-      const response = await apiService.get(`${AppConfig.paymentEndpoint}/billers?category_id=${categoryId}`);
+      // W12-A4B: mobile-bff GET /api/v1/billers/:category ->
+      // { category, billers: [...] } (fallback-tagged when upstream is down).
+      const response = await apiService.get(`/mobile-bff/api/v1/billers/${encodeURIComponent(categoryId)}`);
 
       if (response.status === 200) {
-        const data = response.data as { data?: any[] };
-        return data.data || [];
+        const data = response.data as { data?: any[]; billers?: any[] } | any[];
+        const billers: any[] = Array.isArray(data)
+          ? data
+          : data.billers || data.data || [];
+        return billers.map((b) => ({
+          ...b,
+          id: String(b?.id ?? b?.biller_id ?? b?.name ?? ''),
+          name: String(b?.name ?? b?.biller_name ?? ''),
+        }));
       }
       return [];
     } catch (error) {
@@ -144,16 +177,18 @@ export class PaymentService {
     additionalData?: Record<string, any>;
   }) {
     try {
-      const response = await apiService.post(`${AppConfig.paymentEndpoint}/bills/pay`, {
+      // W12-A4B: mobile-bff POST /api/v1/bills/pay (payload forwarded to the
+      // bill-pay upstream; bff returns 202 Accepted with payment receipt).
+      const response = await apiService.post(`${AppConfig.billEndpoint}/pay`, {
         biller_id: params.billerId,
         customer_id: params.customerId,
         amount: params.amount,
         ...params.additionalData,
       });
 
-      if (response.status === 200 || response.status === 201) {
+      if (response.status === 200 || response.status === 201 || response.status === 202) {
         const data = response.data as { data?: any };
-        return data.data;
+        return data.data ?? data;
       } else {
         throw new Error('Bill payment failed');
       }
@@ -165,14 +200,16 @@ export class PaymentService {
   // =================== VALIDATE CUSTOMER ===================
   async validateCustomer(billerId: string, customerId: string) {
     try {
-      const response = await apiService.post(`${AppConfig.paymentEndpoint}/bills/validate`, {
+      // W12-A4B: mobile-bff POST /api/v1/bills/validate -> validation result
+      // object (status/customer_name/amount_due), no {data} envelope.
+      const response = await apiService.post(`${AppConfig.billEndpoint}/validate`, {
         biller_id: billerId,
         customer_id: customerId,
       });
 
       if (response.status === 200) {
         const data = response.data as { data?: any };
-        return data.data;
+        return data.data ?? data;
       } else {
         throw new Error('Customer validation failed');
       }
@@ -184,11 +221,13 @@ export class PaymentService {
   // =================== GET BENEFICIARIES ===================
   async getBeneficiaries() {
     try {
-      const response = await apiService.get(`${AppConfig.paymentEndpoint}/beneficiaries`);
+      // W12-A4B: beneficiary-management-go GET /v1/beneficiaries ->
+      // { items: [...], total } (gateway prefix /beneficiaries/*).
+      const response = await apiService.get('/beneficiaries/v1/beneficiaries');
 
       if (response.status === 200) {
-        const data = response.data as { data?: any[] };
-        return data.data || [];
+        const data = response.data as { data?: any[]; items?: any[] };
+        return data.items || data.data || [];
       }
       return [];
     } catch (error) {
@@ -205,16 +244,21 @@ export class PaymentService {
     bankName?: string;
   }) {
     try {
-      const response = await apiService.post(`${AppConfig.paymentEndpoint}/beneficiaries`, {
-        account_number: params.accountNumber,
-        account_name: params.accountName,
-        bank_code: params.bankCode,
-        bank_name: params.bankName,
+      // W12-A4B: beneficiary-management-go POST /v1/beneficiaries requires
+      // camelCase { customerId, accountNumber, bankCode }; it validates
+      // 10-digit accountNumber and known bankCode, and returns the created
+      // Beneficiary object directly (201, no envelope).
+      const response = await apiService.post('/beneficiaries/v1/beneficiaries', {
+        customerId: localStorage.getItem('keycloak_id') || localStorage.getItem('account_id') || '',
+        accountNumber: params.accountNumber,
+        name: params.accountName,
+        bankCode: params.bankCode,
+        bankName: params.bankName,
       });
 
       if (response.status === 200 || response.status === 201) {
         const data = response.data as { data?: any };
-        return data.data;
+        return data.data ?? data;
       } else {
         throw new Error('Failed to add beneficiary');
       }
@@ -226,7 +270,11 @@ export class PaymentService {
   // =================== DELETE BENEFICIARY ===================
   async deleteBeneficiary(beneficiaryId: string) {
     try {
-      const response = await apiService.delete(`${AppConfig.paymentEndpoint}/beneficiaries/${beneficiaryId}`);
+      // W12-A4B: beneficiary-management-go DELETE /v1/beneficiaries takes the
+      // id in the request body ({beneficiaryId}), not as a path segment.
+      const response = await apiService.delete('/beneficiaries/v1/beneficiaries', undefined, {
+        beneficiaryId,
+      });
 
       if (response.status === 200) {
         return { success: true, message: 'Beneficiary deleted successfully' };
@@ -245,9 +293,13 @@ export class PaymentService {
     pin: string;
   }): Promise<{ success: boolean; message: string; data?: any }> {
     try {
-      const response = await apiService.post(`${AppConfig.paymentEndpoint}/deposit`, {
-        account_id: params.accountId,
+      // W12-A4B: /payment-processing/payment/deposit now rewrites to
+      // payment-processing-service POST /payment/deposit
+      // (InitiateDepositSchema: recipient:int, amount|amount_kobo, note).
+      const response = await apiService.post(`${AppConfig.paymentEndpoint}/payment/deposit`, {
+        recipient: Number(params.accountId),
         amount: params.amount,
+        note: 'Deposit',
         pin: params.pin,
       });
 
@@ -279,9 +331,13 @@ export class PaymentService {
     pin: string;
   }): Promise<{ success: boolean; message: string; data?: any }> {
     try {
-      const response = await apiService.post(`${AppConfig.paymentEndpoint}/withdraw`, {
-        account_id: params.accountId,
+      // W12-A4B: /payment-processing/payment/withdraw rewrites to the NEW
+      // payment-processing-service POST /payment/withdraw handler (added in
+      // the same batch; InitiateWithdrawalSchema mirrors the deposit schema).
+      const response = await apiService.post(`${AppConfig.paymentEndpoint}/payment/withdraw`, {
+        recipient: Number(params.accountId),
         amount: params.amount,
+        note: 'Withdrawal',
         pin: params.pin,
       });
 
@@ -365,10 +421,12 @@ export class PaymentService {
     pin: string;
   }): Promise<{ success: boolean; message: string; data?: any }> {
     try {
+      // W12-A4B: InitiateLoanPaymentSchema (schemas/payment.py:122) requires
+      // integer amount_kobo — convert from major units here.
       const response = await apiService.post(`${AppConfig.paymentEndpoint}/payment/loan`, {
         loan_id: params.loanId,
         payer: Number(params.payer),
-        amount: params.amount,
+        amount_kobo: Math.round(params.amount * 100),
         pin: params.pin,
       });
 
@@ -439,13 +497,15 @@ export class PaymentService {
     ledger?: number;
   }): Promise<{ success: boolean; message: string; data?: any }> {
     try {
+      // W12-A4B: ValidateQRSchema (schemas/qr.py:10) requires expiry and
+      // signature as strings — default them instead of dropping undefined.
       const response = await apiService.post(`${AppConfig.paymentEndpoint}/qr/validate`, {
         recipient: qrData.recipient,
         amount: qrData.amount,
         currency: qrData.currency,
         note: qrData.note || '',
-        expiry: qrData.expiry,
-        signature: qrData.signature,
+        expiry: qrData.expiry ?? '',
+        signature: qrData.signature ?? '',
         tenant: qrData.tenant,
         ledger: qrData.ledger,
       });
@@ -471,9 +531,11 @@ export class PaymentService {
       };
     }
   }
-}
 
   // =================== BULK PAYMENT ===================
+  // W12-A4B: removed a stray class-closing brace that preceded this section —
+  // bulkPayment/getBulkPaymentHistory are PaymentService methods (the file did
+  // not parse: 43 pre-existing TS1xxx errors at this boundary).
   async bulkPayment(params: {
     batchId?: string;
     pin: string;

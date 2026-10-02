@@ -3,6 +3,9 @@ package main
 // FXService — foreign exchange operations.
 //
 // Data integrity doctrine:
+//   - The typed fx_deals Postgres table is the ONLY deal store and the read
+//     authority. There is no in-memory deal map; every read hits Postgres and
+//     every status transition runs in a transaction with a row lock.
 //   - FX rates come ONLY from the configured rate source (FX_RATES_URL) or a
 //     previously fetched real quote (served labelled with its as-of time).
 //     When no real rate is available, rate/PnL calls return an error (503 at
@@ -10,8 +13,10 @@ package main
 //   - FX positions are AGGREGATED from real executed deals, not pre-seeded.
 //   - Realized PnL is computed by FIFO-matching settled buys against sells.
 //   - Settlement posts a real double-entry journal to the ledger
-//     (JOURNAL_POSTING_URL). If the ledger is unavailable the deal is NOT
-//     marked settled and the call fails.
+//     (JOURNAL_POSTING_URL) OUTSIDE any database transaction, then re-checks
+//     the deal status inside a short transaction before marking it settled.
+//     If the ledger is unavailable the deal is NOT marked settled and the
+//     call fails.
 
 import (
 	"bytes"
@@ -20,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -27,7 +33,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
 )
 
 // FXRate is a real quote obtained from the rate source.
@@ -42,9 +47,6 @@ type FXRate struct {
 // FXService handles foreign exchange operations
 type FXService struct {
 	tenantID   string
-	deals      map[string]*FXDeal
-	counter    int
-	mu         sync.RWMutex
 	db         *sql.DB
 	httpClient *http.Client
 	ratesMu    sync.RWMutex
@@ -61,25 +63,16 @@ func fxLedgerURL() string {
 	return os.Getenv("GL_ENGINE_URL") // gl-engine-go /v1/gl/journal
 }
 
-// NewFXService creates a new FX service. Deals are loaded from Postgres when
-// DATABASE_URL is configured; positions are computed from those deals.
+// NewFXService creates a new FX service backed by the shared Postgres handle.
+// Boot fails closed when the fx_deals schema cannot be ensured.
 func NewFXService(tenantID string) *FXService {
 	svc := &FXService{
 		tenantID:   tenantID,
-		deals:      make(map[string]*FXDeal),
-		counter:    1000,
+		db:         serviceDB,
 		httpClient: &http.Client{Timeout: 15 * time.Second},
 		rates:      make(map[string]FXRate),
 	}
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		if db, err := sql.Open("postgres", dsn); err == nil && db.Ping() == nil {
-			svc.db = db
-			svc.ensureSchema()
-			svc.loadDeals(tenantID)
-		} else {
-			fmt.Printf("[fx-service] DATABASE_URL set but unreachable; deals kept in memory only\n")
-		}
-	}
+	svc.ensureSchema()
 	return svc
 }
 
@@ -100,17 +93,15 @@ func (s *FXService) ensureSchema() {
 		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`)
 	if err != nil {
-		fmt.Printf("[fx-service] fx_deals schema init failed: %v\n", err)
+		log.Fatalf("[fx-service] fx_deals schema init failed: %v", err)
 	}
 }
 
-func (s *FXService) persistDeal(deal *FXDeal) {
-	if s.db == nil {
-		return
-	}
+// dbInsertDeal persists a newly created deal.
+func (s *FXService) dbInsertDeal(deal *FXDeal) error {
 	payload, err := json.Marshal(deal)
 	if err != nil {
-		return
+		return fmt.Errorf("marshal fx deal: %w", err)
 	}
 	if _, err := s.db.Exec(`INSERT INTO fx_deals
 		(deal_id, tenant_id, deal_number, deal_type, buy_currency, sell_currency, buy_amount, sell_amount, rate, status, payload, updated_at)
@@ -118,26 +109,110 @@ func (s *FXService) persistDeal(deal *FXDeal) {
 		ON CONFLICT (deal_id) DO UPDATE SET status = $10, payload = $11, updated_at = NOW()`,
 		deal.DealID, deal.TenantID, deal.DealNumber, deal.DealType, deal.BuyCurrency,
 		deal.SellCurrency, deal.BuyAmount, deal.SellAmount, deal.Rate, deal.Status, string(payload)); err != nil {
-		fmt.Printf("[fx-service] persist deal %s failed: %v\n", deal.DealID, err)
+		return fmt.Errorf("insert fx deal %s: %w", deal.DealID, err)
 	}
+	return nil
 }
 
-func (s *FXService) loadDeals(tenantID string) {
-	rows, err := s.db.Query(`SELECT payload FROM fx_deals WHERE tenant_id = $1`, tenantID)
+// dbGetDeal loads one deal scoped to the tenant (read authority).
+func (s *FXService) dbGetDeal(tenantID, dealID string) (*FXDeal, error) {
+	var p []byte
+	err := s.db.QueryRow(`SELECT payload FROM fx_deals WHERE deal_id = $1 AND tenant_id = $2`,
+		dealID, tenantID).Scan(&p)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("FX deal not found")
+	}
 	if err != nil {
-		return
+		return nil, fmt.Errorf("get fx deal %s: %w", dealID, err)
+	}
+	var d FXDeal
+	if err := json.Unmarshal(p, &d); err != nil {
+		return nil, fmt.Errorf("decode fx deal %s: %w", dealID, err)
+	}
+	return &d, nil
+}
+
+// dbListDeals loads all deals for a tenant (read authority).
+func (s *FXService) dbListDeals(tenantID string) ([]*FXDeal, error) {
+	rows, err := s.db.Query(`SELECT payload FROM fx_deals WHERE tenant_id = $1 ORDER BY created_at, deal_id`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list fx deals: %w", err)
 	}
 	defer rows.Close()
+	out := []*FXDeal{}
 	for rows.Next() {
-		var p string
-		if rows.Scan(&p) != nil {
-			continue
+		var p []byte
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("list fx deals scan: %w", err)
 		}
 		var d FXDeal
-		if json.Unmarshal([]byte(p), &d) == nil {
-			s.deals[d.DealID] = &d
+		if err := json.Unmarshal(p, &d); err != nil {
+			return nil, fmt.Errorf("list fx deals decode: %w", err)
 		}
+		out = append(out, &d)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list fx deals: %w", err)
+	}
+	return out, nil
+}
+
+// dbUpdateDeal replaces a deal's stored state (non-transition updates).
+func (s *FXService) dbUpdateDeal(deal *FXDeal) error {
+	payload, err := json.Marshal(deal)
+	if err != nil {
+		return fmt.Errorf("marshal fx deal: %w", err)
+	}
+	res, err := s.db.Exec(`UPDATE fx_deals SET status = $3, payload = $4, updated_at = NOW()
+		WHERE deal_id = $1 AND tenant_id = $2`,
+		deal.DealID, deal.TenantID, deal.Status, string(payload))
+	if err != nil {
+		return fmt.Errorf("update fx deal %s: %w", deal.DealID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.New("FX deal not found")
+	}
+	return nil
+}
+
+// dbTransitionDeal runs fn against the deal inside a transaction with the row
+// locked (SELECT ... FOR UPDATE). fn must validate the current status and
+// mutate the deal; any error rolls the transaction back.
+func (s *FXService) dbTransitionDeal(tenantID, dealID string, fn func(*FXDeal) error) (*FXDeal, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("fx deal %s begin: %w", dealID, err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after Commit
+
+	var p []byte
+	err = tx.QueryRow(`SELECT payload FROM fx_deals WHERE deal_id = $1 AND tenant_id = $2 FOR UPDATE`,
+		dealID, tenantID).Scan(&p)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errors.New("FX deal not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fx deal %s lock: %w", dealID, err)
+	}
+	var d FXDeal
+	if err := json.Unmarshal(p, &d); err != nil {
+		return nil, fmt.Errorf("fx deal %s decode: %w", dealID, err)
+	}
+	if err := fn(&d); err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(&d)
+	if err != nil {
+		return nil, fmt.Errorf("fx deal %s marshal: %w", dealID, err)
+	}
+	if _, err := tx.Exec(`UPDATE fx_deals SET status = $3, payload = $4, updated_at = NOW()
+		WHERE deal_id = $1 AND tenant_id = $2`, dealID, tenantID, d.Status, string(payload)); err != nil {
+		return nil, fmt.Errorf("fx deal %s write: %w", dealID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("fx deal %s commit: %w", dealID, err)
+	}
+	return &d, nil
 }
 
 // refreshRates fetches real quotes from the configured FX rate source.
@@ -198,13 +273,14 @@ func (s *FXService) currentRate(currency string) (FXRate, bool) {
 }
 
 // computePositions aggregates real executed/settled deals into positions.
-func (s *FXService) computePositions(tenantID string) []*FXPosition {
+// It is a pure function over a per-request snapshot of deals.
+func (s *FXService) computePositions(tenantID string, deals []*FXDeal) []*FXPosition {
 	type agg struct {
 		long, short   int64
 		costNumerator float64 // Σ buyAmount * rate for avg rate
 	}
 	aggs := map[string]*agg{}
-	for _, d := range s.deals {
+	for _, d := range deals {
 		if d.TenantID != tenantID || (d.Status != "executed" && d.Status != "settled") {
 			continue
 		}
@@ -253,34 +329,36 @@ func (s *FXService) computePositions(tenantID string) []*FXPosition {
 }
 
 // ListFXPositions returns positions aggregated from real deals.
-func (s *FXService) ListFXPositions(tenantID string) []*FXPosition {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.computePositions(tenantID)
+func (s *FXService) ListFXPositions(tenantID string) ([]*FXPosition, error) {
+	deals, err := s.dbListDeals(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return s.computePositions(tenantID, deals), nil
 }
 
 // GetFXPosition returns the aggregated FX position for a currency.
-func (s *FXService) GetFXPosition(tenantID, currency string) *FXPosition {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, p := range s.computePositions(tenantID) {
+func (s *FXService) GetFXPosition(tenantID, currency string) (*FXPosition, error) {
+	positions, err := s.ListFXPositions(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range positions {
 		if p.Currency == currency {
-			return p
+			return p, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // ListFXDeals returns FX deals based on filters
-func (s *FXService) ListFXDeals(tenantID, status, dealType string) []*FXDeal {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *FXService) ListFXDeals(tenantID, status, dealType string) ([]*FXDeal, error) {
+	deals, err := s.dbListDeals(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	var result []*FXDeal
-	for _, deal := range s.deals {
-		if deal.TenantID != tenantID {
-			continue
-		}
+	for _, deal := range deals {
 		if status != "" && deal.Status != status {
 			continue
 		}
@@ -289,28 +367,19 @@ func (s *FXService) ListFXDeals(tenantID, status, dealType string) []*FXDeal {
 		}
 		result = append(result, deal)
 	}
-	return result
+	return result, nil
 }
 
 // GetFXDeal retrieves an FX deal by ID
 func (s *FXService) GetFXDeal(tenantID, dealID string) (*FXDeal, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
-		return nil, errors.New("FX deal not found")
-	}
-	return deal, nil
+	return s.dbGetDeal(tenantID, dealID)
 }
 
 // CreateFXDeal creates a new FX deal
 func (s *FXService) CreateFXDeal(tenantID, dealerID string, req *CreateFXDealRequest) (*FXDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.counter++
-	dealNumber := fmt.Sprintf("FX-%s-%d", time.Now().Format("20060102"), s.counter)
+	// Deal numbers derive from the clock, not a process-local counter (which
+	// resets on restart); deal_id is a UUID primary key.
+	dealNumber := fmt.Sprintf("FX-%s-%d", time.Now().Format("20060102"), time.Now().UnixNano()%1000000000)
 
 	valueDate, _ := time.Parse("2006-01-02", req.ValueDate)
 
@@ -340,85 +409,63 @@ func (s *FXService) CreateFXDeal(tenantID, dealerID string, req *CreateFXDealReq
 		deal.MaturityDate = &maturity
 	}
 
-	s.deals[deal.DealID] = deal
-	s.persistDeal(deal)
+	if err := s.dbInsertDeal(deal); err != nil {
+		return nil, err
+	}
 	return deal, nil
 }
 
 // UpdateFXDeal updates an FX deal
 func (s *FXService) UpdateFXDeal(deal *FXDeal) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	existing, exists := s.deals[deal.DealID]
-	if !exists || existing.TenantID != deal.TenantID {
+	existing, err := s.dbGetDeal(deal.TenantID, deal.DealID)
+	if err != nil {
 		return errors.New("FX deal not found")
 	}
 
 	deal.CreatedAt = existing.CreatedAt
 	deal.DealNumber = existing.DealNumber
 	deal.UpdatedAt = time.Now()
-	s.deals[deal.DealID] = deal
-	s.persistDeal(deal)
-	return nil
+	return s.dbUpdateDeal(deal)
 }
 
-// ApproveFXDeal approves an FX deal
+// ApproveFXDeal approves an FX deal (transactional transition)
 func (s *FXService) ApproveFXDeal(tenantID, dealID, approverID string) (*FXDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
-		return nil, errors.New("FX deal not found")
-	}
-
-	if deal.Status != "pending" {
-		return nil, errors.New("can only approve pending deals")
-	}
-
-	now := time.Now()
-	deal.Status = "approved"
-	deal.ApprovedBy = approverID
-	deal.ApprovedAt = &now
-	deal.UpdatedAt = time.Now()
-	s.persistDeal(deal)
-
-	return deal, nil
+	return s.dbTransitionDeal(tenantID, dealID, func(deal *FXDeal) error {
+		if deal.Status != "pending" {
+			return errors.New("can only approve pending deals")
+		}
+		now := time.Now()
+		deal.Status = "approved"
+		deal.ApprovedBy = approverID
+		deal.ApprovedAt = &now
+		deal.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
 // ExecuteFXDeal executes an approved FX deal (books it; positions recompute
 // from executed deals).
 func (s *FXService) ExecuteFXDeal(tenantID, dealID string) (*FXDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
-		return nil, errors.New("FX deal not found")
-	}
-
-	if deal.Status != "approved" {
-		return nil, errors.New("can only execute approved deals")
-	}
-
-	deal.Status = "executed"
-	deal.UpdatedAt = time.Now()
-	s.persistDeal(deal)
-
-	return deal, nil
+	return s.dbTransitionDeal(tenantID, dealID, func(deal *FXDeal) error {
+		if deal.Status != "approved" {
+			return errors.New("can only execute approved deals")
+		}
+		deal.Status = "executed"
+		deal.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
 // SettleFXDeal settles an executed deal by posting a real balanced
-// double-entry journal to the ledger. If the ledger is unavailable or rejects
-// the posting, the deal is NOT marked settled and an error is returned.
+// double-entry journal to the ledger. The ledger HTTP call happens OUTSIDE
+// any database transaction; afterwards the deal status is re-checked inside
+// a short transaction (row lock) before being marked settled. If the ledger
+// is unavailable or rejects the posting, the deal is NOT marked settled and
+// an error is returned.
 func (s *FXService) SettleFXDeal(tenantID, dealID string) (*FXDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
-		return nil, errors.New("FX deal not found")
+	deal, err := s.dbGetDeal(tenantID, dealID)
+	if err != nil {
+		return nil, err
 	}
 
 	if deal.Status != "executed" {
@@ -466,35 +513,34 @@ func (s *FXService) SettleFXDeal(tenantID, dealID string) (*FXDeal, error) {
 		return nil, fmt.Errorf("settlement journal was NOT posted (%v) — deal remains 'executed'", lastErr)
 	}
 
-	now := time.Now()
-	deal.Status = "settled"
-	deal.SettledAt = &now
-	deal.UpdatedAt = time.Now()
-	s.persistDeal(deal)
-
-	return deal, nil
+	// Journal posted. Re-check and transition the status inside a transaction
+	// so a concurrent settle/cancel cannot double-settle this deal.
+	return s.dbTransitionDeal(tenantID, dealID, func(d *FXDeal) error {
+		if d.Status != "executed" {
+			return fmt.Errorf("deal status changed to %q during settlement; journal was posted — reconcile manually", d.Status)
+		}
+		now := time.Now()
+		d.Status = "settled"
+		d.SettledAt = &now
+		d.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
-// CancelFXDeal cancels an FX deal
+// CancelFXDeal cancels an FX deal (transactional transition)
 func (s *FXService) CancelFXDeal(tenantID, dealID, reason string) (*FXDeal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	deal, exists := s.deals[dealID]
-	if !exists || deal.TenantID != tenantID {
-		return nil, errors.New("FX deal not found")
-	}
-
-	if deal.Status == "settled" {
-		return nil, errors.New("cannot cancel settled deals")
-	}
-
-	deal.Status = "cancelled"
-	deal.Metadata["cancelReason"] = reason
-	deal.UpdatedAt = time.Now()
-	s.persistDeal(deal)
-
-	return deal, nil
+	return s.dbTransitionDeal(tenantID, dealID, func(deal *FXDeal) error {
+		if deal.Status == "settled" {
+			return errors.New("cannot cancel settled deals")
+		}
+		deal.Status = "cancelled"
+		if deal.Metadata == nil {
+			deal.Metadata = make(map[string]interface{})
+		}
+		deal.Metadata["cancelReason"] = reason
+		deal.UpdatedAt = time.Now()
+		return nil
+	})
 }
 
 // GetFXRates returns real FX rates from the configured rate source. When no
@@ -534,10 +580,12 @@ func (s *FXService) GetFXRates(tenantID string) (map[string]interface{}, error) 
 //
 // Returns error when rates are required but no real rate has ever been fetched.
 func (s *FXService) GetFXPnL(tenantID string) (map[string]interface{}, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	deals, err := s.dbListDeals(tenantID)
+	if err != nil {
+		return nil, err
+	}
 
-	positions := s.computePositions(tenantID)
+	positions := s.computePositions(tenantID, deals)
 	currencyPnL := make(map[string]int64)
 	var totalUnrealized int64
 	ratesAvailable := true
@@ -557,7 +605,7 @@ func (s *FXService) GetFXPnL(tenantID string) (map[string]interface{}, error) {
 	}
 
 	// Realized PnL: FIFO matching of settled deals per currency pair.
-	realized := s.computeRealizedPnL(tenantID)
+	realized := s.computeRealizedPnL(tenantID, deals)
 
 	return map[string]interface{}{
 		"totalUnrealizedPnL": totalUnrealized,
@@ -570,9 +618,10 @@ func (s *FXService) GetFXPnL(tenantID string) (map[string]interface{}, error) {
 
 // computeRealizedPnL FIFO-matches settled deals: for each currency, sells are
 // matched against earlier buys; realized PnL = Σ qty × (sellRate − buyRate).
-func (s *FXService) computeRealizedPnL(tenantID string) int64 {
+// Pure function over a per-request snapshot of deals.
+func (s *FXService) computeRealizedPnL(tenantID string, deals []*FXDeal) int64 {
 	var settled []*FXDeal
-	for _, d := range s.deals {
+	for _, d := range deals {
 		if d.TenantID == tenantID && d.Status == "settled" && d.SettledAt != nil {
 			settled = append(settled, d)
 		}

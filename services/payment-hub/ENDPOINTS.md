@@ -578,3 +578,17 @@ Why this matters for endpoint flow:
 - `POST /api/v1/card-payment/process-payment`
 - `POST /api/v1/jobs/resolve-pending-transactions`
 - `POST /api/v1/jobs/reattempt-required-transactions`
+
+## W12 A4-P1-A — Headless certification (2026, wave-12 audit remediation)
+
+The following gateway-exposed routes are certified HEADLESS — they are machine/probe
+endpoints, not operator workflows, and intentionally have no UI surface:
+
+| Route | Purpose |
+|---|---|
+| `GET /health` | Liveness/readiness probe payload (k8s + APISIX health checks) |
+| `GET /metrics` | Prometheus scrape endpoint |
+| `GET /` | Static HTML service status page (`src/setup/setupRoutes.ts:13`) |
+
+Justification: no human operator acts on these endpoints; they are consumed by
+infrastructure (APISIX, Prometheus, load balancers). Signed: wave-12 A4-P1-A fixer.

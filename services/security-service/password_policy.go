@@ -217,13 +217,44 @@ func (ppm *PasswordPolicyManager) loadTenantPolicies() {
 	}
 }
 
+// loadTenantPolicyFromDB reads one tenant policy from Postgres (the
+// authoritative store) and refreshes the read-through cache on hit.
+// W12-C3-PX (c3-0767).
+func (ppm *PasswordPolicyManager) loadTenantPolicyFromDB(tenantID string) (PasswordPolicyConfig, bool) {
+	if ppm.db == nil {
+		return PasswordPolicyConfig{}, false
+	}
+	var policyJSON []byte
+	err := ppm.db.QueryRow(`SELECT policy_config FROM password_policies WHERE tenant_id = $1`, tenantID).Scan(&policyJSON)
+	if err != nil {
+		return PasswordPolicyConfig{}, false
+	}
+	var policy PasswordPolicyConfig
+	if err := json.Unmarshal(policyJSON, &policy); err != nil {
+		return PasswordPolicyConfig{}, false
+	}
+	ppm.mu.Lock()
+	ppm.tenantPolicy[tenantID] = policy
+	ppm.mu.Unlock()
+	return policy, true
+}
+
 // GetPolicy returns the applicable password policy
 func (ppm *PasswordPolicyManager) GetPolicy(tenantID string) PasswordPolicyConfig {
 	ppm.mu.RLock()
-	defer ppm.mu.RUnlock()
-
 	if tenantID != "" {
 		if policy, ok := ppm.tenantPolicy[tenantID]; ok {
+			ppm.mu.RUnlock()
+			return policy
+		}
+	}
+	ppm.mu.RUnlock()
+
+	// W12-C3-PX (c3-0767): PG read-through on cache miss so policies written
+	// after boot (by SetTenantPolicy or peer replicas) are honored without a
+	// restart. The map is only a read-through cache; PG is authoritative.
+	if tenantID != "" {
+		if policy, ok := ppm.loadTenantPolicyFromDB(tenantID); ok {
 			return policy
 		}
 	}

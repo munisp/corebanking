@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"log"
 	"math"
 	"math/big"
@@ -580,52 +581,66 @@ func sanitizeError(err error) string {
 	return errStr
 }
 
-// IP-based sliding window rate limiter
-type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
+// W12 C3-P1-B3: pooled go-redis client (canonical pattern per
+// services/cooperative-meetings-go/main.go). Limits/state now hold across
+// restarts and replicas (previously per-process memory).
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+)
+
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		addr := os.Getenv("REDIS_URL")
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         addr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
 }
 
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
+// rateLimitIncr atomically increments the fixed-window counter for key and
+// sets the window TTL on first hit (INCR + PEXPIRE via Lua).
+var rateLimitIncrScript = redis.NewScript(`local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return c`)
+
+func rateLimitAllow(key string, max int, window time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	count, err := rateLimitIncrScript.Run(ctx, getRedisClient(), []string{key}, int64(window/time.Millisecond)).Int64()
+	if err != nil {
+		// FAIL OPEN: rate limiting is not a revocation control — on redis
+		// outage the request proceeds (logged) rather than taking the
+		// service down with the cache layer.
+		log.Printf("[%s] rate-limiter redis error, failing open: %v", serviceName, err)
+		return true
+	}
+	return count <= int64(max)
+}
+
+// IP-based fixed-window rate limiter — W12 C3-P1-B3: redis-backed
+// (key ratelimit:{ip}:{subject}, TTL = window). The visitors map and its
+// cleanup goroutine are gone — limits are enforced globally across replicas
+// and survive restarts.
+type ipRateLimiter struct {
+	rate   int
+	window time.Duration
 }
 
 func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
+	return &ipRateLimiter{rate: rate, window: window}
 }
 
 func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
-		return true
-	}
-	if b.count >= rl.rate {
-		return false
-	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
+	return rateLimitAllow(fmt.Sprintf("ratelimit:%s:%s", serviceName, ip), rl.rate, rl.window)
 }
 
 var globalIPLimiter = newIPRateLimiter(100, time.Minute)

@@ -43,7 +43,11 @@ func main() {
 			},
 		})
 	})
-	mux.HandleFunc("/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+	// W12-B5-P1-D-E: bootstrap is an admin/config mutation surface; gate it
+	// with a real Permify check (identity_verification:manage), fail-closed.
+	// This bootstrap sidecar is edge-authenticated (no JWT middleware of its
+	// own), so the subject comes from the gateway-stamped X-User-Id header.
+	mux.HandleFunc("/bootstrap", permifyAuthzGuard("identity_verification", "manage", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":  "bootstrap-ready",
 			"service": serviceName,
@@ -55,7 +59,7 @@ func main() {
 				"seed_file":      seedFile,
 			},
 		})
-	})
+	}))
 
 	port := getenv("PORT", "8080")
 	log.Printf("%s listening on :%s", serviceName, port)

@@ -1055,17 +1055,17 @@ func main() {
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/eod/trigger", handleTrigger)
-	mux.HandleFunc("/v1/eod/pipeline", handlePipeline)
-	mux.HandleFunc("/v1/eod/runs", handleListRuns)
-	mux.HandleFunc("/v1/eod/runs/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/eod/trigger", permifyAuthzGuard("eod_processor", "trigger", handleTrigger))
+	mux.HandleFunc("/v1/eod/pipeline", permifyAuthzGuard("eod_processor", "pipeline", handlePipeline))
+	mux.HandleFunc("/v1/eod/runs", permifyAuthzGuard("eod_processor", "manage", handleListRuns))
+	mux.HandleFunc("/v1/eod/runs/", permifyAuthzGuard("eod_processor", "manage", func(w http.ResponseWriter, r *http.Request) {
 		runIDStr := strings.TrimPrefix(r.URL.Path, "/v1/eod/runs/")
 		if runIDStr == "" {
 			handleListRuns(w, r)
 			return
 		}
 		handleGetRun(w, r, runIDStr)
-	})
+	}))
 
 	port := getEnv("PORT", "8207")
 	log.Printf("eod-processor-go listening on :%s — %d pipeline steps", port, len(pipeline))

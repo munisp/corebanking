@@ -84,8 +84,11 @@ export class LPOService {
   // =================== REPAY LPO ===================
   async repayLPO(lpoId: string, amount: number): Promise<{ success: boolean; message: string }> {
     try {
-      const response = await apiService.post(`${AppConfig.lpoEndpoint}/${lpoId}/repay`, {
+      const response = await apiService.post(`${AppConfig.lpoEndpoint}/lpo/${lpoId}/record-payment`, {
         amount,
+        payment_date: new Date().toISOString().split('T')[0],
+        payment_method: 'bank_transfer',
+        transaction_id: `TXN-${lpoId}-${Date.now()}`,
       });
 
       if (response.status === 200) {

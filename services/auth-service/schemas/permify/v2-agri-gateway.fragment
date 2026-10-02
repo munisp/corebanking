@@ -1,0 +1,1715 @@
+// ============================================================================
+// Wave-12 B5-P1-D-E: agri/geo + auth/security + gateway schema FRAGMENT
+// (Permify wave 2, batch D-E). Merged into the canonical v2.perm by the
+// integrator; kept in a separate file so the canonical-schema owner
+// (B5-P0-D1), the kyc fragment owner (B5-P0-D2/D3) and the peer batches
+// D-A/D-B/D-C/D-D never share an edit surface with this batch. Syntax
+// identical to v2.perm; the `user` entity is declared in the canonical
+// file and referenced here by type only.
+//
+// Convention: every mutating handler in the batch checks
+//   subject = verified JWT identity, resource = <entity>:<domain-id>,
+//   permission = <entity>.<action> as defined below. Checks fail closed
+//   (Permify unreachable -> 502/503, denied -> 403) via permify_guard.go
+//   / permify_guard.py / permify_check (rust).
+// ============================================================================
+
+// acgsf_guarantee — go route /v1/alerts (acgsf-guarantee-go)
+entity acgsf_guarantee {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// achievements — agricultural route /api/v1/agriculture/achievements
+entity achievements {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agent_banking — agricultural route /api/v1/agent-banking/stats
+entity agent_banking {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agent_farmer_onboarding — go route /v1/alerts (agent-farmer-onboarding-go)
+entity agent_farmer_onboarding {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// aggregation_center — go route /v1/alerts (aggregation-center-go)
+entity aggregation_center {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// agri_analytics — agricultural route /api/v1/analytics/portfolio/dashboard
+entity agri_analytics {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agri_domain — agricultural route /health
+entity agri_domain {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agri_esg_impact — agricultural route /api/v1/agri-esg-impact/list
+entity agri_esg_impact {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agri_evoucher — go route /v1/alerts (agri-evoucher-go)
+entity agri_evoucher {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// agri_input_marketplace — go route /v1/alerts (agri-input-marketplace-go)
+entity agri_input_marketplace {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// agri_iot_sensor — agricultural route /api/v1/agri-iot-sensor/list
+entity agri_iot_sensor {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agri_loan — agricultural route /api/v1/agriculture/loans
+entity agri_loan {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission apply = admin or operator
+  permission approve = admin or operator
+  permission assess = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission disburse = admin or operator
+  permission manage = admin or operator
+  permission repay = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agri_logistics — go route /v1/alerts (agri-logistics-go)
+entity agri_logistics {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// agri_partner — agricultural route /api/v1/agriculture/partners
+entity agri_partner {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission onboard = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agri_program — agricultural route /api/v1/agriculture/programs
+entity agri_program {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission configure = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission enroll = admin or operator
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agri_reinsurance — go route /v1/alerts (agri-reinsurance-go)
+entity agri_reinsurance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// agri_savings_cycles — go route /v1/alerts (agri-savings-cycles-go)
+entity agri_savings_cycles {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// agriculture_banking — rust handler update_record (agriculture-banking-rs)
+entity agriculture_banking {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// agtech — agricultural route /api/v1/agtech/polygons
+entity agtech {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission verify = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// animal_id_traceability — agricultural route /api/v1/animal-id-traceability/list
+entity animal_id_traceability {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// api_key_enforcer — go route /v1/alerts (api-key-enforcer-go)
+entity api_key_enforcer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission rate_limit = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// api_key_vault — go route /v1/alerts (api-key-vault-go)
+entity api_key_vault {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission rate_limit = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// api_marketplace — go route /v1/alerts (api-marketplace-go)
+entity api_marketplace {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission fx_convert = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_calc = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// api_versioning — go route /v1/alerts (api-versioning-go)
+entity api_versioning {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// apisix_gateway — go route /api/v1/service_configs (apisix-gateway-go)
+entity apisix_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// apisix_plugin_optimizer — go route /v1/alerts (apisix-plugin-optimizer-go)
+entity apisix_plugin_optimizer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// area_yield_index_insurance — agricultural route /api/v1/area-yield-index-insurance/list
+entity area_yield_index_insurance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// banking — agricultural route /api/v1/agriculture/banking/farmers
+entity banking {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission claim = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission disburse = admin or operator
+  permission manage = admin or operator
+  permission repay = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// body_limit_enforcer — go route /v1/alerts (body-limit-enforcer-go)
+entity body_limit_enforcer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// browser_fingerprint — go route /v1/alerts (browser-fingerprint-go)
+entity browser_fingerprint {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// cbn_agri_returns — agricultural route /api/v1/cbn-agri-returns/list
+entity cbn_agri_returns {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// cbn_agsmeis — go route /v1/alerts (cbn-agsmeis-go)
+entity cbn_agsmeis {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission generate = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission validate_period = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// cbn_anchor_borrowers — go route /v1/alerts (cbn-anchor-borrowers-go)
+entity cbn_anchor_borrowers {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_assess = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission yield_score = admin or operator
+}
+
+// certificate — agricultural route /api/v1/agriculture/certificate
+entity certificate {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// certificate_manager — py POST /api/v1/service_configs (certificate-manager-py)
+entity certificate_manager {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// channels — agricultural route /api/v1/channels/gateway/config
+entity channels {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// commodity_exchange — rust handler create_record (commodity-exchange-rs)
+entity commodity_exchange {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// commodity_price — agricultural route /api/v1/agriculture/prices/{commodity}
+entity commodity_price {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// commodity_price_intelligence — py POST /api/v1/service_configs (commodity-price-intelligence-py)
+entity commodity_price_intelligence {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// cooperative — agricultural route /api/v1/agriculture/cooperatives
+entity cooperative {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// cors_gateway — go route /v1/alerts (cors-gateway-go)
+entity cors_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// crop_calendars — agricultural route /api/v1/agriculture/crop-calendars
+entity crop_calendars {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// crop_cycle — agricultural route /api/v1/agriculture/crops
+entity crop_cycle {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// crop_yield_prediction — agricultural route /api/v1/crop-yield-prediction/list
+entity crop_yield_prediction {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// crossborder_agri_trade — agricultural route /api/v1/crossborder-agri-trade/list
+entity crossborder_agri_trade {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// csp_nonce_engine — go route /v1/alerts (csp-nonce-engine-go)
+entity csp_nonce_engine {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// dashboard — agricultural route /api/v1/agriculture/dashboard/farmer
+entity dashboard {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// ddos_protection — go route /v1/alerts (ddos-protection-go)
+entity ddos_protection {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// ddos_shield — go route /v1/alerts (ddos-shield-go)
+entity ddos_shield {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// developer_portal — go route /v1/alerts (developer-portal-go)
+entity developer_portal {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// enaira_cbdc_gateway — go route /api/v1/service_configs (enaira-cbdc-gateway-go)
+entity enaira_cbdc_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// farm — agricultural route /api/v1/agriculture/farms
+entity farm {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission verify = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// farm_boundary_mapping — agricultural route /api/v1/farm-boundary-mapping/list
+entity farm_boundary_mapping {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// farmer — agricultural route /api/v1/agriculture/farmers
+entity farmer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// farmer_credit_history — agricultural route /api/v1/agriculture/farmer-credit-history
+entity farmer_credit_history {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// field_level_encryption — rust handler update_record (field-level-encryption-rs)
+entity field_level_encryption {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// fisheries_aquaculture — go route /v1/alerts (fisheries-aquaculture-go)
+entity fisheries_aquaculture {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// graphql_federation — go route /api/v1/service_configs (graphql-federation-go)
+entity graphql_federation {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// group_lending — agricultural route /api/v1/agriculture/group-lending
+entity group_lending {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// grpc_gateway — rust handler transcode (grpc-gateway-rs)
+entity grpc_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission transcode = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// identity_verification — go route /v1/verify/bvn (identity-verification-go)
+entity identity_verification {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission liveness_check = admin or operator
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission verify = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// input_supplier — agricultural route /api/v1/agriculture/input-suppliers
+entity input_supplier {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// input_vouchers — agricultural route /api/v1/agriculture/input-vouchers
+entity input_vouchers {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission redeem = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// insurance_policy — agricultural route /api/v1/agriculture/insurance/products
+entity insurance_policy {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission purchase = admin or operator
+  permission quote = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// integrations — agricultural route /api/v1/integrations/credit-bureau/report
+entity integrations {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission register = admin or operator
+  permission score = admin or operator
+  permission submit = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// interactive_ussd_agri — agricultural route /api/v1/interactive-ussd-agri/list
+entity interactive_ussd_agri {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// ivr — agricultural route /api/v1/agriculture/ivr/flow
+entity ivr {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// keycloak_admin — go route /api/v1/service_configs (keycloak-admin-go)
+entity keycloak_admin {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// keycloak_enforcer — go route /api/v1/service_configs (keycloak-enforcer-go)
+entity keycloak_enforcer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// keycloak_identity — py POST /api/v1/service_configs (keycloak-identity-py)
+entity keycloak_identity {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// languages — agricultural route /api/v1/agriculture/languages
+entity languages {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// liveness_inference — liveness-inference-py raw do_POST routes
+entity liveness_inference {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission analyze = admin or operator
+  permission assess = admin or operator
+  permission check = admin or operator
+  permission classify = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission detect = admin or operator
+  permission extract = admin or operator
+  permission manage = admin or operator
+  permission match = admin or operator
+  permission register = admin or operator
+  permission search = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// liveness_session — go route /v1/sessions/ (liveness-orchestrator-go)
+entity liveness_session {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission check = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission match = admin or operator
+  permission submit = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// livestock — agricultural route /api/v1/agriculture/livestock
+entity livestock {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// livestock_finance — agricultural route /api/v1/livestock-finance/list
+entity livestock_finance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// livestock_insurance — agricultural route /api/v1/livestock-insurance/list
+entity livestock_insurance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// livestock_loan — agricultural route /api/v1/agriculture/livestock-loans/apply
+entity livestock_loan {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission apply = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// livestock_management — agricultural route /api/v1/livestock-management/list
+entity livestock_management {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// ml_security — ml-security-service /v1/security/score (hand-fix; edge-authenticated, subject=gateway X-User-Id)
+entity ml_security {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// multi_peril_crop_insurance — rust handler update_record (multi-peril-crop-insurance-rs)
+entity multi_peril_crop_insurance {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// nirsal_agro_geocoop — go route /v1/alerts (nirsal-agro-geocoop-go)
+entity nirsal_agro_geocoop {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// nirsal_credit_guarantee — go route /v1/alerts (nirsal-credit-guarantee-go)
+entity nirsal_credit_guarantee {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission compute_emi = admin or operator
+  permission create = admin or operator
+  permission credit_check = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// offtaker_contract — agricultural route /api/v1/agriculture/off-takers
+entity offtaker_contract {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// open_banking_gateway — go route /api/v1/service_configs (open-banking-gateway-go)
+entity open_banking_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// pkce_auth_flow — go route /v1/alerts (pkce-auth-flow-go)
+entity pkce_auth_flow {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission rate_limit = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// platform_security_infra — go route /v1/alerts (platform-security-infra-go)
+entity platform_security_infra {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission api_documentation = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission fx_convert = admin or operator
+  permission input_validation = admin or operator
+  permission manage = admin or operator
+  permission multi_tenancy = admin or operator
+  permission risk_calc = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+  permission webhooks = admin or operator
+}
+
+// post_harvest_loss_tracker — go route /v1/alerts (post-harvest-loss-tracker-go)
+entity post_harvest_loss_tracker {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// redis_session_store — go route /v1/alerts (redis-session-store-go)
+entity redis_session_store {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission rate_limit = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// regulatory — agricultural route /api/v1/regulatory/cbn-sectors
+entity regulatory {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission check = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// reports — agricultural route /api/v1/agriculture/reports/regulator
+entity reports {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// risk — agricultural route /api/v1/agriculture/risk/detect-shock
+entity risk {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// route_schema_enforcer — go route /v1/alerts (route-schema-enforcer-go)
+entity route_schema_enforcer {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission partition = admin or operator
+  permission process = admin or operator
+  permission throughput = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// satellite_crop_monitor — agricultural route /api/v1/satellite-crop-monitor/list
+entity satellite_crop_monitor {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// season_aligned_loans — agricultural route /api/v1/agriculture/season-aligned-loans
+entity season_aligned_loans {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// secrets_vault — go route /v1/alerts (secrets-vault-go)
+entity secrets_vault {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission rate_limit = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// security_audit_logger — py POST /api/v1/audit_events (security-audit-logger-py)
+entity security_audit_logger {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// security_gateway — go route /v1/alerts (security-gateway-go)
+entity security_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// security_hardening — go route /v1/alerts (security-hardening-go)
+entity security_hardening {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission fx_convert = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission risk_calc = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// sms_banking_gateway — go route /v1/alerts (sms-banking-gateway-go)
+entity sms_banking_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// sms_email_gateway — go route /v1/alerts (sms-email-gateway-go)
+entity sms_email_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// sms_gateway — py POST /api/v1/notifications (sms-gateway-py)
+entity sms_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// soil_analysis — agricultural route /api/v1/soil-analysis/list
+entity soil_analysis {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// telegram_bot_gateway — go route /v1/alerts (telegram-bot-gateway-go)
+entity telegram_bot_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// tls_terminator — go route /v1/alerts (tls-terminator-go)
+entity tls_terminator {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission score = admin or operator
+  permission update = admin or operator
+  permission validate = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// ussd_banking_gateway — go route /v1/alerts (ussd-banking-gateway-go)
+entity ussd_banking_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// ussd_session — agricultural route /api/v1/agriculture/ussd/request
+entity ussd_session {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// value_chain — agricultural route /api/v1/value-chain/equipment/specs
+entity value_chain {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission approve = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission disburse = admin or operator
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission verify = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// warehouse_receipt_loans — agricultural route /api/v1/agriculture/warehouse-receipt-loans
+entity warehouse_receipt_loans {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// weather_reading — agricultural route /api/v1/agriculture/weather/current
+entity weather_reading {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission create = admin or operator
+  permission delete = admin
+  permission manage = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}
+
+// whatsapp_business_gateway — go route /v1/alerts (whatsapp-business-gateway-go)
+entity whatsapp_business_gateway {
+  relation admin    @user
+  relation operator @user
+  relation approver @user
+  relation auditor  @user
+
+  permission circuit_state = admin or operator
+  permission create = admin or operator
+  permission delete = admin
+  permission health_score = admin or operator
+  permission manage = admin or operator
+  permission process = admin or operator
+  permission update = admin or operator
+  permission view   = admin or operator or approver or auditor
+}

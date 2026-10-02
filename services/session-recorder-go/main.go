@@ -614,11 +614,11 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/api/v1/session/start", handleStartSession)
-	mux.HandleFunc("/api/v1/session/record", handleRecordCommand)
-	mux.HandleFunc("/api/v1/session/end", handleEndSession)
-	mux.HandleFunc("/api/v1/session/list", handleListSessions)
-	mux.HandleFunc("/api/v1/session/stats", handleStats)
+	mux.HandleFunc("/api/v1/session/start", permifyAuthzGuard("session_recorder", "start", handleStartSession))
+	mux.HandleFunc("/api/v1/session/record", permifyAuthzGuard("session_recorder", "record", handleRecordCommand))
+	mux.HandleFunc("/api/v1/session/end", permifyAuthzGuard("session_recorder", "end", handleEndSession))
+	mux.HandleFunc("/api/v1/session/list", permifyAuthzGuard("session_recorder", "view", handleListSessions))
+	mux.HandleFunc("/api/v1/session/stats", permifyAuthzGuard("session_recorder", "view", handleStats))
 	handler := panicMW(rateLimitMW(loggingMW(mux)))
 	srv := &http.Server{
 		Addr: ":" + port, Handler: jwtAuthMiddleware(handler), ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second,

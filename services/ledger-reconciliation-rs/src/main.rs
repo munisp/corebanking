@@ -12,10 +12,10 @@
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware::Logger};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use std::sync::Mutex;
 use uuid::Uuid;
 use chrono::Utc;
 
@@ -72,11 +72,104 @@ struct GLAssertion {
     checked_at: String,
 }
 
+// Wave-12 (C3-P2-RSVEC): reconciliation runs, discrepancies and GL assertions
+// are persisted in Postgres (was: in-memory Mutex<Vec<..>> lost on every
+// restart). jsonb payload — the structs carry u64 fields for which
+// sqlx-postgres has no codec; id is the natural/unique key (ON CONFLICT
+// idempotent). Handlers fail closed (503) on PG error — no memory fallback.
 struct AppState {
-    runs: Mutex<Vec<ReconciliationRun>>,
-    discrepancies: Mutex<Vec<Discrepancy>>,
-    assertions: Mutex<Vec<GLAssertion>>,
     db: Option<PgPool>,
+}
+
+async fn init_recon_db(pool: &PgPool) {
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS recon_runs (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+        "CREATE TABLE IF NOT EXISTS recon_discrepancies (
+            id TEXT PRIMARY KEY,
+            run_id TEXT,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+        "CREATE TABLE IF NOT EXISTS gl_assertions (
+            id TEXT PRIMARY KEY,
+            account_code TEXT,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    ] {
+        if let Err(e) = sqlx::query(ddl).execute(pool).await {
+            eprintln!("[ledger-reconciliation] store DDL failed: {}", e);
+        }
+    }
+}
+
+/// Load every row of a jsonb store, deserializing each payload. `table` is only
+/// ever one of the compile-time-constant store names above.
+async fn load_store<T: serde::de::DeserializeOwned>(
+    pool: &PgPool,
+    table: &str,
+) -> Result<Vec<T>, sqlx::Error> {
+    let rows = sqlx::query_scalar::<_, serde_json::Value>(&format!(
+        "SELECT payload FROM {} ORDER BY created_at, id",
+        table
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
+}
+
+async fn load_one<T: serde::de::DeserializeOwned>(
+    pool: &PgPool,
+    table: &str,
+    id: &str,
+) -> Result<Option<T>, sqlx::Error> {
+    let row = sqlx::query_scalar::<_, serde_json::Value>(&format!(
+        "SELECT payload FROM {} WHERE id = $1",
+        table
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+async fn insert_row<T: serde::Serialize>(
+    pool: &PgPool,
+    table: &str,
+    id: &str,
+    item: &T,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "INSERT INTO {} (id, payload) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+        table
+    ))
+    .bind(id)
+    .bind(serde_json::to_value(item).unwrap_or_else(|_| serde_json::json!({})))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn update_row<T: serde::Serialize>(
+    pool: &PgPool,
+    table: &str,
+    id: &str,
+    item: &T,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!("UPDATE {} SET payload = $1 WHERE id = $2", table))
+        .bind(serde_json::to_value(item).unwrap_or_else(|_| serde_json::json!({})))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // --- JWT Auth Check (fail-closed; N-2 remediation) ---
@@ -301,10 +394,10 @@ async fn main() -> std::io::Result<()> {
             None
         }
     };
+    if let Some(pool) = db.as_ref() {
+        init_recon_db(pool).await;
+    }
     let data = web::Data::new(AppState {
-        runs: Mutex::new(Vec::new()),
-        discrepancies: Mutex::new(Vec::new()),
-        assertions: Mutex::new(Vec::new()),
         db,
     });
 
@@ -339,15 +432,36 @@ async fn healthz() -> HttpResponse {
 
 async fn list_runs(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let runs = data.runs.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({"items": *runs, "total": runs.len()}))
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"})),
+    };
+    let runs: Vec<ReconciliationRun> = match load_store(pool, "recon_runs").await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ledger-reconciliation] list_runs query failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    };
+    let total = runs.len();
+    HttpResponse::Ok().json(serde_json::json!({"items": runs, "total": total}))
 }
 
 async fn get_run(req: actix_web::HttpRequest, data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
-    let runs = data.runs.lock().unwrap();
-    match runs.iter().find(|r| r.id == id) {
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"})),
+    };
+    let found: Option<ReconciliationRun> = match load_one(pool, "recon_runs", &id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ledger-reconciliation] get_run query failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    };
+    match found {
         Some(r) => HttpResponse::Ok().json(r),
         None => HttpResponse::NotFound().json(serde_json::json!({"message": "Run not found"})),
     }
@@ -388,6 +502,7 @@ async fn fetch_both_sides(db: &PgPool) -> Result<(Vec<(String, f64)>, Vec<(Strin
 
 async fn start_run(req: actix_web::HttpRequest, data: web::Data<AppState>, body: web::Json<StartRunRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "reconciliation", "run").await { return resp; } // W12-B5D1
     let req = body.into_inner();
     let run_type = req.run_type.unwrap_or_else(|| "incremental".into());
     let scope = req.scope.unwrap_or_else(|| "all".into());
@@ -418,7 +533,8 @@ async fn start_run(req: actix_web::HttpRequest, data: web::Data<AppState>, body:
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 created_at: now,
             };
-            data.runs.lock().unwrap().push(run.clone());
+            // No DATABASE_URL: the failed run cannot be persisted (C3-P2-RSVEC);
+            // it is only returned in this 503.
             return HttpResponse::ServiceUnavailable().json(run);
         }
     };
@@ -444,7 +560,7 @@ async fn start_run(req: actix_web::HttpRequest, data: web::Data<AppState>, body:
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 created_at: now,
             };
-            data.runs.lock().unwrap().push(run.clone());
+            let _ = insert_row(db, "recon_runs", &run.id, &run).await;
             return HttpResponse::ServiceUnavailable().json(run);
         }
     };
@@ -537,12 +653,20 @@ async fn start_run(req: actix_web::HttpRequest, data: web::Data<AppState>, body:
         created_at: now,
     };
 
-    let mut discrepancies = data.discrepancies.lock().unwrap();
-    discrepancies.extend(new_discrepancies);
-    drop(discrepancies);
-
-    let mut runs = data.runs.lock().unwrap();
-    runs.push(run.clone());
+    // Wave-12 (C3-P2-RSVEC): persist discrepancies + run to Postgres (was
+    // in-memory Vec extend/push). Fail closed on PG error.
+    for d in &new_discrepancies {
+        if let Err(e) = insert_row(db, "recon_discrepancies", &d.id, d).await {
+            eprintln!("[ledger-reconciliation] discrepancy insert failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    }
+    if let Err(e) = insert_row(db, "recon_runs", &run.id, &run).await {
+        eprintln!("[ledger-reconciliation] run insert failed: {}", e);
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "recon_store_unavailable"}));
+    }
 
     println!("[kafka] publish topic=54link-dev.reconciliation.run.completed key={}", run.id);
     println!("[lakehouse] PUBLISH reconciliation_runs records=1");
@@ -551,15 +675,37 @@ async fn start_run(req: actix_web::HttpRequest, data: web::Data<AppState>, body:
 
 async fn list_discrepancies(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let discrepancies = data.discrepancies.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({"items": *discrepancies, "total": discrepancies.len()}))
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"})),
+    };
+    let discrepancies: Vec<Discrepancy> = match load_store(pool, "recon_discrepancies").await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ledger-reconciliation] list_discrepancies query failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    };
+    let total = discrepancies.len();
+    HttpResponse::Ok().json(serde_json::json!({"items": discrepancies, "total": total}))
 }
 
 async fn get_discrepancy(req: actix_web::HttpRequest, data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "reconciliation", "resolve").await { return resp; } // W12-B5D1
     let id = path.into_inner();
-    let discrepancies = data.discrepancies.lock().unwrap();
-    match discrepancies.iter().find(|d| d.id == id) {
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"})),
+    };
+    let found: Option<Discrepancy> = match load_one(pool, "recon_discrepancies", &id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ledger-reconciliation] get_discrepancy query failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    };
+    match found {
         Some(d) => HttpResponse::Ok().json(d),
         None => HttpResponse::NotFound().json(serde_json::json!({"message": "Discrepancy not found"})),
     }
@@ -573,17 +719,32 @@ struct ResolveRequest {
 
 async fn resolve_discrepancy(req: actix_web::HttpRequest, data: web::Data<AppState>, path: web::Path<String>, body: web::Json<ResolveRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "reconciliation", "escalate").await { return resp; } // W12-B5D1
     let id = path.into_inner();
-    let mut discrepancies = data.discrepancies.lock().unwrap();
-    match discrepancies.iter_mut().find(|d| d.id == id) {
-        Some(d) => {
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"})),
+    };
+    let found: Option<Discrepancy> = match load_one(pool, "recon_discrepancies", &id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ledger-reconciliation] resolve fetch failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    };
+    match found {
+        Some(mut d) => {
             if d.status == "auto_repaired" || d.status == "resolved" {
                 return HttpResponse::BadRequest().json(serde_json::json!({"message": "Already resolved"}));
             }
             d.status = "resolved".into();
             d.resolution = Some(body.resolution.clone());
             d.resolved_at = Some(Utc::now().to_rfc3339());
-            HttpResponse::Ok().json(d.clone())
+            if let Err(e) = update_row(pool, "recon_discrepancies", &id, &d).await {
+                eprintln!("[ledger-reconciliation] resolve update failed: {}", e);
+                return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+            }
+            HttpResponse::Ok().json(d)
         }
         None => HttpResponse::NotFound().json(serde_json::json!({"message": "Discrepancy not found"})),
     }
@@ -592,13 +753,27 @@ async fn resolve_discrepancy(req: actix_web::HttpRequest, data: web::Data<AppSta
 async fn escalate_discrepancy(req: actix_web::HttpRequest, data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
-    let mut discrepancies = data.discrepancies.lock().unwrap();
-    match discrepancies.iter_mut().find(|d| d.id == id) {
-        Some(d) => {
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"})),
+    };
+    let found: Option<Discrepancy> = match load_one(pool, "recon_discrepancies", &id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ledger-reconciliation] escalate fetch failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    };
+    match found {
+        Some(mut d) => {
             d.status = "escalated".into();
             d.severity = "critical".into();
+            if let Err(e) = update_row(pool, "recon_discrepancies", &id, &d).await {
+                eprintln!("[ledger-reconciliation] escalate update failed: {}", e);
+                return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+            }
             println!("[temporal] StartWorkflow name=DiscrepancyEscalation id={}", d.id);
-            HttpResponse::Ok().json(d.clone())
+            HttpResponse::Ok().json(d)
         }
         None => HttpResponse::NotFound().json(serde_json::json!({"message": "Discrepancy not found"})),
     }
@@ -606,8 +781,19 @@ async fn escalate_discrepancy(req: actix_web::HttpRequest, data: web::Data<AppSt
 
 async fn list_assertions(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let assertions = data.assertions.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({"items": *assertions, "total": assertions.len()}))
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"})),
+    };
+    let assertions: Vec<GLAssertion> = match load_store(pool, "gl_assertions").await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ledger-reconciliation] list_assertions query failed: {}", e);
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "recon_store_unavailable"}));
+        }
+    };
+    let total = assertions.len();
+    HttpResponse::Ok().json(serde_json::json!({"items": assertions, "total": total}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -620,6 +806,7 @@ struct GLAssertionRequest {
 
 async fn run_gl_assertion(req: actix_web::HttpRequest, data: web::Data<AppState>, body: web::Json<GLAssertionRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "reconciliation", "run").await { return resp; } // W12-B5D1
     let req = body.into_inner();
 
     // Fetch the ACTUAL balance from the GL; never simulate it.
@@ -669,7 +856,13 @@ async fn run_gl_assertion(req: actix_web::HttpRequest, data: web::Data<AppState>
         checked_at: Utc::now().to_rfc3339(),
     };
 
-    let mut assertions = data.assertions.lock().unwrap();
-    assertions.push(assertion.clone());
+    if let Err(e) = insert_row(db, "gl_assertions", &assertion.id, &assertion).await {
+        eprintln!("[ledger-reconciliation] assertion insert failed: {}", e);
+        return HttpResponse::ServiceUnavailable()
+            .json(serde_json::json!({"error": "recon_store_unavailable"}));
+    }
     HttpResponse::Created().json(assertion)
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

@@ -12,7 +12,7 @@ export default function DocumentManagementWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/escrow-documents/count")
+    fetch("/api/db/escrow-documents/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

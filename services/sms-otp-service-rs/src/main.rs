@@ -1,4 +1,7 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
+use deadpool_redis::redis::{self, AsyncCommands, SetExpiry, SetOptions};
+use deadpool_redis::{Config as RedisConfig, Pool as RedisPool, Runtime};
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
@@ -12,18 +15,41 @@ use std::time::{Duration, Instant};
 const OTP_TTL_SECS: u64 = 300;
 const OTP_MAX_ATTEMPTS: u32 = 5;
 
+/// OTP state lives in redis (c3-0778): `otp:{tenant}:{phone}` JSON
+/// {code_hash, attempts}, EX 300. The previous in-process HashMap lost OTPs
+/// on restart, was per-replica, and made verify-after-send race across
+/// replicas. Failure policy: FAIL-CLOSED — a redis outage answers 503 on
+/// both send and verify.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct OtpRecord {
     /// SHA-256 hash of the OTP — the plaintext code is NEVER stored server-side.
     code_hash: String,
-    expires_at: Instant,
     attempts: u32,
 }
 
 struct AppState {
     start_time: Instant,
-    otps: Mutex<HashMap<String, OtpRecord>>,
+    redis_pool: RedisPool,
     records: Mutex<Vec<serde_json::Value>>,
     db_client: Option<Arc<tokio_postgres::Client>>,
+}
+
+/// Tenant for the OTP key, from the verified JWT claims (else "default").
+fn request_tenant(req: &actix_web::HttpRequest) -> String {
+    if let Some(claims) = req.extensions().get::<VerifiedClaims>() {
+        for field in ["tenant_id", "tenant"] {
+            if let Some(t) = claims.0.get(field).and_then(|v| v.as_str()) {
+                if !t.is_empty() {
+                    return t.to_string();
+                }
+            }
+        }
+    }
+    "default".to_string()
+}
+
+fn otp_key(tenant: &str, phone: &str) -> String {
+    format!("otp:{}:{}", tenant, phone)
 }
 
 #[derive(Deserialize)]
@@ -279,7 +305,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -330,25 +356,47 @@ async fn degradation_status(state: web::Data<AppState>, req: actix_web::HttpRequ
 /// The OTP is NEVER returned in the API response.
 async fn send_otp(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<SendOtpRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "otp", "collection", "send").await { return resp; }
     if !validate_phone_ng(&body.phone) {
         return HttpResponse::UnprocessableEntity().json(json!({"error": "invalid_phone", "sent": false}));
     }
     let otp = generate_otp();
     let rec = OtpRecord {
         code_hash: sha256_hex(&otp),
-        expires_at: Instant::now() + Duration::from_secs(OTP_TTL_SECS),
         attempts: 0,
     };
+    let tenant = request_tenant(&req);
+    let key = otp_key(&tenant, &body.phone);
+    let payload = match serde_json::to_string(&rec) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sms-otp-service-rs: OTP record encode failed: {}", e);
+            return HttpResponse::InternalServerError().json(json!({"error": "otp_encode_failed", "sent": false}));
+        }
+    };
+    let mut conn = match state.redis_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            // fail-closed: no OTP store, no send
+            eprintln!("sms-otp-service-rs: redis unavailable for send_otp: {}", e);
+            return HttpResponse::ServiceUnavailable().json(json!({"error": "otp_store_unavailable", "sent": false}));
+        }
+    };
+    // SET first (EX 300), then dispatch; on dispatch failure the stored OTP is
+    // deleted so no undelivered code can ever be verified.
+    if let Err(e) = conn.set_ex::<_, _, ()>(&key, payload, OTP_TTL_SECS).await {
+        eprintln!("sms-otp-service-rs: redis SET failed in send_otp: {}", e);
+        return HttpResponse::ServiceUnavailable().json(json!({"error": "otp_store_unavailable", "sent": false}));
+    }
     let message = format!("Your verification code is {}. It expires in 5 minutes.", otp);
-    // Dispatch first; only retain the OTP if the provider accepted it.
     if let Err(e) = dispatch_sms(&body.phone, &message).await {
         eprintln!("sms-otp-service-rs: SMS dispatch failed: {}", e);
+        let _ = conn.del::<_, ()>(&key).await;
         return HttpResponse::ServiceUnavailable().json(json!({
             "error": "sms_provider_unavailable",
             "sent": false,
         }));
     }
-    state.otps.lock().unwrap().insert(body.phone.clone(), rec);
     db_persist(&state, "send_otp", &json!({"phone": body.phone, "purpose": body.purpose})).await;
     HttpResponse::Ok().json(json!({"sent": true, "expires_in": OTP_TTL_SECS}))
 }
@@ -356,29 +404,57 @@ async fn send_otp(req: actix_web::HttpRequest, state: web::Data<AppState>, body:
 /// POST /v1/otp/verify — constant-time hash comparison with expiry + attempt cap.
 async fn verify_otp(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<VerifyOtpRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "otp", "collection", "verify").await { return resp; }
     if body.otp.len() != 6 || !body.otp.chars().all(|c| c.is_ascii_digit()) {
         return HttpResponse::Unauthorized().json(json!({"verified": false, "reason": "invalid_otp_format"}));
     }
-    // Resolve the outcome while holding the lock; never hold the guard across .await.
+    // Redis-backed verify (c3-0778): GET / KEEPTTL attempt write-back /
+    // constant-time compare / DEL on success. Expiry is enforced by the
+    // redis EX 300 — an expired key collapses to "no_otp_pending".
     enum Outcome { Verified, Failed(&'static str) }
-    let outcome = {
-        let mut otps = state.otps.lock().unwrap();
-        match otps.get_mut(&body.phone) {
-            None => Outcome::Failed("no_otp_pending"),
-            Some(rec) => {
-                if Instant::now() > rec.expires_at {
-                    otps.remove(&body.phone);
-                    Outcome::Failed("otp_expired")
-                } else if rec.attempts >= OTP_MAX_ATTEMPTS {
-                    otps.remove(&body.phone);
-                    Outcome::Failed("max_attempts_exceeded")
-                } else {
-                    rec.attempts += 1;
-                    if ct_eq(&sha256_hex(&body.otp), &rec.code_hash) {
-                        otps.remove(&body.phone);
-                        Outcome::Verified
+    let tenant = request_tenant(&req);
+    let key = otp_key(&tenant, &body.phone);
+    let mut conn = match state.redis_pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            // fail-closed: without the OTP store we cannot verify — 503
+            eprintln!("sms-otp-service-rs: redis unavailable for verify_otp: {}", e);
+            return HttpResponse::ServiceUnavailable().json(json!({"verified": false, "reason": "otp_store_unavailable"}));
+        }
+    };
+    let outcome = match conn.get::<_, Option<String>>(&key).await {
+        Err(e) => {
+            eprintln!("sms-otp-service-rs: redis GET failed in verify_otp: {}", e);
+            return HttpResponse::ServiceUnavailable().json(json!({"verified": false, "reason": "otp_store_unavailable"}));
+        }
+        Ok(None) => Outcome::Failed("no_otp_pending"),
+        Ok(Some(raw)) => {
+            let parsed: Result<OtpRecord, _> = serde_json::from_str(&raw);
+            match parsed {
+                Err(_) => {
+                    let _ = conn.del::<_, ()>(&key).await;
+                    Outcome::Failed("no_otp_pending")
+                }
+                Ok(mut rec) => {
+                    if rec.attempts >= OTP_MAX_ATTEMPTS {
+                        let _ = conn.del::<_, ()>(&key).await;
+                        Outcome::Failed("max_attempts_exceeded")
                     } else {
-                        Outcome::Failed("otp_mismatch")
+                        rec.attempts += 1;
+                        // Write the incremented attempt counter back WITHOUT
+                        // extending the 300s window (KEEPTTL).
+                        let payload = serde_json::to_string(&rec).unwrap_or_default();
+                        let keep = SetOptions::default().with_expiration(SetExpiry::KEEPTTL);
+                        if let Err(e) = conn.set_options::<_, _, ()>(&key, payload, keep).await {
+                            eprintln!("sms-otp-service-rs: redis attempt write-back failed: {}", e);
+                            return HttpResponse::ServiceUnavailable().json(json!({"verified": false, "reason": "otp_store_unavailable"}));
+                        }
+                        if ct_eq(&sha256_hex(&body.otp), &rec.code_hash) {
+                            let _ = conn.del::<_, ()>(&key).await;
+                            Outcome::Verified
+                        } else {
+                            Outcome::Failed("otp_mismatch")
+                        }
                     }
                 }
             }
@@ -415,6 +491,7 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
 
 async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "service_config", "collection", "create").await { return resp; }
     let mut rec = body.into_inner();
     rec["id"] = json!(uuid::Uuid::new_v4().to_string());
     rec["created_at"] = json!(chrono::Utc::now().to_rfc3339());
@@ -436,6 +513,7 @@ async fn get_record(req: actix_web::HttpRequest, state: web::Data<AppState>, pat
 async fn update_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
+    if let Err(resp) = permify_check(&req, "service_config", &id, "update").await { return resp; }
     let mut records = state.records.lock().unwrap();
     match records.iter_mut().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
         Some(r) => {
@@ -453,6 +531,7 @@ async fn update_record(req: actix_web::HttpRequest, state: web::Data<AppState>, 
 async fn delete_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
+    if let Err(resp) = permify_check(&req, "service_config", &id, "delete").await { return resp; }
     let mut records = state.records.lock().unwrap();
     let before = records.len();
     records.retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
@@ -533,15 +612,116 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
     }
 }
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = verified JWT tenant claim
+// (fallback: X-Tenant-Id header, PERMIFY_DEFAULT_TENANT, "bpmgd"), resource =
+// domain entity id, permission per action (schema: canonical v2.perm
+// service_config entity + services/auth-service/schemas/permify/
+// v2-core-domain-rs.fragment). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (services/risk-scoring-rs/src/main.rs).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    use actix_web::HttpMessage as _;
+    let (subject, claim_tenant) = {
+        let ext = req.extensions();
+        match ext.get::<VerifiedClaims>() {
+            Some(c) => (
+                c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ),
+            None => (None, None),
+        }
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8251);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
         init_db(&url).await.map(Arc::new)
     } else { None };
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+    let redis_pool = RedisConfig::from_url(redis_url)
+        .create_pool(Some(Runtime::Tokio1))
+        .expect("redis pool config must be valid");
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        otps: Mutex::new(HashMap::new()),
+        redis_pool,
         records: Mutex::new(Vec::new()),
         db_client,
     });

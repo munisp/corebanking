@@ -11,7 +11,7 @@ import (
 // LimitService handles risk limit operations
 type LimitService struct {
 	tenantID string
-	limits   map[string]*RiskLimit
+	limits   *repo[RiskLimit]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type LimitService struct {
 func NewLimitService(tenantID string) *LimitService {
 	svc := &LimitService{
 		tenantID: tenantID,
-		limits:   make(map[string]*RiskLimit),
+		limits:   newRepo[RiskLimit](serviceDB, "risk_limits"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewLimitService(tenantID string) *LimitService {
 
 func (s *LimitService) initializeDefaultData(tenantID string) {
 	// Credit concentration limit
-	s.limits["lim-001"] = &RiskLimit{
+	s.limits.seed(tenantID, "lim-001", &RiskLimit{
 		LimitID:      "lim-001",
 		TenantID:     tenantID,
 		LimitType:    "concentration",
@@ -44,10 +44,10 @@ func (s *LimitService) initializeDefaultData(tenantID string) {
 		Metadata:     make(map[string]interface{}),
 		CreatedAt:    time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
 	// Market risk VaR limit
-	s.limits["lim-002"] = &RiskLimit{
+	s.limits.seed(tenantID, "lim-002", &RiskLimit{
 		LimitID:      "lim-002",
 		TenantID:     tenantID,
 		LimitType:    "market",
@@ -64,10 +64,10 @@ func (s *LimitService) initializeDefaultData(tenantID string) {
 		Metadata:     make(map[string]interface{}),
 		CreatedAt:    time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
 	// FX open position limit
-	s.limits["lim-003"] = &RiskLimit{
+	s.limits.seed(tenantID, "lim-003", &RiskLimit{
 		LimitID:      "lim-003",
 		TenantID:     tenantID,
 		LimitType:    "market",
@@ -84,10 +84,10 @@ func (s *LimitService) initializeDefaultData(tenantID string) {
 		Metadata:     make(map[string]interface{}),
 		CreatedAt:    time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
 	// Operational loss limit
-	s.limits["lim-004"] = &RiskLimit{
+	s.limits.seed(tenantID, "lim-004", &RiskLimit{
 		LimitID:      "lim-004",
 		TenantID:     tenantID,
 		LimitType:    "operational",
@@ -104,10 +104,10 @@ func (s *LimitService) initializeDefaultData(tenantID string) {
 		Metadata:     make(map[string]interface{}),
 		CreatedAt:    time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
 	// Sector concentration limit - warning
-	s.limits["lim-005"] = &RiskLimit{
+	s.limits.seed(tenantID, "lim-005", &RiskLimit{
 		LimitID:      "lim-005",
 		TenantID:     tenantID,
 		LimitType:    "concentration",
@@ -124,16 +124,18 @@ func (s *LimitService) initializeDefaultData(tenantID string) {
 		Metadata:     make(map[string]interface{}),
 		CreatedAt:    time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 }
 
 // ListLimits returns limits based on filters
-func (s *LimitService) ListLimits(tenantID, limitType string) []*RiskLimit {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *LimitService) ListLimits(tenantID, limitType string) ([]*RiskLimit, error) {
 
 	var result []*RiskLimit
-	for _, limit := range s.limits {
+	__ALL__, __ERR__ := s.limits.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, limit := range __ALL__ {
 		if limit.TenantID != tenantID {
 			continue
 		}
@@ -142,16 +144,14 @@ func (s *LimitService) ListLimits(tenantID, limitType string) []*RiskLimit {
 		}
 		result = append(result, limit)
 	}
-	return result
+	return result, nil
 }
 
 // GetLimit retrieves a limit by ID
 func (s *LimitService) GetLimit(tenantID, limitID string) (*RiskLimit, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	limit, exists := s.limits[limitID]
-	if !exists || limit.TenantID != tenantID {
+	limit, err := s.limits.get(tenantID, limitID)
+	if err != nil {
 		return nil, errors.New("limit not found")
 	}
 	return limit, nil
@@ -159,8 +159,6 @@ func (s *LimitService) GetLimit(tenantID, limitID string) (*RiskLimit, error) {
 
 // CreateLimit creates a new risk limit
 func (s *LimitService) CreateLimit(tenantID, userID string, req *CreateRiskLimitRequest) (*RiskLimit, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	validFrom, _ := time.Parse("2006-01-02", req.ValidFrom)
 	validTo, _ := time.Parse("2006-01-02", req.ValidTo)
@@ -184,17 +182,17 @@ func (s *LimitService) CreateLimit(tenantID, userID string, req *CreateRiskLimit
 		UpdatedAt:    time.Now(),
 	}
 
-	s.limits[limit.LimitID] = limit
+	if err := s.limits.put(tenantID, limit.LimitID, limit); err != nil {
+		return nil, err
+	}
 	return limit, nil
 }
 
 // UpdateLimit updates a risk limit
 func (s *LimitService) UpdateLimit(limit *RiskLimit) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.limits[limit.LimitID]
-	if !exists || existing.TenantID != limit.TenantID {
+	existing, err := s.limits.get(limit.TenantID, limit.LimitID)
+	if err != nil {
 		return errors.New("limit not found")
 	}
 
@@ -214,18 +212,19 @@ func (s *LimitService) UpdateLimit(limit *RiskLimit) error {
 		limit.Status = "within_limit"
 	}
 
-	s.limits[limit.LimitID] = limit
-	return nil
+	return s.limits.put(limit.TenantID, limit.LimitID, limit)
 }
 
 // GetUtilization returns limit utilization summary
-func (s *LimitService) GetUtilization(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *LimitService) GetUtilization(tenantID string) (map[string]interface{}, error) {
 
 	byType := make(map[string][]map[string]interface{})
 
-	for _, limit := range s.limits {
+	__ALL__, __ERR__ := s.limits.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, limit := range __ALL__ {
 		if limit.TenantID != tenantID {
 			continue
 		}
@@ -243,16 +242,18 @@ func (s *LimitService) GetUtilization(tenantID string) map[string]interface{} {
 	return map[string]interface{}{
 		"byType":    byType,
 		"timestamp": time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetBreaches returns breached or warning limits
-func (s *LimitService) GetBreaches(tenantID string) []*RiskLimit {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *LimitService) GetBreaches(tenantID string) ([]*RiskLimit, error) {
 
 	var result []*RiskLimit
-	for _, limit := range s.limits {
+	__ALL__, __ERR__ := s.limits.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, limit := range __ALL__ {
 		if limit.TenantID != tenantID {
 			continue
 		}
@@ -260,5 +261,5 @@ func (s *LimitService) GetBreaches(tenantID string) []*RiskLimit {
 			result = append(result, limit)
 		}
 	}
-	return result
+	return result, nil
 }

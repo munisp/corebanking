@@ -530,15 +530,15 @@ func main() {
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/customers", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/customers", permifyAuthzGuard("cif_management", "manage", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			svc.createCustomer(w, r)
 		} else {
 			svc.listCustomers(w, r)
 		}
-	})
-	mux.HandleFunc("/v1/customers/", svc.getCustomer)
-	mux.HandleFunc("/v1/stats", svc.getStats)
+	}))
+	mux.HandleFunc("/v1/customers/", permifyAuthzGuard("cif_management", "manage", svc.getCustomer))
+	mux.HandleFunc("/v1/stats", permifyAuthzGuard("cif_management", "view", svc.getStats))
 
 	log.Printf("[cif-management] Listening on :%s\n", port)
 	log.Fatal((&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())

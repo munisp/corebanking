@@ -46,7 +46,7 @@ export const riskScoringApi = {
     apiClient.get<RiskScore>(`${APISIX.RISK_SCORING}/v1/scores/${customerId}`).then((r) => r.data),
 
   list: (params?: { page?: number; limit?: number; grade?: string }) =>
-    apiClient.get<{ items: RiskScore[]; total: number }>(`${APISIX.RISK_SCORING}/v1/scores`, { params }).then((r) => r.data),
+    apiClient.get<{ items: RiskScore[]; total: number }>(`/credit/v1/scores`, { params }).then((r) => r.data),
 
   getDistribution: () =>
     apiClient.get(`${APISIX.RISK_SCORING}/v1/distribution`).then((r) => r.data),
@@ -113,13 +113,13 @@ export const creditFacilityApi = {
     apiClient.get<{ items: CreditFacility[]; total: number }>(`${APISIX.CREDIT_FACILITY}/v1/facilities`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<CreditFacility>(`${APISIX.CREDIT_FACILITY}/v1/facilities/${id}`).then((r) => r.data),
+    apiClient.get<CreditFacility>(`/credit/v1/facilities/${id}`).then((r) => r.data),
 
   create: (body: Partial<CreditFacility>) =>
     apiClient.post<CreditFacility>(`${APISIX.CREDIT_FACILITY}/v1/facilities`, body).then((r) => r.data),
 
   update: (id: string, body: Partial<CreditFacility>) =>
-    apiClient.put(`${APISIX.CREDIT_FACILITY}/v1/facilities/${id}`, body).then((r) => r.data),
+    apiClient.put(`/credit/v1/facilities/${id}`, body).then((r) => r.data),
 
   getLimits: (params?: { page?: number; limit?: number; status?: string }) =>
     apiClient.get<{ items: LimitManagement[]; total: number }>(`${APISIX.CREDIT_FACILITY}/v1/limits`, { params }).then((r) => r.data),
@@ -328,14 +328,137 @@ export interface ProjectFinance {
 
 export const projectFinanceApi = {
   list: (params?: { page?: number; limit?: number; sector?: string; status?: string }) =>
-    apiClient.get<{ items: ProjectFinance[]; total: number }>(`${APISIX.PROJECT_FINANCE}/v1/projects`, { params }).then((r) => r.data),
+    apiClient.get<{ items: ProjectFinance[]; total: number }>(`/carbon/api/v1/carbon/projects`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<ProjectFinance>(`${APISIX.PROJECT_FINANCE}/v1/projects/${id}`).then((r) => r.data),
+    apiClient.get<ProjectFinance>(`/carbon/api/v1/carbon/projects/${id}`).then((r) => r.data),
 
   create: (body: Partial<ProjectFinance>) =>
-    apiClient.post<ProjectFinance>(`${APISIX.PROJECT_FINANCE}/v1/projects`, body).then((r) => r.data),
+    apiClient.post<ProjectFinance>(`/carbon/api/v1/carbon/projects`, body).then((r) => r.data),
 
   getDisbursements: (id: string) =>
     apiClient.get(`${APISIX.PROJECT_FINANCE}/v1/projects/${id}/disbursements`).then((r) => r.data),
+};
+
+// ─── Credit Service Operations (W12 A4-P1-A: credit-service /credit/*) ──────
+// Scores, multicurrency revaluation, OTC derivatives, ETD trades and clearing
+// instructions served by credit-service (services/credit-service/main.go).
+
+export interface CreditRiskAssessment {
+  id: string;
+  entity_id: string;
+  entity_name: string;
+  entity_type: string;
+  risk_type: string;
+  pd: number;
+  lgd: number;
+  ead: number;
+  expected_loss: number;
+  rwa: number;
+  rating: string;
+  ifrs9_stage: number;
+  assessment_date: string;
+  next_review: string;
+  status: string;
+  created_at: string;
+}
+
+export interface MulticurrencyRevaluation {
+  id: string;
+  currency: string;
+  base_currency: string;
+  book_rate: number;
+  market_rate: number;
+  book_value: number;
+  market_value: number;
+  unrealized_pnl: number;
+  position_type: string;
+  account_id: string;
+  status: string;
+  revaluation_date: string;
+}
+
+export interface OtcDerivative {
+  id: string;
+  instrument_type: string;
+  counterparty: string;
+  notional: number;
+  currency: string;
+  strike_rate: number;
+  market_rate: number;
+  mtm_value: number;
+  maturity_date: string;
+  status: string;
+}
+
+export interface EtdTrade {
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface ClearingInstruction {
+  id: string;
+  type: string;
+  reference: string;
+  amount: number;
+  currency: string;
+  debtor_account: string;
+  creditor_account: string;
+  clearing_house: string;
+  settlement_date: string;
+  status: string;
+}
+
+export const creditServiceOpsApi = {
+  listScores: () =>
+    apiClient.get<{ items: CreditRiskAssessment[]; total: number }>(`${APISIX.CREDIT_SERVICE}/v1/scores`).then((r) => r.data),
+
+  getRevaluation: () =>
+    apiClient.get<{ items: MulticurrencyRevaluation[]; total: number }>(`${APISIX.CREDIT_SERVICE}/v1/multicurrency/revaluation`).then((r) => r.data),
+
+  runRevaluation: (body?: { revaluation_date?: string }) =>
+    apiClient.post(`${APISIX.CREDIT_SERVICE}/v1/multicurrency/run`, body ?? {}).then((r) => r.data),
+
+  listOtcDerivatives: () =>
+    apiClient.get<{ items: OtcDerivative[]; total: number }>(`${APISIX.CREDIT_SERVICE}/v1/otc/derivatives`).then((r) => r.data),
+
+  createOtcDerivative: (body: { instrument_type: string; counterparty: string; notional: number; currency?: string; strike_rate?: number; maturity_date?: string }) =>
+    apiClient.post(`${APISIX.CREDIT_SERVICE}/v1/otc/derivatives`, body).then((r) => r.data),
+
+  otcStats: () =>
+    apiClient.get(`${APISIX.CREDIT_SERVICE}/v1/otc/stats`).then((r) => r.data),
+
+  listEtdTrades: () =>
+    apiClient.get<{ items: EtdTrade[]; total: number }>(`${APISIX.CREDIT_SERVICE}/v1/etd/trades`).then((r) => r.data),
+
+  etdStats: () =>
+    apiClient.get(`${APISIX.CREDIT_SERVICE}/v1/etd/stats`).then((r) => r.data),
+
+  listClearingInstructions: () =>
+    apiClient.get<{ items: ClearingInstruction[]; total: number }>(`${APISIX.CREDIT_SERVICE}/v1/banking-clearing-ops/instructions`).then((r) => r.data),
+
+  createClearingInstruction: (body: { instruction_type?: string; reference: string; amount: number; currency?: string; debtor_account?: string; creditor_account?: string; clearing_house?: string; settlement_date?: string }) =>
+    apiClient.post(`${APISIX.CREDIT_SERVICE}/v1/banking-clearing-ops/instructions`, body).then((r) => r.data),
+
+  clearingStats: () =>
+    apiClient.get(`${APISIX.CREDIT_SERVICE}/v1/banking-clearing-ops/stats`).then((r) => r.data),
+};
+
+// ─── Credit Advisory (W12 A4-P1-A: credit-scoring-py /credit-scoring/*) ─────
+export interface CreditAdvisoryResult {
+  score?: number;
+  rating?: string;
+  advisory: boolean;
+  [key: string]: unknown;
+}
+
+export const creditAdvisoryApi = {
+  listLoans: () =>
+    apiClient.get(`${APISIX.CREDIT_SCORING_PY}/api/v1/loans`).then((r) => r.data),
+
+  scoreAdvisory: (body: { income: number; debt: number; employment_years: number; loan_history_count: number; defaults: number; age: number }) =>
+    apiClient.post<CreditAdvisoryResult>(`${APISIX.CREDIT_SCORING_PY}/api/v1/score/advisory`, body).then((r) => r.data),
+
+  affordabilityAdvisory: (body: { monthly_income: number; monthly_expenses: number; proposed_emi: number }) =>
+    apiClient.post<CreditAdvisoryResult>(`${APISIX.CREDIT_SCORING_PY}/api/v1/affordability/advisory`, body).then((r) => r.data),
 };

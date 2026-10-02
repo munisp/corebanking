@@ -74,6 +74,65 @@ def get_application(
     return app.to_dict()
 
 
+class DecisionPayload(BaseModel):
+    notes: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@opening_router.post("/{application_id}/approve")
+def approve_application(
+    application_id: str,
+    payload: Optional[DecisionPayload] = None,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_id: str = Header(..., alias="x-keycloak-id"),
+):
+    """W12-A4-P0-D: tenant_admin POST /account/account-opening/{id}/approve.
+    Mirrors closure approve: pending -> approved, recorded reviewer."""
+    app = db.query(AccountOpeningApplication).filter(
+        AccountOpeningApplication.id == application_id,
+        AccountOpeningApplication.tenant_id == tenant_id,
+    ).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if app.status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot approve an application with status '{app.status}'",
+        )
+    app.status = "approved"
+    db.commit()
+    db.refresh(app)
+    return {"message": "success", "data": app.to_dict()}
+
+
+@opening_router.post("/{application_id}/reject")
+def reject_application(
+    application_id: str,
+    payload: Optional[DecisionPayload] = None,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_id: str = Header(..., alias="x-keycloak-id"),
+):
+    """W12-A4-P0-D: tenant_admin POST /account/account-opening/{id}/reject.
+    Mirrors closure reject: pending -> rejected."""
+    app = db.query(AccountOpeningApplication).filter(
+        AccountOpeningApplication.id == application_id,
+        AccountOpeningApplication.tenant_id == tenant_id,
+    ).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if app.status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot reject an application with status '{app.status}'",
+        )
+    app.status = "rejected"
+    db.commit()
+    db.refresh(app)
+    return {"message": "success", "data": app.to_dict()}
+
+
 @opening_router.post("")
 def create_application(
     payload: CreateApplicationPayload,

@@ -1159,14 +1159,14 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("open_banking_baas", "manage", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("open_banking_baas", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", healthz)
-	mux.Handle("/v1/open-banking/apis", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(openBankingAPIs)))
-	mux.Handle("/v1/ai/credit-scoring", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(aiCreditScoring)))
-	mux.Handle("/v1/embedded-finance", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(embeddedFinance)))
-	mux.Handle("/v1/open-banking-baas/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(open_banking_baasScoreHandler)))
-	mux.Handle("/v1/open-banking-baas/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(open_banking_baasValidateRequestHandler)))
+	mux.Handle("/v1/open-banking/apis", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("open_banking_baas", "manage", http.HandlerFunc(openBankingAPIs))))
+	mux.Handle("/v1/ai/credit-scoring", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("open_banking_baas", "credit_scoring", http.HandlerFunc(aiCreditScoring))))
+	mux.Handle("/v1/embedded-finance", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("open_banking_baas", "embedded_finance", http.HandlerFunc(embeddedFinance))))
+	mux.Handle("/v1/open-banking-baas/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("open_banking_baas", "score", http.HandlerFunc(open_banking_baasScoreHandler))))
+	mux.Handle("/v1/open-banking-baas/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("open_banking_baas", "validate", http.HandlerFunc(open_banking_baasValidateRequestHandler))))
 	log.Printf("Open Banking & BaaS (Go) on :%s — Enhancements 1, 2, 5", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

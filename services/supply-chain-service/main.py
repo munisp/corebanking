@@ -4,6 +4,8 @@ Production-ready implementation
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks, Query
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -414,7 +416,7 @@ async def shutdown():
 async def health_check():
     return {"status": "healthy", "service": "supply-chain-service"}
 
-@app.post("/api/v1/supply-chain/invoice-financing/apply")
+@app.post("/api/v1/supply-chain/invoice-financing/apply", dependencies=[Depends(require_permify("supply_chain_financing", "create"))])
 async def apply_invoice_financing(
     application: InvoiceFinancing,
     background_tasks: BackgroundTasks,
@@ -469,7 +471,7 @@ async def apply_invoice_financing(
         "submitted_at": datetime.now()
     }
 
-@app.post("/api/v1/supply-chain/po-financing/apply")
+@app.post("/api/v1/supply-chain/po-financing/apply", dependencies=[Depends(require_permify("supply_chain_financing", "create"))])
 async def apply_po_financing(
     application: PurchaseOrderFinancing,
     background_tasks: BackgroundTasks,
@@ -555,7 +557,7 @@ async def assess_supply_chain_risk(financing_id: str, supplier_id: str, buyer_id
             WHERE financing_id = $2
         """, risk_score, financing_id)
 
-@app.get("/api/v1/supply-chain/financing/{financing_id}")
+@app.get("/api/v1/supply-chain/financing/{financing_id}", dependencies=[Depends(require_permify("supply_chain_financing", "view"))])
 async def get_financing(
     financing_id: str,
     db=Depends(lambda: db_pool),
@@ -572,7 +574,7 @@ async def get_financing(
         """, tenant_id, keycloak_id, financing_id)
         return dict(row)
 
-@app.get("/api/v1/supply-chain/financing")
+@app.get("/api/v1/supply-chain/financing", dependencies=[Depends(require_permify("supply_chain_financing", "view"))])
 async def get_all_financing(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
@@ -591,7 +593,7 @@ async def get_all_financing(
         """, tenant_id, keycloak_id, size, offset)
         return [dict(row) for row in rows]
 
-@app.post("/api/v1/supply-chain/financing/{financing_id}/approve")
+@app.post("/api/v1/supply-chain/financing/{financing_id}/approve", dependencies=[Depends(require_permify("supply_chain_financing", "manage"))])
 async def approve_financing(
     financing_id: str,
     db=Depends(lambda: db_pool),
@@ -627,7 +629,7 @@ async def approve_financing(
         "approved_at": datetime.now()
     }
 
-@app.post("/api/v1/supply-chain/financing/{financing_id}/disburse")
+@app.post("/api/v1/supply-chain/financing/{financing_id}/disburse", dependencies=[Depends(require_permify("supply_chain_financing", "manage"))])
 async def disburse_financing(
     financing_id: str,
     db=Depends(lambda: db_pool),
@@ -697,7 +699,7 @@ async def disburse_financing(
         "disbursed_at": datetime.now()
     }
 
-@app.post("/api/v1/system/supply-chain/financing/record-payment/{financing_id}")
+@app.post("/api/v1/system/supply-chain/financing/record-payment/{financing_id}", dependencies=[Depends(require_permify("supply_chain_financing", "manage"))])
 async def record_repayment(
     financing_id: str,
     payment: RecordRePayment,
@@ -746,7 +748,7 @@ async def record_repayment(
         "payment_date": datetime.now().date()
     }
 
-@app.post("/api/v1/supply-chain/relationships/create")
+@app.post("/api/v1/supply-chain/relationships/create", dependencies=[Depends(require_permify("supply_chain_relationship", "create"))])
 async def create_relationship(
     supplier_id: str,
     buyer_id: str,
@@ -772,7 +774,7 @@ async def create_relationship(
         "buyer_id": buyer_id
     }
 
-@app.get("/api/v1/supply-chain/relationships/{supplier_id}/{buyer_id}")
+@app.get("/api/v1/supply-chain/relationships/{supplier_id}/{buyer_id}", dependencies=[Depends(require_permify("supply_chain_relationship", "view"))])
 async def get_relationship(
     supplier_id: str,
     buyer_id: str,
@@ -790,7 +792,7 @@ async def get_relationship(
         
         return dict(row)
 
-@app.get("/api/v1/supply-chain/financing/supplier/{supplier_id}")
+@app.get("/api/v1/supply-chain/financing/supplier/{supplier_id}", dependencies=[Depends(require_permify("supply_chain_financing", "view"))])
 async def list_supplier_financing(
     supplier_id: str,
     status: Optional[FinancingStatus] = None,
@@ -814,7 +816,7 @@ async def list_supplier_financing(
             "total": len(rows)
         }
 
-@app.get("/api/v1/supply-chain/financing/buyer/{buyer_id}")
+@app.get("/api/v1/supply-chain/financing/buyer/{buyer_id}", dependencies=[Depends(require_permify("supply_chain_financing", "view"))])
 async def list_buyer_financing(
     buyer_id: str,
     status: Optional[FinancingStatus] = None,

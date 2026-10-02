@@ -25,6 +25,7 @@ import (
 
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -225,13 +226,42 @@ func generateChallenges(count int) []Challenge {
 // Every challenge carries a single-use nonce bound to (session ID, challenge
 // ID, subject). The nonce is stored at challenge creation and consumed
 // atomically at submission; reuse is rejected. Postgres is the store of
-// record (multi-replica safe). When no database is configured (single-process
-// mode) an in-memory binding map provides the same guarantee locally.
+// record (multi-replica safe). When no database is configured the binding
+// lives in redis (c3-0635): `SET NX liveness:nonce:{nonce}` TTL 900s at
+// issue (collision == error, mirroring the PG primary key) and an atomic
+// GetDel at submission (single-use). Fail closed on store errors.
 
+// Pooled go-redis client (canonical fleet pattern, c3-0635).
 var (
-	noncesMu      sync.Mutex
-	nonceBindings = map[string]string{} // nonce -> sessionID|challengeID|customerID (db == nil mode only)
+	redisAddr       string
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
 )
+
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+}
+
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
+}
+
+func nonceRedisKey(nonce string) string {
+	return "liveness:nonce:" + nonce
+}
 
 func generateNonce() string {
 	b := make([]byte, 32)
@@ -246,12 +276,18 @@ func nonceBinding(sessionID, challengeID, customerID string) string {
 }
 
 // storeChallengeNonce records a freshly issued nonce. With a database, the
-// primary key guarantees global uniqueness; a collision is an error.
+// primary key guarantees global uniqueness; a collision is an error. The
+// redis fallback enforces the same via SET NX (collision == error).
 func storeChallengeNonce(nonce, sessionID, challengeID, customerID string) error {
 	if db == nil {
-		noncesMu.Lock()
-		nonceBindings[nonce] = nonceBinding(sessionID, challengeID, customerID)
-		noncesMu.Unlock()
+		ok, err := getRedisClient().SetNX(redisCtx, nonceRedisKey(nonce),
+			nonceBinding(sessionID, challengeID, customerID), 900*time.Second).Result()
+		if err != nil {
+			return fmt.Errorf("nonce store unavailable (fail closed): %w", err)
+		}
+		if !ok {
+			return fmt.Errorf("nonce collision for session %s", sessionID)
+		}
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -271,14 +307,16 @@ func consumeChallengeNonce(nonce, sessionID, challengeID, customerID string) boo
 	}
 	if db == nil {
 		key := nonceBinding(sessionID, challengeID, customerID)
-		noncesMu.Lock()
-		defer noncesMu.Unlock()
-		binding, ok := nonceBindings[nonce]
-		if !ok || binding != key {
+		// GetDel is atomic: the nonce is consumed exactly once.
+		binding, err := getRedisClient().GetDel(redisCtx, nonceRedisKey(nonce)).Result()
+		if err == redis.Nil {
+			return false // unknown or already-consumed nonce
+		}
+		if err != nil {
+			log.Printf("[%s] nonce consume failed (fail closed): %v", serviceName, err)
 			return false
 		}
-		delete(nonceBindings, nonce)
-		return true
+		return binding == key
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1378,14 +1416,14 @@ func main() {
 			handleListSessions(w, r)
 		}
 	})
-	mux.HandleFunc("/v1/sessions/", handleGetSession)
-	mux.HandleFunc("/v1/submit-frame", handleSubmitFrame)
-	mux.HandleFunc("/v1/submit-challenge", handleSubmitChallenge)
-	mux.HandleFunc("/v1/passive-liveness", handlePassiveLiveness)
-	mux.HandleFunc("/v1/face-match", handleFaceMatch)
-	mux.HandleFunc("/v1/face-matches", handleGetFaceMatches)
-	mux.HandleFunc("/v1/events", handleGetEvents)
-	mux.HandleFunc("/v1/stats", handleGetStats)
+	mux.HandleFunc("/v1/sessions/", permifyAuthzGuard("liveness_session", "manage", handleGetSession))
+	mux.HandleFunc("/v1/submit-frame", permifyAuthzGuard("liveness_session", "submit", handleSubmitFrame))
+	mux.HandleFunc("/v1/submit-challenge", permifyAuthzGuard("liveness_session", "submit", handleSubmitChallenge))
+	mux.HandleFunc("/v1/passive-liveness", permifyAuthzGuard("liveness_session", "check", handlePassiveLiveness))
+	mux.HandleFunc("/v1/face-match", permifyAuthzGuard("liveness_session", "match", handleFaceMatch))
+	mux.HandleFunc("/v1/face-matches", permifyAuthzGuard("liveness_session", "view", handleGetFaceMatches))
+	mux.HandleFunc("/v1/events", permifyAuthzGuard("liveness_session", "view", handleGetEvents))
+	mux.HandleFunc("/v1/stats", permifyAuthzGuard("liveness_session", "view", handleGetStats))
 
 	server := &http.Server{
 		Addr:              ":" + port,

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto"
+	"database/sql"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -49,10 +52,74 @@ type ProjectDeal struct {
 	Status          string  `json:"status"`
 }
 
-var (
-	mu    sync.RWMutex
-	items = []ProjectDeal{}
-)
+// ── Postgres persistence (W12 C3-P2-B5) ─────────────────────────────────────
+// The in-memory `items` slice was removed. domain_items is authoritative;
+// reads are served from PG. When DATABASE_URL is unset/unreachable the
+// list/stats endpoints fail closed (503) — no in-memory fallback claims
+// durability Postgres lacks. (Read-only service: no mutation endpoints exist.)
+
+var db *sql.DB
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[project-finance-go] DATABASE_URL not set — deal endpoints fail closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[project-finance-go] DB open failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[project-finance-go] DB ping failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS domain_items (
+		id TEXT PRIMARY KEY,
+		project_name TEXT NOT NULL DEFAULT '',
+		sponsor TEXT NOT NULL DEFAULT '',
+		sector TEXT NOT NULL DEFAULT '',
+		total_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+		debt_equity_ratio TEXT NOT NULL DEFAULT '',
+		currency TEXT NOT NULL DEFAULT '',
+		tenor TEXT NOT NULL DEFAULT '',
+		dscr DOUBLE PRECISION NOT NULL DEFAULT 0,
+		status TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[project-finance-go] DDL failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	log.Printf("[project-finance-go] Postgres connected (pool: 10/2), domain_items ready")
+}
+
+func listProjectDeals() ([]ProjectDeal, error) {
+	rows, err := db.Query(`SELECT id, project_name, sponsor, sector, total_cost, debt_equity_ratio, currency, tenor, dscr, status
+		FROM domain_items ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ProjectDeal{}
+	for rows.Next() {
+		var d ProjectDeal
+		if err := rows.Scan(&d.ID, &d.ProjectName, &d.Sponsor, &d.Sector, &d.TotalCost, &d.DebtEquityRatio, &d.Currency, &d.Tenor, &d.DSCR, &d.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -78,15 +145,39 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func listItems(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
+	if db == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "deal store unavailable (postgres down)"})
+		return
+	}
+	items, err := listProjectDeals()
+	if err != nil {
+		log.Printf("[project-finance-go] list failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "deal store unavailable (postgres down)"})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items)})
+	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items), "source": "postgres"})
 }
 
 func getStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
+	if db == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "deal store unavailable (postgres down)"})
+		return
+	}
+	items, err := listProjectDeals()
+	if err != nil {
+		log.Printf("[project-finance-go] stats query failed: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "deal store unavailable (postgres down)"})
+		return
+	}
 	var total float64
 	for _, d := range items {
 		total += d.TotalCost
@@ -271,13 +362,14 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	port := envOr("PORT", "8172")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/project-finance/deals", listItems)
-	http.HandleFunc("/v1/project-finance/stats", getStats)
+	http.HandleFunc("/v1/project-finance/deals", permifyAuthzGuard("project_finance", "manage", listItems))
+	http.HandleFunc("/v1/project-finance/stats", permifyAuthzGuard("project_finance", "view", getStats))
 	fmt.Printf("Project Finance Service running on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

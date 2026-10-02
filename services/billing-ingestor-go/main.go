@@ -1075,8 +1075,15 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	payload, _ := json.Marshal(body)
 
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var id string
-	err := db.QueryRowContext(r.Context(),
+	err = tx.QueryRowContext(r.Context(),
 		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
@@ -1084,10 +1091,20 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
+		"service_configs.created", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1124,7 +1141,14 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 		status = "updated"
 	}
 
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1132,25 +1156,54 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
+		"service_configs.updated", id, string(payload)); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
 }
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
+	tx, err := db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(r.Context(),
 		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
-	_, _ = db.ExecContext(r.Context(),
+	// Write to outbox in the SAME transaction as the domain write; an
+	// outbox error aborts the transaction (fail closed), so the domain
+	// row and its event can never diverge.
+	if _, err = tx.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+		"service_configs.deleted", id, `{"id":"`+id+`"}`); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1443,10 +1496,12 @@ type UsageEvent struct {
 }
 
 var (
-	usageEventsMu   sync.RWMutex
-	usageEvents     = []UsageEvent{}
-	idempotencyKeys = map[string]bool{}
-	totalIngested   int64
+	usageEventsMu sync.RWMutex
+	usageEvents   = []UsageEvent{}
+	// W12 C3-P1-B2 (c3-0441): the idempotencyKeys map is gone — duplicate
+	// detection now lives in redis (idem:default:{key}, SET NX EX 86400) so
+	// it holds across replicas and restarts.
+	totalIngested int64
 )
 
 func handleUsageEventsList(w http.ResponseWriter, r *http.Request) {
@@ -1479,12 +1534,23 @@ func handleUsageEventsIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	usageEventsMu.Lock()
 	defer usageEventsMu.Unlock()
-	if ikey != "" && idempotencyKeys[ikey] {
-		respondJSON(w, 200, map[string]interface{}{"duplicate": true, "message": "event already ingested"})
-		return
-	}
 	if ikey != "" {
-		idempotencyKeys[ikey] = true
+		// W12 C3-P1-B2 (c3-0441): redis idempotency via the wired pooled
+		// client (:794) — idem:default:{key} SET NX EX 86400. FAIL CLOSED:
+		// if redis is unreachable the duplicate state cannot be verified, so
+		// the ingest is refused with 503 instead of risking a double-bill.
+		ctx, cancel := context.WithTimeout(redisCtx, 2*time.Second)
+		firstSeen, err := getRedisClient().SetNX(ctx, "idem:default:"+ikey, "1", 86400*time.Second).Result()
+		cancel()
+		if err != nil {
+			log.Printf("[%s] idempotency check failed — failing closed: %v", serviceName, err)
+			respondJSON(w, 503, map[string]interface{}{"error": "idempotency state unavailable", "code": "IDEMPOTENCY_STATE_UNAVAILABLE"})
+			return
+		}
+		if !firstSeen {
+			respondJSON(w, 200, map[string]interface{}{"duplicate": true, "message": "event already ingested"})
+			return
+		}
 	}
 	qty := int64(1)
 	if v, ok := body["quantity"]; ok {
@@ -1553,26 +1619,26 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "manage", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.Handle("/v1/billing-ingestor/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
-	mux.Handle("/v1/billing-ingestor/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
-	mux.Handle("/v1/billing-ingestor/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
-	mux.Handle("/v1/billing-ingestor/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
-	mux.Handle("/v1/billing-ingestor/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
-	mux.Handle("/v1/billing-ingestor/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
-	mux.Handle("/v1/billing-ingestor/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(billing_ingestorScoreHandler)))
-	mux.Handle("/v1/billing-ingestor/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(billing_ingestorValidateRequestHandler)))
+	mux.Handle("/v1/billing-ingestor/list", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "view", http.HandlerFunc(handleList))))
+	mux.Handle("/v1/billing-ingestor/create", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "create", http.HandlerFunc(handleCreate))))
+	mux.Handle("/v1/billing-ingestor/update", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "update", http.HandlerFunc(handleUpdate))))
+	mux.Handle("/v1/billing-ingestor/process", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "process", http.HandlerFunc(handleProcess))))
+	mux.Handle("/v1/billing-ingestor/audit", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "view", http.HandlerFunc(handleAudit))))
+	mux.Handle("/v1/billing-ingestor/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "view", http.HandlerFunc(handleStats))))
+	mux.Handle("/v1/billing-ingestor/score", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "score", http.HandlerFunc(billing_ingestorScoreHandler))))
+	mux.Handle("/v1/billing-ingestor/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "validate", http.HandlerFunc(billing_ingestorValidateRequestHandler))))
 	// ── Usage event endpoints consumed by platform admin UI ──────────────────
-	mux.HandleFunc("/v1/billing/usage-events", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/billing/usage-events", permifyAuthzGuard("billing_ingestor", "manage", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			handleUsageEventsIngest(w, r)
 		} else {
 			handleUsageEventsList(w, r)
 		}
-	})
-	mux.Handle("/v1/billing/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleIngestorStats)))
+	}))
+	mux.Handle("/v1/billing/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("billing_ingestor", "view", http.HandlerFunc(handleIngestorStats))))
 	log.Printf("Billing Ingestor v2.0 (Billing) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

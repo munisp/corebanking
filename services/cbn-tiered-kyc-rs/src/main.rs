@@ -4,9 +4,13 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use serde_json::json;
+use std::time::Instant;
+use actix_web::HttpMessage;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -26,11 +30,101 @@ struct CreateRequest {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+
+// W12-RUSTFIX: TierConfig/TierAssessment/LimitCheck were referenced throughout
+// (default_tiers, assess_tier_eligibility, check_limit, AppState) but the
+// generator never emitted the definitions (baseline did not compile).
+// Field sets/types reconstructed exactly from the constructor literals and
+// comparison sites in this file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TierConfig {
+    tier: String,
+    description: String,
+    max_balance_ngn: Option<u64>,
+    daily_txn_limit_ngn: Option<u64>,
+    single_txn_limit_ngn: Option<u64>,
+    required_docs: Vec<String>,
+    liveness_required: bool,
+    bvn_required: bool,
+    nin_required: bool,
+    address_required: bool,
+    photo_required: bool,
+    upgrade_path: Option<String>,
+    cbn_circular: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TierAssessment {
+    id: String,
+    customer_id: String,
+    current_tier: String,
+    eligible_tier: String,
+    docs_present: Vec<String>,
+    docs_missing: Vec<String>,
+    liveness_passed: bool,
+    bvn_verified: bool,
+    nin_verified: bool,
+    address_verified: bool,
+    upgrade_possible: bool,
+    upgrade_blockers: Vec<String>,
+    compliance_score: f64,
+    assessed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LimitCheck {
+    customer_id: String,
+    tier: String,
+    transaction_amount: u64,
+    transaction_type: String,
+    current_daily_total: u64,
+    current_balance: u64,
+    allowed: bool,
+    reason: String,
+    remaining_daily: Option<u64>,
+    remaining_balance: Option<u64>,
+}
+
+// Wave-12 (C3-P2-RSVEC): tier assessments and limit checks are persisted in
+// Postgres (was: in-memory Mutex<Vec<..>> lost on every restart). jsonb payload
+// (both structs carry Vec<String>/nested fields); assessment.id is the natural
+// unique key (ON CONFLICT idempotent); limit_checks is an append-only event log.
 struct AppState {
     start_time: Instant,
-    assessments: Mutex<Vec<TierAssessment>>,
-    limit_checks: Mutex<Vec<LimitCheck>>,
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
+}
+
+/// Boot DDL for the C3-P2-RSVEC stores. Fail-open at boot (logs, does not
+/// crash) so the service can still start; handlers fail closed on query error.
+async fn init_kyc_stores(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tier_assessments (
+            id TEXT PRIMARY KEY,
+            customer_id TEXT,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("[cbn-tiered-kyc-rs] tier_assessments DDL failed: {}", e);
+    }
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS limit_checks (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            customer_id TEXT,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("[cbn-tiered-kyc-rs] limit_checks DDL failed: {}", e);
+    }
 }
 
 fn default_tiers() -> Vec<TierConfig> {
@@ -205,7 +299,7 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests()
             .insert_header(("Retry-After", "1"))
             .json(serde_json::json!({"error": "rate_limit_exceeded"}));
@@ -267,6 +361,7 @@ async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppSta
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let _sanitized = sanitize_input("");
     let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
+    if let Err(resp) = permify_check(&req, "kyc_case", customer_id, "tier_upgrade").await { return resp; }
     let docs: Vec<String> = body.get("docsPresent")
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
@@ -277,8 +372,20 @@ async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppSta
     let address = body.get("addressVerified").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let assessment = assess_tier_eligibility(customer_id, &docs, liveness, bvn, nin, address);
-    let mut assessments = state.assessments.lock().await;
-    assessments.push(assessment.clone());
+    // Wave-12 (C3-P2-RSVEC): persist to Postgres (was in-memory Vec push). Fail closed.
+    if let Err(e) = sqlx::query(
+        "INSERT INTO tier_assessments (id, customer_id, payload) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&assessment.id)
+    .bind(&assessment.customer_id)
+    .bind(serde_json::to_value(&assessment).unwrap_or_else(|_| json!({})))
+    .execute(&state.db)
+    .await
+    {
+        eprintln!("[cbn-tiered-kyc-rs] assess_tier insert failed: {}", e);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "assessment_store_unavailable"}));
+    }
 
     db_persist(&state, "assess_tier", &json!({"action": "assess_tier"})).await;
     HttpResponse::Ok().json(json!({"assessment": assessment}))
@@ -290,13 +397,24 @@ async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web:
     let amount = body.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
     let daily = body.get("currentDailyTotal").and_then(|v| v.as_u64()).unwrap_or(0);
     let balance = body.get("currentBalance").and_then(|v| v.as_u64()).unwrap_or(0);
+    let permify_entity = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
+    if let Err(resp) = permify_check(&req, "kyc_case", permify_entity, "evaluate").await { return resp; }
 
     let mut check = check_limit(tier, amount, daily, balance);
     check.customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
     check.transaction_type = body.get("transactionType").and_then(|v| v.as_str()).unwrap_or("transfer").to_string();
 
-    let mut checks = state.limit_checks.lock().await;
-    checks.push(check.clone());
+    // Wave-12 (C3-P2-RSVEC): persist to Postgres (was in-memory Vec push). Fail closed.
+    if let Err(e) = sqlx::query("INSERT INTO limit_checks (customer_id, payload) VALUES ($1, $2)")
+        .bind(&check.customer_id)
+        .bind(serde_json::to_value(&check).unwrap_or_else(|_| json!({})))
+        .execute(&state.db)
+        .await
+    {
+        eprintln!("[cbn-tiered-kyc-rs] check_transaction_limit insert failed: {}", e);
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({"error": "limit_check_store_unavailable"}));
+    }
 
     db_persist(&state, "check_transaction_limit", &json!({"action": "check_transaction_limit"})).await;
     HttpResponse::Ok().json(json!({"limitCheck": check}))
@@ -304,15 +422,64 @@ async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web:
 
 async fn get_assessments(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let assessments = state.assessments.lock().await;
+    let rows = match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM tier_assessments ORDER BY created_at, id",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[cbn-tiered-kyc-rs] get_assessments query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "assessment_store_unavailable"}));
+        }
+    };
+    let assessments: Vec<TierAssessment> = rows
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+    let total = assessments.len();
     db_persist(&state, "get_assessments", &json!({"action": "get_assessments"})).await;
-    HttpResponse::Ok().json(json!({"assessments": *assessments, "total": assessments.len()}))
+    HttpResponse::Ok().json(json!({"assessments": assessments, "total": total}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let assessments = state.assessments.lock().await;
-    let checks = state.limit_checks.lock().await;
+    let arows = match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM tier_assessments ORDER BY created_at, id",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[cbn-tiered-kyc-rs] get_stats assessments query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "assessment_store_unavailable"}));
+        }
+    };
+    let assessments: Vec<TierAssessment> = arows
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+    let crows = match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM limit_checks ORDER BY created_at, id",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[cbn-tiered-kyc-rs] get_stats limit_checks query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error": "limit_check_store_unavailable"}));
+        }
+    };
+    let checks: Vec<LimitCheck> = crows
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
     let mut tier_counts = std::collections::HashMap::new();
     for a in assessments.iter() {
         *tier_counts.entry(a.eligible_tier.clone()).or_insert(0) += 1;
@@ -334,8 +501,6 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -559,7 +724,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -742,20 +907,57 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:cbn-tiered-kyc-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:cbn-tiered-kyc-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -848,17 +1050,105 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+// --- Permify authorization (W12-B5-P0-D3) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = X-Tenant-Id header or
+// PERMIFY_DEFAULT_TENANT, resource = domain entity id, permission per action
+// (schema: services/auth-service/schemas/permify/v2-kyc-compliance.fragment).
+// FAIL-CLOSED: Permify unreachable/non-200 => 503; denied => 403.
+// Canonical pattern: services/permify-authz-go/main.go:428 (REST check) and
+// services/auth-service/adapters/permify.py check_permission.
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    let subject = {
+        let ext = req.extensions();
+        ext.get::<VerifiedClaims>()
+            .and_then(|c| c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()))
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = req.headers().get("X-Tenant-Id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "9210".to_string());
+    // W12-RUSTFIX: main() never initialised the sqlx pool used by the CRUD
+    // handlers (data.db) and dropped the tokio_postgres client on the floor
+    // (baseline did not compile). Fleet-canonical pool init added; client wired in.
+    let db: sqlx::PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("cbn-tiered-kyc-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[cbn-tiered-kyc-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[cbn-tiered-kyc-rs] DATABASE_URL not set — DB endpoints will fail");
+            sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+        }
+    };
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
+    let db_client = if !db_url.is_empty() { init_db(&db_url).await.map(std::sync::Arc::new) } else { None };
+    init_kyc_stores(&db).await;
     let state = AppState {
         start_time: Instant::now(),
-        assessments: Mutex::new(vec![]),
-        limit_checks: Mutex::new(vec![]),
+        db_client: db_client.clone(),
+        db: db.clone(),
     };
     println!("CBN Tiered KYC Rules Engine v2.0 (Rust) on :{}", port);
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
         start_grpc_server("cbn-tiered-kyc-rs", 10330);
     HttpServer::new(move || {
         App::new()
@@ -896,8 +1186,8 @@ async fn main() -> std::io::Result<()> {
             })
             .app_data(web::Data::new(AppState {
                 start_time: state.start_time,
-                assessments: Mutex::new(vec![]),
-                limit_checks: Mutex::new(vec![]),
+                db_client: db_client.clone(),
+                db: db.clone(),
             }))
             .wrap(actix_web::middleware::DefaultHeaders::new()
                 .add(("X-Content-Type-Options", "nosniff"))
@@ -980,20 +1270,29 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("kyc_records.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -1002,18 +1301,28 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let id = path.into_inner();
-    sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("kyc_records.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }

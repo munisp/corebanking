@@ -3,6 +3,8 @@ Insurance Service - Policy management, premium calculation, claims processing, u
 """
 
 from fastapi import FastAPI, Depends, Header, BackgroundTasks
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -443,7 +445,7 @@ async def health_check():
     return {"status": "healthy", "service": "insurance-service"}
 
 
-@app.post("/api/v1/insurance/policies/apply")
+@app.post("/api/v1/insurance/policies/apply", dependencies=[Depends(require_permify("insurance_policy", "create"))])
 async def apply_for_policy(
     application: PolicyApplication,
     background_tasks: BackgroundTasks,
@@ -581,7 +583,7 @@ async def perform_underwriting(policy_id: str, application: PolicyApplication):
         )
 
 
-@app.get("/api/v1/insurance/policies/all")
+@app.get("/api/v1/insurance/policies/all", dependencies=[Depends(require_permify("insurance_policy", "view"))])
 async def list_policies(
     status: Optional[PolicyStatus] = None,
     db=Depends(lambda: db_pool),
@@ -602,7 +604,7 @@ async def list_policies(
         return {"policies": [dict(row) for row in rows], "total": len(rows)}
 
 
-@app.get("/api/v1/insurance/policies/{policy_id}")
+@app.get("/api/v1/insurance/policies/{policy_id}", dependencies=[Depends(require_permify("insurance_policy", "view"))])
 async def get_policy(
     policy_id: str,
     db=Depends(lambda: db_pool),
@@ -622,7 +624,7 @@ async def get_policy(
         return dict(row)
 
 
-@app.post("/api/v1/administration/insurance/policies/{policy_id}/activate")
+@app.post("/api/v1/administration/insurance/policies/{policy_id}/activate", dependencies=[Depends(require_permify("insurance_policy", "manage"))])
 async def activate_policy(
     policy_id: str,
     db=Depends(lambda: db_pool),
@@ -670,7 +672,7 @@ async def activate_policy(
     }
 
 
-@app.post("/api/v1/administration/insurance/policies/{policy_id}/deactivate")
+@app.post("/api/v1/administration/insurance/policies/{policy_id}/deactivate", dependencies=[Depends(require_permify("insurance_policy", "manage"))])
 async def deactivate_policy(
     policy_id: str,
     db=Depends(lambda: db_pool),
@@ -718,7 +720,7 @@ async def deactivate_policy(
     }
 
 
-@app.get("/api/v1/insurance/policies/customer/all")
+@app.get("/api/v1/insurance/policies/customer/all", dependencies=[Depends(require_permify("insurance_policy", "view"))])
 async def list_customer_policies(
     status: Optional[PolicyStatus] = None,
     db=Depends(lambda: db_pool),
@@ -744,7 +746,7 @@ async def list_customer_policies(
         }
 
 
-@app.post("/api/v1/insurance/claims/submit")
+@app.post("/api/v1/insurance/claims/submit", dependencies=[Depends(require_permify("insurance_claim", "create"))])
 async def submit_claim(
     claim: ClaimSubmission,
     db=Depends(lambda: db_pool),
@@ -802,7 +804,7 @@ async def submit_claim(
     }
 
 
-@app.get("/api/v1/insurance/claims/all")
+@app.get("/api/v1/insurance/claims/all", dependencies=[Depends(require_permify("insurance_claim", "view"))])
 async def list_all_claims(
     status: Optional[ClaimStatus] = None,
     db=Depends(lambda: db_pool),
@@ -823,7 +825,7 @@ async def list_all_claims(
         return {"claims": [dict(row) for row in rows], "total": len(rows)}
 
 
-@app.get("/api/v1/insurance/claims/customer/all")
+@app.get("/api/v1/insurance/claims/customer/all", dependencies=[Depends(require_permify("insurance_claim", "view"))])
 async def list_customer_claims(
     status: Optional[ClaimStatus] = None,
     db=Depends(lambda: db_pool),
@@ -854,7 +856,7 @@ async def list_customer_claims(
         }
 
 
-@app.get("/api/v1/insurance/claims/{claim_id}")
+@app.get("/api/v1/insurance/claims/{claim_id}", dependencies=[Depends(require_permify("insurance_claim", "view"))])
 async def get_claim(
     claim_id: str,
     db=Depends(lambda: db_pool),
@@ -874,7 +876,7 @@ async def get_claim(
         return dict(row)
 
 
-@app.post("/api/v1/administration/insurance/claims/{claim_id}/review")
+@app.post("/api/v1/administration/insurance/claims/{claim_id}/review", dependencies=[Depends(require_permify("insurance_claim", "manage"))])
 async def review_claim(
     claim_id: str,
     review: ClaimReview,
@@ -941,7 +943,7 @@ async def review_claim(
     }
 
 
-@app.post("/api/v1/administration/insurance/claims/{claim_id}/pay")
+@app.post("/api/v1/administration/insurance/claims/{claim_id}/pay", dependencies=[Depends(require_permify("insurance_claim", "manage"))])
 async def pay_claim(
     claim_id: str,
     db=Depends(lambda: db_pool),
@@ -1025,7 +1027,7 @@ async def pay_claim(
     }
 
 
-@app.get("/api/v1/insurance/claims/policy/{policy_id}")
+@app.get("/api/v1/insurance/claims/policy/{policy_id}", dependencies=[Depends(require_permify("insurance_claim", "view"))])
 async def list_policy_claims(
     policy_id: str,
     db=Depends(lambda: db_pool),
@@ -1060,7 +1062,7 @@ async def list_policy_claims(
         }
 
 
-@app.post("/api/v1/system/insurance/premiums/record-payment/{policy_id}")
+@app.post("/api/v1/system/insurance/premiums/record-payment/{policy_id}", dependencies=[Depends(require_permify("insurance_policy", "manage"))])
 async def pay_premium(
     policy_id: str,
     payment: RecordPremiumPayment,
@@ -1093,7 +1095,7 @@ async def pay_premium(
     }
 
 
-@app.get("/api/v1/insurance/premiums/policy/{policy_id}")
+@app.get("/api/v1/insurance/premiums/policy/{policy_id}", dependencies=[Depends(require_permify("insurance_policy", "view"))])
 async def list_premium_payments(
     policy_id: str,
     db=Depends(lambda: db_pool),
@@ -1122,7 +1124,7 @@ async def list_premium_payments(
         }
 
 
-@app.post("/api/v1/insurance/policies/{policy_id}/renew")
+@app.post("/api/v1/insurance/policies/{policy_id}/renew", dependencies=[Depends(require_permify("insurance_policy", "manage"))])
 async def renew_policy(
     policy_id: str,
     duration_months: int,

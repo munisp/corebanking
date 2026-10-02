@@ -2,6 +2,124 @@ import os
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
 PORT = int(os.environ.get("PORT", "8168"))
 def _require_env(name):
     """Fail-fast required environment variable (finding R3-NEW-3).
@@ -34,13 +152,17 @@ MW = {
     "openappsec": {"url": os.environ.get("OPENAPPSEC_URL", "http://localhost:4000"), "policy": "wealth-waf"},
 }
 
-CLIENTS = [
+_CLIENT_SEED = [
     {"id": "WC-001", "client_name": "Aliko Dangote", "client_type": "uhnw", "relationship_manager": "RM-001", "total_wealth": 12500000000.0, "currency": "USD", "risk_profile": "moderate", "investment_mandate": "balanced_growth", "portfolios": ["equities", "fixed_income", "real_estate", "alternatives"], "annual_review_date": "2026-06-15", "status": "active"},
     {"id": "WC-002", "client_name": "Mike Adenuga Jr", "client_type": "uhnw", "relationship_manager": "RM-002", "total_wealth": 6800000000.0, "currency": "USD", "risk_profile": "aggressive", "investment_mandate": "growth", "portfolios": ["equities", "private_equity", "telecom_ventures"], "annual_review_date": "2026-07-01", "status": "active"},
     {"id": "WC-003", "client_name": "Abdul Samad Rabiu", "client_type": "uhnw", "relationship_manager": "RM-001", "total_wealth": 5200000000.0, "currency": "USD", "risk_profile": "moderate", "investment_mandate": "income_plus_growth", "portfolios": ["fixed_income", "real_estate", "cement_industry"], "annual_review_date": "2026-08-15", "status": "active"},
     {"id": "WC-004", "client_name": "Folorunso Alakija", "client_type": "hnw", "relationship_manager": "RM-003", "total_wealth": 1100000000.0, "currency": "USD", "risk_profile": "conservative", "investment_mandate": "capital_preservation", "portfolios": ["fixed_income", "real_estate"], "annual_review_date": "2026-05-30", "status": "active"},
     {"id": "WC-005", "client_name": "Tony Elumelu", "client_type": "uhnw", "relationship_manager": "RM-002", "total_wealth": 3500000000.0, "currency": "USD", "risk_profile": "aggressive", "investment_mandate": "pan_african_growth", "portfolios": ["equities", "banking_ventures", "energy", "agriculture"], "annual_review_date": "2026-09-01", "status": "active"},
 ]
+
+
+# W12-C3P2B5: wealth client registry persisted in PG (idempotent seed).
+CLIENT_STORE = _W12Store("wealth_clients", seed=_CLIENT_SEED)
 
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
@@ -194,8 +316,18 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._json(200, {"service": "wealth-mgmt-py", "status": "healthy", "version": "1.0.0", "middleware": MW})
         elif self.path.startswith("/v1/wealth/clients"):
-            self._json(200, {"items": CLIENTS, "total": len(CLIENTS)})
+            try:
+                _items = CLIENT_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._json(200, {"items": _items, "total": len(_items)})
         elif self.path.startswith("/v1/wealth/stats"):
+            try:
+                CLIENTS = CLIENT_STORE.all()
+            except Exception as _e:
+                self._json(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             total = sum(c["total_wealth"] for c in CLIENTS)
             self._json(200, {"total_clients": len(CLIENTS), "total_auw": total, "currency": "USD"})
         else:

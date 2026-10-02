@@ -31,6 +31,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"math/big"
 )
 
@@ -137,6 +138,102 @@ var (
 	db        *sql.DB
 	requestID uint64
 )
+
+// ─── PAM policy store (c3-0703) ─────────────────────────────────────────────
+// Access policies are seeded into redis — `pam:policy:{resource}` JSON and a
+// `pam:policy:index` SET of resource names, no TTL (policies are static) —
+// and read through from redis on every request so policy state is shared
+// across replicas and survives restarts. The in-code map remains as the seed
+// source. Failure policy: FAIL-CLOSED — a policy-store outage rejects the
+// privileged-access operation rather than evaluating without policy.
+
+const pamPolicyIndexKey = "pam:policy:index"
+
+func pamPolicyKey(resource string) string { return "pam:policy:" + resource }
+
+// Pooled go-redis client (canonical fleet pattern).
+var (
+	redisAddr       string
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
+)
+
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+}
+
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
+}
+
+// seedPAMPolicies writes the compiled-in policies to redis (NX: existing
+// entries win, so restarts never clobber operator-updated policies).
+func seedPAMPolicies() {
+	r := getRedisClient()
+	for resource, pol := range policies {
+		data, err := json.Marshal(pol)
+		if err != nil {
+			log.Printf("[PAM] cannot marshal policy for %s: %v", resource, err)
+			continue
+		}
+		if err := r.SetNX(redisCtx, pamPolicyKey(resource), data, 0).Err(); err != nil {
+			log.Printf("[PAM] policy seed failed for %s (reads fail closed): %v", resource, err)
+		}
+		if err := r.SAdd(redisCtx, pamPolicyIndexKey, resource).Err(); err != nil {
+			log.Printf("[PAM] policy index seed failed for %s: %v", resource, err)
+		}
+	}
+}
+
+// getPolicy reads a single policy back from redis (read-through).
+// Returns (nil, nil) when no policy is defined for the resource.
+func getPolicy(resource string) (*AccessPolicy, error) {
+	data, err := getRedisClient().Get(redisCtx, pamPolicyKey(resource)).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("policy store unavailable: %w", err)
+	}
+	var pol AccessPolicy
+	if err := json.Unmarshal([]byte(data), &pol); err != nil {
+		return nil, fmt.Errorf("policy for %s undecodable: %w", resource, err)
+	}
+	return &pol, nil
+}
+
+// listPolicies reads all policies back from redis (read-through).
+func listPolicies() (map[string]*AccessPolicy, error) {
+	r := getRedisClient()
+	resources, err := r.SMembers(redisCtx, pamPolicyIndexKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("policy index unreadable: %w", err)
+	}
+	out := make(map[string]*AccessPolicy, len(resources))
+	for _, resource := range resources {
+		pol, err := getPolicy(resource)
+		if err != nil {
+			return nil, err
+		}
+		if pol != nil {
+			out[resource] = pol
+		}
+	}
+	return out, nil
+}
 
 // ─── Database Schema ────────────────────────────────────────────────────────
 
@@ -390,8 +487,12 @@ func createAccessRequest(req *AccessRequest) error {
 	req.Status = "pending"
 	req.AuditTrail = []string{fmt.Sprintf("%s: request created by %s for %s (%s)", req.CreatedAt.Format(time.RFC3339), req.RequestorID, req.Resource, req.AccessLevel)}
 
-	policy, ok := policies[req.Resource]
-	if !ok {
+	policy, err := getPolicy(req.Resource)
+	if err != nil {
+		// fail-closed: never create privileged access without policy state
+		return fmt.Errorf("cannot evaluate policy for %q: %w", req.Resource, err)
+	}
+	if policy == nil {
 		return fmt.Errorf("no policy defined for resource %q", req.Resource)
 	}
 	if req.Duration > policy.MaxDuration {
@@ -447,7 +548,14 @@ func approveRequest(reqID, approverID string) error {
 		}
 	}
 
-	policy := policies[req.Resource]
+	policy, err := getPolicy(req.Resource)
+	if err != nil {
+		// fail-closed: never approve privileged access without policy state
+		return fmt.Errorf("cannot evaluate policy for %q: %w", req.Resource, err)
+	}
+	if policy == nil {
+		return fmt.Errorf("no policy defined for resource %q", req.Resource)
+	}
 	req.ApprovalChain = append(req.ApprovalChain, approverID)
 	req.AuditTrail = append(req.AuditTrail, fmt.Sprintf("%s: approved by %s (%d/%d)", time.Now().Format(time.RFC3339), approverID, len(req.ApprovalChain), policy.RequiredApprovers))
 
@@ -687,10 +795,15 @@ func handleListRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleListPolicies(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(policies)
+	pols, err := listPolicies()
+	if err != nil {
+		// fail-closed: never serve a stale/empty policy catalog as authoritative
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "policy store unavailable"})
+		return
+	}
+	json.NewEncoder(w).Encode(pols)
 }
 
 func handleActiveSessions(w http.ResponseWriter, r *http.Request) {
@@ -713,9 +826,19 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		"active_sessions": len(sessions),
 		"denied":          denied,
 		"expired":         expired,
-		"policies":        len(policies),
+		"policies":        policyCountOrUnavailable(),
 		"uptime_seconds":  int(time.Since(startTime).Seconds()),
 	})
+}
+
+// policyCountOrUnavailable returns SCARD of the policy index; -1 signals the
+// policy store is unavailable.
+func policyCountOrUnavailable() int64 {
+	n, err := getRedisClient().SCard(redisCtx, pamPolicyIndexKey).Result()
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 // ─── Middleware ──────────────────────────────────────────────────────────────
@@ -1149,6 +1272,7 @@ func main() {
 
 	startWatchdog()
 	go expireLoop()
+	seedPAMPolicies() // c3-0703: seed PAM policies into redis (NX)
 
 	mux := http.NewServeMux()
 
@@ -1156,14 +1280,14 @@ func main() {
 	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 
-	mux.Handle("/api/v1/pam/request", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleRequestAccess)))
-	mux.Handle("/api/v1/pam/approve", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleApproveRequest)))
-	mux.Handle("/api/v1/pam/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleValidateSession)))
-	mux.Handle("/api/v1/pam/revoke", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleRevokeSession)))
-	mux.Handle("/api/v1/pam/requests", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleListRequests)))
-	mux.Handle("/api/v1/pam/sessions", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleActiveSessions)))
-	mux.Handle("/api/v1/pam/policies", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleListPolicies)))
-	mux.Handle("/api/v1/pam/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
+	mux.Handle("/api/v1/pam/request", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "request", http.HandlerFunc(handleRequestAccess))))
+	mux.Handle("/api/v1/pam/approve", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "approve", http.HandlerFunc(handleApproveRequest))))
+	mux.Handle("/api/v1/pam/validate", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "validate", http.HandlerFunc(handleValidateSession))))
+	mux.Handle("/api/v1/pam/revoke", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "revoke", http.HandlerFunc(handleRevokeSession))))
+	mux.Handle("/api/v1/pam/requests", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "manage", http.HandlerFunc(handleListRequests))))
+	mux.Handle("/api/v1/pam/sessions", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "manage", http.HandlerFunc(handleActiveSessions))))
+	mux.Handle("/api/v1/pam/policies", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "manage", http.HandlerFunc(handleListPolicies))))
+	mux.Handle("/api/v1/pam/stats", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("privileged_access", "view", http.HandlerFunc(handleStats))))
 
 	handler := panicRecoveryMiddleware(rateLimitMiddleware(loggingMiddleware(mux)))
 

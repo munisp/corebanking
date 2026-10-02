@@ -1,11 +1,12 @@
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::PgPool;
 use tracing::{info, warn, error};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, sqlx::FromRow)]
 struct Valuation {
     id: String,
     collateral_id: String,
@@ -35,8 +36,56 @@ struct ValuationRequest {
     condition: String,
 }
 
+// Wave-12 (C3-P2-RSVEC): valuations are served from Postgres (was: in-memory
+// Mutex<Vec<Valuation>> lost on every restart). Typed columns matching the
+// all-scalar Valuation shape; id is the natural/unique key. None => 503 (no
+// silent memory fallback).
 struct AppState {
-    valuations: Mutex<Vec<Valuation>>,
+    db: Option<PgPool>,
+}
+
+const VALUATION_COLS: &str = "id, collateral_id, collateral_type, description, owner, \
+     market_value, forced_sale_value, haircut_pct, net_realizable_value, currency, valuer, \
+     valuation_date, expiry_date, insurance_value, insurance_expiry, lien_status, status";
+
+async fn init_db(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS valuations (
+            id TEXT PRIMARY KEY,
+            collateral_id TEXT NOT NULL DEFAULT '',
+            collateral_type TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            owner TEXT NOT NULL DEFAULT '',
+            market_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+            forced_sale_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+            haircut_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
+            net_realizable_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            valuer TEXT NOT NULL DEFAULT '',
+            valuation_date TEXT NOT NULL DEFAULT '',
+            expiry_date TEXT NOT NULL DEFAULT '',
+            insurance_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+            insurance_expiry TEXT NOT NULL DEFAULT '',
+            lien_status TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        error!("collateral-valuation-rs: valuations DDL failed: {}", e);
+    }
+}
+
+async fn fetch_valuations(pool: &PgPool) -> Result<Vec<Valuation>, sqlx::Error> {
+    sqlx::query_as::<_, Valuation>(&format!(
+        "SELECT {} FROM valuations ORDER BY id",
+        VALUATION_COLS
+    ))
+    .fetch_all(pool)
+    .await
 }
 
 
@@ -56,13 +105,29 @@ async fn healthz() -> HttpResponse {
 async fn list_valuations(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     info!("Listing valuations");
-    let vals = data.valuations.lock().unwrap();
-    info!("Returning {} valuations", vals.len());
-    HttpResponse::Ok().json(serde_json::json!({ "items": *vals, "total": vals.len() }))
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => {
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "valuation_store_unavailable"}));
+        }
+    };
+    let vals = match fetch_valuations(pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("collateral-valuation-rs: list_valuations query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "valuation_store_unavailable"}));
+        }
+    };
+    let total = vals.len();
+    info!("Returning {} valuations", total);
+    HttpResponse::Ok().json(serde_json::json!({ "items": vals, "total": total }))
 }
 
 async fn compute_fsv(req: actix_web::HttpRequest, body: web::Json<ValuationRequest>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "collateral_valuation", "collection", "compute").await { return resp; }
     let req = body.into_inner();
     info!("Computing FSV for collateral_type: {}, market_value: {}", req.collateral_type, req.market_value);
     if req.market_value <= 0.0 {
@@ -113,7 +178,21 @@ async fn compute_fsv(req: actix_web::HttpRequest, body: web::Json<ValuationReque
 async fn valuation_summary(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     info!("Computing valuation summary");
-    let vals = data.valuations.lock().unwrap();
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => {
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "valuation_store_unavailable"}));
+        }
+    };
+    let vals = match fetch_valuations(pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("collateral-valuation-rs: valuation_summary query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "valuation_store_unavailable"}));
+        }
+    };
     let mut total_market = 0.0_f64;
     let mut total_fsv = 0.0_f64;
     let mut by_type: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
@@ -331,6 +410,103 @@ fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
         .map(String::from)
 }
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = verified JWT tenant claim
+// (fallback: X-Tenant-Id header, PERMIFY_DEFAULT_TENANT, "bpmgd"), resource =
+// domain entity id, permission per action (schema: canonical v2.perm
+// service_config entity + services/auth-service/schemas/permify/
+// v2-core-domain-rs.fragment). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (services/risk-scoring-rs/src/main.rs).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    use actix_web::HttpMessage as _;
+    let (subject, claim_tenant) = {
+        let ext = req.extensions();
+        match ext.get::<VerifiedClaims>() {
+            Some(c) => (
+                c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ),
+            None => (None, None),
+        }
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Initialize logging
@@ -349,13 +525,32 @@ async fn main() -> std::io::Result<()> {
         "0.0.0.0:8154".to_string()
     });
 
-    // LN-14: no seed data. Valuations are produced on demand by the real FSV
-    // calculator (POST /v1/valuations/compute-fsv).
-    let valuations: Vec<Valuation> = Vec::new();
+    // Wave-12 (C3-P2-RSVEC): Postgres is the valuation store (was in-memory Vec,
+    // always empty — valuations are produced on demand by the FSV calculator).
+    // DATABASE_URL optional: when unset the pool is None and reads fail closed
+    // (503) rather than falling back to memory.
+    let db: Option<PgPool> = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => Some(p),
+            Err(e) => {
+                error!("collateral-valuation-rs: invalid DATABASE_URL: {} — reads will return 503", e);
+                None
+            }
+        },
+        Err(_) => {
+            warn!("collateral-valuation-rs: DATABASE_URL not set — reads will return 503");
+            None
+        }
+    };
+    if let Some(pool) = db.as_ref() {
+        init_db(pool).await;
+    }
 
-    let state = web::Data::new(AppState {
-        valuations: Mutex::new(valuations),
-    });
+    let state = web::Data::new(AppState { db });
 
     info!("Binding to address: {}", addr);
     let addr_clone = addr.clone();

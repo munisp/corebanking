@@ -4,18 +4,83 @@
  * - QR code generation for authenticator apps
  * - Backup recovery codes
  * - MFA enrollment and verification
+ *
+ * W12-C3-P0 (top-risk #3): TOTP secrets + backup codes were held in a
+ * process-memory Map — restart un-enrolled every user, and replicas disagreed.
+ * Per the C3 plan §3.5 they now persist to `postgres:mfa_secrets` with the
+ * secret ENVELOPE-ENCRYPTED (lib/kmsEnvelope.ts, AES-256-GCM under
+ * KMS_MASTER_KEY, structured for a later Vault/KMS swap) and backup codes
+ * one-way hashed (scrypt, self-describing format, argon2id swap documented).
+ * Plain PG storage of the secret was rejected by the plan.
  */
 import { Request, Response, Express } from "express";
 import crypto from "crypto";
+import { sql } from "drizzle-orm";
 import { logger } from "./logger";
+import { exec, ensureTables } from "./pgJsonStore";
+import { envelopeEncrypt, envelopeDecrypt, hashBackupCode, verifyBackupCodeHash } from "./kmsEnvelope";
 
 // TOTP constants
 const TOTP_PERIOD = 30;
 const TOTP_DIGITS = 6;
 const TOTP_WINDOW = 1; // Accept tokens ±1 period
 
-// In-memory MFA state (replace with DB in production)
-const mfaSecrets: Map<string, { secret: string; enabled: boolean; backupCodes: string[] }> = new Map();
+const MFA_DDL: string[] = [
+  `CREATE TABLE IF NOT EXISTS mfa_secrets (
+    user_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL DEFAULT '',
+    secret_ciphertext TEXT NOT NULL,
+    backup_code_hashes JSONB NOT NULL DEFAULT '[]',
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    enrolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    rotated_at TIMESTAMPTZ
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_mfa_secrets_tenant ON mfa_secrets(tenant_id)`,
+];
+
+function ensure(): Promise<void> {
+  return ensureTables("mfaTotp", MFA_DDL);
+}
+
+interface MfaRecord {
+  secret: string;
+  enabled: boolean;
+  backupCodeHashes: string[];
+}
+
+function tenantOf(req: Request): string {
+  return (req.headers["x-tenant-id"] as string) ?? "";
+}
+
+async function loadMfa(userId: string): Promise<MfaRecord | null> {
+  const rows = await exec<{
+    secret_ciphertext: string; backup_code_hashes: string[] | string; enabled: boolean;
+  }>(sql`SELECT secret_ciphertext, backup_code_hashes, enabled FROM mfa_secrets WHERE user_id = ${userId}`);
+  if (rows.length === 0) return null;
+  const r = rows[0];
+  const hashes = typeof r.backup_code_hashes === "string" ? JSON.parse(r.backup_code_hashes) : r.backup_code_hashes;
+  return {
+    secret: envelopeDecrypt(r.secret_ciphertext),
+    enabled: r.enabled,
+    backupCodeHashes: Array.isArray(hashes) ? hashes : [],
+  };
+}
+
+async function saveMfa(userId: string, tenantId: string, rec: MfaRecord): Promise<void> {
+  await exec(
+    sql`INSERT INTO mfa_secrets (user_id, tenant_id, secret_ciphertext, backup_code_hashes, enabled, enrolled_at, rotated_at)
+        VALUES (${userId}, ${tenantId}, ${envelopeEncrypt(rec.secret)}, ${JSON.stringify(rec.backupCodeHashes)}::jsonb, ${rec.enabled}, NOW(), NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+          secret_ciphertext = EXCLUDED.secret_ciphertext,
+          backup_code_hashes = EXCLUDED.backup_code_hashes,
+          enabled = EXCLUDED.enabled,
+          rotated_at = NOW()`,
+  );
+}
+
+async function deleteMfa(userId: string): Promise<void> {
+  await exec(sql`DELETE FROM mfa_secrets WHERE user_id = ${userId}`);
+}
 
 function generateBase32Secret(): string {
   const bytes = crypto.randomBytes(20);
@@ -73,94 +138,120 @@ function generateBackupCodes(count = 8): string[] {
   );
 }
 
+function dbUnavailable(res: Response, err: unknown) {
+  logger.error("mfaTotp: store unavailable", { error: String(err) });
+  return res.status(503).json({ error: "mfa_store_unavailable", message: "MFA store (Postgres/KMS envelope) unavailable; refusing to fall back to memory" });
+}
+
 export function registerMfaRoutes(app: Express) {
   // POST /api/auth/mfa/enroll — start MFA enrollment
-  app.post("/api/auth/mfa/enroll", (req: Request, res: Response) => {
+  app.post("/api/auth/mfa/enroll", async (req: Request, res: Response) => {
     const user = (req as any).user;
     if (!user) return res.status(401).json({ error: "Authentication required" });
 
-    const secret = generateBase32Secret();
-    const backupCodes = generateBackupCodes();
-    mfaSecrets.set(user.openId, { secret, enabled: false, backupCodes });
+    try {
+      await ensure();
+      const secret = generateBase32Secret();
+      const backupCodes = generateBackupCodes();
+      await saveMfa(user.openId, tenantOf(req), {
+        secret,
+        enabled: false,
+        backupCodeHashes: backupCodes.map(hashBackupCode),
+      });
 
-    const otpauthUrl = `otpauth://totp/54Bank:${user.email}?secret=${secret}&issuer=54Bank&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD}`;
+      const otpauthUrl = `otpauth://totp/54Bank:${user.email}?secret=${secret}&issuer=54Bank&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD}`;
 
-    logger.info(`MFA enrollment started for ${user.email}`);
-    return res.json({
-      secret,
-      otpauthUrl,
-      backupCodes,
-      qrCodeUrl: `https://chart.googleapis.com/chart?cht=qr&chs=200x200&chl=${encodeURIComponent(otpauthUrl)}`,
-    });
+      logger.info(`MFA enrollment started for ${user.email}`);
+      return res.json({
+        secret,
+        otpauthUrl,
+        backupCodes,
+        qrCodeUrl: `https://chart.googleapis.com/chart?cht=qr&chs=200x200&chl=${encodeURIComponent(otpauthUrl)}`,
+      });
+    } catch (err) { return dbUnavailable(res, err); }
   });
 
   // POST /api/auth/mfa/verify — verify TOTP and enable MFA
-  app.post("/api/auth/mfa/verify", (req: Request, res: Response) => {
+  app.post("/api/auth/mfa/verify", async (req: Request, res: Response) => {
     const user = (req as any).user;
     if (!user) return res.status(401).json({ error: "Authentication required" });
 
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: "TOTP token required" });
 
-    const mfa = mfaSecrets.get(user.openId);
-    if (!mfa) return res.status(400).json({ error: "MFA not enrolled" });
+    try {
+      await ensure();
+      const mfa = await loadMfa(user.openId);
+      if (!mfa) return res.status(400).json({ error: "MFA not enrolled" });
 
-    if (verifyTOTP(mfa.secret, token)) {
-      mfa.enabled = true;
-      logger.info(`MFA enabled for ${user.email}`);
-      return res.json({ verified: true, mfaEnabled: true });
-    }
+      if (verifyTOTP(mfa.secret, token)) {
+        mfa.enabled = true;
+        await saveMfa(user.openId, tenantOf(req), mfa);
+        logger.info(`MFA enabled for ${user.email}`);
+        return res.json({ verified: true, mfaEnabled: true });
+      }
 
-    return res.status(401).json({ error: "Invalid TOTP token" });
+      return res.status(401).json({ error: "Invalid TOTP token" });
+    } catch (err) { return dbUnavailable(res, err); }
   });
 
   // POST /api/auth/mfa/validate — validate TOTP during login
-  app.post("/api/auth/mfa/validate", (req: Request, res: Response) => {
+  app.post("/api/auth/mfa/validate", async (req: Request, res: Response) => {
     const { userId, token, backupCode } = req.body;
     if (!userId) return res.status(400).json({ error: "userId required" });
 
-    const mfa = mfaSecrets.get(userId);
-    if (!mfa || !mfa.enabled) {
-      return res.json({ valid: true, mfaRequired: false });
-    }
-
-    if (token && verifyTOTP(mfa.secret, token)) {
-      return res.json({ valid: true });
-    }
-
-    if (backupCode) {
-      const idx = mfa.backupCodes.indexOf(backupCode.toUpperCase());
-      if (idx >= 0) {
-        mfa.backupCodes.splice(idx, 1);
-        logger.info(`Backup code used for ${userId}, ${mfa.backupCodes.length} remaining`);
-        return res.json({ valid: true, backupCodesRemaining: mfa.backupCodes.length });
+    try {
+      await ensure();
+      const mfa = await loadMfa(userId);
+      if (!mfa || !mfa.enabled) {
+        return res.json({ valid: true, mfaRequired: false });
       }
-    }
 
-    return res.status(401).json({ error: "Invalid MFA token or backup code" });
+      if (token && verifyTOTP(mfa.secret, token)) {
+        return res.json({ valid: true });
+      }
+
+      if (backupCode) {
+        const idx = mfa.backupCodeHashes.findIndex((h) => verifyBackupCodeHash(backupCode, h));
+        if (idx >= 0) {
+          mfa.backupCodeHashes.splice(idx, 1);
+          await saveMfa(userId, tenantOf(req), mfa);
+          logger.info(`Backup code used for ${userId}, ${mfa.backupCodeHashes.length} remaining`);
+          return res.json({ valid: true, backupCodesRemaining: mfa.backupCodeHashes.length });
+        }
+      }
+
+      return res.status(401).json({ error: "Invalid MFA token or backup code" });
+    } catch (err) { return dbUnavailable(res, err); }
   });
 
   // GET /api/auth/mfa/status — check MFA status
-  app.get("/api/auth/mfa/status", (req: Request, res: Response) => {
+  app.get("/api/auth/mfa/status", async (req: Request, res: Response) => {
     const user = (req as any).user;
     if (!user) return res.status(401).json({ error: "Authentication required" });
 
-    const mfa = mfaSecrets.get(user.openId);
-    return res.json({
-      enrolled: !!mfa,
-      enabled: mfa?.enabled ?? false,
-      backupCodesRemaining: mfa?.backupCodes.length ?? 0,
-    });
+    try {
+      await ensure();
+      const mfa = await loadMfa(user.openId);
+      return res.json({
+        enrolled: !!mfa,
+        enabled: mfa?.enabled ?? false,
+        backupCodesRemaining: mfa?.backupCodeHashes.length ?? 0,
+      });
+    } catch (err) { return dbUnavailable(res, err); }
   });
 
   // DELETE /api/auth/mfa/disable — disable MFA
-  app.delete("/api/auth/mfa/disable", (req: Request, res: Response) => {
+  app.delete("/api/auth/mfa/disable", async (req: Request, res: Response) => {
     const user = (req as any).user;
     if (!user) return res.status(401).json({ error: "Authentication required" });
 
-    mfaSecrets.delete(user.openId);
-    logger.info(`MFA disabled for ${user.email}`);
-    return res.json({ mfaEnabled: false });
+    try {
+      await ensure();
+      await deleteMfa(user.openId);
+      logger.info(`MFA disabled for ${user.email}`);
+      return res.json({ mfaEnabled: false });
+    } catch (err) { return dbUnavailable(res, err); }
   });
 
   logger.info("MFA/TOTP routes registered: enroll, verify, validate, status, disable");

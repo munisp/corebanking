@@ -53,18 +53,22 @@ export interface AccountSummary {
   accountType: string;
 }
 
+// W12-A4-P0-D: repointed from the unserved /account/v1/* namespace to
+// account-service /statements/* routes (transactions list is in-service;
+// transactions/{id}, reverse and accounts/{id}/summary were created in W12 —
+// see services/account-service/api/v1/statements.py).
 export const transactionApi = {
   list: (params?: { page?: number; limit?: number; accountId?: string; status?: string; from?: string; to?: string }) =>
-    apiClient.get<TransactionListResponse>(`${APISIX.ACCOUNT}/v1/transactions`, { params }).then((r) => r.data),
+    apiClient.get<TransactionListResponse>(`${APISIX.ACCOUNT}/statements/transactions`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<Transaction>(`${APISIX.ACCOUNT}/v1/transactions/${id}`).then((r) => r.data),
+    apiClient.get<Transaction>(`${APISIX.ACCOUNT}/statements/transactions/${id}`).then((r) => r.data),
 
   reverse: (id: string, reason: string) =>
-    apiClient.post(`${APISIX.ACCOUNT}/v1/transactions/${id}/reverse`, { reason }).then((r) => r.data),
+    apiClient.post(`${APISIX.ACCOUNT}/statements/transactions/${id}/reverse`, { reason }).then((r) => r.data),
 
   getAccountSummary: (accountId: string) =>
-    apiClient.get<AccountSummary>(`${APISIX.ACCOUNT}/v1/accounts/${accountId}/summary`).then((r) => r.data),
+    apiClient.get<AccountSummary>(`${APISIX.ACCOUNT}/statements/accounts/${accountId}/summary`).then((r) => r.data),
 };
 
 // ─── Payment Processing / Transfer ────────────────────────────────────────────
@@ -207,6 +211,9 @@ export interface ATMStats {
   totalTransactions: number;
 }
 
+// W12-A4-P0-D: APISIX.ATM now points at the dedicated /atm-management gateway
+// prefix (atm-management-go) whose /v1/atms* REST endpoints were created in
+// W12 — the previous /account/v1/atms* namespace was served by nothing.
 export const atmApi = {
   list: (params?: { page?: number; limit?: number; branchId?: string; status?: string }) =>
     apiClient.get<{ items: ATMDevice[]; total: number }>(`${APISIX.ATM}/v1/atms`, { params }).then((r) => r.data),

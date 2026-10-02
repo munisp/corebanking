@@ -7,6 +7,7 @@
 //! source is unavailable the run fails fast (503) and dashboards report zeros.
 
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -14,6 +15,7 @@ use tokio::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 use chrono::Utc;
+use sqlx::PgPool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReconJob {
@@ -35,7 +37,7 @@ struct ReconJob {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct ReconException {
     id: String,
     job_id: String,
@@ -69,9 +71,51 @@ struct ResolveRequest {
 
 struct AppState {
     start_time: Instant,
-    jobs: Mutex<Vec<ReconJob>>,
-    exceptions: Mutex<Vec<ReconException>>,
+    db: Option<PgPool>,
     db_url: Option<String>,
+}
+
+// ReconJob carries u64 fields (no sqlx-postgres codec) => JSONB payload.
+async fn persist_job(pool: &PgPool, job: &ReconJob) -> Result<(), sqlx::Error> {
+    let payload = serde_json::to_value(job).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query("INSERT INTO recon_jobs (job_id, payload) VALUES ($1, $2) ON CONFLICT (job_id) DO UPDATE SET payload = EXCLUDED.payload")
+        .bind(&job.job_id)
+        .bind(payload)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn load_jobs(pool: &PgPool) -> Result<Vec<ReconJob>, sqlx::Error> {
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM recon_jobs ORDER BY created_at")
+        .fetch_all(pool)
+        .await?;
+    let mut jobs = Vec::with_capacity(rows.len());
+    for v in rows {
+        let j: ReconJob = serde_json::from_value(v).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        jobs.push(j);
+    }
+    Ok(jobs)
+}
+
+async fn persist_exception(pool: &PgPool, exc: &ReconException) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO recon_exceptions (id, job_id, exception_type, source_ref, target_ref, source_amount, target_amount, difference, channel, status, assigned_to, resolution, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, assigned_to = EXCLUDED.assigned_to, resolution = EXCLUDED.resolution")
+        .bind(&exc.id).bind(&exc.job_id).bind(&exc.exception_type).bind(&exc.source_ref).bind(&exc.target_ref)
+        .bind(exc.source_amount).bind(exc.target_amount).bind(exc.difference).bind(&exc.channel).bind(&exc.status)
+        .bind(&exc.assigned_to).bind(&exc.resolution).bind(&exc.created_at)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn load_exceptions(pool: &PgPool) -> Result<Vec<ReconException>, sqlx::Error> {
+    sqlx::query_as::<_, ReconException>("SELECT id, job_id, exception_type, source_ref, target_ref, source_amount, target_amount, difference, channel, status, assigned_to, resolution, created_at FROM recon_exceptions ORDER BY created_at")
+        .fetch_all(pool)
+        .await
+}
+
+fn db_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({"error": "persistence_unavailable", "detail": detail}))
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -234,6 +278,7 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
 
 async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "reconciliation", "run").await { return resp; } // W12-B5D1
     let channel = body.channel.clone().unwrap_or_else(|| "NIP".into());
     let biz_date = body.business_date.clone().unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
     let start = Instant::now();
@@ -255,7 +300,6 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 error: Some("source_unavailable".into()),
             };
-            state.jobs.lock().await.push(job.clone());
             return HttpResponse::ServiceUnavailable().json(json!({"job": job, "error": "source_unavailable"}));
         }
     };
@@ -283,8 +327,18 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 error: None,
             };
-            state.jobs.lock().await.push(job.clone());
-            state.exceptions.lock().await.extend(new_exceptions);
+            let pool = match &state.db {
+                Some(p) => p,
+                None => return db_unavailable("recon_jobs pool not configured"),
+            };
+            if let Err(e) = persist_job(pool, &job).await {
+                return db_unavailable(&format!("recon_jobs persist failed: {}", e));
+            }
+            for exc in &new_exceptions {
+                if let Err(e) = persist_exception(pool, exc).await {
+                    return db_unavailable(&format!("recon_exceptions persist failed: {}", e));
+                }
+            }
             HttpResponse::Ok().json(json!({
                 "job": job,
                 "summary": {
@@ -312,7 +366,11 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 error: Some("source_unavailable".into()),
             };
-            state.jobs.lock().await.push(job.clone());
+            if let Some(pool) = &state.db {
+                if let Err(pe) = persist_job(pool, &job).await {
+                    eprintln!("[recon-engine-rs] failed-job persist error: {}", pe);
+                }
+            }
             HttpResponse::ServiceUnavailable().json(json!({"job": job, "error": "source_unavailable", "detail": e}))
         }
     }
@@ -320,39 +378,63 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
 
 async fn list_jobs(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let jobs = state.jobs.lock().await;
-    HttpResponse::Ok().json(json!({"jobs": *jobs, "total": jobs.len()}))
+    let pool = match &state.db { Some(p) => p, None => return db_unavailable("recon_jobs pool not configured") };
+    let jobs = match load_jobs(pool).await {
+        Ok(j) => j,
+        Err(e) => return db_unavailable(&format!("recon_jobs read failed: {}", e)),
+    };
+    HttpResponse::Ok().json(json!({"jobs": jobs, "total": jobs.len()}))
 }
 
 async fn list_exceptions(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let excs = state.exceptions.lock().await;
+    let pool = match &state.db { Some(p) => p, None => return db_unavailable("recon_exceptions pool not configured") };
+    let excs = match load_exceptions(pool).await {
+        Ok(x) => x,
+        Err(e) => return db_unavailable(&format!("recon_exceptions read failed: {}", e)),
+    };
     let open = excs.iter().filter(|e| e.status == "open").count();
     let resolved = excs.iter().filter(|e| e.status == "resolved").count();
     HttpResponse::Ok().json(json!({
-        "exceptions": *excs, "total": excs.len(),
+        "exceptions": excs, "total": excs.len(),
         "open": open, "resolved": resolved,
     }))
 }
 
 async fn resolve_exception(req: actix_web::HttpRequest, body: web::Json<ResolveRequest>, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let mut excs = state.exceptions.lock().await;
-    for exc in excs.iter_mut() {
-        if exc.id == body.exception_id {
-            exc.status = "resolved".into();
-            exc.resolution = Some(body.resolution.clone());
-            exc.assigned_to = Some(body.resolved_by.clone());
-            return HttpResponse::Ok().json(json!({"resolved": true, "exception": exc.clone()}));
+    if let Err(resp) = permify::require_permify(&req, "reconciliation", "resolve").await { return resp; } // W12-B5D1
+    let pool = match &state.db { Some(p) => p, None => return db_unavailable("recon_exceptions pool not configured") };
+    let updated = sqlx::query("UPDATE recon_exceptions SET status = 'resolved', resolution = $2, assigned_to = $3 WHERE id = $1")
+        .bind(&body.exception_id)
+        .bind(&body.resolution)
+        .bind(&body.resolved_by)
+        .execute(pool)
+        .await;
+    match updated {
+        Ok(res) if res.rows_affected() > 0 => {
+            match sqlx::query_as::<_, ReconException>("SELECT id, job_id, exception_type, source_ref, target_ref, source_amount, target_amount, difference, channel, status, assigned_to, resolution, created_at FROM recon_exceptions WHERE id = $1")
+                .bind(&body.exception_id).fetch_one(pool).await {
+                Ok(exc) => HttpResponse::Ok().json(json!({"resolved": true, "exception": exc})),
+                Err(e) => db_unavailable(&format!("recon_exceptions re-read failed: {}", e)),
+            }
         }
+        Ok(_) => HttpResponse::NotFound().json(json!({"error": format!("Exception not found: {}", body.exception_id)})),
+        Err(e) => db_unavailable(&format!("recon_exceptions update failed: {}", e)),
     }
-    HttpResponse::NotFound().json(json!({"error": format!("Exception not found: {}", body.exception_id)}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let jobs = state.jobs.lock().await;
-    let excs = state.exceptions.lock().await;
+    let pool = match &state.db { Some(p) => p, None => return db_unavailable("persistence pool not configured") };
+    let jobs = match load_jobs(pool).await {
+        Ok(j) => j,
+        Err(e) => return db_unavailable(&format!("recon_jobs read failed: {}", e)),
+    };
+    let excs = match load_exceptions(pool).await {
+        Ok(x) => x,
+        Err(e) => return db_unavailable(&format!("recon_exceptions read failed: {}", e)),
+    };
     let total_matched: u64 = jobs.iter().map(|j| j.matched).sum();
     let total_source: u64 = jobs.iter().map(|j| j.source_count).sum();
     let avg_match_rate = if total_source > 0 { total_matched as f64 / total_source as f64 * 100.0 } else { 0.0 };
@@ -379,8 +461,15 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn recon_dashboard(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let jobs = state.jobs.lock().await;
-    let excs = state.exceptions.lock().await;
+    let pool = match &state.db { Some(p) => p, None => return db_unavailable("persistence pool not configured") };
+    let jobs = match load_jobs(pool).await {
+        Ok(j) => j,
+        Err(e) => return db_unavailable(&format!("recon_jobs read failed: {}", e)),
+    };
+    let excs = match load_exceptions(pool).await {
+        Ok(x) => x,
+        Err(e) => return db_unavailable(&format!("recon_exceptions read failed: {}", e)),
+    };
 
     if jobs.is_empty() {
         // Never hardcode dashboard figures: no stored runs => zeros + no_runs.
@@ -668,7 +757,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -726,11 +815,11 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
                     if stream.read_exact(&mut payload).is_err() { return; }
                     let resp = if std::env::var("FAKE_GRPC_OK").ok().as_deref() == Some("1") {
                         // FAKE_GRPC_OK=1: legacy stub for local development only.
-                        format!(r#"{"status":"ok","service":"{}"}"#, service_name)
+                        format!(r#"{{"status":"ok","service":"{}"}}"#, service_name)
                     } else {
                         // gRPC UNIMPLEMENTED (status 12): never fabricate OK for
                         // an unimplemented handler.
-                        format!(r#"{"error":"unimplemented","grpcStatus":12,"service":"{}"}"#, service_name)
+                        format!(r#"{{"error":"unimplemented","grpcStatus":12,"service":"{}"}}"#, service_name)
                     };
                     let resp_bytes = resp.as_bytes();
                     let resp_len = (resp_bytes.len() as u32).to_be_bytes();
@@ -749,10 +838,41 @@ async fn main() -> std::io::Result<()> {
     if db_url.is_none() {
         eprintln!("[recon-engine-rs] DATABASE_URL not set — recon runs will fail fast (503), dashboard reports zeros");
     }
+    let db_pool: Option<PgPool> = db_url.as_ref().and_then(|u| {
+        match sqlx::postgres::PgPoolOptions::new().max_connections(10).connect_lazy(u) {
+            Ok(p) => Some(p),
+            Err(e) => { eprintln!("[recon-engine-rs] pool init failed: {}", e); None }
+        }
+    });
+    if let Some(pool) = &db_pool {
+        if let Err(e) = sqlx::query(r#"CREATE TABLE IF NOT EXISTS recon_jobs (
+            job_id TEXT PRIMARY KEY,
+            payload JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#).execute(pool).await {
+            eprintln!("[recon-engine-rs] recon_jobs schema init failed: {}", e);
+        }
+        if let Err(e) = sqlx::query(r#"CREATE TABLE IF NOT EXISTS recon_exceptions (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            exception_type TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            target_ref TEXT,
+            source_amount DOUBLE PRECISION NOT NULL,
+            target_amount DOUBLE PRECISION,
+            difference DOUBLE PRECISION,
+            channel TEXT NOT NULL,
+            status TEXT NOT NULL,
+            assigned_to TEXT,
+            resolution TEXT,
+            created_at TEXT NOT NULL
+        )"#).execute(pool).await {
+            eprintln!("[recon-engine-rs] recon_exceptions schema init failed: {}", e);
+        }
+    }
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        jobs: Mutex::new(Vec::new()),
-        exceptions: Mutex::new(Vec::new()),
+        db: db_pool,
         db_url,
     });
     println!("Recon Engine v3.0 (Rust) on :{} — 3-way transaction reconciliation", port);
@@ -799,3 +919,6 @@ mod tests {
         DB_AVAILABLE.store(true, AtomicOrdering::Relaxed);
     }
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

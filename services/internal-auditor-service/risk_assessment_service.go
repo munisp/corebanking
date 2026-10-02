@@ -11,7 +11,7 @@ import (
 // RiskAssessmentService handles risk assessment operations
 type RiskAssessmentService struct {
 	tenantID    string
-	assessments map[string]*RiskAssessment
+	assessments *repo[RiskAssessment]
 	mu          sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type RiskAssessmentService struct {
 func NewRiskAssessmentService(tenantID string) *RiskAssessmentService {
 	svc := &RiskAssessmentService{
 		tenantID:    tenantID,
-		assessments: make(map[string]*RiskAssessment),
+		assessments: newRepo[RiskAssessment](serviceDB, "audit_risk_assessments"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -30,7 +30,7 @@ func (s *RiskAssessmentService) initializeDefaultData(tenantID string) {
 	nextAudit := time.Now().AddDate(0, 6, 0)
 
 	// High risk - Treasury
-	s.assessments["ra-001"] = &RiskAssessment{
+	s.assessments.seed(tenantID, "ra-001", &RiskAssessment{
 		AssessmentID:         "ra-001",
 		TenantID:             tenantID,
 		AssessmentName:       "Treasury Operations Risk Assessment",
@@ -50,10 +50,10 @@ func (s *RiskAssessmentService) initializeDefaultData(tenantID string) {
 		Metadata:             make(map[string]interface{}),
 		CreatedAt:            time.Now().AddDate(0, -1, 0),
 		UpdatedAt:            time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// High risk - IT Security
-	s.assessments["ra-002"] = &RiskAssessment{
+	s.assessments.seed(tenantID, "ra-002", &RiskAssessment{
 		AssessmentID:         "ra-002",
 		TenantID:             tenantID,
 		AssessmentName:       "IT Security Risk Assessment",
@@ -73,10 +73,10 @@ func (s *RiskAssessmentService) initializeDefaultData(tenantID string) {
 		Metadata:             make(map[string]interface{}),
 		CreatedAt:            time.Now().AddDate(0, -1, 0),
 		UpdatedAt:            time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// Medium risk - Branch Operations
-	s.assessments["ra-003"] = &RiskAssessment{
+	s.assessments.seed(tenantID, "ra-003", &RiskAssessment{
 		AssessmentID:         "ra-003",
 		TenantID:             tenantID,
 		AssessmentName:       "Branch Operations Risk Assessment",
@@ -96,10 +96,10 @@ func (s *RiskAssessmentService) initializeDefaultData(tenantID string) {
 		Metadata:             make(map[string]interface{}),
 		CreatedAt:            time.Now().AddDate(0, -1, 0),
 		UpdatedAt:            time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// High risk - AML/CFT
-	s.assessments["ra-004"] = &RiskAssessment{
+	s.assessments.seed(tenantID, "ra-004", &RiskAssessment{
 		AssessmentID:         "ra-004",
 		TenantID:             tenantID,
 		AssessmentName:       "AML/CFT Compliance Risk Assessment",
@@ -119,10 +119,10 @@ func (s *RiskAssessmentService) initializeDefaultData(tenantID string) {
 		Metadata:             make(map[string]interface{}),
 		CreatedAt:            time.Now().AddDate(0, -1, 0),
 		UpdatedAt:            time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// Low risk - HR
-	s.assessments["ra-005"] = &RiskAssessment{
+	s.assessments.seed(tenantID, "ra-005", &RiskAssessment{
 		AssessmentID:         "ra-005",
 		TenantID:             tenantID,
 		AssessmentName:       "HR Operations Risk Assessment",
@@ -142,10 +142,10 @@ func (s *RiskAssessmentService) initializeDefaultData(tenantID string) {
 		Metadata:             make(map[string]interface{}),
 		CreatedAt:            time.Now().AddDate(0, -1, 0),
 		UpdatedAt:            time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// Draft assessment
-	s.assessments["ra-006"] = &RiskAssessment{
+	s.assessments.seed(tenantID, "ra-006", &RiskAssessment{
 		AssessmentID:         "ra-006",
 		TenantID:             tenantID,
 		AssessmentName:       "Lending Operations Risk Assessment",
@@ -162,16 +162,18 @@ func (s *RiskAssessmentService) initializeDefaultData(tenantID string) {
 		Metadata:             make(map[string]interface{}),
 		CreatedAt:            time.Now().AddDate(0, 0, -5),
 		UpdatedAt:            time.Now().AddDate(0, 0, -5),
-	}
+	})
 }
 
 // ListAssessments returns assessments based on filters
-func (s *RiskAssessmentService) ListAssessments(tenantID, status string) []*RiskAssessment {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *RiskAssessmentService) ListAssessments(tenantID, status string) ([]*RiskAssessment, error) {
 
 	var result []*RiskAssessment
-	for _, assessment := range s.assessments {
+	__ALL__, __ERR__ := s.assessments.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, assessment := range __ALL__ {
 		if assessment.TenantID != tenantID {
 			continue
 		}
@@ -180,16 +182,14 @@ func (s *RiskAssessmentService) ListAssessments(tenantID, status string) []*Risk
 		}
 		result = append(result, assessment)
 	}
-	return result
+	return result, nil
 }
 
 // GetAssessment retrieves an assessment by ID
 func (s *RiskAssessmentService) GetAssessment(tenantID, assessmentID string) (*RiskAssessment, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	assessment, exists := s.assessments[assessmentID]
-	if !exists || assessment.TenantID != tenantID {
+	assessment, err := s.assessments.get(tenantID, assessmentID)
+	if err != nil {
 		return nil, errors.New("assessment not found")
 	}
 	return assessment, nil
@@ -197,8 +197,6 @@ func (s *RiskAssessmentService) GetAssessment(tenantID, assessmentID string) (*R
 
 // CreateAssessment creates a new assessment
 func (s *RiskAssessmentService) CreateAssessment(tenantID, auditorID string, assessment *RiskAssessment) (*RiskAssessment, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	assessment.AssessmentID = uuid.New().String()
 	assessment.TenantID = tenantID
@@ -211,55 +209,50 @@ func (s *RiskAssessmentService) CreateAssessment(tenantID, auditorID string, ass
 	// Calculate risk score
 	assessment.RiskScore = s.calculateRiskScore(assessment.InherentRisk, assessment.ControlEffectiveness)
 
-	s.assessments[assessment.AssessmentID] = assessment
+	if err := s.assessments.put(tenantID, assessment.AssessmentID, assessment); err != nil {
+		return nil, err
+	}
 	return assessment, nil
 }
 
 // UpdateAssessment updates an assessment
 func (s *RiskAssessmentService) UpdateAssessment(assessment *RiskAssessment) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.assessments[assessment.AssessmentID]
-	if !exists || existing.TenantID != assessment.TenantID {
+	existing, err := s.assessments.get(assessment.TenantID, assessment.AssessmentID)
+	if err != nil {
 		return errors.New("assessment not found")
 	}
 
 	assessment.CreatedAt = existing.CreatedAt
 	assessment.UpdatedAt = time.Now()
 	assessment.RiskScore = s.calculateRiskScore(assessment.InherentRisk, assessment.ControlEffectiveness)
-	s.assessments[assessment.AssessmentID] = assessment
-	return nil
+	return s.assessments.put(assessment.TenantID, assessment.AssessmentID, assessment)
 }
 
 // ApproveAssessment approves an assessment
 func (s *RiskAssessmentService) ApproveAssessment(tenantID, assessmentID, approverID string) (*RiskAssessment, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.assessments.update(tenantID, assessmentID, func(assessment *RiskAssessment) error {
+		if assessment.Status != "draft" {
+			return errors.New("assessment is not in draft status")
+		}
 
-	assessment, exists := s.assessments[assessmentID]
-	if !exists || assessment.TenantID != tenantID {
-		return nil, errors.New("assessment not found")
-	}
+		assessment.ApprovedBy = approverID
+		assessment.Status = "approved"
+		assessment.UpdatedAt = time.Now()
 
-	if assessment.Status != "draft" {
-		return nil, errors.New("assessment is not in draft status")
-	}
-
-	assessment.ApprovedBy = approverID
-	assessment.Status = "approved"
-	assessment.UpdatedAt = time.Now()
-
-	return assessment, nil
+		return nil
+	})
 }
 
 // GetHighRiskAreas returns high risk areas
-func (s *RiskAssessmentService) GetHighRiskAreas(tenantID string) []*RiskAssessment {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *RiskAssessmentService) GetHighRiskAreas(tenantID string) ([]*RiskAssessment, error) {
 
 	var result []*RiskAssessment
-	for _, assessment := range s.assessments {
+	__ALL__, __ERR__ := s.assessments.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, assessment := range __ALL__ {
 		if assessment.TenantID != tenantID {
 			continue
 		}
@@ -267,7 +260,7 @@ func (s *RiskAssessmentService) GetHighRiskAreas(tenantID string) []*RiskAssessm
 			result = append(result, assessment)
 		}
 	}
-	return result
+	return result, nil
 }
 
 func (s *RiskAssessmentService) calculateRiskScore(inherentRisk, controlEffectiveness string) int {

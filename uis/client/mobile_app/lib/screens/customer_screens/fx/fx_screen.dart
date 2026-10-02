@@ -1,8 +1,26 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../../config/app_config.dart';
 import '../../../config/app_theme.dart';
 import '../../../services/api_service.dart';
+
+// W12-A4B: fx-service requires a tenant_id query/body field that must match
+// the x-tenant-id header (which ApiService sets from tenant_config).
+Future<String> _fxTenantId() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final tenantStr = prefs.getString('tenant_config');
+    if (tenantStr != null) {
+      final tenant = jsonDecode(tenantStr) as Map<String, dynamic>;
+      final id = tenant['tenant_id'] ?? tenant['id'];
+      if (id != null) return id.toString();
+    }
+  } catch (_) {}
+  return AppConfig.CURRENT_TENANT_ID;
+}
 
 class FXScreen extends StatefulWidget {
   const FXScreen({super.key});
@@ -39,14 +57,25 @@ class _FXScreenState extends State<FXScreen> with SingleTickerProviderStateMixin
   Future<void> _loadRates() async {
     setState(() { _loadingRates = true; _ratesError = null; });
     try {
-      final response = await _api.get('${AppConfig.fxEndpoint}/rates',
-          queryParameters: {'limit': 50}); // MOB-03: bound the fetch
+      // W12-A4B: fx-service rate LIST is GET /api/v1/fx/rates/all
+      // (?tenant_id&base_currency) -> { rates: {CCY: rate} } — expand the
+      // currency->rate map into the card model this screen renders.
+      final response = await _api.get('${AppConfig.fxEndpoint}/rates/all',
+          queryParameters: {'tenant_id': await _fxTenantId(), 'base_currency': 'NGN'});
       final data = response.data;
       List<dynamic> raw = [];
       if (data is List) {
         raw = data;
       } else if (data is Map && data['data'] is List) {
         raw = data['data'] as List;
+      } else if (data is Map && data['rates'] is Map) {
+        raw = (data['rates'] as Map).entries
+            .map((e) => {
+                  'currency': e.key.toString(),
+                  'rate': (e.value as num).toDouble(),
+                  'buy_rate': (e.value as num).toDouble(),
+                })
+            .toList();
       } else if (data is Map && data['rates'] is List) {
         raw = data['rates'] as List;
       }
@@ -62,8 +91,9 @@ class _FXScreenState extends State<FXScreen> with SingleTickerProviderStateMixin
   Future<void> _loadTransactions() async {
     setState(() { _loadingTransactions = true; _transactionsError = null; });
     try {
+      // W12-A4B: fx-service GET /api/v1/fx/transactions requires tenant_id.
       final response = await _api.get('${AppConfig.fxEndpoint}/transactions',
-          queryParameters: {'page': 1, 'limit': 50}); // MOB-03: bound the fetch
+          queryParameters: {'tenant_id': await _fxTenantId(), 'limit': 50}); // MOB-03: bound the fetch
       final data = response.data;
       List<dynamic> raw = [];
       if (data is List) {
@@ -139,11 +169,20 @@ class _FXScreenState extends State<FXScreen> with SingleTickerProviderStateMixin
     Navigator.pop(dialogContext);
     final currency = (rate['currency'] ?? rate['foreign_currency'] ?? '').toString();
     try {
-      await _api.post('${AppConfig.fxEndpoint}/exchange', data: {
-        'from_currency': 'NGN',
-        'to_currency': currency,
-        'amount': amount,
-      });
+      // W12-A4B: fx-service POST /api/v1/fx/exchange (ExchangeRequest:
+      // tenant_id/customer_id/from_currency/to_currency/from_amount) plus an
+      // x-actor-id header.
+      final prefs = await SharedPreferences.getInstance();
+      final actorId = prefs.getString('keycloak_id') ?? 'mobile-customer';
+      await _api.post('${AppConfig.fxEndpoint}/exchange',
+          data: {
+            'tenant_id': await _fxTenantId(),
+            'customer_id': actorId,
+            'from_currency': 'NGN',
+            'to_currency': currency,
+            'from_amount': amount,
+          },
+          headers: {'x-actor-id': actorId});
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Exchange of $amount $currency initiated'), backgroundColor: Colors.green),

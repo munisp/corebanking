@@ -1,0 +1,22 @@
+# W12-B5-P1-G: communication-hub referenced component 'communication-pubsub'
+# (communication_hub.go:1023, also omini-service copy :872) with NO manifest —
+# added here. Broker by evidence: the service dual-publishes the SAME topic var
+# to raw Kafka (communication_hub.go:1017-1020) and this component; its topics
+# (e.g. lakehouse.communication.events :1045, billing.communication.charges :1077)
+# are harvested Kafka literals with KafkaTopic CRDs (work/w12/kafka-topic-catalog.json),
+# so the component is pubsub.kafka, mirroring eod-pubsub.yaml.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: communication-pubsub
+  namespace: 54bank
+spec:
+  type: pubsub.kafka
+  version: v1
+  metadata:
+    - name: brokers
+      value: "localhost:9092"
+    - name: consumerGroup
+      value: "54bank-communication"
+    - name: authType
+      value: "none"

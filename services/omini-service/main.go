@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"shared/otel/go/otelkit"
@@ -143,6 +145,12 @@ type USSDMenuResponse struct {
 
 // ─── OminiServer ─────────────────────────────────────────────────────────────────
 
+// C3-P2-B5-go-2: the in-memory waMsg/waTpl/tgMsg slices (and their mutexes/
+// counters) were removed. WhatsApp/Telegram messages and WhatsApp templates
+// are business communication records and MUST be durable: they now live in
+// Postgres — omini_messages (channel-typed) + wa_templates — with boot-time
+// CREATE TABLE IF NOT EXISTS, idempotent seeds, and fail-closed handlers
+// (503 persistence_unavailable). No in-memory fallback on business data.
 type OminiServer struct {
 	router         *mux.Router
 	accountService string
@@ -150,14 +158,7 @@ type OminiServer struct {
 	ledgerService  string
 	fraudService   string
 
-	waMu      sync.RWMutex
-	waCounter int
-	waMsg     []WAMessage
-	waTpl     []WATemplate
-
-	tgMu      sync.RWMutex
-	tgCounter int
-	tgMsg     []TGMessage
+	db *sql.DB
 }
 
 func newServer() *OminiServer {
@@ -167,23 +168,124 @@ func newServer() *OminiServer {
 		paymentService: getEnv("PAYMENT_SERVICE_URL", "http://payment-service:8080"),
 		ledgerService:  getEnv("LEDGER_SERVICE_URL", "http://ledger-service:8080"),
 		fraudService:   getEnv("FRAUD_SERVICE_URL", "http://fraud-service:8080"),
-		waMsg: []WAMessage{
-			{ID: "WA-001", WAMessageID: "wamid.HBgLMjM0ODAxMjM0NTY3OBUCABEYEjVDRTU0", PhoneNumber: "+2348012345678", Direction: "outbound", TemplateName: "credit_alert_v2", MessageType: "template", Content: "Credit Alert: ₦500,000.00 from JOHN OKO", Status: "read", DeliveredAt: "2026-05-09T14:30:02Z", ReadAt: "2026-05-09T14:30:15Z"},
-			{ID: "WA-002", WAMessageID: "wamid.HBgLMjM0ODA5ODc2NTQzMhUCABEYEjVDRTU1", PhoneNumber: "+2348098765432", Direction: "outbound", TemplateName: "debit_alert_v2", MessageType: "template", Content: "Debit Alert: ₦150,000.00 to Grace Okafor", Status: "delivered", DeliveredAt: "2026-05-09T15:00:01Z"},
-		},
-		waTpl: []WATemplate{
-			{Name: "credit_alert_v2", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Credit Alert: {{1}} from {{2}}. Bal: {{3}}"}}},
-			{Name: "debit_alert_v2", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Debit Alert: {{1}} to {{2}}. Bal: {{3}}"}}},
-			{Name: "otp_delivery_v1", Language: "en", Category: "AUTHENTICATION", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Your OTP is {{1}}. Valid for {{2}} minutes."}}},
-			{Name: "fraud_alert_v1", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "URGENT: Suspicious transaction {{1}} on your account. Call 0800-54-BANK."}}},
-		},
-		tgMsg: []TGMessage{
-			{ID: "TG-001", ChatID: 1234567890, ChatType: "private", Direction: "inbound", Text: "/balance", Status: "processed", SentAt: "2026-05-09T10:00:00Z"},
-			{ID: "TG-002", ChatID: 1234567890, ChatType: "private", Direction: "outbound", Text: "Your balance is ₦1,250,000.00", Status: "delivered", SentAt: "2026-05-09T10:00:01Z"},
-		},
 	}
+	s.initDB()
 	s.setupRoutes()
 	return s
+}
+
+// initDB opens the Postgres pool and creates/seed the omnichannel tables
+// idempotently. When DATABASE_URL is unset or unreachable the server keeps
+// serving, but every message/template handler fails closed with 503.
+func (s *OminiServer) initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[omini] DATABASE_URL not set — persistence unavailable (fail-closed)")
+		return
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[omini] db open failed: %v — persistence unavailable (fail-closed)", err)
+		return
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err := db.Ping(); err != nil {
+		log.Printf("[omini] db ping failed: %v — persistence unavailable (fail-closed)", err)
+		return
+	}
+	s.db = db
+	s.initSchema()
+	log.Printf("[omini] Postgres connected (pool: 25/5)")
+}
+
+func (s *OminiServer) initSchema() {
+	stmts := []string{
+		// Channel-typed message store: channel = 'whatsapp' | 'telegram';
+		// message_key is the external id (WA-001 / TG-001); the remaining
+		// columns cover both channel shapes (nullable per channel).
+		`CREATE TABLE IF NOT EXISTS omini_messages (
+			id BIGSERIAL PRIMARY KEY,
+			channel TEXT NOT NULL,
+			message_key TEXT NOT NULL,
+			wa_message_id TEXT,
+			phone_number TEXT,
+			chat_id BIGINT,
+			chat_type TEXT,
+			direction TEXT NOT NULL,
+			template_name TEXT,
+			message_type TEXT,
+			content TEXT NOT NULL DEFAULT '',
+			parse_mode TEXT,
+			status TEXT NOT NULL DEFAULT '',
+			delivered_at TEXT,
+			read_at TEXT,
+			sent_at TEXT,
+			payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (channel, message_key)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_omini_messages_channel ON omini_messages(channel, created_at)`,
+		`CREATE TABLE IF NOT EXISTS wa_templates (
+			name TEXT NOT NULL,
+			language TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT '',
+			components JSONB NOT NULL DEFAULT '[]'::jsonb,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (name, language)
+		)`,
+		// External message ids come from per-channel sequences that start past
+		// the seed range (WA-001/002, TG-001/002 are seeded below).
+		`CREATE SEQUENCE IF NOT EXISTS omini_wa_number_seq START 3`,
+		`CREATE SEQUENCE IF NOT EXISTS omini_tg_number_seq START 3`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			log.Fatalf("[omini] schema init failed: %v", err)
+		}
+	}
+	// Idempotent seeds: the pre-PG in-memory seed set (ON CONFLICT DO NOTHING).
+	msgSeeds := []string{
+		`INSERT INTO omini_messages (channel, message_key, wa_message_id, phone_number, direction, template_name, message_type, content, status, delivered_at, read_at, sent_at) VALUES
+			('whatsapp', 'WA-001', 'wamid.HBgLMjM0ODAxMjM0NTY3OBUCABEYEjVDRTU0', '+2348012345678', 'outbound', 'credit_alert_v2', 'template', 'Credit Alert: ₦500,000.00 from JOHN OKO', 'read', '2026-05-09T14:30:02Z', '2026-05-09T14:30:15Z', NULL),
+			('whatsapp', 'WA-002', 'wamid.HBgLMjM0ODA5ODc2NTQzMhUCABEYEjVDRTU1', '+2348098765432', 'outbound', 'debit_alert_v2', 'template', 'Debit Alert: ₦150,000.00 to Grace Okafor', 'delivered', '2026-05-09T15:00:01Z', NULL, NULL),
+			('telegram', 'TG-001', NULL, NULL, 'inbound', NULL, NULL, '/balance', 'processed', NULL, NULL, '2026-05-09T10:00:00Z'),
+			('telegram', 'TG-002', NULL, NULL, 'outbound', NULL, NULL, 'Your balance is ₦1,250,000.00', 'delivered', NULL, NULL, '2026-05-09T10:00:01Z')
+			ON CONFLICT (channel, message_key) DO NOTHING`,
+	}
+	// Telegram seeds need chat columns — apply them via UPDATE-friendly form.
+	msgSeeds = append(msgSeeds,
+		`UPDATE omini_messages SET chat_id = 1234567890, chat_type = 'private' WHERE channel = 'telegram' AND message_key IN ('TG-001', 'TG-002') AND chat_id IS NULL`)
+	for _, stmt := range msgSeeds {
+		if _, err := s.db.Exec(stmt); err != nil {
+			log.Printf("[omini] message seed (may already exist): %v", err)
+		}
+	}
+	tplSeeds := []struct{ name, lang, cat, status, components string }{
+		{"credit_alert_v2", "en", "UTILITY", "APPROVED", `[{"type":"BODY","text":"Credit Alert: {{1}} from {{2}}. Bal: {{3}}"}]`},
+		{"debit_alert_v2", "en", "UTILITY", "APPROVED", `[{"type":"BODY","text":"Debit Alert: {{1}} to {{2}}. Bal: {{3}}"}]`},
+		{"otp_delivery_v1", "en", "AUTHENTICATION", "APPROVED", `[{"type":"BODY","text":"Your OTP is {{1}}. Valid for {{2}} minutes."}]`},
+		{"fraud_alert_v1", "en", "UTILITY", "APPROVED", `[{"type":"BODY","text":"URGENT: Suspicious transaction {{1}} on your account. Call 0800-54-BANK."}]`},
+	}
+	for _, t := range tplSeeds {
+		if _, err := s.db.Exec(`INSERT INTO wa_templates (name, language, category, status, components)
+			VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name, language) DO NOTHING`,
+			t.name, t.lang, t.cat, t.status, t.components); err != nil {
+			log.Printf("[omini] template seed %s (may already exist): %v", t.name, err)
+		}
+	}
+}
+
+// storeUnavailable fails closed when Postgres is unavailable (no in-memory
+// fallback on business data).
+func (s *OminiServer) storeUnavailable(w http.ResponseWriter) bool {
+	if s.db == nil {
+		respondJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "persistence_unavailable"})
+		return true
+	}
+	return false
 }
 
 // ─── route registration ───────────────────────────────────────────────────────────
@@ -250,16 +352,30 @@ func (s *OminiServer) waSendTemplate(w http.ResponseWriter, r *http.Request) {
 		Parameters   []map[string]interface{} `json:"parameters"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	s.waMu.Lock()
-	s.waCounter++
+	if s.storeUnavailable(w) {
+		return
+	}
+	var seq int64
+	if err := s.db.QueryRow(`SELECT nextval('omini_wa_number_seq')`).Scan(&seq); err != nil {
+		log.Printf("[omini] waSendTemplate seq failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	msg := WAMessage{
-		ID: fmt.Sprintf("WA-%03d", s.waCounter+2), WAMessageID: fmt.Sprintf("wamid.%d", time.Now().UnixNano()),
+		ID: fmt.Sprintf("WA-%03d", seq), WAMessageID: fmt.Sprintf("wamid.%d", time.Now().UnixNano()),
 		PhoneNumber: req.PhoneNumber, Direction: "outbound",
 		TemplateName: req.TemplateName, MessageType: "template",
 		Content: "Template message sent", Status: "accepted",
 	}
-	s.waMsg = append(s.waMsg, msg)
-	s.waMu.Unlock()
+	if _, err := s.db.Exec(`INSERT INTO omini_messages
+		(channel, message_key, wa_message_id, phone_number, direction, template_name, message_type, content, status)
+		VALUES ('whatsapp', $1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (channel, message_key) DO NOTHING`,
+		msg.ID, msg.WAMessageID, msg.PhoneNumber, msg.Direction, msg.TemplateName, msg.MessageType, msg.Content, msg.Status); err != nil {
+		log.Printf("[omini] waSendTemplate insert failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	respondJSON(w, 201, map[string]interface{}{"success": true, "message": msg})
 }
 
@@ -274,22 +390,76 @@ func (s *OminiServer) waWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *OminiServer) waMessages(w http.ResponseWriter, _ *http.Request) {
-	s.waMu.RLock()
-	defer s.waMu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"messages": s.waMsg, "total": len(s.waMsg)})
+	if s.storeUnavailable(w) {
+		return
+	}
+	rows, err := s.db.Query(`SELECT message_key, COALESCE(wa_message_id,''), COALESCE(phone_number,''), direction,
+		COALESCE(template_name,''), COALESCE(message_type,''), content, status,
+		COALESCE(delivered_at,''), COALESCE(read_at,'')
+		FROM omini_messages WHERE channel = 'whatsapp' ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		log.Printf("[omini] waMessages query failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer rows.Close()
+	msgs := []WAMessage{}
+	for rows.Next() {
+		var m WAMessage
+		if err := rows.Scan(&m.ID, &m.WAMessageID, &m.PhoneNumber, &m.Direction, &m.TemplateName, &m.MessageType, &m.Content, &m.Status, &m.DeliveredAt, &m.ReadAt); err != nil {
+			log.Printf("[omini] waMessages scan failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		msgs = append(msgs, m)
+	}
+	respondJSON(w, 200, map[string]interface{}{"messages": msgs, "total": len(msgs)})
 }
 
 func (s *OminiServer) waTemplates(w http.ResponseWriter, _ *http.Request) {
-	respondJSON(w, 200, map[string]interface{}{"templates": s.waTpl, "total": len(s.waTpl)})
+	if s.storeUnavailable(w) {
+		return
+	}
+	rows, err := s.db.Query(`SELECT name, language, category, status, components FROM wa_templates ORDER BY name`)
+	if err != nil {
+		log.Printf("[omini] waTemplates query failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer rows.Close()
+	tpls := []WATemplate{}
+	for rows.Next() {
+		var t WATemplate
+		var components []byte
+		if err := rows.Scan(&t.Name, &t.Language, &t.Category, &t.Status, &components); err != nil {
+			log.Printf("[omini] waTemplates scan failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		if err := json.Unmarshal(components, &t.Components); err != nil {
+			log.Printf("[omini] waTemplates components decode failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		tpls = append(tpls, t)
+	}
+	respondJSON(w, 200, map[string]interface{}{"templates": tpls, "total": len(tpls)})
 }
 
 func (s *OminiServer) waStats(w http.ResponseWriter, _ *http.Request) {
-	s.waMu.RLock()
-	defer s.waMu.RUnlock()
+	if s.storeUnavailable(w) {
+		return
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM omini_messages WHERE channel = 'whatsapp'`).Scan(&total); err != nil {
+		log.Printf("[omini] waStats count failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"channel": "whatsapp", "apiVersion": "v18.0",
 		"sentToday": 95000, "deliveryRatePct": 99.4, "avgLatencyMs": 1200,
-		"totalMessages": len(s.waMsg),
+		"totalMessages": total,
 	})
 }
 
@@ -320,19 +490,55 @@ func (s *OminiServer) tgWebhook(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 200, map[string]bool{"ok": true})
 		return
 	}
-	s.tgMu.Lock()
-	s.tgCounter++
+	if s.storeUnavailable(w) {
+		return
+	}
+	reply := s.buildTGReply(update.Message.Chat.ID, update.Message.Text)
+	// Transactional: inbound + reply rows commit atomically; ids come from the
+	// per-channel Postgres sequence (durable across restarts).
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("[omini] tgWebhook begin tx failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer tx.Rollback()
+	var seqIn, seqOut int64
+	if err := tx.QueryRow(`SELECT nextval('omini_tg_number_seq'), nextval('omini_tg_number_seq')`).Scan(&seqIn, &seqOut); err != nil {
+		log.Printf("[omini] tgWebhook seq failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	inbound := TGMessage{
-		ID: fmt.Sprintf("TG-%03d", s.tgCounter), ChatID: update.Message.Chat.ID,
+		ID: fmt.Sprintf("TG-%03d", seqIn), ChatID: update.Message.Chat.ID,
 		ChatType: update.Message.Chat.Type, Direction: "inbound",
 		Text: update.Message.Text, Status: "received",
 		SentAt: time.Now().UTC().Format(time.RFC3339),
 	}
-	s.tgMsg = append(s.tgMsg, inbound)
-	reply := s.buildTGReply(update.Message.Chat.ID, update.Message.Text)
-	s.tgCounter++
-	s.tgMsg = append(s.tgMsg, reply)
-	s.tgMu.Unlock()
+	reply.ID = fmt.Sprintf("TG-%03d", seqOut)
+	if _, err := tx.Exec(`INSERT INTO omini_messages
+		(channel, message_key, chat_id, chat_type, direction, content, status, sent_at)
+		VALUES ('telegram', $1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (channel, message_key) DO NOTHING`,
+		inbound.ID, inbound.ChatID, inbound.ChatType, inbound.Direction, inbound.Text, inbound.Status, inbound.SentAt); err != nil {
+		log.Printf("[omini] tgWebhook inbound insert failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	if _, err := tx.Exec(`INSERT INTO omini_messages
+		(channel, message_key, chat_id, chat_type, direction, content, parse_mode, status, sent_at)
+		VALUES ('telegram', $1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (channel, message_key) DO NOTHING`,
+		reply.ID, reply.ChatID, reply.ChatType, reply.Direction, reply.Text, reply.ParseMode, reply.Status, reply.SentAt); err != nil {
+		log.Printf("[omini] tgWebhook reply insert failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[omini] tgWebhook commit failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{"ok": true, "reply": reply.Text})
 }
 
@@ -353,8 +559,10 @@ func (s *OminiServer) buildTGReply(chatID int64, text string) TGMessage {
 	default:
 		replyText = "🏦 54Bank Telegram Banking\n\n/balance — Check balance\n/transfer — Send money\n/statement — Mini statement\n/airtime — Buy airtime\n/bills — Pay bills\n/help — This menu"
 	}
+	// ID is assigned by the caller from the Postgres sequence; ChatType stays
+	// empty here (wire parity with the pre-PG reply shape).
 	return TGMessage{
-		ID: fmt.Sprintf("TG-%03d", s.tgCounter), ChatID: chatID,
+		ChatID:    chatID,
 		Direction: "outbound", Text: replyText, Status: "queued",
 		SentAt: time.Now().UTC().Format(time.RFC3339),
 	}
@@ -367,22 +575,56 @@ func (s *OminiServer) tgSend(w http.ResponseWriter, r *http.Request) {
 		ParseMode string `json:"parseMode"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	s.tgMu.Lock()
-	s.tgCounter++
+	if s.storeUnavailable(w) {
+		return
+	}
+	var seq int64
+	if err := s.db.QueryRow(`SELECT nextval('omini_tg_number_seq')`).Scan(&seq); err != nil {
+		log.Printf("[omini] tgSend seq failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	msg := TGMessage{
-		ID: fmt.Sprintf("TG-%03d", s.tgCounter), ChatID: req.ChatID,
+		ID: fmt.Sprintf("TG-%03d", seq), ChatID: req.ChatID,
 		Direction: "outbound", Text: req.Text, ParseMode: req.ParseMode,
 		Status: "queued", SentAt: time.Now().UTC().Format(time.RFC3339),
 	}
-	s.tgMsg = append(s.tgMsg, msg)
-	s.tgMu.Unlock()
+	if _, err := s.db.Exec(`INSERT INTO omini_messages
+		(channel, message_key, chat_id, direction, content, parse_mode, status, sent_at)
+		VALUES ('telegram', $1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (channel, message_key) DO NOTHING`,
+		msg.ID, msg.ChatID, msg.Direction, msg.Text, msg.ParseMode, msg.Status, msg.SentAt); err != nil {
+		log.Printf("[omini] tgSend insert failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	respondJSON(w, 201, map[string]interface{}{"ok": true, "message": msg})
 }
 
 func (s *OminiServer) tgListMessages(w http.ResponseWriter, _ *http.Request) {
-	s.tgMu.RLock()
-	defer s.tgMu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"messages": s.tgMsg, "total": len(s.tgMsg)})
+	if s.storeUnavailable(w) {
+		return
+	}
+	rows, err := s.db.Query(`SELECT message_key, COALESCE(chat_id,0), COALESCE(chat_type,''), direction,
+		content, COALESCE(parse_mode,''), status, COALESCE(sent_at,'')
+		FROM omini_messages WHERE channel = 'telegram' ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		log.Printf("[omini] tgListMessages query failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
+	defer rows.Close()
+	msgs := []TGMessage{}
+	for rows.Next() {
+		var m TGMessage
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.ChatType, &m.Direction, &m.Text, &m.ParseMode, &m.Status, &m.SentAt); err != nil {
+			log.Printf("[omini] tgListMessages scan failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+			return
+		}
+		msgs = append(msgs, m)
+	}
+	respondJSON(w, 200, map[string]interface{}{"messages": msgs, "total": len(msgs)})
 }
 
 func (s *OminiServer) tgListCommands(w http.ResponseWriter, _ *http.Request) {
@@ -390,11 +632,18 @@ func (s *OminiServer) tgListCommands(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *OminiServer) tgStats(w http.ResponseWriter, _ *http.Request) {
-	s.tgMu.RLock()
-	defer s.tgMu.RUnlock()
+	if s.storeUnavailable(w) {
+		return
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM omini_messages WHERE channel = 'telegram'`).Scan(&total); err != nil {
+		log.Printf("[omini] tgStats count failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"channel": "telegram", "botApiVersion": "7.0",
-		"totalMessages": len(s.tgMsg), "commands": len(botCommands),
+		"totalMessages": total, "commands": len(botCommands),
 	})
 }
 
@@ -535,17 +784,23 @@ func (s *OminiServer) smsSend(w http.ResponseWriter, r *http.Request) {
 // ─── aggregate stats ───────────────────────────────────────────────────────────────
 
 func (s *OminiServer) omniStats(w http.ResponseWriter, _ *http.Request) {
-	s.waMu.RLock()
-	waMsgCount := len(s.waMsg)
-	s.waMu.RUnlock()
-	s.tgMu.RLock()
-	tgMsgCount := len(s.tgMsg)
-	s.tgMu.RUnlock()
+	if s.storeUnavailable(w) {
+		return
+	}
+	var waMsgCount, tgMsgCount, waTplCount int
+	if err := s.db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM omini_messages WHERE channel = 'whatsapp'),
+		(SELECT COUNT(*) FROM omini_messages WHERE channel = 'telegram'),
+		(SELECT COUNT(*) FROM wa_templates)`).Scan(&waMsgCount, &tgMsgCount, &waTplCount); err != nil {
+		log.Printf("[omini] omniStats counts failed: %v", err)
+		respondJSON(w, 503, map[string]string{"error": "persistence_unavailable"})
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"service":     "omini-service",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
 		"channels": map[string]interface{}{
-			"whatsapp": map[string]interface{}{"messages": waMsgCount, "templates": len(s.waTpl), "apiVersion": "v18.0"},
+			"whatsapp": map[string]interface{}{"messages": waMsgCount, "templates": waTplCount, "apiVersion": "v18.0"},
 			"telegram": map[string]interface{}{"messages": tgMsgCount, "commands": len(botCommands), "botApiVersion": "7.0"},
 			"ussd":     map[string]interface{}{"shortCode": getEnv("USSD_SHORT_CODE", "*901#"), "status": "active"},
 			"sms":      map[string]interface{}{"shortCode": getEnv("SMS_SHORT_CODE", "54545"), "status": "active"},

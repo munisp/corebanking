@@ -487,7 +487,11 @@ func (s *RMServer) listCustomersHandler(w http.ResponseWriter, r *http.Request) 
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
 	segment := r.URL.Query().Get("segment")
-	customers := s.customerService.ListCustomers(tenantID, rmID, segment)
+	customers, err := s.customerService.ListCustomers(tenantID, rmID, segment)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"customers": customers})
 }
 
@@ -568,7 +572,11 @@ func (s *RMServer) getCustomerActivitiesHandler(w http.ResponseWriter, r *http.R
 	customerID := vars["customer_id"]
 	tenantID := getTenantID(r)
 
-	activities := s.activityService.GetCustomerActivities(tenantID, customerID)
+	activities, err := s.activityService.GetCustomerActivities(tenantID, customerID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"activities": activities})
 }
 
@@ -577,7 +585,11 @@ func (s *RMServer) getCustomerOpportunitiesHandler(w http.ResponseWriter, r *htt
 	customerID := vars["customer_id"]
 	tenantID := getTenantID(r)
 
-	opportunities := s.opportunityService.GetCustomerOpportunities(tenantID, customerID)
+	opportunities, err := s.opportunityService.GetCustomerOpportunities(tenantID, customerID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"opportunities": opportunities})
 }
 
@@ -586,28 +598,44 @@ func (s *RMServer) getCustomerRecommendationsHandler(w http.ResponseWriter, r *h
 	customerID := vars["customer_id"]
 	tenantID := getTenantID(r)
 
-	recommendations := s.crossSellService.GetCustomerRecommendations(tenantID, customerID)
+	recommendations, err := s.crossSellService.GetCustomerRecommendations(tenantID, customerID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"recommendations": recommendations})
 }
 
 func (s *RMServer) getAtRiskCustomersHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	customers := s.customerService.GetAtRiskCustomers(tenantID, rmID)
+	customers, err := s.customerService.GetAtRiskCustomers(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"customers": customers})
 }
 
 func (s *RMServer) getDormantCustomersHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	customers := s.customerService.GetDormantCustomers(tenantID, rmID)
+	customers, err := s.customerService.GetDormantCustomers(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"customers": customers})
 }
 
 func (s *RMServer) searchCustomersHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	query := r.URL.Query().Get("q")
-	customers := s.customerService.SearchCustomers(tenantID, query)
+	customers, err := s.customerService.SearchCustomers(tenantID, query)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"customers": customers})
 }
 
@@ -652,7 +680,11 @@ func (s *RMServer) listOpportunitiesHandler(w http.ResponseWriter, r *http.Reque
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
 	stage := r.URL.Query().Get("stage")
-	opportunities := s.opportunityService.ListOpportunities(tenantID, rmID, stage)
+	opportunities, err := s.opportunityService.ListOpportunities(tenantID, rmID, stage)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"opportunities": opportunities})
 }
 
@@ -735,21 +767,33 @@ func (s *RMServer) updateOpportunityStageHandler(w http.ResponseWriter, r *http.
 func (s *RMServer) getPipelineHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	pipeline := s.opportunityService.GetPipeline(tenantID, rmID)
+	pipeline, err := s.opportunityService.GetPipeline(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, pipeline)
 }
 
 func (s *RMServer) getPipelineByStageHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	stages := s.opportunityService.GetPipelineByStage(tenantID, rmID)
+	stages, err := s.opportunityService.GetPipelineByStage(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, stages)
 }
 
 func (s *RMServer) getForecastHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	forecast := s.opportunityService.GetForecast(tenantID, rmID)
+	forecast, err := s.opportunityService.GetForecast(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, forecast)
 }
 
@@ -758,7 +802,11 @@ func (s *RMServer) listActivitiesHandler(w http.ResponseWriter, r *http.Request)
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
 	activityType := r.URL.Query().Get("type")
-	activities := s.activityService.ListActivities(tenantID, rmID, activityType)
+	activities, err := s.activityService.ListActivities(tenantID, rmID, activityType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"activities": activities})
 }
 
@@ -820,14 +868,22 @@ func (s *RMServer) updateActivityHandler(w http.ResponseWriter, r *http.Request)
 func (s *RMServer) getFollowUpsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	followUps := s.activityService.GetFollowUps(tenantID, rmID)
+	followUps, err := s.activityService.GetFollowUps(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"followUps": followUps})
 }
 
 func (s *RMServer) getActivityCalendarHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	calendar := s.activityService.GetCalendar(tenantID, rmID)
+	calendar, err := s.activityService.GetCalendar(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, calendar)
 }
 
@@ -836,7 +892,11 @@ func (s *RMServer) listRecommendationsHandler(w http.ResponseWriter, r *http.Req
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
 	status := r.URL.Query().Get("status")
-	recommendations := s.crossSellService.ListRecommendations(tenantID, rmID, status)
+	recommendations, err := s.crossSellService.ListRecommendations(tenantID, rmID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"recommendations": recommendations})
 }
 
@@ -900,7 +960,11 @@ func (s *RMServer) convertRecommendationHandler(w http.ResponseWriter, r *http.R
 func (s *RMServer) getCrossSellAnalyticsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	analytics := s.crossSellService.GetAnalytics(tenantID, rmID)
+	analytics, err := s.crossSellService.GetAnalytics(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, analytics)
 }
 
@@ -908,7 +972,11 @@ func (s *RMServer) getCrossSellAnalyticsHandler(w http.ResponseWriter, r *http.R
 func (s *RMServer) listCampaignsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
-	campaigns := s.campaignService.ListCampaigns(tenantID, status)
+	campaigns, err := s.campaignService.ListCampaigns(tenantID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"campaigns": campaigns})
 }
 
@@ -987,7 +1055,11 @@ func (s *RMServer) getCampaignPerformanceHandler(w http.ResponseWriter, r *http.
 func (s *RMServer) listRMsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	segment := r.URL.Query().Get("segment")
-	rms := s.rmService.ListRMs(tenantID, segment)
+	rms, err := s.rmService.ListRMs(tenantID, segment)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"rms": rms})
 }
 
@@ -1064,7 +1136,11 @@ func (s *RMServer) getRMPerformanceHandler(w http.ResponseWriter, r *http.Reques
 
 func (s *RMServer) getRMLeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	leaderboard := s.rmService.GetLeaderboard(tenantID)
+	leaderboard, err := s.rmService.GetLeaderboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"leaderboard": leaderboard})
 }
 
@@ -1072,14 +1148,22 @@ func (s *RMServer) getRMLeaderboardHandler(w http.ResponseWriter, r *http.Reques
 func (s *RMServer) getDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	dashboard := s.getDashboard(tenantID, rmID)
+	dashboard, err := s.getDashboard(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, dashboard)
 }
 
 func (s *RMServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	dashboard := s.getDashboard(tenantID, rmID)
+	dashboard, err := s.getDashboard(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	summary := map[string]interface{}{
 		"totalCustomers":   dashboard.TotalCustomers,
 		"totalRevenue":     dashboard.TotalRevenue,
@@ -1093,18 +1177,26 @@ func (s *RMServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http.Req
 func (s *RMServer) getAlertsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	alerts := s.getAlerts(tenantID, rmID)
+	alerts, err := s.getAlerts(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"alerts": alerts})
 }
 
 func (s *RMServer) getTasksHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	rmID := getRMID(r)
-	tasks := s.getTasks(tenantID, rmID)
+	tasks, err := s.getTasks(tenantID, rmID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"tasks": tasks})
 }
 
-func (s *RMServer) getDashboard(tenantID, rmID string) *RMDashboard {
+func (s *RMServer) getDashboard(tenantID, rmID string) (*RMDashboard, error) {
 	dashboard := &RMDashboard{
 		Date: time.Now(),
 	}
@@ -1120,7 +1212,10 @@ func (s *RMServer) getDashboard(tenantID, rmID string) *RMDashboard {
 	}
 
 	// Pipeline
-	pipeline := s.opportunityService.GetPipeline(tenantID, rmID)
+	pipeline, err := s.opportunityService.GetPipeline(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
 	if total, ok := pipeline["totalOpportunities"].(int); ok {
 		dashboard.TotalOpportunities = total
 	}
@@ -1132,7 +1227,10 @@ func (s *RMServer) getDashboard(tenantID, rmID string) *RMDashboard {
 	}
 
 	// Activities
-	activities := s.activityService.GetActivityStats(tenantID, rmID)
+	activities, err := s.activityService.GetActivityStats(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
 	if today, ok := activities["today"].(int); ok {
 		dashboard.ActivitiesToday = today
 	}
@@ -1144,7 +1242,10 @@ func (s *RMServer) getDashboard(tenantID, rmID string) *RMDashboard {
 	}
 
 	// Cross-sell
-	crossSell := s.crossSellService.GetAnalytics(tenantID, rmID)
+	crossSell, err := s.crossSellService.GetAnalytics(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
 	if recs, ok := crossSell["totalRecommendations"].(int); ok {
 		dashboard.Recommendations = recs
 	}
@@ -1153,18 +1254,29 @@ func (s *RMServer) getDashboard(tenantID, rmID string) *RMDashboard {
 	}
 
 	// Customer health
-	dashboard.AtRiskCustomers = len(s.customerService.GetAtRiskCustomers(tenantID, rmID))
-	dashboard.DormantCustomers = len(s.customerService.GetDormantCustomers(tenantID, rmID))
+	atRiskList, err := s.customerService.GetAtRiskCustomers(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
+	dashboard.AtRiskCustomers = len(atRiskList)
+	dormantList, err := s.customerService.GetDormantCustomers(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
+	dashboard.DormantCustomers = len(dormantList)
 	dashboard.AverageNPS = 72.5
 
-	return dashboard
+	return dashboard, nil
 }
 
-func (s *RMServer) getAlerts(tenantID, rmID string) []map[string]interface{} {
+func (s *RMServer) getAlerts(tenantID, rmID string) ([]map[string]interface{}, error) {
 	var alerts []map[string]interface{}
 
 	// At-risk customers
-	atRisk := s.customerService.GetAtRiskCustomers(tenantID, rmID)
+	atRisk, err := s.customerService.GetAtRiskCustomers(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
 	if len(atRisk) > 0 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "at_risk_customers",
@@ -1175,7 +1287,10 @@ func (s *RMServer) getAlerts(tenantID, rmID string) []map[string]interface{} {
 	}
 
 	// Pending follow-ups
-	followUps := s.activityService.GetFollowUps(tenantID, rmID)
+	followUps, err := s.activityService.GetFollowUps(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
 	overdue := 0
 	for _, f := range followUps {
 		if f.FollowUpDate != nil && f.FollowUpDate.Before(time.Now()) {
@@ -1191,14 +1306,17 @@ func (s *RMServer) getAlerts(tenantID, rmID string) []map[string]interface{} {
 		})
 	}
 
-	return alerts
+	return alerts, nil
 }
 
-func (s *RMServer) getTasks(tenantID, rmID string) []map[string]interface{} {
+func (s *RMServer) getTasks(tenantID, rmID string) ([]map[string]interface{}, error) {
 	var tasks []map[string]interface{}
 
 	// Follow-ups due today
-	followUps := s.activityService.GetFollowUps(tenantID, rmID)
+	followUps, err := s.activityService.GetFollowUps(tenantID, rmID)
+	if err != nil {
+		return nil, err
+	}
 	for _, f := range followUps {
 		if f.FollowUpDate != nil {
 			tasks = append(tasks, map[string]interface{}{
@@ -1212,7 +1330,10 @@ func (s *RMServer) getTasks(tenantID, rmID string) []map[string]interface{} {
 	}
 
 	// Customer reviews due
-	customers := s.customerService.ListCustomers(tenantID, rmID, "")
+	customers, err := s.customerService.ListCustomers(tenantID, rmID, "")
+	if err != nil {
+		return nil, err
+	}
 	for _, c := range customers {
 		if c.NextReview.Before(time.Now().AddDate(0, 0, 7)) {
 			tasks = append(tasks, map[string]interface{}{
@@ -1224,5 +1345,5 @@ func (s *RMServer) getTasks(tenantID, rmID string) []map[string]interface{} {
 		}
 	}
 
-	return tasks
+	return tasks, nil
 }

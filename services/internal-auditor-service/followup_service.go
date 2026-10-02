@@ -11,7 +11,7 @@ import (
 // FollowUpService handles follow-up operations
 type FollowUpService struct {
 	tenantID  string
-	followUps map[string]*FollowUp
+	followUps *repo[FollowUp]
 	mu        sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type FollowUpService struct {
 func NewFollowUpService(tenantID string) *FollowUpService {
 	svc := &FollowUpService{
 		tenantID:  tenantID,
-		followUps: make(map[string]*FollowUp),
+		followUps: newRepo[FollowUp](serviceDB, "follow_ups"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -30,7 +30,7 @@ func (s *FollowUpService) initializeDefaultData(tenantID string) {
 	overdueNext := time.Now().AddDate(0, 0, -7)
 
 	// Pending follow-up
-	s.followUps["fu-001"] = &FollowUp{
+	s.followUps.seed(tenantID, "fu-001", &FollowUp{
 		FollowUpID:       "fu-001",
 		TenantID:         tenantID,
 		FindingID:        "find-001",
@@ -43,10 +43,10 @@ func (s *FollowUpService) initializeDefaultData(tenantID string) {
 		NextFollowUp:     &nextFollowUp,
 		CreatedAt:        time.Now().AddDate(0, 0, -3),
 		UpdatedAt:        time.Now().AddDate(0, 0, -3),
-	}
+	})
 
 	// In progress follow-up
-	s.followUps["fu-002"] = &FollowUp{
+	s.followUps.seed(tenantID, "fu-002", &FollowUp{
 		FollowUpID:       "fu-002",
 		TenantID:         tenantID,
 		FindingID:        "find-002",
@@ -59,10 +59,10 @@ func (s *FollowUpService) initializeDefaultData(tenantID string) {
 		NextFollowUp:     &nextFollowUp,
 		CreatedAt:        time.Now().AddDate(0, 0, -7),
 		UpdatedAt:        time.Now().AddDate(0, 0, -2),
-	}
+	})
 
 	// Completed follow-up
-	s.followUps["fu-003"] = &FollowUp{
+	s.followUps.seed(tenantID, "fu-003", &FollowUp{
 		FollowUpID:       "fu-003",
 		TenantID:         tenantID,
 		FindingID:        "find-003",
@@ -74,10 +74,10 @@ func (s *FollowUpService) initializeDefaultData(tenantID string) {
 		FollowedUpBy:     "auditor-001",
 		CreatedAt:        time.Now().AddDate(0, 0, -14),
 		UpdatedAt:        time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// Overdue follow-up
-	s.followUps["fu-004"] = &FollowUp{
+	s.followUps.seed(tenantID, "fu-004", &FollowUp{
 		FollowUpID:       "fu-004",
 		TenantID:         tenantID,
 		FindingID:        "find-004",
@@ -90,16 +90,18 @@ func (s *FollowUpService) initializeDefaultData(tenantID string) {
 		NextFollowUp:     &overdueNext,
 		CreatedAt:        time.Now().AddDate(0, 0, -30),
 		UpdatedAt:        time.Now().AddDate(0, 0, -7),
-	}
+	})
 }
 
 // ListFollowUps returns follow-ups based on filters
-func (s *FollowUpService) ListFollowUps(tenantID, status string) []*FollowUp {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FollowUpService) ListFollowUps(tenantID, status string) ([]*FollowUp, error) {
 
 	var result []*FollowUp
-	for _, fu := range s.followUps {
+	__ALL__, __ERR__ := s.followUps.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, fu := range __ALL__ {
 		if fu.TenantID != tenantID {
 			continue
 		}
@@ -108,16 +110,14 @@ func (s *FollowUpService) ListFollowUps(tenantID, status string) []*FollowUp {
 		}
 		result = append(result, fu)
 	}
-	return result
+	return result, nil
 }
 
 // GetFollowUp retrieves a follow-up by ID
 func (s *FollowUpService) GetFollowUp(tenantID, followUpID string) (*FollowUp, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	fu, exists := s.followUps[followUpID]
-	if !exists || fu.TenantID != tenantID {
+	fu, err := s.followUps.get(tenantID, followUpID)
+	if err != nil {
 		return nil, errors.New("follow-up not found")
 	}
 	return fu, nil
@@ -125,8 +125,6 @@ func (s *FollowUpService) GetFollowUp(tenantID, followUpID string) (*FollowUp, e
 
 // CreateFollowUp creates a new follow-up
 func (s *FollowUpService) CreateFollowUp(tenantID, auditorID string, fu *FollowUp) (*FollowUp, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	fu.FollowUpID = uuid.New().String()
 	fu.TenantID = tenantID
@@ -138,33 +136,34 @@ func (s *FollowUpService) CreateFollowUp(tenantID, auditorID string, fu *FollowU
 	fu.CreatedAt = time.Now()
 	fu.UpdatedAt = time.Now()
 
-	s.followUps[fu.FollowUpID] = fu
+	if err := s.followUps.put(tenantID, fu.FollowUpID, fu); err != nil {
+		return nil, err
+	}
 	return fu, nil
 }
 
 // UpdateFollowUp updates a follow-up
 func (s *FollowUpService) UpdateFollowUp(fu *FollowUp) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.followUps[fu.FollowUpID]
-	if !exists || existing.TenantID != fu.TenantID {
+	existing, err := s.followUps.get(fu.TenantID, fu.FollowUpID)
+	if err != nil {
 		return errors.New("follow-up not found")
 	}
 
 	fu.CreatedAt = existing.CreatedAt
 	fu.UpdatedAt = time.Now()
-	s.followUps[fu.FollowUpID] = fu
-	return nil
+	return s.followUps.put(fu.TenantID, fu.FollowUpID, fu)
 }
 
 // GetPendingFollowUps returns pending follow-ups
-func (s *FollowUpService) GetPendingFollowUps(tenantID string) []*FollowUp {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FollowUpService) GetPendingFollowUps(tenantID string) ([]*FollowUp, error) {
 
 	var result []*FollowUp
-	for _, fu := range s.followUps {
+	__ALL__, __ERR__ := s.followUps.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, fu := range __ALL__ {
 		if fu.TenantID != tenantID {
 			continue
 		}
@@ -172,17 +171,19 @@ func (s *FollowUpService) GetPendingFollowUps(tenantID string) []*FollowUp {
 			result = append(result, fu)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetOverdueFollowUps returns overdue follow-ups
-func (s *FollowUpService) GetOverdueFollowUps(tenantID string) []*FollowUp {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FollowUpService) GetOverdueFollowUps(tenantID string) ([]*FollowUp, error) {
 
 	now := time.Now()
 	var result []*FollowUp
-	for _, fu := range s.followUps {
+	__ALL__, __ERR__ := s.followUps.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, fu := range __ALL__ {
 		if fu.TenantID != tenantID {
 			continue
 		}
@@ -193,16 +194,18 @@ func (s *FollowUpService) GetOverdueFollowUps(tenantID string) []*FollowUp {
 			result = append(result, fu)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetFindingFollowUps returns follow-ups for a finding
-func (s *FollowUpService) GetFindingFollowUps(tenantID, findingID string) []*FollowUp {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FollowUpService) GetFindingFollowUps(tenantID, findingID string) ([]*FollowUp, error) {
 
 	var result []*FollowUp
-	for _, fu := range s.followUps {
+	__ALL__, __ERR__ := s.followUps.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, fu := range __ALL__ {
 		if fu.TenantID != tenantID {
 			continue
 		}
@@ -210,5 +213,5 @@ func (s *FollowUpService) GetFindingFollowUps(tenantID, findingID string) []*Fol
 			result = append(result, fu)
 		}
 	}
-	return result
+	return result, nil
 }

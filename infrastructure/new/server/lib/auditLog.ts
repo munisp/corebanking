@@ -1,13 +1,28 @@
 /**
  * Immutable Audit Trail — Logs all CRUD operations across all domains.
  * Records: who changed what, when, with before/after snapshots.
- * Storage: In-memory + file-based (replace with DB table in production).
+ * Storage: Postgres-authoritative (table `audit_entries`) + JSONL file mirror.
+ *
+ * W12-C3-P2-MLIB (c3-1030): the audit ring buffer was process memory — a
+ * restart (or >10k entries) silently destroyed the forensic audit trail.
+ * Now every audit write is persisted to Postgres (fail-closed: if the insert
+ * fails, log() throws — an audit event is never silently dropped) and the
+ * capped in-memory array is gone. The JSONL file mirror is retained as a
+ * defense-in-depth local copy. Table shared with lib/auditTrail.ts
+ * (c3-1000) per the C3 register's audit_entries mapping.
  */
 
 import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 import { logger } from "./logger";
+import { ensureTables, storeDDL, storeInsert, storeList } from "./pgJsonStore";
+
+const TABLE = "audit_entries";
+
+async function ensureAuditLogStore(): Promise<void> {
+  await ensureTables("auditLog", storeDDL(TABLE));
+}
 
 export interface AuditEntry {
   id: string;
@@ -30,8 +45,6 @@ export interface AuditEntry {
 }
 
 class AuditLogger {
-  private entries: AuditEntry[] = [];
-  private readonly maxInMemory = 10_000;
   private readonly logFilePath: string;
   private writeStream: fs.WriteStream | null = null;
 
@@ -48,17 +61,18 @@ class AuditLogger {
     }
   }
 
-  log(entry: Omit<AuditEntry, "id" | "timestamp">): AuditEntry {
+  async log(entry: Omit<AuditEntry, "id" | "timestamp">): Promise<AuditEntry> {
     const full: AuditEntry = {
       ...entry,
       id: randomUUID(),
       timestamp: new Date().toISOString(),
     };
 
-    this.entries.push(full);
-    if (this.entries.length > this.maxInMemory) {
-      this.entries = this.entries.slice(-this.maxInMemory);
-    }
+    // Fail-closed: the audit event is persisted to Postgres FIRST. If the
+    // database is unavailable this throws — the mutation being audited must
+    // not proceed on the assumption that an audit record exists.
+    await ensureAuditLogStore();
+    await storeInsert(TABLE, full.tenantId ?? "", full);
 
     if (this.writeStream) {
       this.writeStream.write(JSON.stringify(full) + "\n");
@@ -68,7 +82,7 @@ class AuditLogger {
     return full;
   }
 
-  query(filters: {
+  async query(filters: {
     domain?: string;
     userId?: string;
     action?: string;
@@ -76,8 +90,9 @@ class AuditLogger {
     from?: string;
     to?: string;
     limit?: number;
-  }): AuditEntry[] {
-    let result = this.entries;
+  }): Promise<AuditEntry[]> {
+    await ensureAuditLogStore();
+    let result = await storeList<AuditEntry>(TABLE);
 
     if (filters.domain) result = result.filter((e) => e.domain === filters.domain);
     if (filters.userId) result = result.filter((e) => e.userId === filters.userId);
@@ -90,12 +105,12 @@ class AuditLogger {
     return result.slice(-limit).reverse();
   }
 
-  getStats(): {
+  async getStats(): Promise<{
     total: number;
     byAction: Record<string, number>;
     byDomain: Record<string, number>;
     last24h: number;
-  } {
+  }> {
     const now = new Date();
     const oneDayAgo = new Date(now.getTime() - 86400000).toISOString();
 
@@ -103,13 +118,15 @@ class AuditLogger {
     const byDomain: Record<string, number> = {};
     let last24h = 0;
 
-    for (const entry of this.entries) {
+    await ensureAuditLogStore();
+    const entries = await storeList<AuditEntry>(TABLE);
+    for (const entry of entries) {
       byAction[entry.action] = (byAction[entry.action] ?? 0) + 1;
       byDomain[entry.domain] = (byDomain[entry.domain] ?? 0) + 1;
       if (entry.timestamp >= oneDayAgo) last24h++;
     }
 
-    return { total: this.entries.length, byAction, byDomain, last24h };
+    return { total: entries.length, byAction, byDomain, last24h };
   }
 
   close(): void {

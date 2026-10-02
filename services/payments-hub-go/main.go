@@ -323,7 +323,9 @@ func tenantFromClaims(claims map[string]interface{}) string {
 	return ""
 }
 
-var idempCache sync.Map
+// W12 C3-P1-B2 (c3-0686): the idempCache sync.Map that used to sit here was
+// dead code — the live idempotency path below is redis/PostgreSQL-backed
+// (see initRedis :385). Removed.
 
 func auditHash(prev, data string) string {
 	h := sha256.New()
@@ -807,7 +809,7 @@ func outboxStatsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/payments-hub/route", routePayment)
+	mux.HandleFunc("/v1/payments-hub/route", permifyAuthzGuard("payment_order", "route", routePayment))
 	mux.HandleFunc("/v1/payments-hub/outbox/stats", outboxStatsHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1289,52 +1291,42 @@ func sanitizeError(err error) string {
 	return errStr
 }
 
-// IP-based sliding window rate limiter
+// IP-based fixed-window rate limiter — W12 C3-P1-B2 (c3-0687): redis-backed
+// via the wired idempotency client at :385 (key ratelimit:{svc}:{subject},
+// TTL = window). The per-process visitors map and its cleanup goroutine are
+// gone — limits are now enforced globally across replicas and survive
+// restarts (previously effective limits multiplied by replica count).
 type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
-}
-
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
+	rate   int
+	window time.Duration
 }
 
 func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
+	return &ipRateLimiter{rate: rate, window: window}
 }
+
+// rateLimitIncrScript atomically increments the fixed-window counter for key
+// and sets the window TTL on first hit (INCR + PEXPIRE via Lua).
+var rateLimitIncrScript = redis.NewScript(`local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return c`)
 
 func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
+	if redisClient == nil {
+		// FAIL OPEN: rate limiting is not a revocation control — on redis
+		// outage the request proceeds (logged) rather than taking the
+		// service down with the cache layer.
+		log.Printf("[%s] rate-limiter redis unavailable, failing open", serviceName)
 		return true
 	}
-	if b.count >= rl.rate {
-		return false
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	count, err := rateLimitIncrScript.Run(ctx, redisClient, []string{fmt.Sprintf("ratelimit:%s:%s", serviceName, ip)}, int64(rl.window/time.Millisecond)).Int64()
+	if err != nil {
+		log.Printf("[%s] rate-limiter redis error, failing open: %v", serviceName, err)
+		return true
 	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
+	return count <= int64(rl.rate)
 }
 
 var globalIPLimiter = newIPRateLimiter(100, time.Minute)

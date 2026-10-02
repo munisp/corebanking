@@ -12,7 +12,7 @@ export default function ReportGenerationWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/efass-returns/count")
+    fetch("/api/db/efass-returns/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

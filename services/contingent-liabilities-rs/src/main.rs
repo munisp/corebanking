@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::PgPool;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct MiddlewareConfig {
@@ -40,7 +41,7 @@ fn mw() -> MiddlewareConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct ContingentLiability {
     id: String,
     liability_type: String,
@@ -83,8 +84,64 @@ fn seed() -> Vec<ContingentLiability> {
     ]
 }
 
+// Wave-12 (C3-P2-RSVEC): contingent liabilities are persisted in Postgres (was:
+// in-memory Mutex<Vec<ContingentLiability>> re-seeded on every boot). Typed
+// columns matching the all-scalar struct; id is the natural/unique key. None =>
+// 503 (no silent memory fallback).
 struct AppState {
-    items: Mutex<Vec<ContingentLiability>>,
+    db: Option<PgPool>,
+}
+
+async fn init_db(pool: &PgPool) {
+    if let Err(e) = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS contingent_liabilities (
+            id TEXT PRIMARY KEY,
+            liability_type TEXT NOT NULL DEFAULT '',
+            counterparty TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            max_exposure DOUBLE PRECISION NOT NULL DEFAULT 0,
+            probability DOUBLE PRECISION NOT NULL DEFAULT 0,
+            expected_loss DOUBLE PRECISION NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'NGN',
+            expiry_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await
+    {
+        eprintln!("contingent-liabilities-rs: contingent_liabilities DDL failed: {}", e);
+    }
+}
+
+/// Idempotent seed of the reference liabilities (was: in-memory seed on every
+/// boot). ON CONFLICT DO NOTHING so restarts never duplicate or overwrite.
+async fn seed_to_db(pool: &PgPool) {
+    for it in seed() {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO contingent_liabilities (id, liability_type, counterparty, description,
+                max_exposure, probability, expected_loss, currency, expiry_date, status)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&it.id)
+        .bind(&it.liability_type)
+        .bind(&it.counterparty)
+        .bind(&it.description)
+        .bind(it.max_exposure)
+        .bind(it.probability)
+        .bind(it.expected_loss)
+        .bind(&it.currency)
+        .bind(&it.expiry_date)
+        .bind(&it.status)
+        .execute(pool)
+        .await
+        {
+            eprintln!("contingent-liabilities-rs: seed {} failed: {}", it.id, e);
+        }
+    }
 }
 
 async fn healthz() -> HttpResponse {
@@ -96,10 +153,32 @@ async fn healthz() -> HttpResponse {
 
 async fn list_items(req: actix_web::HttpRequest, data: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let d = data.items.lock().unwrap();
+    if let Err(resp) = permify::require_permify(&req, "contingent_liability", "view").await { return resp; } // W12-B5P1DD
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => {
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "liability_store_unavailable"}));
+        }
+    };
+    let d = match sqlx::query_as::<_, ContingentLiability>(
+        "SELECT id, liability_type, counterparty, description, max_exposure, probability,
+                expected_loss, currency, expiry_date, status FROM contingent_liabilities ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("contingent-liabilities-rs: list_items query failed: {}", e);
+            return HttpResponse::ServiceUnavailable()
+                .json(serde_json::json!({"error": "liability_store_unavailable"}));
+        }
+    };
+    let total = d.len();
     HttpResponse::Ok().json(serde_json::json!({
-        "items": *d,
-        "total": d.len()
+        "items": d,
+        "total": total
     }))
 }
 
@@ -307,9 +386,32 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .unwrap_or(8174);
 
-    let data = web::Data::new(AppState {
-        items: Mutex::new(seed()),
-    });
+    // Wave-12 (C3-P2-RSVEC): Postgres is the liability store (was in-memory
+    // Vec). DATABASE_URL optional: when unset the pool is None and reads fail
+    // closed (503) rather than falling back to memory.
+    let db: Option<PgPool> = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("contingent-liabilities-rs: invalid DATABASE_URL: {} — reads will return 503", e);
+                None
+            }
+        },
+        Err(_) => {
+            eprintln!("contingent-liabilities-rs: DATABASE_URL not set — reads will return 503");
+            None
+        }
+    };
+    if let Some(pool) = db.as_ref() {
+        init_db(pool).await;
+        seed_to_db(pool).await;
+    }
+
+    let data = web::Data::new(AppState { db });
 
     println!("Contingent Liabilities Service running on port {}", port);
 
@@ -323,3 +425,6 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
+
+// Wave-12 B5-P1-D-D: Permify authorization guard module.
+mod permify;

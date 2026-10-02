@@ -1,15 +1,52 @@
 /**
  * Verification Session Store
  *
- * In-memory store for the step-by-step verification flow.
- * Sessions expire after 30 minutes; a background interval clears them.
+ * W12 C3-P1-B2 (c3-1024): redis-backed store for the step-by-step
+ * verification flow (register b3 verdict said REUSE an existing client, but
+ * the cited otel/init.ts:5 is only an instrumentation comment — this service
+ * has NO wired redis client, so a pooled ioredis client is initialized here
+ * from the declared-pattern dep; ioredis ^5.4.2 matches the fleet).
+ *
+ * Keys (register pattern session:{tenant}:{session_id} with
+ * tenant="verification"):
+ *   session:verification:{sessionId}  JSON VerificationSession,
+ *                                     TTL 1800s SLIDING (re-expired on every
+ *                                     access — preserves the previous
+ *                                     30-minute in-memory lifetime)
+ * Sessions expire after 30 minutes; redis TTL replaces the background sweep.
+ * Session state now survives restarts and is consistent across replicas;
+ * previously a restart silently dropped in-flight KYC verification flows
+ * (including uploaded document images and OCR job state).
+ * FAIL MODE: redis down => these functions throw and controllers fail closed
+ * (500 via asyncHandler) — session state is never silently skipped.
  * No DB writes here — images are transient, only final scores go to the DB
  * (via the /submit endpoint which updates KycVerificationWorkflowEntity).
  */
 
 import { randomUUID } from "crypto";
+import Redis from "ioredis";
 
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
+const SESSION_TTL_SECONDS = SESSION_TTL_MS / 1000; // 1800s sliding
+
+// ─── Redis client (lazy singleton, REDIS_URL per fleet convention) ───────────
+
+let redisClient: Redis | null = null;
+
+function getRedis(): Redis {
+  if (!redisClient) {
+    redisClient = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+      maxRetriesPerRequest: 2,
+    });
+    redisClient.on("error", (err) => {
+      // Logged, not thrown — operations themselves surface errors to callers.
+      console.error("[verificationSessionStore] redis error:", err);
+    });
+  }
+  return redisClient;
+}
+
+const sessionKey = (id: string): string => `session:verification:${id}`;
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
 
@@ -87,17 +124,20 @@ export interface VerificationSession {
   expiresAt:        number;
 }
 
-// ─── Store ────────────────────────────────────────────────────────────────────
+// ─── Store helpers ────────────────────────────────────────────────────────────
 
-const store = new Map<string, VerificationSession>();
+async function loadSession(id: string): Promise<VerificationSession | undefined> {
+  const raw = await getRedis().get(sessionKey(id));
+  if (!raw) return undefined;
+  // Sliding expiry: every access re-applies the TTL (preserves the previous
+  // 30-minute inactivity lifetime).
+  await getRedis().expire(sessionKey(id), SESSION_TTL_SECONDS);
+  return JSON.parse(raw) as VerificationSession;
+}
 
-// Sweep expired sessions every 5 minutes without blocking process exit
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, s] of store.entries()) {
-    if (s.expiresAt < now) store.delete(id);
-  }
-}, 5 * 60 * 1000).unref();
+async function saveSession(session: VerificationSession): Promise<void> {
+  await getRedis().set(sessionKey(session.id), JSON.stringify(session), "EX", SESSION_TTL_SECONDS);
+}
 
 // ─── ID generator ─────────────────────────────────────────────────────────────
 
@@ -108,7 +148,7 @@ function genId(prefix: string): string {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export function createSession(metadata?: Record<string, unknown>, id?: string): VerificationSession {
+export async function createSession(metadata?: Record<string, unknown>, id?: string): Promise<VerificationSession> {
   const sessionId = id || genId("ver");
   const session: VerificationSession = {
     id:        sessionId,
@@ -119,42 +159,44 @@ export function createSession(metadata?: Record<string, unknown>, id?: string): 
     createdAt: Date.now(),
     expiresAt: Date.now() + SESSION_TTL_MS,
   };
-  store.set(sessionId, session);
+  await saveSession(session);
   return session;
 }
 
-export function getSession(id: string): VerificationSession | undefined {
-  const session = store.get(id);
+export async function getSession(id: string): Promise<VerificationSession | undefined> {
+  const session = await loadSession(id);
   if (!session) return undefined;
   if (session.expiresAt < Date.now()) session.status = "expired";
   return session;
 }
 
-export function updateSession(
+export async function updateSession(
   id: string,
   updates: Partial<VerificationSession>,
-): VerificationSession | undefined {
-  const session = store.get(id);
+): Promise<VerificationSession | undefined> {
+  const session = await loadSession(id);
   if (!session) return undefined;
   Object.assign(session, updates);
+  await saveSession(session);
   return session;
 }
 
-export function addDocument(
+export async function addDocument(
   sessionId: string,
   doc: Omit<SessionDocument, "id">,
-): SessionDocument | undefined {
-  const session = store.get(sessionId);
+): Promise<SessionDocument | undefined> {
+  const session = await loadSession(sessionId);
   if (!session) return undefined;
   // Replace existing image of the same side
   session.documents = session.documents.filter(d => d.side !== doc.side);
   const document: SessionDocument = { ...doc, id: genId("doc") };
   session.documents.push(document);
+  await saveSession(session);
   return document;
 }
 
-export function createOcrJob(sessionId: string): OcrJob | undefined {
-  const session = store.get(sessionId);
+export async function createOcrJob(sessionId: string): Promise<OcrJob | undefined> {
+  const session = await loadSession(sessionId);
   if (!session) return undefined;
   const job: OcrJob = {
     jobId:     genId("ocr"),
@@ -162,20 +204,23 @@ export function createOcrJob(sessionId: string): OcrJob | undefined {
     createdAt: Date.now(),
   };
   session.ocrJobs[job.jobId] = job;
+  await saveSession(session);
   return job;
 }
 
-export function getOcrJob(sessionId: string, jobId: string): OcrJob | undefined {
-  return store.get(sessionId)?.ocrJobs[jobId];
+export async function getOcrJob(sessionId: string, jobId: string): Promise<OcrJob | undefined> {
+  const session = await loadSession(sessionId);
+  return session?.ocrJobs[jobId];
 }
 
-export function updateOcrJob(
+export async function updateOcrJob(
   sessionId: string,
   jobId: string,
   updates: Partial<OcrJob>,
-): OcrJob | undefined {
-  const session = store.get(sessionId);
+): Promise<OcrJob | undefined> {
+  const session = await loadSession(sessionId);
   if (!session || !session.ocrJobs[jobId]) return undefined;
   Object.assign(session.ocrJobs[jobId], updates);
+  await saveSession(session);
   return session.ocrJobs[jobId];
 }

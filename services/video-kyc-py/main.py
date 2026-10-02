@@ -4,6 +4,7 @@ Middleware: Kafka, Dapr, Fluvio, Temporal, Postgres, Keycloak, Permify,
            Redis, Mojaloop, OpenSearch, OpenAppSec, APISIX, TigerBeetle, Lakehouse
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from permify_guard import check_permission, PermifyUnavailableError  # W12-B5-P1-D-C
 import json, os
 import os
 import json
@@ -207,6 +208,28 @@ class Handler(BaseHTTPRequestHandler):
             _n1_claims, _n1_err = validate_jwt(dict(self.headers))
             if _n1_err:
                 self._json({"error": "unauthorized", "detail": _n1_err}, code=401)
+                return
+            # W12-B5-P1-D-C: real Permify check AFTER JWT auth, before the
+            # session operation is accepted. Fail-closed: unreachable -> 503,
+            # denied -> 403.
+            _pg_claims = _n1_claims or {}
+            _pg_subject = (_pg_claims.get("sub") or _pg_claims.get("keycloak_id")
+                           or self.headers.get("x-keycloak-id"))
+            _pg_tenant = (_pg_claims.get("tenant_id") or _pg_claims.get("tenant")
+                          or self.headers.get("x-tenant-id") or "")
+            if not _pg_subject:
+                self._json({"error": "forbidden", "detail": "missing authenticated subject"}, code=403)
+                return
+            try:
+                _pg_allowed = check_permission(
+                    _pg_tenant, "video_kyc_session",
+                    "scope:" + _n1_path.lstrip("/"), "create", _pg_subject)
+            except PermifyUnavailableError as _pg_exc:
+                self._json({"error": "authorization_unavailable", "detail": str(_pg_exc)}, code=503)
+                return
+            if not _pg_allowed:
+                self._json({"error": "forbidden",
+                            "detail": "permify: create denied on video_kyc_session"}, code=403)
                 return
         self._json({"message": "operation queued", "service": "video-kyc-py"})
     def _json(self, data, code=200):

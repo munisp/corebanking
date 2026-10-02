@@ -2,32 +2,31 @@ package main
 
 import (
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// LimitService handles treasury limit management
+// LimitService handles treasury limit management.
+// Postgres (table treasury_limits) is the system of record.
 type LimitService struct {
 	tenantID string
-	limits   map[string]*TreasuryLimit
-	mu       sync.RWMutex
+	limits   *repo[TreasuryLimit]
 }
 
 // NewLimitService creates a new limit service
 func NewLimitService(tenantID string) *LimitService {
 	svc := &LimitService{
 		tenantID: tenantID,
-		limits:   make(map[string]*TreasuryLimit),
+		limits:   newRepo[TreasuryLimit](serviceDB, "treasury_limits"),
 	}
 	svc.initializeDefaultLimits(tenantID)
 	return svc
 }
 
 func (s *LimitService) initializeDefaultLimits(tenantID string) {
-	// FX Position Limits
-	s.limits["limit-fx-usd"] = &TreasuryLimit{
+	// FX Position Limits (idempotent seeds)
+	s.limits.seed(tenantID, "limit-fx-usd", &TreasuryLimit{
 		LimitID:      "limit-fx-usd",
 		TenantID:     tenantID,
 		LimitType:    "fx_position",
@@ -42,9 +41,9 @@ func (s *LimitService) initializeDefaultLimits(tenantID string) {
 		ValidTo:      time.Now().AddDate(0, 6, 0),
 		CreatedAt:    time.Now().AddDate(0, -6, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
-	s.limits["limit-fx-gbp"] = &TreasuryLimit{
+	s.limits.seed(tenantID, "limit-fx-gbp", &TreasuryLimit{
 		LimitID:      "limit-fx-gbp",
 		TenantID:     tenantID,
 		LimitType:    "fx_position",
@@ -59,10 +58,10 @@ func (s *LimitService) initializeDefaultLimits(tenantID string) {
 		ValidTo:      time.Now().AddDate(0, 6, 0),
 		CreatedAt:    time.Now().AddDate(0, -6, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
 	// Interbank Limits
-	s.limits["limit-interbank-placement"] = &TreasuryLimit{
+	s.limits.seed(tenantID, "limit-interbank-placement", &TreasuryLimit{
 		LimitID:      "limit-interbank-placement",
 		TenantID:     tenantID,
 		LimitType:    "interbank",
@@ -77,10 +76,10 @@ func (s *LimitService) initializeDefaultLimits(tenantID string) {
 		ValidTo:      time.Now().AddDate(0, 9, 0),
 		CreatedAt:    time.Now().AddDate(0, -3, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
 	// Investment Limits
-	s.limits["limit-investment-tbills"] = &TreasuryLimit{
+	s.limits.seed(tenantID, "limit-investment-tbills", &TreasuryLimit{
 		LimitID:      "limit-investment-tbills",
 		TenantID:     tenantID,
 		LimitType:    "investment",
@@ -95,10 +94,10 @@ func (s *LimitService) initializeDefaultLimits(tenantID string) {
 		ValidTo:      time.Now().AddDate(1, 0, 0),
 		CreatedAt:    time.Now().AddDate(-1, 0, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 
 	// Counterparty Limits
-	s.limits["limit-counterparty-fbn"] = &TreasuryLimit{
+	s.limits.seed(tenantID, "limit-counterparty-fbn", &TreasuryLimit{
 		LimitID:      "limit-counterparty-fbn",
 		TenantID:     tenantID,
 		LimitType:    "counterparty",
@@ -113,34 +112,29 @@ func (s *LimitService) initializeDefaultLimits(tenantID string) {
 		ValidTo:      time.Now().AddDate(0, 6, 0),
 		CreatedAt:    time.Now().AddDate(0, -6, 0),
 		UpdatedAt:    time.Now(),
-	}
+	})
 }
 
 // ListLimits returns limits based on filters
-func (s *LimitService) ListLimits(tenantID, limitType string) []*TreasuryLimit {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *LimitService) ListLimits(tenantID, limitType string) ([]*TreasuryLimit, error) {
+	all, err := s.limits.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	var result []*TreasuryLimit
-	for _, limit := range s.limits {
-		if limit.TenantID != tenantID {
-			continue
-		}
+	for _, limit := range all {
 		if limitType != "" && limit.LimitType != limitType {
 			continue
 		}
 		result = append(result, limit)
 	}
-	return result
+	return result, nil
 }
 
 // GetLimit retrieves a limit by ID
 func (s *LimitService) GetLimit(tenantID, limitID string) (*TreasuryLimit, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	limit, exists := s.limits[limitID]
-	if !exists || limit.TenantID != tenantID {
+	limit, err := s.limits.get(tenantID, limitID)
+	if err != nil {
 		return nil, errors.New("limit not found")
 	}
 	return limit, nil
@@ -148,9 +142,6 @@ func (s *LimitService) GetLimit(tenantID, limitID string) (*TreasuryLimit, error
 
 // CreateLimit creates a new limit
 func (s *LimitService) CreateLimit(tenantID, approverID string, req *CreateLimitRequest) (*TreasuryLimit, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	validFrom, _ := time.Parse("2006-01-02", req.ValidFrom)
 	validTo, _ := time.Parse("2006-01-02", req.ValidTo)
 
@@ -171,17 +162,16 @@ func (s *LimitService) CreateLimit(tenantID, approverID string, req *CreateLimit
 		UpdatedAt:    time.Now(),
 	}
 
-	s.limits[limit.LimitID] = limit
+	if err := s.limits.put(tenantID, limit.LimitID, limit); err != nil {
+		return nil, err
+	}
 	return limit, nil
 }
 
 // UpdateLimit updates a limit
 func (s *LimitService) UpdateLimit(limit *TreasuryLimit) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	existing, exists := s.limits[limit.LimitID]
-	if !exists || existing.TenantID != limit.TenantID {
+	existing, err := s.limits.get(limit.TenantID, limit.LimitID)
+	if err != nil {
 		return errors.New("limit not found")
 	}
 
@@ -198,23 +188,21 @@ func (s *LimitService) UpdateLimit(limit *TreasuryLimit) error {
 		limit.Status = "within_limit"
 	}
 
-	s.limits[limit.LimitID] = limit
-	return nil
+	return s.limits.put(limit.TenantID, limit.LimitID, limit)
 }
 
 // GetLimitUtilization returns limit utilization summary
-func (s *LimitService) GetLimitUtilization(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *LimitService) GetLimitUtilization(tenantID string) (map[string]interface{}, error) {
+	all, err := s.limits.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 
 	var totalLimits, withinLimit, warning, breached int
 	utilizationByType := make(map[string]float64)
 	countByType := make(map[string]int)
 
-	for _, limit := range s.limits {
-		if limit.TenantID != tenantID {
-			continue
-		}
+	for _, limit := range all {
 		totalLimits++
 
 		switch limit.Status {
@@ -242,19 +230,20 @@ func (s *LimitService) GetLimitUtilization(tenantID string) map[string]interface
 		"breached":             breached,
 		"avgUtilizationByType": avgUtilizationByType,
 		"timestamp":            time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetLimitBreaches returns breached limits
-func (s *LimitService) GetLimitBreaches(tenantID string) []*TreasuryLimit {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *LimitService) GetLimitBreaches(tenantID string) ([]*TreasuryLimit, error) {
+	all, err := s.limits.list(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	var result []*TreasuryLimit
-	for _, limit := range s.limits {
-		if limit.TenantID == tenantID && limit.Status == "breached" {
+	for _, limit := range all {
+		if limit.Status == "breached" {
 			result = append(result, limit)
 		}
 	}
-	return result
+	return result, nil
 }

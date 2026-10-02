@@ -10,6 +10,8 @@ use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering as AtomicOrdering};
+use std::time::Instant;
+use actix_web::HttpMessage;
 
 struct AppState {
     db: Option<PgPool>,
@@ -40,7 +42,7 @@ async fn gl_balance(db: &PgPool, code: &str) -> Result<f64, sqlx::Error> {
 // ── Gap 13: Cheque clearing ────────────────────────────────────────────────
 async fn cheque_clearing_gl(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let _span = otelkit::pg_span("SELECT cycle_id, direction, clearing, cheque_no, amount FROM cheques (cheque_clearing_gl)").entered();
     let rows = sqlx::query(
@@ -103,7 +105,7 @@ async fn cheque_clearing_gl(req: actix_web::HttpRequest, state: web::Data<AppSta
 // ── Gap 14: Collateral events ──────────────────────────────────────────────
 async fn collateral_gl(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let rows = sqlx::query(
         r#"SELECT event_id, event_type, collateral_type, customer, loan_id, amount::float8,
@@ -150,7 +152,7 @@ async fn collateral_gl(req: actix_web::HttpRequest, state: web::Data<AppState>) 
 // ── Gap 15: Cash management (vault / CRR / ATM) — computed from real GL ────
 async fn cash_management_gl(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
 
     let vault = match gl_balance(db, "1001").await { Ok(v) => v, Err(e) => return source_unavailable(&format!("GL 1001 unavailable: {}", e)) };
@@ -205,7 +207,7 @@ async fn cash_management_gl(req: actix_web::HttpRequest, state: web::Data<AppSta
 // ── Gap 16: SWIFT / correspondent banking ──────────────────────────────────
 async fn swift_correspondent_gl(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
+    if !rl_allow().await { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
 
     let messages = match sqlx::query(
@@ -307,6 +309,7 @@ async fn list_records(state: web::Data<AppState>, req: actix_web::HttpRequest) -
 
 async fn create_record(state: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "settlement", "create").await { return resp; } // W12-B5D1
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let req = body.into_inner();
     let batch_id = req.extra.get("batchId").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -350,6 +353,7 @@ async fn get_record(state: web::Data<AppState>, path: web::Path<String>, req: ac
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "settlement", "update").await { return resp; } // W12-B5D1
     let db = match require_db(&data) { Ok(d) => d, Err(r) => return r };
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
@@ -366,6 +370,7 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "settlement", "delete").await { return resp; } // W12-B5D1
     let db = match require_db(&data) { Ok(d) => d, Err(r) => return r };
     let id = path.into_inner();
     let _ = sqlx::query("UPDATE settlements SET status = 'deleted' WHERE id = $1::uuid")
@@ -604,7 +609,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -622,20 +627,57 @@ async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
     Ok(())
 }
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:banking-clearing-ops-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:banking-clearing-ops-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 // --- gRPC Server (binary protocol, length-prefixed) ---
@@ -764,3 +806,6 @@ mod tests {
         DB_AVAILABLE.store(true, AtomicOrdering::Relaxed);
     }
 }
+
+// Wave-12 B5-P0-D1: Permify authorization guard module.
+mod permify;

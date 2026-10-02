@@ -10,9 +10,163 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Header
+from permify_guard import require_permify  # W12-B5P1DF
 from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
+from enum import Enum
+import json
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
+
+
+class _W12PgDict:
+    """Dict-like facade over a PG jsonb store — every read/write hits Postgres.
+    __getitem__ returns a FRESH dict: in-place mutation of the returned dict is
+    NOT persisted (use update_document_record / _doc_set)."""
+    def __init__(self, store):
+        self._store = store
+    def __contains__(self, k):
+        return self._store.get(k) is not None
+    def __getitem__(self, k):
+        row = self._store.get(k)
+        if row is None:
+            raise KeyError(k)
+        return row
+    def get(self, k, default=None):
+        row = self._store.get(k)
+        return default if row is None else row
+    def __setitem__(self, k, v):
+        self._store.put(k, {kk: (vv.value if isinstance(vv, Enum) else vv)
+                            for kk, vv in v.items()})
+    def values(self):
+        return self._store.all()
+    def __len__(self):
+        self._store.ensure()
+        return _w12_run(f"SELECT COUNT(*) AS n FROM {self._store.table}", fetch="one")["n"]
+
+def _doc_set(document_id, **changes):
+    """W12-C3P2B5: PG read-modify-write of a document record (single upsert)."""
+    row = DOC_STORE.get(document_id) or {"document_id": document_id}
+    row.update({k: (v.value if isinstance(v, Enum) else v) for k, v in changes.items()})
+    DOC_STORE.put(document_id, row)
 import structlog
 
 from processors.docling_processor import DoclingProcessor
@@ -36,8 +190,10 @@ docling_processor: Optional[DoclingProcessor] = None
 deepseek_processor: Optional[DeepSeekProcessor] = None
 banking_parser: Optional[BankingDocumentParser] = None
 
-# In-memory storage for demo (replace with database in production)
-document_store: Dict[str, Dict[str, Any]] = {}
+# W12-C3P2B5: PG-backed document store (table ocr_documents) via facade —
+# every access hits Postgres (replaces the in-memory demo dict).
+DOC_STORE = _W12Store("ocr_documents")
+document_store = _W12PgDict(DOC_STORE)
 
 
 @app.on_event("startup")
@@ -274,23 +430,23 @@ async def process_document_async(
     """
     try:
         # Update status to processing
-        document_store[document_id]["status"] = ProcessingStatus.PROCESSING
-        document_store[document_id]["progress"] = 10
+        _doc_set(document_id, status=ProcessingStatus.PROCESSING)
+        _doc_set(document_id, progress=10)
         
         logger.info(f"Starting processing for document {document_id}")
         
         # Step 1: Detect document type if not provided
         if not document_type:
             document_type = await docling_processor.detect_document_type(file_path)
-            document_store[document_id]["document_type"] = document_type
-            document_store[document_id]["progress"] = 20
+            _doc_set(document_id, document_type=document_type)
+            _doc_set(document_id, progress=20)
         
         # Step 2: Process with Docling
         docling_result = await docling_processor.process_document(
             file_path=file_path,
             document_type=document_type
         )
-        document_store[document_id]["progress"] = 50
+        _doc_set(document_id, progress=50)
         
         # Step 3: Enhance with DeepSeek OCR if needed
         if docling_result.get("requires_ocr", False):
@@ -302,7 +458,7 @@ async def process_document_async(
             docling_result["text"] = deepseek_result.get("text", docling_result.get("text"))
             docling_result["confidence"] = deepseek_result.get("confidence", docling_result.get("confidence"))
         
-        document_store[document_id]["progress"] = 70
+        _doc_set(document_id, progress=70)
         
         # Step 4: Parse banking-specific fields
         if document_type in [DocumentType.NATIONAL_ID, DocumentType.PASSPORT, 
@@ -314,7 +470,7 @@ async def process_document_async(
             )
             docling_result["parsed_fields"] = parsed_fields
         
-        document_store[document_id]["progress"] = 90
+        _doc_set(document_id, progress=90)
         
         # Step 5: Store results
         result = DocumentResult(
@@ -329,22 +485,22 @@ async def process_document_async(
             processing_time_ms=docling_result.get("processing_time_ms", 0)
         )
         
-        document_store[document_id]["status"] = ProcessingStatus.COMPLETED
-        document_store[document_id]["progress"] = 100
-        document_store[document_id]["result"] = result.dict()
-        document_store[document_id]["completed_at"] = datetime.utcnow().isoformat()
+        _doc_set(document_id, status=ProcessingStatus.COMPLETED)
+        _doc_set(document_id, progress=100)
+        _doc_set(document_id, result=result.dict())
+        _doc_set(document_id, completed_at=datetime.utcnow().isoformat())
         
         logger.info(f"Completed processing for document {document_id}")
         
     except Exception as e:
         logger.error(f"Error processing document {document_id}: {str(e)}")
-        document_store[document_id]["status"] = ProcessingStatus.FAILED
-        document_store[document_id]["error"] = str(e)
+        _doc_set(document_id, status=ProcessingStatus.FAILED)
+        _doc_set(document_id, error=str(e))
 
 
 # ==================== API ENDPOINTS ====================
 
-@app.post("/api/v1/documents/upload", response_model=DocumentUploadResponse)
+@app.post("/api/v1/documents/upload", response_model=DocumentUploadResponse, dependencies=[Depends(require_permify("document", "upload"))])
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -421,7 +577,7 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
-@app.get("/api/v1/documents/{document_id}/status", response_model=DocumentStatusResponse)
+@app.get("/api/v1/documents/{document_id}/status", response_model=DocumentStatusResponse, dependencies=[Depends(require_permify("document", "view"))])
 async def get_document_status(
     document_id: str,
     tenant_id: str = Depends(get_current_tenant),
@@ -447,7 +603,7 @@ async def get_document_status(
     )
 
 
-@app.get("/api/v1/documents/{document_id}/result")
+@app.get("/api/v1/documents/{document_id}/result", dependencies=[Depends(require_permify("document", "view"))])
 async def get_document_result(
     document_id: str,
     format: str = "json",  # json, markdown, html
@@ -498,7 +654,7 @@ async def get_document_result(
         raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
 
 
-@app.post("/api/v1/documents/batch")
+@app.post("/api/v1/documents/batch", dependencies=[Depends(require_permify("document", "batch"))])
 async def batch_upload(
     request: BatchUploadRequest,
     background_tasks: BackgroundTasks,
@@ -559,7 +715,7 @@ async def batch_upload(
     }
 
 
-@app.get("/api/v1/health")
+@app.get("/api/v1/health", dependencies=[Depends(require_permify("document", "view"))])
 async def health_check():
     """
     Health check endpoint
@@ -576,7 +732,7 @@ async def health_check():
     }
 
 
-@app.get("/api/v1/metrics")
+@app.get("/api/v1/metrics", dependencies=[Depends(require_permify("document", "view"))])
 async def get_metrics():
     """
     Get service metrics

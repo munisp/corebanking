@@ -49,11 +49,6 @@ type LeaseContract struct {
 	Status           string  `json:"status"`
 }
 
-var (
-	mu    sync.RWMutex
-	items = []LeaseContract{}
-)
-
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -61,7 +56,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"leasing.contracts", "leasing.payments", "leasing.assets"}, "usage": "event streaming"},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"leasing-go:cache"}},
-			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"lease_contracts", "lease_payments", "leased_assets"}},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "connected": pgPing(), "tables": []string{"lease_contracts"}},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"leasing-contracts", "leasing-audit"}},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "leasing-go"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"leasing-go"}},
@@ -75,25 +70,6 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 			"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000"), "policy": "leasing-go-waf"},
 		},
 	})
-}
-
-func listItems(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items)})
-}
-
-func getStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	var total float64
-	for _, d := range items {
-		total += d.AssetValue
-	}
-	stats := map[string]interface{}{"total_contracts": len(items), "total_asset_value": total}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
 }
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
@@ -271,13 +247,14 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	port := envOr("PORT", "8173")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/leasing/contracts", listItems)
-	http.HandleFunc("/v1/leasing/stats", getStats)
+	http.HandleFunc("/v1/leasing/contracts", permifyAuthzGuard("lease", "manage", listItems))
+	http.HandleFunc("/v1/leasing/stats", permifyAuthzGuard("lease", "view", getStats))
 	fmt.Printf("Leasing Service running on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

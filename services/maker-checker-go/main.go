@@ -1200,10 +1200,10 @@ func main() {
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/rules", handleRules)
-	mux.HandleFunc("/v1/stats", handleStats)
+	mux.HandleFunc("/v1/rules", permifyAuthzGuard("maker_checker", "manage", handleRules))
+	mux.HandleFunc("/v1/stats", permifyAuthzGuard("maker_checker", "view", handleStats))
 
-	mux.HandleFunc("/v1/approvals", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/approvals", permifyAuthzGuard("maker_checker", "manage", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			handleListApprovals(w, r)
@@ -1212,9 +1212,9 @@ func main() {
 		default:
 			errorJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
-	})
+	}))
 
-	mux.HandleFunc("/v1/approvals/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/approvals/", permifyAuthzGuard("maker_checker", "manage", func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/approvals/"), "/")
 		if len(parts) == 0 || parts[0] == "" {
 			errorJSON(w, http.StatusNotFound, "not found")
@@ -1248,7 +1248,7 @@ func main() {
 		default:
 			errorJSON(w, http.StatusNotFound, "unknown action: "+action)
 		}
-	})
+	}))
 
 	// Read body for logging
 	io.Discard.Write(nil)

@@ -601,13 +601,13 @@ func main() {
 
 	r.Handle("/metrics", promhttp.Handler())
 
-	r.HandleFunc("/api/v1/sms/receive", receiveSMS).
+	r.HandleFunc("/api/v1/sms/receive", permifyAuthzGuard("notification", "receive", receiveSMS)).
 		Methods(http.MethodPost)
 
-	r.HandleFunc("/api/v1/sms/send", sendSMS).
+	r.HandleFunc("/api/v1/sms/send", permifyAuthzGuard("notification", "send", sendSMS)).
 		Methods(http.MethodPost)
 
-	r.HandleFunc("/api/v1/sms/stats", stats).
+	r.HandleFunc("/api/v1/sms/stats", permifyAuthzGuard("notification", "view", stats)).
 		Methods(http.MethodGet)
 
 	srv := &http.Server{

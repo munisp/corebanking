@@ -47,17 +47,6 @@ type StandingCharge struct {
 	Status      string  `json:"status"`
 }
 
-var (
-	mu    sync.RWMutex
-	items = []StandingCharge{
-		{ID: "SC-001", ChargeName: "Account Maintenance Fee", ChargeType: "flat", AccountType: "savings", Amount: 100.0, Frequency: "monthly", Currency: "NGN", Status: "active"},
-		{ID: "SC-002", ChargeName: "SMS Alert Charges", ChargeType: "flat", AccountType: "all", Amount: 50.0, Frequency: "monthly", Currency: "NGN", Status: "active"},
-		{ID: "SC-003", ChargeName: "Card Maintenance", ChargeType: "flat", AccountType: "current", Amount: 1000.0, Frequency: "annual", Currency: "NGN", Status: "active"},
-		{ID: "SC-004", ChargeName: "COT/Turnover Commission", ChargeType: "percentage", AccountType: "current", Amount: 0.5, Frequency: "per_transaction", Currency: "NGN", Status: "active"},
-		{ID: "SC-005", ChargeName: "Dormancy Fee", ChargeType: "flat", AccountType: "all", Amount: 500.0, Frequency: "quarterly", Currency: "NGN", Status: "active"},
-	}
-)
-
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -65,7 +54,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092")},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379")},
-			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL")},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "connected": pgPing(), "tables": []string{"standing_charges"}},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200")},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476")},
@@ -79,21 +68,6 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 			"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000")},
 		},
 	})
-}
-
-func listItems(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items)})
-}
-
-func getStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	stats := map[string]interface{}{"total_charges": len(items)}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
 }
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
@@ -271,6 +245,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	// Fail fast: DATABASE_URL must come from the environment.
 	// No credential-bearing default DSN is shipped (M-04).
@@ -282,8 +257,8 @@ func main() {
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/standing-charges-go/list", listItems)
-	http.HandleFunc("/v1/standing-charges-go/stats", getStats)
+	http.HandleFunc("/v1/standing-charges-go/list", permifyAuthzGuard("standing_charge", "view", listItems))
+	http.HandleFunc("/v1/standing-charges-go/stats", permifyAuthzGuard("standing_charge", "view", getStats))
 	fmt.Printf("Standing Charges Service running on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

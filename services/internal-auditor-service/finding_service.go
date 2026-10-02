@@ -11,7 +11,7 @@ import (
 // FindingService handles audit finding operations
 type FindingService struct {
 	tenantID string
-	findings map[string]*AuditFinding
+	findings *repo[AuditFinding]
 	mu       sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type FindingService struct {
 func NewFindingService(tenantID string) *FindingService {
 	svc := &FindingService{
 		tenantID: tenantID,
-		findings: make(map[string]*AuditFinding),
+		findings: newRepo[AuditFinding](serviceDB, "audit_findings"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -31,7 +31,7 @@ func (s *FindingService) initializeDefaultData(tenantID string) {
 	closedAt := time.Now().AddDate(0, 0, -10)
 
 	// Critical open finding
-	s.findings["find-001"] = &AuditFinding{
+	s.findings.seed(tenantID, "find-001", &AuditFinding{
 		FindingID:         "find-001",
 		TenantID:          tenantID,
 		EngagementID:      "eng-001",
@@ -54,10 +54,10 @@ func (s *FindingService) initializeDefaultData(tenantID string) {
 		Metadata:          make(map[string]interface{}),
 		CreatedAt:         time.Now().AddDate(0, 0, -5),
 		UpdatedAt:         time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// High finding with management response
-	s.findings["find-002"] = &AuditFinding{
+	s.findings.seed(tenantID, "find-002", &AuditFinding{
 		FindingID:          "find-002",
 		TenantID:           tenantID,
 		EngagementID:       "eng-001",
@@ -82,10 +82,10 @@ func (s *FindingService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(0, 0, -7),
 		UpdatedAt:          time.Now().AddDate(0, 0, -2),
-	}
+	})
 
 	// Medium finding in remediation
-	s.findings["find-003"] = &AuditFinding{
+	s.findings.seed(tenantID, "find-003", &AuditFinding{
 		FindingID:          "find-003",
 		TenantID:           tenantID,
 		EngagementID:       "eng-003",
@@ -110,10 +110,10 @@ func (s *FindingService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(0, -1, 0),
 		UpdatedAt:          time.Now().AddDate(0, 0, -5),
-	}
+	})
 
 	// Overdue finding
-	s.findings["find-004"] = &AuditFinding{
+	s.findings.seed(tenantID, "find-004", &AuditFinding{
 		FindingID:          "find-004",
 		TenantID:           tenantID,
 		EngagementID:       "eng-004",
@@ -138,10 +138,10 @@ func (s *FindingService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(0, -3, 0),
 		UpdatedAt:          time.Now().AddDate(0, 0, -15),
-	}
+	})
 
 	// Closed finding
-	s.findings["find-005"] = &AuditFinding{
+	s.findings.seed(tenantID, "find-005", &AuditFinding{
 		FindingID:          "find-005",
 		TenantID:           tenantID,
 		EngagementID:       "eng-004",
@@ -168,16 +168,18 @@ func (s *FindingService) initializeDefaultData(tenantID string) {
 		Metadata:           make(map[string]interface{}),
 		CreatedAt:          time.Now().AddDate(0, -2, 0),
 		UpdatedAt:          time.Now().AddDate(0, 0, -10),
-	}
+	})
 }
 
 // ListFindings returns findings based on filters
-func (s *FindingService) ListFindings(tenantID, status, riskRating string) []*AuditFinding {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FindingService) ListFindings(tenantID, status, riskRating string) ([]*AuditFinding, error) {
 
 	var result []*AuditFinding
-	for _, finding := range s.findings {
+	__ALL__, __ERR__ := s.findings.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, finding := range __ALL__ {
 		if finding.TenantID != tenantID {
 			continue
 		}
@@ -189,16 +191,14 @@ func (s *FindingService) ListFindings(tenantID, status, riskRating string) []*Au
 		}
 		result = append(result, finding)
 	}
-	return result
+	return result, nil
 }
 
 // GetFinding retrieves a finding by ID
 func (s *FindingService) GetFinding(tenantID, findingID string) (*AuditFinding, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	finding, exists := s.findings[findingID]
-	if !exists || finding.TenantID != tenantID {
+	finding, err := s.findings.get(tenantID, findingID)
+	if err != nil {
 		return nil, errors.New("finding not found")
 	}
 	return finding, nil
@@ -206,8 +206,6 @@ func (s *FindingService) GetFinding(tenantID, findingID string) (*AuditFinding, 
 
 // CreateFinding creates a new finding
 func (s *FindingService) CreateFinding(tenantID, auditorID string, req *CreateFindingRequest) (*AuditFinding, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	finding := &AuditFinding{
 		FindingID:      uuid.New().String(),
@@ -231,72 +229,61 @@ func (s *FindingService) CreateFinding(tenantID, auditorID string, req *CreateFi
 		UpdatedAt:      time.Now(),
 	}
 
-	s.findings[finding.FindingID] = finding
+	if err := s.findings.put(tenantID, finding.FindingID, finding); err != nil {
+		return nil, err
+	}
 	return finding, nil
 }
 
 // UpdateFinding updates a finding
 func (s *FindingService) UpdateFinding(finding *AuditFinding) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.findings[finding.FindingID]
-	if !exists || existing.TenantID != finding.TenantID {
+	existing, err := s.findings.get(finding.TenantID, finding.FindingID)
+	if err != nil {
 		return errors.New("finding not found")
 	}
 
 	finding.CreatedAt = existing.CreatedAt
 	finding.UpdatedAt = time.Now()
-	s.findings[finding.FindingID] = finding
-	return nil
+	return s.findings.put(finding.TenantID, finding.FindingID, finding)
 }
 
 // SubmitManagementResponse submits management response
 func (s *FindingService) SubmitManagementResponse(tenantID, findingID string, req *ManagementResponseRequest) (*AuditFinding, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.findings.update(tenantID, findingID, func(finding *AuditFinding) error {
+		targetDate, _ := time.Parse("2006-01-02", req.TargetDate)
+		finding.ManagementResponse = req.Response
+		finding.ActionPlan = req.ActionPlan
+		finding.TargetDate = &targetDate
+		finding.Status = "management_response"
+		finding.UpdatedAt = time.Now()
 
-	finding, exists := s.findings[findingID]
-	if !exists || finding.TenantID != tenantID {
-		return nil, errors.New("finding not found")
-	}
-
-	targetDate, _ := time.Parse("2006-01-02", req.TargetDate)
-	finding.ManagementResponse = req.Response
-	finding.ActionPlan = req.ActionPlan
-	finding.TargetDate = &targetDate
-	finding.Status = "management_response"
-	finding.UpdatedAt = time.Now()
-
-	return finding, nil
+		return nil
+	})
 }
 
 // CloseFinding closes a finding
 func (s *FindingService) CloseFinding(tenantID, findingID, auditorID string) (*AuditFinding, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.findings.update(tenantID, findingID, func(finding *AuditFinding) error {
+		now := time.Now()
+		finding.Status = "closed"
+		finding.ClosedBy = auditorID
+		finding.ClosedAt = &now
+		finding.UpdatedAt = now
 
-	finding, exists := s.findings[findingID]
-	if !exists || finding.TenantID != tenantID {
-		return nil, errors.New("finding not found")
-	}
-
-	now := time.Now()
-	finding.Status = "closed"
-	finding.ClosedBy = auditorID
-	finding.ClosedAt = &now
-	finding.UpdatedAt = now
-
-	return finding, nil
+		return nil
+	})
 }
 
 // GetOpenFindings returns open findings
-func (s *FindingService) GetOpenFindings(tenantID string) []*AuditFinding {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FindingService) GetOpenFindings(tenantID string) ([]*AuditFinding, error) {
 
 	var result []*AuditFinding
-	for _, finding := range s.findings {
+	__ALL__, __ERR__ := s.findings.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, finding := range __ALL__ {
 		if finding.TenantID != tenantID {
 			continue
 		}
@@ -304,17 +291,19 @@ func (s *FindingService) GetOpenFindings(tenantID string) []*AuditFinding {
 			result = append(result, finding)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetOverdueFindings returns overdue findings
-func (s *FindingService) GetOverdueFindings(tenantID string) []*AuditFinding {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FindingService) GetOverdueFindings(tenantID string) ([]*AuditFinding, error) {
 
 	now := time.Now()
 	var result []*AuditFinding
-	for _, finding := range s.findings {
+	__ALL__, __ERR__ := s.findings.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, finding := range __ALL__ {
 		if finding.TenantID != tenantID {
 			continue
 		}
@@ -325,16 +314,18 @@ func (s *FindingService) GetOverdueFindings(tenantID string) []*AuditFinding {
 			result = append(result, finding)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetEngagementFindings returns findings for an engagement
-func (s *FindingService) GetEngagementFindings(tenantID, engagementID string) []*AuditFinding {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FindingService) GetEngagementFindings(tenantID, engagementID string) ([]*AuditFinding, error) {
 
 	var result []*AuditFinding
-	for _, finding := range s.findings {
+	__ALL__, __ERR__ := s.findings.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, finding := range __ALL__ {
 		if finding.TenantID != tenantID {
 			continue
 		}
@@ -342,18 +333,20 @@ func (s *FindingService) GetEngagementFindings(tenantID, engagementID string) []
 			result = append(result, finding)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetSummary returns finding summary
-func (s *FindingService) GetSummary(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *FindingService) GetSummary(tenantID string) (map[string]interface{}, error) {
 
 	var total, open, critical, high, medium, low, overdue, closed int
 	now := time.Now()
 
-	for _, finding := range s.findings {
+	__ALL__, __ERR__ := s.findings.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, finding := range __ALL__ {
 		if finding.TenantID != tenantID {
 			continue
 		}
@@ -390,5 +383,5 @@ func (s *FindingService) GetSummary(tenantID string) map[string]interface{} {
 		"lowFindings":      low,
 		"overdueFindings":  overdue,
 		"timestamp":        time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

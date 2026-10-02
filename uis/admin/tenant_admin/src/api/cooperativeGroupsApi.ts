@@ -48,28 +48,28 @@ export interface CooperativeMember {
 
 export const cooperativeMgmtApi = {
   list: (params?: { page?: number; limit?: number; type?: string; status?: string; q?: string }) =>
-    apiClient.get<{ items: Cooperative[]; total: number }>(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives`, { params }).then((r) => r.data),
+    apiClient.get<{ items: Cooperative[]; total: number }>(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<Cooperative>(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives/${id}`).then((r) => r.data),
+    apiClient.get<Cooperative>(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives/${id}`).then((r) => r.data),
 
   create: (body: Partial<Cooperative>) =>
-    apiClient.post<Cooperative>(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives`, body).then((r) => r.data),
+    apiClient.post<Cooperative>(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives`, body).then((r) => r.data),
 
   update: (id: string, body: Partial<Cooperative>) =>
-    apiClient.put(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives/${id}`, body).then((r) => r.data),
+    apiClient.put(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives/${id}`, body).then((r) => r.data),
 
   getMembers: (id: string, params?: { page?: number; limit?: number; status?: string }) =>
-    apiClient.get<{ items: CooperativeMember[]; total: number }>(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives/${id}/members`, { params }).then((r) => r.data),
+    apiClient.get<{ items: CooperativeMember[]; total: number }>(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives/${id}/members`, { params }).then((r) => r.data),
 
   addMember: (id: string, body: { customerId: string; shareCount?: number }) =>
-    apiClient.post<CooperativeMember>(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives/${id}/members`, body).then((r) => r.data),
+    apiClient.post<CooperativeMember>(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives/${id}/members`, body).then((r) => r.data),
 
   removeMember: (coopId: string, memberId: string, reason: string) =>
-    apiClient.post(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives/${coopId}/members/${memberId}/remove`, { reason }).then((r) => r.data),
+    apiClient.post(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives/${coopId}/members/${memberId}/remove`, { reason }).then((r) => r.data),
 
   getDashboard: (id: string) =>
-    apiClient.get(`${APISIX.COOPERATIVE_MGMT}/api/v1/cooperatives/${id}/dashboard`).then((r) => r.data),
+    apiClient.get(`${APISIX.COOPERATIVE_MGMT}/api/v1/agriculture/cooperatives/${id}/dashboard`).then((r) => r.data),
 };
 
 // ─── Cooperative Financials ───────────────────────────────────────────────────
@@ -87,22 +87,22 @@ export interface CooperativeFinancials {
 
 export const cooperativeFinancialsApi = {
   getSummary: (coopId: string, params?: { period?: string }) =>
-    apiClient.get<CooperativeFinancials>(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/cooperatives/${coopId}/financials`, { params }).then((r) => r.data),
+    apiClient.get<CooperativeFinancials>(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/agriculture/cooperatives/${coopId}/financials`, { params }).then((r) => r.data),
 
   getIncomeStatement: (coopId: string, params?: { from?: string; to?: string }) =>
-    apiClient.get(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/cooperatives/${coopId}/income-statement`, { params }).then((r) => r.data),
+    apiClient.get(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/agriculture/cooperatives/${coopId}/income-statement`, { params }).then((r) => r.data),
 
   getBalanceSheet: (coopId: string, params?: { asOf?: string }) =>
-    apiClient.get(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/cooperatives/${coopId}/balance-sheet`, { params }).then((r) => r.data),
+    apiClient.get(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/agriculture/cooperatives/${coopId}/balance-sheet`, { params }).then((r) => r.data),
 
   getDividendCalculation: (coopId: string, period: string) =>
-    apiClient.post(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/cooperatives/${coopId}/dividends/calculate`, { period }).then((r) => r.data),
+    apiClient.post(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/agriculture/cooperatives/${coopId}/dividends/calculate`, { period }).then((r) => r.data),
 
   approveDividends: (coopId: string, period: string) =>
-    apiClient.post(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/cooperatives/${coopId}/dividends/approve`, { period }).then((r) => r.data),
+    apiClient.post(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/agriculture/cooperatives/${coopId}/dividends/approve`, { period }).then((r) => r.data),
 
   getShareLedger: (coopId: string, params?: { page?: number; limit?: number }) =>
-    apiClient.get(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/cooperatives/${coopId}/share-ledger`, { params }).then((r) => r.data),
+    apiClient.get(`${APISIX.COOPERATIVE_FINANCIALS}/api/v1/agriculture/cooperatives/${coopId}/share-ledger`, { params }).then((r) => r.data),
 };
 
 // ─── Cooperative Meetings ─────────────────────────────────────────────────────
@@ -122,19 +122,19 @@ export interface CooperativeMeeting {
 
 export const cooperativeMeetingsApi = {
   list: (coopId: string, params?: { page?: number; limit?: number; meetingType?: string; status?: string }) =>
-    apiClient.get<{ items: CooperativeMeeting[]; total: number }>(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/cooperatives/${coopId}/meetings`, { params }).then((r) => r.data),
+    apiClient.get<{ items: CooperativeMeeting[]; total: number }>(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/agriculture/cooperatives/${coopId}/meetings`, { params }).then((r) => r.data),
 
   getById: (coopId: string, meetingId: string) =>
-    apiClient.get<CooperativeMeeting>(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/cooperatives/${coopId}/meetings/${meetingId}`).then((r) => r.data),
+    apiClient.get<CooperativeMeeting>(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/agriculture/cooperatives/${coopId}/meetings/${meetingId}`).then((r) => r.data),
 
   schedule: (coopId: string, body: Partial<CooperativeMeeting>) =>
-    apiClient.post<CooperativeMeeting>(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/cooperatives/${coopId}/meetings`, body).then((r) => r.data),
+    apiClient.post<CooperativeMeeting>(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/agriculture/cooperatives/${coopId}/meetings`, body).then((r) => r.data),
 
   uploadMinutes: (coopId: string, meetingId: string, body: FormData) =>
-    apiClient.post(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/cooperatives/${coopId}/meetings/${meetingId}/minutes`, body, { headers: { "Content-Type": "multipart/form-data" } }).then((r) => r.data),
+    apiClient.post(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/agriculture/cooperatives/${coopId}/meetings/${meetingId}/minutes`, body, { headers: { "Content-Type": "multipart/form-data" } }).then((r) => r.data),
 
   recordAttendance: (coopId: string, meetingId: string, body: { attendees: string[] }) =>
-    apiClient.post(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/cooperatives/${coopId}/meetings/${meetingId}/attendance`, body).then((r) => r.data),
+    apiClient.post(`${APISIX.COOPERATIVE_MEETINGS}/api/v1/agriculture/cooperatives/${coopId}/meetings/${meetingId}/attendance`, body).then((r) => r.data),
 };
 
 // ─── Esusu Groups ─────────────────────────────────────────────────────────────
@@ -166,22 +166,22 @@ export interface EsusuContribution {
 
 export const esusuGroupsApi = {
   list: (params?: { page?: number; limit?: number; status?: string }) =>
-    apiClient.get<{ items: EsusuGroup[]; total: number }>(`${APISIX.ESUSU_GROUPS}/v1/groups`, { params }).then((r) => r.data),
+    apiClient.get<{ items: EsusuGroup[]; total: number }>(`${APISIX.ESUSU_GROUPS}/api/v1/esusu/groups`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<EsusuGroup>(`${APISIX.ESUSU_GROUPS}/v1/groups/${id}`).then((r) => r.data),
+    apiClient.get<EsusuGroup>(`${APISIX.ESUSU_GROUPS}/api/v1/esusu/groups/${id}`).then((r) => r.data),
 
   create: (body: Partial<EsusuGroup>) =>
-    apiClient.post<EsusuGroup>(`${APISIX.ESUSU_GROUPS}/v1/groups`, body).then((r) => r.data),
+    apiClient.post<EsusuGroup>(`${APISIX.ESUSU_GROUPS}/api/v1/esusu/groups`, body).then((r) => r.data),
 
   getContributions: (id: string, params?: { page?: number; limit?: number; cycleNumber?: number }) =>
-    apiClient.get<{ items: EsusuContribution[]; total: number }>(`${APISIX.ESUSU_GROUPS}/v1/groups/${id}/contributions`, { params }).then((r) => r.data),
+    apiClient.get<{ items: EsusuContribution[]; total: number }>(`${APISIX.ESUSU_GROUPS}/api/v1/esusu/groups/${id}/contributions`, { params }).then((r) => r.data),
 
   recordContribution: (id: string, body: { memberId: string; amount: number; cycleNumber: number }) =>
-    apiClient.post<EsusuContribution>(`${APISIX.ESUSU_GROUPS}/v1/groups/${id}/contributions`, body).then((r) => r.data),
+    apiClient.post<EsusuContribution>(`${APISIX.ESUSU_GROUPS}/api/v1/esusu/groups/${id}/contributions`, body).then((r) => r.data),
 
   disburse: (id: string, body: { beneficiaryId: string; cycleNumber: number }) =>
-    apiClient.post(`${APISIX.ESUSU_GROUPS}/v1/groups/${id}/disburse`, body).then((r) => r.data),
+    apiClient.post(`${APISIX.ESUSU_GROUPS}/api/v1/esusu/groups/${id}/disburse`, body).then((r) => r.data),
 };
 
 // ─── Group Lending ────────────────────────────────────────────────────────────
@@ -216,7 +216,7 @@ export const groupLendingApi = {
     apiClient.get<{ items: LendingGroup[]; total: number }>(`${APISIX.GROUP_LENDING}/v1/groups`, { params }).then((r) => r.data),
 
   getGroupById: (id: string) =>
-    apiClient.get<LendingGroup>(`${APISIX.GROUP_LENDING}/v1/groups/${id}`).then((r) => r.data),
+    apiClient.get<LendingGroup>(`${APISIX.ESUSU_GROUPS}/api/v1/esusu/groups/${id}`).then((r) => r.data),
 
   createGroup: (body: Partial<LendingGroup>) =>
     apiClient.post<LendingGroup>(`${APISIX.GROUP_LENDING}/v1/groups`, body).then((r) => r.data),
@@ -231,7 +231,7 @@ export const groupLendingApi = {
     apiClient.get<GroupLoan>(`${APISIX.GROUP_LENDING}/v1/loans/${id}`).then((r) => r.data),
 
   approveLoan: (id: string) =>
-    apiClient.post(`${APISIX.GROUP_LENDING}/v1/loans/${id}/approve`, {}).then((r) => r.data),
+    apiClient.post(`/agricultural/api/v1/agriculture/loans/${id}/approve`, {}).then((r) => r.data),
 
   disburseLoan: (id: string) =>
     apiClient.post(`${APISIX.GROUP_LENDING}/v1/loans/${id}/disburse`, {}).then((r) => r.data),

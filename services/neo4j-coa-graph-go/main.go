@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
+
 	"math/big"
 	"math/rand"
 	"net"
@@ -241,178 +241,11 @@ func getSeedEdges() []COAEdge {
 	}
 }
 
-// ─── Graph Analytics (In-Memory) ────────────────────────────────────────────
-
-type InMemoryGraph struct {
-	nodes map[string]COANode
-	edges []COAEdge
-	mu    sync.RWMutex
-}
-
-var graph = &InMemoryGraph{nodes: make(map[string]COANode)}
-
-func (g *InMemoryGraph) SeedCOA() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for _, n := range getSeedCOA() {
-		g.nodes[n.Code] = n
-	}
-	g.edges = getSeedEdges()
-}
-
-func (g *InMemoryGraph) GetNode(code string) (COANode, bool) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	n, ok := g.nodes[code]
-	return n, ok
-}
-
-func (g *InMemoryGraph) GetNeighbors(code string, relType string) []COAEdge {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	var result []COAEdge
-	for _, e := range g.edges {
-		if (e.FromCode == code || e.ToCode == code) && (relType == "" || e.RelationType == relType) {
-			result = append(result, e)
-		}
-	}
-	return result
-}
-
-func (g *InMemoryGraph) TraversePath(from, to string, maxDepth int) []string {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	visited := map[string]bool{}
-	return g.bfs(from, to, maxDepth, visited)
-}
-
-func (g *InMemoryGraph) bfs(from, to string, maxDepth int, visited map[string]bool) []string {
-	if from == to {
-		return []string{from}
-	}
-	if maxDepth <= 0 {
-		return nil
-	}
-	visited[from] = true
-	for _, e := range g.edges {
-		next := ""
-		if e.FromCode == from {
-			next = e.ToCode
-		} else if e.ToCode == from {
-			next = e.FromCode
-		}
-		if next == "" || visited[next] {
-			continue
-		}
-		path := g.bfs(next, to, maxDepth-1, visited)
-		if path != nil {
-			return append([]string{from}, path...)
-		}
-	}
-	return nil
-}
-
-func (g *InMemoryGraph) ComputePageRank(iterations int, damping float64) map[string]float64 {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	n := len(g.nodes)
-	if n == 0 {
-		return map[string]float64{}
-	}
-	rank := make(map[string]float64)
-	for code := range g.nodes {
-		rank[code] = 1.0 / float64(n)
-	}
-	outDegree := make(map[string]int)
-	for _, e := range g.edges {
-		outDegree[e.FromCode]++
-	}
-	for i := 0; i < iterations; i++ {
-		newRank := make(map[string]float64)
-		for code := range g.nodes {
-			newRank[code] = (1 - damping) / float64(n)
-		}
-		for _, e := range g.edges {
-			if outDegree[e.FromCode] > 0 {
-				newRank[e.ToCode] += damping * rank[e.FromCode] / float64(outDegree[e.FromCode])
-			}
-		}
-		rank = newRank
-	}
-	return rank
-}
-
-func (g *InMemoryGraph) ComputeBaselIIIMetrics() map[string]interface{} {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	var totalRWA, cet1Capital, tier2Capital, totalLoans, totalProvisions float64
-	for _, n := range g.nodes {
-		switch {
-		case strings.HasPrefix(n.Subcategory, "loans_"):
-			riskWeight := 1.0
-			if n.Subcategory == "loans_corporate" {
-				riskWeight = 1.0
-			} else if n.Subcategory == "loans_sme" {
-				riskWeight = 0.75
-			} else if n.Subcategory == "loans_agric" {
-				riskWeight = 0.50
-			}
-			totalRWA += math.Abs(n.Balance) * riskWeight
-			totalLoans += math.Abs(n.Balance)
-		case n.Subcategory == "share_capital" || n.Subcategory == "reserves" || n.Subcategory == "retained":
-			cet1Capital += math.Abs(n.Balance)
-		case n.Subcategory == "borrowings_sub":
-			tier2Capital += math.Abs(n.Balance)
-		case strings.HasPrefix(n.Subcategory, "provision_"):
-			totalProvisions += math.Abs(n.Balance)
-		}
-	}
-	car := 0.0
-	if totalRWA > 0 {
-		car = (cet1Capital + tier2Capital) / totalRWA * 100
-	}
-	nplRatio := 0.0
-	if totalLoans > 0 {
-		nplRatio = totalProvisions / totalLoans * 100
-	}
-	return map[string]interface{}{
-		"total_rwa":              totalRWA,
-		"cet1_capital":           cet1Capital,
-		"tier2_capital":          tier2Capital,
-		"total_capital":          cet1Capital + tier2Capital,
-		"capital_adequacy_ratio": car,
-		"cbn_minimum_car":        15.0,
-		"car_compliant":          car >= 15.0,
-		"total_loans":            totalLoans,
-		"total_provisions":       totalProvisions,
-		"npl_coverage_ratio":     nplRatio,
-	}
-}
-
-func (g *InMemoryGraph) ComputeLiquidityRatio() map[string]interface{} {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	var liquidAssets, totalDeposits float64
-	for _, n := range g.nodes {
-		switch n.Subcategory {
-		case "cash", "cash_cbn", "placements", "investments_govt":
-			liquidAssets += math.Abs(n.Balance)
-		case "deposits_demand", "deposits_savings", "deposits_time":
-			totalDeposits += math.Abs(n.Balance)
-		}
-	}
-	ratio := 0.0
-	if totalDeposits > 0 {
-		ratio = liquidAssets / totalDeposits * 100
-	}
-	return map[string]interface{}{
-		"liquid_assets":   liquidAssets,
-		"total_deposits":  totalDeposits,
-		"liquidity_ratio": ratio,
-		"cbn_minimum":     30.0,
-		"compliant":       ratio >= 30.0,
-	}
-}
+// ─── Graph Analytics ───────────────────────────────────────────────────────
+// W12-C3-P2-B2 (register items main.go:247-248): the shadow InMemoryGraph
+// (nodes map[string]COANode, edges []COAEdge) was REMOVED. Neo4j is the
+// graph-of-record — see graph_neo4j.go (seed via MERGE, reads/writes via the
+// Bolt client, analytics as pure functions over Neo4j-fetched snapshots).
 
 // ─── HTTP Handlers ──────────────────────────────────────────────────────────
 
@@ -460,14 +293,30 @@ func coaGraphHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
 		return
 	}
-	nodes := make([]COANode, 0)
-	graph.mu.RLock()
-	for _, n := range graph.nodes {
+	// W12-C3-P2-B2: served from Neo4j (was shadow InMemoryGraph).
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	nodeMap, err := fetchNodes(neo)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	edges, err := fetchEdges(neo)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	nodes := make([]COANode, 0, len(nodeMap))
+	for _, n := range nodeMap {
 		nodes = append(nodes, n)
 	}
-	edges := graph.edges
-	graph.mu.RUnlock()
-	jsonResp(w, 200, map[string]interface{}{"nodes": nodes, "edges": edges, "total_nodes": len(nodes), "total_edges": len(edges)})
+	jsonResp(w, 200, map[string]interface{}{"nodes": nodes, "edges": edges, "total_nodes": len(nodes), "total_edges": len(edges), "source": "neo4j"})
 }
 
 func coaNodeHandler(w http.ResponseWriter, r *http.Request) {
@@ -481,12 +330,29 @@ func coaNodeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code := strings.TrimPrefix(r.URL.Path, "/v1/coa/node/")
-	node, ok := graph.GetNode(code)
-	if !ok {
+	// W12-C3-P2-B2: served from Neo4j (was shadow InMemoryGraph).
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	node, err := fetchNode(neo, code)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	if node == nil {
 		jsonResp(w, 404, map[string]string{"error": "account_not_found"})
 		return
 	}
-	neighbors := graph.GetNeighbors(code, "")
+	neighbors, err := fetchNeighbors(neo, code, "")
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
 	jsonResp(w, 200, map[string]interface{}{"node": node, "relationships": neighbors})
 }
 
@@ -511,7 +377,21 @@ func coaTraverseHandler(w http.ResponseWriter, r *http.Request) {
 	if req.MaxDepth == 0 {
 		req.MaxDepth = 5
 	}
-	path := graph.TraversePath(req.From, req.To, req.MaxDepth)
+	// W12-C3-P2-B2: traversal runs over edges fetched from Neo4j (was shadow
+	// InMemoryGraph BFS).
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	edges, err := fetchEdges(neo)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	path := traversePathBFS(edges, req.From, req.To, req.MaxDepth, map[string]bool{})
 	jsonResp(w, 200, map[string]interface{}{"from": req.From, "to": req.To, "path": path, "hops": len(path) - 1})
 }
 
@@ -562,21 +442,39 @@ func pagerankHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
 		return
 	}
-	ranks := graph.ComputePageRank(20, 0.85)
+	// W12-C3-P2-B2: PageRank computed over a Neo4j snapshot (was shadow
+	// InMemoryGraph).
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	nodes, err := fetchNodes(neo)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	edges, err := fetchEdges(neo)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	ranks := computePageRank(nodes, edges, 20, 0.85)
 	type rankedNode struct {
 		Code string  `json:"code"`
 		Name string  `json:"name"`
 		Rank float64 `json:"rank"`
 	}
 	ranked := make([]rankedNode, 0)
-	graph.mu.RLock()
 	for code, rank := range ranks {
-		if n, ok := graph.nodes[code]; ok {
+		if n, ok := nodes[code]; ok {
 			ranked = append(ranked, rankedNode{Code: code, Name: n.Name, Rank: rank})
 		}
 	}
-	graph.mu.RUnlock()
-	jsonResp(w, 200, map[string]interface{}{"algorithm": "pagerank", "iterations": 20, "damping": 0.85, "rankings": ranked})
+	jsonResp(w, 200, map[string]interface{}{"algorithm": "pagerank", "iterations": 20, "damping": 0.85, "rankings": ranked, "source": "neo4j"})
 }
 
 func baselHandler(w http.ResponseWriter, r *http.Request) {
@@ -589,7 +487,20 @@ func baselHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
 		return
 	}
-	metrics := graph.ComputeBaselIIIMetrics()
+	// W12-C3-P2-B2: Basel III metrics over a Neo4j snapshot (was shadow graph).
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	nodes, err := fetchNodes(neo)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	metrics := computeBaselIIIMetrics(nodes)
 	jsonResp(w, 200, metrics)
 }
 
@@ -603,7 +514,20 @@ func liquidityHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
 		return
 	}
-	metrics := graph.ComputeLiquidityRatio()
+	// W12-C3-P2-B2: liquidity ratio over a Neo4j snapshot (was shadow graph).
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	nodes, err := fetchNodes(neo)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	metrics := computeLiquidityRatio(nodes)
 	jsonResp(w, 200, metrics)
 }
 
@@ -621,13 +545,23 @@ func transactionFlowHandler(w http.ResponseWriter, r *http.Request) {
 	body = []byte(sanitizeInput(string(body)))
 	var txn TransactionFlow
 	json.Unmarshal(body, &txn)
-	graph.mu.Lock()
-	graph.edges = append(graph.edges, COAEdge{
+	// W12-C3-P2-B2: TRANSACTION edges are written to Neo4j (was append-only
+	// shadow InMemoryGraph). Fail closed when the graph store is unavailable.
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	if err := mergeEdge(neo, COAEdge{
 		FromCode: txn.DebitAccount, ToCode: txn.CreditAccount,
 		RelationType: "TRANSACTION", Weight: txn.Amount,
 		Metadata: map[string]interface{}{"narration": txn.Narration, "timestamp": txn.Timestamp, "currency": txn.Currency},
-	})
-	graph.mu.Unlock()
+	}); err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_write_failed", "detail": err.Error()})
+		return
+	}
 	dbData, _ := json.Marshal(txn)
 	dbInsert(fmt.Sprintf("txn_%d", time.Now().UnixNano()), serviceName, "default", "active", dbData)
 	// Notify gl-engine
@@ -656,9 +590,19 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	body = []byte(sanitizeInput(string(body)))
 	var node COANode
 	json.Unmarshal(body, &node)
-	graph.mu.Lock()
-	graph.nodes[node.Code] = node
-	graph.mu.Unlock()
+	// W12-C3-P2-B2: nodes are MERGEd into Neo4j (idempotent on code; was the
+	// shadow InMemoryGraph).
+	neo, err := connectedNeo4j()
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_store_unavailable", "detail": err.Error()})
+		return
+	}
+	if err := mergeNode(neo, node); err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 503, map[string]string{"error": "graph_write_failed", "detail": err.Error()})
+		return
+	}
 	dbData, _ := json.Marshal(node)
 	dbInsert(fmt.Sprintf("node_%s_%d", node.Code, time.Now().UnixNano()), serviceName, "default", "active", dbData)
 	jsonResp(w, 201, map[string]interface{}{"created": true, "code": node.Code})
@@ -1308,7 +1252,12 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 
 func main() {
 	initDB()
-	graph.SeedCOA()
+	// W12-C3-P2-B2: seed the canonical COA graph into Neo4j (idempotent
+	// MERGE). When Neo4j is down the service still boots; graph endpoints
+	// fail closed (503) until it is reachable.
+	if err := seedGraphToNeo4j(); err != nil {
+		log.Printf("[neo4j-coa-graph-go] WARNING: Neo4j seed failed (%v) — graph endpoints will 503 until Neo4j is reachable", err)
+	}
 
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

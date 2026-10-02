@@ -1,35 +1,35 @@
 package main
 
 import (
+	"errors"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// LiquidityService handles liquidity management operations
+// LiquidityService handles liquidity management operations.
+// Postgres (tables liquidity_positions, cash_flows) is the system of record.
 type LiquidityService struct {
 	tenantID  string
-	positions map[string]*LiquidityPosition
-	cashFlows map[string]*CashFlow
-	mu        sync.RWMutex
+	positions *repo[LiquidityPosition]
+	cashFlows *repo[CashFlow]
 }
 
 // NewLiquidityService creates a new liquidity service
 func NewLiquidityService(tenantID string) *LiquidityService {
 	svc := &LiquidityService{
 		tenantID:  tenantID,
-		positions: make(map[string]*LiquidityPosition),
-		cashFlows: make(map[string]*CashFlow),
+		positions: newRepo[LiquidityPosition](serviceDB, "liquidity_positions"),
+		cashFlows: newRepo[CashFlow](serviceDB, "cash_flows"),
 	}
 	svc.initializeDefaultPositions(tenantID)
 	return svc
 }
 
 func (s *LiquidityService) initializeDefaultPositions(tenantID string) {
-	// Initialize NGN position
-	s.positions["NGN"] = &LiquidityPosition{
+	// Initialize NGN position (idempotent seed)
+	s.positions.seed(tenantID, "NGN", &LiquidityPosition{
 		PositionID:       uuid.New().String(),
 		TenantID:         tenantID,
 		Date:             time.Now(),
@@ -55,10 +55,10 @@ func (s *LiquidityService) initializeDefaultPositions(tenantID string) {
 		Metadata:  make(map[string]interface{}),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
-	}
+	})
 
-	// Initialize USD position
-	s.positions["USD"] = &LiquidityPosition{
+	// Initialize USD position (idempotent seed)
+	s.positions.seed(tenantID, "USD", &LiquidityPosition{
 		PositionID:       uuid.New().String(),
 		TenantID:         tenantID,
 		Date:             time.Now(),
@@ -75,16 +75,17 @@ func (s *LiquidityService) initializeDefaultPositions(tenantID string) {
 		Metadata:         make(map[string]interface{}),
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
-	}
+	})
 }
 
 // GetLiquidityPosition returns the liquidity position for a currency
-func (s *LiquidityService) GetLiquidityPosition(tenantID, currency string) *LiquidityPosition {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if pos, exists := s.positions[currency]; exists && pos.TenantID == tenantID {
-		return pos
+func (s *LiquidityService) GetLiquidityPosition(tenantID, currency string) (*LiquidityPosition, error) {
+	pos, err := s.positions.get(tenantID, currency)
+	if err == nil {
+		return pos, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
 	}
 
 	// Return empty position if not found
@@ -93,21 +94,26 @@ func (s *LiquidityService) GetLiquidityPosition(tenantID, currency string) *Liqu
 		Currency: currency,
 		Date:     time.Now(),
 		Status:   "unknown",
-	}
+	}, nil
 }
 
 // GetCashFlows returns cash flows for a date range
-func (s *LiquidityService) GetCashFlows(tenantID, startDate, endDate string) []*CashFlow {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var result []*CashFlow
-	for _, cf := range s.cashFlows {
-		if cf.TenantID == tenantID {
-			result = append(result, cf)
-		}
+func (s *LiquidityService) GetCashFlows(tenantID, startDate, endDate string) ([]*CashFlow, error) {
+	flows, err := s.cashFlows.list(tenantID)
+	if err != nil {
+		return nil, err
 	}
-	return result
+	var result []*CashFlow
+	for _, cf := range flows {
+		if startDate != "" && cf.Date.Format("2006-01-02") < startDate {
+			continue
+		}
+		if endDate != "" && cf.Date.Format("2006-01-02") > endDate {
+			continue
+		}
+		result = append(result, cf)
+	}
+	return result, nil
 }
 
 // GetCashFlowProjection returns projected cash flows
@@ -142,13 +148,13 @@ func (s *LiquidityService) GetCashFlowProjection(tenantID, daysStr string) []Cas
 }
 
 // GetLiquidityRatios returns liquidity ratios
-func (s *LiquidityService) GetLiquidityRatios(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ngnPos := s.positions["NGN"]
-	if ngnPos == nil {
-		return map[string]interface{}{}
+func (s *LiquidityService) GetLiquidityRatios(tenantID string) (map[string]interface{}, error) {
+	ngnPos, err := s.positions.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]interface{}{}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return map[string]interface{}{
@@ -166,41 +172,41 @@ func (s *LiquidityService) GetLiquidityRatios(tenantID string) map[string]interf
 		"availableStableFunding": ngnPos.TotalLiabilities,
 		"requiredStableFunding":  ngnPos.TotalAssets * 87 / 100,
 		"timestamp":              time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetNostroBalances returns nostro account balances
-func (s *LiquidityService) GetNostroBalances(tenantID string) map[string]int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ngnPos := s.positions["NGN"]
-	if ngnPos == nil {
-		return map[string]int64{}
+func (s *LiquidityService) GetNostroBalances(tenantID string) (map[string]int64, error) {
+	ngnPos, err := s.positions.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]int64{}, nil
 	}
-	return ngnPos.NostroBalances
+	if err != nil {
+		return nil, err
+	}
+	return ngnPos.NostroBalances, nil
 }
 
 // GetVostroBalances returns vostro account balances
-func (s *LiquidityService) GetVostroBalances(tenantID string) map[string]int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ngnPos := s.positions["NGN"]
-	if ngnPos == nil {
-		return map[string]int64{}
+func (s *LiquidityService) GetVostroBalances(tenantID string) (map[string]int64, error) {
+	ngnPos, err := s.positions.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]int64{}, nil
 	}
-	return ngnPos.VostroBalances
+	if err != nil {
+		return nil, err
+	}
+	return ngnPos.VostroBalances, nil
 }
 
 // GetCRRPosition returns CRR position
-func (s *LiquidityService) GetCRRPosition(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	ngnPos := s.positions["NGN"]
-	if ngnPos == nil {
-		return map[string]interface{}{}
+func (s *LiquidityService) GetCRRPosition(tenantID string) (map[string]interface{}, error) {
+	ngnPos, err := s.positions.get(tenantID, "NGN")
+	if errors.Is(err, ErrNotFound) {
+		return map[string]interface{}{}, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	totalDeposits := ngnPos.TotalLiabilities
@@ -216,5 +222,5 @@ func (s *LiquidityService) GetCRRPosition(tenantID string) map[string]interface{
 		"complianceStatus": "compliant",
 		"cbnAccountNumber": "0001234567890",
 		"lastUpdated":      time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

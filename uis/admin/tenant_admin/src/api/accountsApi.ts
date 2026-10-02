@@ -41,24 +41,26 @@ export interface AccountOpeningStats {
   today: number;
 }
 
+// W12-A4-P0-D: repointed from the unserved /account/v1/applications* namespace
+// to account-service's real /account-opening* routes (gateway /account/* -> /*).
 export const accountOpeningApi = {
   list: (params?: { page?: number; limit?: number; status?: string; accountType?: string }) =>
-    apiClient.get<{ items: AccountOpeningApplication[]; total: number }>(`${APISIX.ACCOUNT_OPENING}/v1/applications`, { params }).then((r) => r.data),
+    apiClient.get<{ items: AccountOpeningApplication[]; total: number }>(`${APISIX.ACCOUNT_OPENING}/account-opening/list`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<AccountOpeningApplication>(`${APISIX.ACCOUNT_OPENING}/v1/applications/${id}`).then((r) => r.data),
+    apiClient.get<AccountOpeningApplication>(`${APISIX.ACCOUNT_OPENING}/account-opening/${id}`).then((r) => r.data),
 
   create: (body: { customerId: string; accountType: string; currency: string; initialDeposit?: number }) =>
-    apiClient.post<AccountOpeningApplication>(`${APISIX.ACCOUNT_OPENING}/v1/applications`, body).then((r) => r.data),
+    apiClient.post<AccountOpeningApplication>(`${APISIX.ACCOUNT_OPENING}/account-opening`, body).then((r) => r.data),
 
   approve: (id: string, notes?: string) =>
-    apiClient.post(`${APISIX.ACCOUNT_OPENING}/v1/applications/${id}/approve`, { notes }).then((r) => r.data),
+    apiClient.post(`${APISIX.ACCOUNT_OPENING}/account-opening/${id}/approve`, { notes }).then((r) => r.data),
 
   reject: (id: string, reason: string) =>
-    apiClient.post(`${APISIX.ACCOUNT_OPENING}/v1/applications/${id}/reject`, { reason }).then((r) => r.data),
+    apiClient.post(`${APISIX.ACCOUNT_OPENING}/account-opening/${id}/reject`, { reason }).then((r) => r.data),
 
   getStats: () =>
-    apiClient.get<AccountOpeningStats>(`${APISIX.ACCOUNT_OPENING}/v1/applications/stats`).then((r) => r.data),
+    apiClient.get<AccountOpeningStats>(`${APISIX.ACCOUNT_OPENING}/account-opening/stats`).then((r) => r.data),
 };
 
 // ─── Account Closure ──────────────────────────────────────────────────────────
@@ -75,21 +77,25 @@ export interface AccountClosureRequest {
   refundAccount?: string;
 }
 
+// W12-A4-P0-D: repointed from the unserved /account/v1/closure-requests*
+// namespace to account-service's real /account-closure* routes. The service
+// uses PATCH for decisions; UI "cancel" maps to the service's reject
+// (a rejected closure request leaves the account open, i.e. cancelled).
 export const accountClosureApi = {
   list: (params?: { page?: number; limit?: number; status?: string }) =>
-    apiClient.get<{ items: AccountClosureRequest[]; total: number }>(`${APISIX.ACCOUNT_CLOSURE}/v1/closure-requests`, { params }).then((r) => r.data),
+    apiClient.get<{ items: AccountClosureRequest[]; total: number }>(`${APISIX.ACCOUNT_CLOSURE}/account-closure/list`, { params }).then((r) => r.data),
 
   create: (body: { accountId: string; reason: string; refundAccount?: string }) =>
-    apiClient.post<AccountClosureRequest>(`${APISIX.ACCOUNT_CLOSURE}/v1/closure-requests`, body).then((r) => r.data),
+    apiClient.post<AccountClosureRequest>(`${APISIX.ACCOUNT_CLOSURE}/account-closure`, body).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<AccountClosureRequest>(`${APISIX.ACCOUNT_CLOSURE}/v1/closure-requests/${id}`).then((r) => r.data),
+    apiClient.get<AccountClosureRequest>(`${APISIX.ACCOUNT_CLOSURE}/account-closure/${id}`).then((r) => r.data),
 
   approve: (id: string) =>
-    apiClient.post(`${APISIX.ACCOUNT_CLOSURE}/v1/closure-requests/${id}/approve`, {}).then((r) => r.data),
+    apiClient.patch(`${APISIX.ACCOUNT_CLOSURE}/account-closure/${id}/approve`, {}).then((r) => r.data),
 
   cancel: (id: string) =>
-    apiClient.post(`${APISIX.ACCOUNT_CLOSURE}/v1/closure-requests/${id}/cancel`, {}).then((r) => r.data),
+    apiClient.patch(`${APISIX.ACCOUNT_CLOSURE}/account-closure/${id}/reject`, {}).then((r) => r.data),
 };
 
 // ─── Account Statements ───────────────────────────────────────────────────────
@@ -107,15 +113,18 @@ export interface Statement {
   downloadUrl?: string;
 }
 
+// W12-A4-P0-D: repointed from the unserved /account/v1/statements* namespace
+// to account-service /statements/* routes (statement jobs are persisted by
+// POST /statements/generate; see services/account-service/api/v1/statements.py).
 export const accountStatementsApi = {
   list: (params?: { page?: number; limit?: number; accountId?: string }) =>
-    apiClient.get<{ items: Statement[]; total: number }>(`${APISIX.ACCOUNT_STATEMENTS}/v1/statements`, { params }).then((r) => r.data),
+    apiClient.get<{ items: Statement[]; total: number }>(`${APISIX.ACCOUNT_STATEMENTS}/statements/jobs`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<Statement>(`${APISIX.ACCOUNT_STATEMENTS}/v1/statements/${id}`).then((r) => r.data),
+    apiClient.get<Statement>(`${APISIX.ACCOUNT_STATEMENTS}/statements/jobs/${id}`).then((r) => r.data),
 
   getForAccount: (accountId: string, params?: { from?: string; to?: string; format?: string }) =>
-    apiClient.get(`${APISIX.ACCOUNT_STATEMENTS}/v1/accounts/${accountId}/statement`, { params }).then((r) => r.data),
+    apiClient.get(`${APISIX.ACCOUNT_STATEMENTS}/statements/accounts/${accountId}/statement`, { params }).then((r) => r.data),
 };
 
 // ─── Statement Generator ──────────────────────────────────────────────────────
@@ -135,18 +144,22 @@ export interface StatementGenerationResult {
   estimatedTime?: number;
 }
 
+// W12-A4-P0-D: generate/getStatus/download repointed to account-service
+// /statements/* (generate persists a job row; jobs/{id} + download created
+// in W12). getHistory repointed cross-service to recon-engine-rs
+// GET /v1/recon/jobs (gateway /recon-engine/* -> /*) per A4 matrix.
 export const statementGeneratorApi = {
   generate: (body: StatementRequest) =>
-    apiClient.post<StatementGenerationResult>(`${APISIX.STATEMENT_GENERATOR}/v1/generate`, body).then((r) => r.data),
+    apiClient.post<StatementGenerationResult>(`${APISIX.STATEMENT_GENERATOR}/statements/generate`, body).then((r) => r.data),
 
   getStatus: (jobId: string) =>
-    apiClient.get<StatementGenerationResult>(`${APISIX.STATEMENT_GENERATOR}/v1/jobs/${jobId}`).then((r) => r.data),
+    apiClient.get<StatementGenerationResult>(`${APISIX.STATEMENT_GENERATOR}/statements/jobs/${jobId}`).then((r) => r.data),
 
   download: (jobId: string) =>
-    apiClient.get(`${APISIX.STATEMENT_GENERATOR}/v1/jobs/${jobId}/download`, { responseType: "blob" }).then((r) => r.data),
+    apiClient.get(`${APISIX.STATEMENT_GENERATOR}/statements/jobs/${jobId}/download`, { responseType: "blob" }).then((r) => r.data),
 
   getHistory: (params?: { page?: number; limit?: number; accountId?: string }) =>
-    apiClient.get(`${APISIX.STATEMENT_GENERATOR}/v1/jobs`, { params }).then((r) => r.data),
+    apiClient.get(`/recon-engine/v1/recon/jobs`, { params }).then((r) => r.data),
 };
 
 // ─── Beneficiary Management ───────────────────────────────────────────────────

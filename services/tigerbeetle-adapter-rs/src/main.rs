@@ -21,6 +21,7 @@ fn account_flags(debit: bool, credit: bool) -> u32 { (if debit { 1 } else { 0 })
 
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
@@ -31,6 +32,7 @@ fn degradation_mode() -> &'static str {
 
 async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "view").await { return resp; } // W12-B5P1DF
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -44,10 +46,11 @@ async fn health() -> HttpResponse {
 
 async fn tb_operation(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     let _sanitized = sanitize_input("");
-    if !rl_allow() {
+    if !rl_allow().await {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "tb_operation").await { return resp; } // W12-B5P1DF
     let input = body.into_inner();
     let debit = input.get("debit").and_then(|v| v.as_bool()).unwrap_or(false);
     let credit = input.get("credit").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -83,6 +86,7 @@ async fn tb_operation(req: actix_web::HttpRequest, state: web::Data<AppState>, b
 
 async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "view").await { return resp; } // W12-B5P1DF
     let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
@@ -93,6 +97,7 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
 
 async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "view").await { return resp; } // W12-B5P1DF
     let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
     HttpResponse::Ok().json(json!({"total": records.len(), "service": "tigerbeetle-adapter-rs"}))
 }
@@ -101,8 +106,6 @@ async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpR
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
 const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
@@ -110,6 +113,7 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 // --- Alerting ---
 async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify::require_permify(&req, "ledger_entry", "view").await { return resp; } // W12-B5P1DF
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -488,8 +492,6 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 }
 
 
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 
 
@@ -570,17 +572,56 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     }
 }
 
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+// --- Distributed rate limiting (redis shared sliding window; W12 C3-P1-B1) ---
+// Replaces the per-replica statics _RL_TOKENS/_RL_LAST (and the dead
+// _RATE_WINDOW_START/_RATE_WINDOW_COUNT pair): behind >1 replica the old
+// per-process bucket multiplied the effective limit by the replica count
+// (correctness bug). Now an atomic Lua INCR+PEXPIRE sliding window on a shared
+// deadpool-redis pool; limit is global per service, not per replica.
+// Key: ratelimit:tigerbeetle-adapter-rs:global — the replaced bucket was process-global (no
+// per-ip/per-user subject), so the subject segment is preserved as "global".
+// Window/limit: 100 requests per 1000 ms — identical to the old token bucket.
+// Env: REDIS_URL (fleet-wide var, cf. docker-compose.yml REDIS_URL entries);
+// default redis://redis:6379 matches the compose network.
+// Fail-mode: FAIL CLOSED — when redis is unreachable or errors, rl_allow()
+// returns false and callers answer 429 + Retry-After, mirroring check_jwt's
+// fail-closed style. Limiting is never silently disabled.
+static RL_POOL: std::sync::OnceLock<Option<deadpool_redis::Pool>> = std::sync::OnceLock::new();
+static RL_SCRIPT: std::sync::OnceLock<deadpool_redis::redis::Script> = std::sync::OnceLock::new();
+
+const RL_WINDOW_MS: u64 = 1000;
+const RL_LIMIT: i64 = 100;
+const RL_LUA: &str = "local c = redis.call('INCR', KEYS[1])\nif c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end\nreturn c";
+
+fn rl_pool() -> Option<&'static deadpool_redis::Pool> {
+    RL_POOL
+        .get_or_init(|| {
+            let url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
+            deadpool_redis::Config::from_url(url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()
+        })
+        .as_ref()
+}
+
+async fn rl_allow() -> bool {
+    let Some(pool) = rl_pool() else {
+        return false; // fail closed: redis pool unavailable (malformed REDIS_URL)
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return false; // fail closed: redis unreachable
+    };
+    let script = RL_SCRIPT.get_or_init(|| deadpool_redis::redis::Script::new(RL_LUA));
+    let count: Result<i64, deadpool_redis::redis::RedisError> = script
+        .key("ratelimit:tigerbeetle-adapter-rs:global")
+        .arg(RL_WINDOW_MS)
+        .invoke_async(&mut *conn)
+        .await;
+    match count {
+        Ok(n) => n <= RL_LIMIT,
+        Err(_) => false, // fail closed: redis error
     }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
 }
 
 
@@ -792,3 +833,6 @@ mod tests {
     }
 
 }
+
+// Wave-12 B5-P1-D-F: Permify authorization guard module.
+mod permify;

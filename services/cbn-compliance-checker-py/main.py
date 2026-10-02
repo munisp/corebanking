@@ -12,7 +12,9 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -209,6 +211,14 @@ class _PooledConn:
     def close(self):
         raw, self._raw = self._raw, None
         if raw is not None:
+            # B5-P1-B: with autocommit off, an uncommitted transaction
+            # (read-only, or aborted by an error) must be rolled back
+            # before the connection returns to the pool, otherwise the
+            # next borrower inherits an idle/aborted transaction.
+            try:
+                raw.rollback()
+            except Exception:
+                pass
             try:
                 _get_db_pool().putconn(raw)
             except Exception:
@@ -224,9 +234,17 @@ class _PooledConn:
             pass
 
 def get_db():
-    """Borrow a connection from the pool (thread-safe)."""
+    """Borrow a connection from the pool (thread-safe).
+
+    B5-P1-B: autocommit is OFF. Multi-statement write blocks (domain
+    write + INSERT INTO outbox) now commit as ONE transaction via the
+    explicit conn.commit() at the end of each block. Previously
+    autocommit=True made every execute() its own transaction and the
+    trailing conn.commit() a no-op, so a crash between the domain
+    write and the outbox insert silently lost the event (or the row).
+    """
     raw = _get_db_pool().getconn()
-    raw.autocommit = True
+    raw.autocommit = False
     return _PooledConn(raw)
 
 def release_db(conn):
@@ -405,7 +423,7 @@ def metrics():
         return {"service": "cbn-compliance-checker-py", "total_records": 0}
 
 
-@app.get("/api/v1/compliance_records")
+@app.get("/api/v1/compliance_records", dependencies=[Depends(require_permify("compliance_record", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
@@ -688,7 +706,7 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-@app.post("/api/v1/compliance_records", status_code=201)
+@app.post("/api/v1/compliance_records", status_code=201, dependencies=[Depends(require_permify("compliance_record", "create"))])
 def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
     tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
     status = body.status or "active"

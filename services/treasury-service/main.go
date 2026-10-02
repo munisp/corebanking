@@ -509,7 +509,11 @@ func respondError(w http.ResponseWriter, status int, message string) {
 // Liquidity handlers
 func (s *TreasuryServer) getLiquidityPositionHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	position := s.liquidityService.GetLiquidityPosition(tenantID, "NGN")
+	position, err := s.liquidityService.GetLiquidityPosition(tenantID, "NGN")
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, position)
 }
 
@@ -517,7 +521,11 @@ func (s *TreasuryServer) getLiquidityByCurrencyHandler(w http.ResponseWriter, r 
 	vars := mux.Vars(r)
 	currency := vars["currency"]
 	tenantID := getTenantID(r)
-	position := s.liquidityService.GetLiquidityPosition(tenantID, currency)
+	position, err := s.liquidityService.GetLiquidityPosition(tenantID, currency)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, position)
 }
 
@@ -525,7 +533,11 @@ func (s *TreasuryServer) getCashFlowHandler(w http.ResponseWriter, r *http.Reque
 	tenantID := getTenantID(r)
 	startDate := r.URL.Query().Get("start_date")
 	endDate := r.URL.Query().Get("end_date")
-	cashFlows := s.liquidityService.GetCashFlows(tenantID, startDate, endDate)
+	cashFlows, err := s.liquidityService.GetCashFlows(tenantID, startDate, endDate)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"cashFlows": cashFlows})
 }
 
@@ -538,32 +550,52 @@ func (s *TreasuryServer) getCashFlowProjectionHandler(w http.ResponseWriter, r *
 
 func (s *TreasuryServer) getLiquidityRatiosHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	ratios := s.liquidityService.GetLiquidityRatios(tenantID)
+	ratios, err := s.liquidityService.GetLiquidityRatios(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, ratios)
 }
 
 func (s *TreasuryServer) getNostroBalancesHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	balances := s.liquidityService.GetNostroBalances(tenantID)
+	balances, err := s.liquidityService.GetNostroBalances(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"nostroBalances": balances})
 }
 
 func (s *TreasuryServer) getVostroBalancesHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	balances := s.liquidityService.GetVostroBalances(tenantID)
+	balances, err := s.liquidityService.GetVostroBalances(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"vostroBalances": balances})
 }
 
 func (s *TreasuryServer) getCRRPositionHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	crr := s.liquidityService.GetCRRPosition(tenantID)
+	crr, err := s.liquidityService.GetCRRPosition(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, crr)
 }
 
 // FX handlers
 func (s *TreasuryServer) listFXPositionsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	positions := s.fxService.ListFXPositions(tenantID)
+	positions, err := s.fxService.ListFXPositions(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"positions": positions})
 }
 
@@ -571,7 +603,11 @@ func (s *TreasuryServer) getFXPositionHandler(w http.ResponseWriter, r *http.Req
 	vars := mux.Vars(r)
 	currency := vars["currency"]
 	tenantID := getTenantID(r)
-	position := s.fxService.GetFXPosition(tenantID, currency)
+	position, err := s.fxService.GetFXPosition(tenantID, currency)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, position)
 }
 
@@ -579,7 +615,11 @@ func (s *TreasuryServer) listFXDealsHandler(w http.ResponseWriter, r *http.Reque
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
 	dealType := r.URL.Query().Get("type")
-	deals := s.fxService.ListFXDeals(tenantID, status, dealType)
+	deals, err := s.fxService.ListFXDeals(tenantID, status, dealType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"deals": deals})
 }
 
@@ -727,7 +767,11 @@ func (s *TreasuryServer) listInvestmentsHandler(w http.ResponseWriter, r *http.R
 	tenantID := getTenantID(r)
 	investmentType := r.URL.Query().Get("type")
 	status := r.URL.Query().Get("status")
-	investments := s.investmentService.ListInvestments(tenantID, investmentType, status)
+	investments, err := s.investmentService.ListInvestments(tenantID, investmentType, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"investments": investments})
 }
 
@@ -808,20 +852,32 @@ func (s *TreasuryServer) sellInvestmentHandler(w http.ResponseWriter, r *http.Re
 
 func (s *TreasuryServer) getPortfolioSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	summary := s.investmentService.GetPortfolioSummary(tenantID)
+	summary, err := s.investmentService.GetPortfolioSummary(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, summary)
 }
 
 func (s *TreasuryServer) getMaturingInvestmentsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	days := r.URL.Query().Get("days")
-	investments := s.investmentService.GetMaturingInvestments(tenantID, days)
+	investments, err := s.investmentService.GetMaturingInvestments(tenantID, days)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"investments": investments})
 }
 
 func (s *TreasuryServer) getPortfolioYieldHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	yield := s.investmentService.GetPortfolioYield(tenantID)
+	yield, err := s.investmentService.GetPortfolioYield(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, yield)
 }
 
@@ -830,7 +886,11 @@ func (s *TreasuryServer) listInterbankDealsHandler(w http.ResponseWriter, r *htt
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
 	dealType := r.URL.Query().Get("type")
-	deals := s.interbankService.ListInterbankDeals(tenantID, status, dealType)
+	deals, err := s.interbankService.ListInterbankDeals(tenantID, status, dealType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"deals": deals})
 }
 
@@ -930,7 +990,11 @@ func (s *TreasuryServer) rolloverInterbankDealHandler(w http.ResponseWriter, r *
 
 func (s *TreasuryServer) getInterbankPositionHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	position := s.interbankService.GetInterbankPosition(tenantID)
+	position, err := s.interbankService.GetInterbankPosition(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, position)
 }
 
@@ -947,25 +1011,41 @@ func (s *TreasuryServer) getALMGapHandler(w http.ResponseWriter, r *http.Request
 	if currency == "" {
 		currency = "NGN"
 	}
-	gap := s.almService.GetALMGap(tenantID, currency)
+	gap, err := s.almService.GetALMGap(tenantID, currency)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, gap)
 }
 
 func (s *TreasuryServer) getGapAnalysisHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	analysis := s.almService.GetGapAnalysis(tenantID)
+	analysis, err := s.almService.GetGapAnalysis(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, analysis)
 }
 
 func (s *TreasuryServer) getInterestRateRiskHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	risk := s.almService.GetInterestRateRisk(tenantID)
+	risk, err := s.almService.GetInterestRateRisk(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, risk)
 }
 
 func (s *TreasuryServer) getDurationAnalysisHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	analysis := s.almService.GetDurationAnalysis(tenantID)
+	analysis, err := s.almService.GetDurationAnalysis(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, analysis)
 }
 
@@ -982,7 +1062,11 @@ func (s *TreasuryServer) runStressTestHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	result := s.almService.RunStressTest(tenantID, req.Scenario, req.RateShift, req.FXShift)
+	result, err := s.almService.RunStressTest(tenantID, req.Scenario, req.RateShift, req.FXShift)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, result)
 }
 
@@ -996,7 +1080,11 @@ func (s *TreasuryServer) getScenarioAnalysisHandler(w http.ResponseWriter, r *ht
 func (s *TreasuryServer) listLimitsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	limitType := r.URL.Query().Get("type")
-	limits := s.limitService.ListLimits(tenantID, limitType)
+	limits, err := s.limitService.ListLimits(tenantID, limitType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"limits": limits})
 }
 
@@ -1056,13 +1144,21 @@ func (s *TreasuryServer) updateLimitHandler(w http.ResponseWriter, r *http.Reque
 
 func (s *TreasuryServer) getLimitUtilizationHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	utilization := s.limitService.GetLimitUtilization(tenantID)
+	utilization, err := s.limitService.GetLimitUtilization(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, utilization)
 }
 
 func (s *TreasuryServer) getLimitBreachesHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	breaches := s.limitService.GetLimitBreaches(tenantID)
+	breaches, err := s.limitService.GetLimitBreaches(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"breaches": breaches})
 }
 
@@ -1070,7 +1166,11 @@ func (s *TreasuryServer) getLimitBreachesHandler(w http.ResponseWriter, r *http.
 func (s *TreasuryServer) listOfficersHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	desk := r.URL.Query().Get("desk")
-	officers := s.officerService.ListOfficers(tenantID, desk)
+	officers, err := s.officerService.ListOfficers(tenantID, desk)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"officers": officers})
 }
 
@@ -1132,20 +1232,32 @@ func (s *TreasuryServer) getOfficerDealsHandler(w http.ResponseWriter, r *http.R
 	officerID := vars["officer_id"]
 	tenantID := getTenantID(r)
 
-	deals := s.officerService.GetOfficerDeals(tenantID, officerID, s.fxService, s.interbankService)
+	deals, err := s.officerService.GetOfficerDeals(tenantID, officerID, s.fxService, s.interbankService)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, deals)
 }
 
 // Dashboard handlers
 func (s *TreasuryServer) getDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	dashboard := s.getDashboard(tenantID)
+	dashboard, err := s.getDashboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, dashboard)
 }
 
 func (s *TreasuryServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	dashboard := s.getDashboard(tenantID)
+	dashboard, err := s.getDashboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	summary := map[string]interface{}{
 		"totalLiquidity":   dashboard.TotalLiquidity,
 		"lcr":              dashboard.LCR,
@@ -1158,17 +1270,24 @@ func (s *TreasuryServer) getDashboardSummaryHandler(w http.ResponseWriter, r *ht
 
 func (s *TreasuryServer) getAlertsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	alerts := s.getAlerts(tenantID)
+	alerts, err := s.getAlerts(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"alerts": alerts})
 }
 
-func (s *TreasuryServer) getDashboard(tenantID string) *TreasuryDashboard {
+func (s *TreasuryServer) getDashboard(tenantID string) (*TreasuryDashboard, error) {
 	dashboard := &TreasuryDashboard{
 		Date: time.Now(),
 	}
 
 	// Get liquidity data
-	liquidity := s.liquidityService.GetLiquidityPosition(tenantID, "NGN")
+	liquidity, err := s.liquidityService.GetLiquidityPosition(tenantID, "NGN")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.TotalLiquidity = liquidity.NetPosition
 	dashboard.LCR = liquidity.LCR
 	dashboard.NSFR = liquidity.NSFR
@@ -1176,16 +1295,25 @@ func (s *TreasuryServer) getDashboard(tenantID string) *TreasuryDashboard {
 	dashboard.LiquidityStatus = liquidity.Status
 
 	// Get FX data
-	fxPositions := s.fxService.ListFXPositions(tenantID)
+	fxPositions, err := s.fxService.ListFXPositions(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	for _, pos := range fxPositions {
 		dashboard.TotalFXPosition += pos.NetPosition
 		dashboard.FXPnL += pos.UnrealizedPnL
 	}
-	fxDeals := s.fxService.ListFXDeals(tenantID, "pending", "")
+	fxDeals, err := s.fxService.ListFXDeals(tenantID, "pending", "")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.OpenFXDeals = len(fxDeals)
 
 	// Get investment data
-	portfolio := s.investmentService.GetPortfolioSummary(tenantID)
+	portfolio, err := s.investmentService.GetPortfolioSummary(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if total, ok := portfolio["totalValue"].(int64); ok {
 		dashboard.TotalInvestments = total
 	}
@@ -1194,7 +1322,10 @@ func (s *TreasuryServer) getDashboard(tenantID string) *TreasuryDashboard {
 	}
 
 	// Get interbank data
-	interbankPos := s.interbankService.GetInterbankPosition(tenantID)
+	interbankPos, err := s.interbankService.GetInterbankPosition(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if placements, ok := interbankPos["placements"].(int64); ok {
 		dashboard.Placements = placements
 	}
@@ -1204,22 +1335,31 @@ func (s *TreasuryServer) getDashboard(tenantID string) *TreasuryDashboard {
 	dashboard.NetInterbankPosition = dashboard.Placements - dashboard.Takings
 
 	// Get ALM data
-	almGap := s.almService.GetALMGap(tenantID, "NGN")
+	almGap, err := s.almService.GetALMGap(tenantID, "NGN")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.GapRatio = almGap.GapRatio
 	dashboard.ALMStatus = almGap.Status
 
 	// Get limit data
-	breaches := s.limitService.GetLimitBreaches(tenantID)
+	breaches, err := s.limitService.GetLimitBreaches(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	dashboard.LimitsBreached = len(breaches)
 
-	return dashboard
+	return dashboard, nil
 }
 
-func (s *TreasuryServer) getAlerts(tenantID string) []map[string]interface{} {
+func (s *TreasuryServer) getAlerts(tenantID string) ([]map[string]interface{}, error) {
 	var alerts []map[string]interface{}
 
 	// Check liquidity alerts
-	liquidity := s.liquidityService.GetLiquidityPosition(tenantID, "NGN")
+	liquidity, err := s.liquidityService.GetLiquidityPosition(tenantID, "NGN")
+	if err != nil {
+		return nil, err
+	}
 	if liquidity.LCR < 100 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "liquidity",
@@ -1230,7 +1370,10 @@ func (s *TreasuryServer) getAlerts(tenantID string) []map[string]interface{} {
 	}
 
 	// Check limit breaches
-	breaches := s.limitService.GetLimitBreaches(tenantID)
+	breaches, err := s.limitService.GetLimitBreaches(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	for _, breach := range breaches {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "limit_breach",
@@ -1240,14 +1383,18 @@ func (s *TreasuryServer) getAlerts(tenantID string) []map[string]interface{} {
 		})
 	}
 
-	return alerts
+	return alerts, nil
 }
 
 // Report handlers
 func (s *TreasuryServer) getDailyReportHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	date := r.URL.Query().Get("date")
-	report := s.generateDailyReport(tenantID, date)
+	report, err := s.generateDailyReport(tenantID, date)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, report)
 }
 
@@ -1273,11 +1420,14 @@ func (s *TreasuryServer) getRegulatoryReportHandler(w http.ResponseWriter, r *ht
 	respondJSON(w, http.StatusOK, report)
 }
 
-func (s *TreasuryServer) generateDailyReport(tenantID, date string) map[string]interface{} {
+func (s *TreasuryServer) generateDailyReport(tenantID, date string) (map[string]interface{}, error) {
 	if date == "" {
 		date = time.Now().Format("2006-01-02")
 	}
-	dashboard := s.getDashboard(tenantID)
+	dashboard, err := s.getDashboard(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{
 		"reportType":        "daily",
 		"date":              date,
@@ -1290,7 +1440,7 @@ func (s *TreasuryServer) generateDailyReport(tenantID, date string) map[string]i
 		"interbankPosition": dashboard.NetInterbankPosition,
 		"limitsBreached":    dashboard.LimitsBreached,
 		"generatedAt":       time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 func (s *TreasuryServer) generateWeeklyReport(tenantID, startDate string) map[string]interface{} {

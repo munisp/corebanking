@@ -12,7 +12,7 @@ export default function MakerCheckerWorkspace() {
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/customer-approvals/count")
+    fetch("/api/db/customer-approvals/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

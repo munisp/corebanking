@@ -11,7 +11,7 @@ import (
 // OpportunityService handles opportunity operations
 type OpportunityService struct {
 	tenantID      string
-	opportunities map[string]*Opportunity
+	opportunities *repo[Opportunity]
 	mu            sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type OpportunityService struct {
 func NewOpportunityService(tenantID string) *OpportunityService {
 	svc := &OpportunityService{
 		tenantID:      tenantID,
-		opportunities: make(map[string]*Opportunity),
+		opportunities: newRepo[Opportunity](serviceDB, "opportunities"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewOpportunityService(tenantID string) *OpportunityService {
 
 func (s *OpportunityService) initializeDefaultData(tenantID string) {
 	// Loan opportunity - negotiation stage
-	s.opportunities["opp-001"] = &Opportunity{
+	s.opportunities.seed(tenantID, "opp-001", &Opportunity{
 		OpportunityID: "opp-001",
 		TenantID:      tenantID,
 		CustomerID:    "cust-002",
@@ -45,10 +45,10 @@ func (s *OpportunityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, -1, 0),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Investment opportunity - proposal stage
-	s.opportunities["opp-002"] = &Opportunity{
+	s.opportunities.seed(tenantID, "opp-002", &Opportunity{
 		OpportunityID: "opp-002",
 		TenantID:      tenantID,
 		CustomerID:    "cust-001",
@@ -66,10 +66,10 @@ func (s *OpportunityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, 0, -14),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Insurance opportunity - qualified stage
-	s.opportunities["opp-003"] = &Opportunity{
+	s.opportunities.seed(tenantID, "opp-003", &Opportunity{
 		OpportunityID: "opp-003",
 		TenantID:      tenantID,
 		CustomerID:    "cust-003",
@@ -87,10 +87,10 @@ func (s *OpportunityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, 0, -7),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Card opportunity - lead stage
-	s.opportunities["opp-004"] = &Opportunity{
+	s.opportunities.seed(tenantID, "opp-004", &Opportunity{
 		OpportunityID: "opp-004",
 		TenantID:      tenantID,
 		CustomerID:    "cust-004",
@@ -108,11 +108,11 @@ func (s *OpportunityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, 0, -3),
 		UpdatedAt:     time.Now(),
-	}
+	})
 
 	// Closed won opportunity
 	closedAt := time.Now().AddDate(0, 0, -5)
-	s.opportunities["opp-005"] = &Opportunity{
+	s.opportunities.seed(tenantID, "opp-005", &Opportunity{
 		OpportunityID: "opp-005",
 		TenantID:      tenantID,
 		CustomerID:    "cust-001",
@@ -131,16 +131,18 @@ func (s *OpportunityService) initializeDefaultData(tenantID string) {
 		Metadata:      make(map[string]interface{}),
 		CreatedAt:     time.Now().AddDate(0, -1, 0),
 		UpdatedAt:     time.Now().AddDate(0, 0, -5),
-	}
+	})
 }
 
 // ListOpportunities returns opportunities based on filters
-func (s *OpportunityService) ListOpportunities(tenantID, rmID, stage string) []*Opportunity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OpportunityService) ListOpportunities(tenantID, rmID, stage string) ([]*Opportunity, error) {
 
 	var result []*Opportunity
-	for _, opp := range s.opportunities {
+	__ALL__, __ERR__ := s.opportunities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, opp := range __ALL__ {
 		if opp.TenantID != tenantID {
 			continue
 		}
@@ -152,16 +154,14 @@ func (s *OpportunityService) ListOpportunities(tenantID, rmID, stage string) []*
 		}
 		result = append(result, opp)
 	}
-	return result
+	return result, nil
 }
 
 // GetOpportunity retrieves an opportunity by ID
 func (s *OpportunityService) GetOpportunity(tenantID, opportunityID string) (*Opportunity, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	opp, exists := s.opportunities[opportunityID]
-	if !exists || opp.TenantID != tenantID {
+	opp, err := s.opportunities.get(tenantID, opportunityID)
+	if err != nil {
 		return nil, errors.New("opportunity not found")
 	}
 	return opp, nil
@@ -169,8 +169,6 @@ func (s *OpportunityService) GetOpportunity(tenantID, opportunityID string) (*Op
 
 // CreateOpportunity creates a new opportunity
 func (s *OpportunityService) CreateOpportunity(tenantID, rmID string, req *CreateOpportunityRequest) (*Opportunity, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	expectedClose, _ := time.Parse("2006-01-02", req.ExpectedClose)
 
@@ -193,75 +191,70 @@ func (s *OpportunityService) CreateOpportunity(tenantID, rmID string, req *Creat
 		UpdatedAt:     time.Now(),
 	}
 
-	s.opportunities[opp.OpportunityID] = opp
+	if err := s.opportunities.put(tenantID, opp.OpportunityID, opp); err != nil {
+		return nil, err
+	}
 	return opp, nil
 }
 
 // UpdateOpportunity updates an opportunity
 func (s *OpportunityService) UpdateOpportunity(opp *Opportunity) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.opportunities[opp.OpportunityID]
-	if !exists || existing.TenantID != opp.TenantID {
+	existing, err := s.opportunities.get(opp.TenantID, opp.OpportunityID)
+	if err != nil {
 		return errors.New("opportunity not found")
 	}
 
 	opp.CreatedAt = existing.CreatedAt
 	opp.UpdatedAt = time.Now()
 	opp.WeightedValue = int64(float64(opp.ExpectedValue) * opp.Probability)
-	s.opportunities[opp.OpportunityID] = opp
-	return nil
+	return s.opportunities.put(opp.TenantID, opp.OpportunityID, opp)
 }
 
 // UpdateStage updates opportunity stage
 func (s *OpportunityService) UpdateStage(tenantID, opportunityID, stage, notes string) (*Opportunity, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	opp, exists := s.opportunities[opportunityID]
-	if !exists || opp.TenantID != tenantID {
-		return nil, errors.New("opportunity not found")
-	}
+	return s.opportunities.update(tenantID, opportunityID, func(opp *Opportunity) error {
+		opp.Stage = stage
+		if notes != "" {
+			opp.Notes = notes
+		}
+		opp.UpdatedAt = time.Now()
 
-	opp.Stage = stage
-	if notes != "" {
-		opp.Notes = notes
-	}
-	opp.UpdatedAt = time.Now()
+		// Update probability based on stage
+		switch stage {
+		case "lead":
+			opp.Probability = 0.10
+		case "qualified":
+			opp.Probability = 0.25
+		case "proposal":
+			opp.Probability = 0.50
+		case "negotiation":
+			opp.Probability = 0.75
+		case "closed_won":
+			opp.Probability = 1.0
+			now := time.Now()
+			opp.ActualClose = &now
+		case "closed_lost":
+			opp.Probability = 0.0
+			now := time.Now()
+			opp.ActualClose = &now
+		}
 
-	// Update probability based on stage
-	switch stage {
-	case "lead":
-		opp.Probability = 0.10
-	case "qualified":
-		opp.Probability = 0.25
-	case "proposal":
-		opp.Probability = 0.50
-	case "negotiation":
-		opp.Probability = 0.75
-	case "closed_won":
-		opp.Probability = 1.0
-		now := time.Now()
-		opp.ActualClose = &now
-	case "closed_lost":
-		opp.Probability = 0.0
-		now := time.Now()
-		opp.ActualClose = &now
-	}
-
-	opp.WeightedValue = int64(float64(opp.ExpectedValue) * opp.Probability)
-
-	return opp, nil
+		opp.WeightedValue = int64(float64(opp.ExpectedValue) * opp.Probability)
+		return nil
+	})
 }
 
 // GetCustomerOpportunities returns opportunities for a customer
-func (s *OpportunityService) GetCustomerOpportunities(tenantID, customerID string) []*Opportunity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OpportunityService) GetCustomerOpportunities(tenantID, customerID string) ([]*Opportunity, error) {
 
 	var result []*Opportunity
-	for _, opp := range s.opportunities {
+	__ALL__, __ERR__ := s.opportunities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, opp := range __ALL__ {
 		if opp.TenantID != tenantID {
 			continue
 		}
@@ -269,18 +262,20 @@ func (s *OpportunityService) GetCustomerOpportunities(tenantID, customerID strin
 			result = append(result, opp)
 		}
 	}
-	return result
+	return result, nil
 }
 
 // GetPipeline returns pipeline summary
-func (s *OpportunityService) GetPipeline(tenantID, rmID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OpportunityService) GetPipeline(tenantID, rmID string) (map[string]interface{}, error) {
 
 	var totalOpportunities int
 	var totalValue, weightedValue int64
 
-	for _, opp := range s.opportunities {
+	__ALL__, __ERR__ := s.opportunities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, opp := range __ALL__ {
 		if opp.TenantID != tenantID {
 			continue
 		}
@@ -299,13 +294,11 @@ func (s *OpportunityService) GetPipeline(tenantID, rmID string) map[string]inter
 		"totalValue":         totalValue,
 		"weightedValue":      weightedValue,
 		"timestamp":          time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetPipelineByStage returns pipeline breakdown by stage
-func (s *OpportunityService) GetPipelineByStage(tenantID, rmID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OpportunityService) GetPipelineByStage(tenantID, rmID string) (map[string]interface{}, error) {
 
 	stages := map[string]map[string]interface{}{
 		"lead":        {"count": 0, "value": int64(0)},
@@ -314,7 +307,11 @@ func (s *OpportunityService) GetPipelineByStage(tenantID, rmID string) map[strin
 		"negotiation": {"count": 0, "value": int64(0)},
 	}
 
-	for _, opp := range s.opportunities {
+	__ALL__, __ERR__ := s.opportunities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, opp := range __ALL__ {
 		if opp.TenantID != tenantID {
 			continue
 		}
@@ -330,13 +327,11 @@ func (s *OpportunityService) GetPipelineByStage(tenantID, rmID string) map[strin
 	return map[string]interface{}{
 		"stages":    stages,
 		"timestamp": time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }
 
 // GetForecast returns revenue forecast
-func (s *OpportunityService) GetForecast(tenantID, rmID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *OpportunityService) GetForecast(tenantID, rmID string) (map[string]interface{}, error) {
 
 	var thisMonth, nextMonth, thisQuarter int64
 
@@ -345,7 +340,11 @@ func (s *OpportunityService) GetForecast(tenantID, rmID string) map[string]inter
 	endOfNextMonth := time.Date(now.Year(), now.Month()+2, 0, 23, 59, 59, 0, now.Location())
 	endOfQuarter := time.Date(now.Year(), ((now.Month()-1)/3+1)*3+1, 0, 23, 59, 59, 0, now.Location())
 
-	for _, opp := range s.opportunities {
+	__ALL__, __ERR__ := s.opportunities.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, opp := range __ALL__ {
 		if opp.TenantID != tenantID {
 			continue
 		}
@@ -372,5 +371,5 @@ func (s *OpportunityService) GetForecast(tenantID, rmID string) map[string]inter
 		"nextMonth":   nextMonth,
 		"thisQuarter": thisQuarter,
 		"timestamp":   time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

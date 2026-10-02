@@ -2,6 +2,7 @@
 use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
@@ -32,14 +33,12 @@ struct CreateRequest {
 
 struct AppState {
     db: PgPool,
-    entities: Mutex<Vec<EntityNode>>,
-    edges: Mutex<Vec<GraphEdge>>,
     falkordb: FalkorDBClient,
     db_url: Option<String>,
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct EntityNode {
     entity_id: String,
     entity_type: String,
@@ -48,7 +47,7 @@ struct EntityNode {
     risk_score: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct GraphEdge {
     from_id: String,
     to_id: String,
@@ -556,15 +555,21 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let entities = state.entities.lock().await;
-    let edges = state.edges.lock().await;
+    let entity_count = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM graph_entities").fetch_one(&state.db).await {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": format!("graph_entities unavailable: {}", e)})),
+    };
+    let edge_count = match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM graph_edges").fetch_one(&state.db).await {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": format!("graph_edges unavailable: {}", e)})),
+    };
     let _cbn = cbn_reporting_threshold_ngn();
     HttpResponse::Ok().json(json!({
         "status": "healthy",
         "service": "falkordb-graph-engine-rs",
         "version": "1.0.0",
         "falkordb": {"url": state.falkordb.redis_url, "graph": state.falkordb.graph_name},
-        "graph": {"entities": entities.len(), "edges": edges.len()},
+        "graph": {"entities": entity_count, "edges": edge_count},
         "capabilities": [
             "entity_resolution", "transaction_network_analysis", "circular_transaction_detection",
             "community_detection", "centrality_computation", "path_finding",
@@ -607,6 +612,7 @@ async fn livez() -> HttpResponse {
 
 async fn seed_graph(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "knowledge_graph", "collection", "seed").await { return resp; }
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let queries = falkordb_seed_coa_query();
     for q in &queries {
@@ -621,14 +627,19 @@ async fn create_entity(req: actix_web::HttpRequest, state: web::Data<AppState>, 
     sanitize_input("");
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "knowledge_graph", "collection", "create").await { return resp; }
     let entity = body.into_inner();
     let cypher = format!(
         "CREATE (e:{} {{entityId: '{}', name: '{}', riskScore: {}}})",
         entity.entity_type, entity.entity_id, entity.name, entity.risk_score.unwrap_or(0.0)
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut entities = state.entities.lock().await;
-    entities.push(entity.clone());
+    if let Err(e) = sqlx::query("INSERT INTO graph_entities (entity_id, entity_type, name, risk_score) VALUES ($1, $2, $3, $4) ON CONFLICT (entity_id) DO UPDATE SET entity_type = EXCLUDED.entity_type, name = EXCLUDED.name, risk_score = EXCLUDED.risk_score")
+        .bind(&entity.entity_id).bind(&entity.entity_type).bind(&entity.name).bind(entity.risk_score)
+        .execute(&state.db).await {
+        ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        return HttpResponse::ServiceUnavailable().json(json!({"error": format!("graph_entities persist failed: {}", e)}));
+    }
     db_persist(&state, "create_entity", &json!({"entityId": entity.entity_id})).await;
     HttpResponse::Created().json(json!({"created": true, "entityId": entity.entity_id}))
 }
@@ -638,14 +649,19 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     sanitize_input("");
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "knowledge_graph", "collection", "create").await { return resp; }
     let edge = body.into_inner();
     let cypher = format!(
         "MATCH (a {{entityId: '{}'}}), (b {{entityId: '{}'}}) CREATE (a)-[:{}]->(b)",
         edge.from_id, edge.to_id, edge.edge_type
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut edges = state.edges.lock().await;
-    edges.push(edge.clone());
+    if let Err(e) = sqlx::query("INSERT INTO graph_edges (from_id, to_id, edge_type) VALUES ($1, $2, $3) ON CONFLICT (from_id, to_id, edge_type) DO NOTHING")
+        .bind(&edge.from_id).bind(&edge.to_id).bind(&edge.edge_type)
+        .execute(&state.db).await {
+        ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        return HttpResponse::ServiceUnavailable().json(json!({"error": format!("graph_edges persist failed: {}", e)}));
+    }
     db_persist(&state, "create_edge", &json!({"from": edge.from_id, "to": edge.to_id, "type": edge.edge_type})).await;
     HttpResponse::Created().json(json!({"linked": true, "edgeType": edge.edge_type}))
 }
@@ -653,7 +669,10 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
 async fn detect_circular(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let edges = state.edges.lock().await;
+    let edges = match sqlx::query_as::<_, GraphEdge>("SELECT from_id, to_id, edge_type FROM graph_edges").fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": format!("graph_edges unavailable: {}", e)})),
+    };
     let cycles = detect_circular_transactions(&edges);
 
     // Inter-service: notify AML engine
@@ -675,8 +694,10 @@ async fn entity_centrality(req: actix_web::HttpRequest, state: web::Data<AppStat
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let entity_id = query.get("entityId").cloned().unwrap_or_default();
-    let edges = state.edges.lock().await;
-    let entity_edges: Vec<GraphEdge> = edges.iter().filter(|e| e.from_id == entity_id).cloned().collect();
+    let entity_edges = match sqlx::query_as::<_, GraphEdge>("SELECT from_id, to_id, edge_type FROM graph_edges WHERE from_id = $1").bind(&entity_id).fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": format!("graph_edges unavailable: {}", e)})),
+    };
     let centrality = compute_entity_centrality(&entity_edges);
     HttpResponse::Ok().json(json!({"entityId": entity_id, "degreeCentrality": centrality, "connections": entity_edges.len()}))
 }
@@ -685,6 +706,7 @@ async fn risk_classification(req: actix_web::HttpRequest, state: web::Data<AppSt
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     sanitize_input("");
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "knowledge_graph", "collection", "classify").await { return resp; }
     let input = body.into_inner();
     let is_pep = input.get("isPep").and_then(|v| v.as_bool()).unwrap_or(false);
     let is_sanctioned = input.get("isSanctioned").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -700,6 +722,7 @@ async fn query_graph(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     sanitize_input("");
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "knowledge_graph", "collection", "query").await { return resp; }
     let q = body.into_inner();
     let params = q.params.unwrap_or(json!({}));
     match state.falkordb.execute_query(&q.cypher, &params) {
@@ -717,6 +740,7 @@ async fn query_graph(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
 async fn find_path(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<PathQuery>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "knowledge_graph", "collection", "traverse").await { return resp; }
     let q = body.into_inner();
     let max_hops = q.max_hops.unwrap_or(5);
     let cypher = format!(
@@ -736,7 +760,10 @@ async fn transaction_velocity(req: actix_web::HttpRequest, state: web::Data<AppS
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let window = query.get("window").and_then(|w| w.parse::<u64>().ok()).unwrap_or(3600);
-    let edges = state.edges.lock().await;
+    let edges = match sqlx::query_as::<_, GraphEdge>("SELECT from_id, to_id, edge_type FROM graph_edges").fetch_all(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => return HttpResponse::ServiceUnavailable().json(json!({"error": format!("graph_edges unavailable: {}", e)})),
+    };
     let velocity = compute_transaction_velocity(&edges, window);
     HttpResponse::Ok().json(json!({"velocity": velocity, "windowSeconds": window, "totalEdges": edges.len()}))
 }
@@ -833,6 +860,103 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Every mutating handler performs a REAL Permify permission check AFTER
+// check_jwt has authenticated the caller. Subject = verified JWT sub (from
+// VerifiedClaims in request extensions), tenant = verified JWT tenant claim
+// (fallback: X-Tenant-Id header, PERMIFY_DEFAULT_TENANT, "bpmgd"), resource =
+// domain entity id, permission per action (schema: canonical v2.perm
+// service_config entity + services/auth-service/schemas/permify/
+// v2-core-domain-rs.fragment). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (services/risk-scoring-rs/src/main.rs).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), HttpResponse> {
+    use actix_web::HttpMessage as _;
+    let (subject, claim_tenant) = {
+        let ext = req.extensions();
+        match ext.get::<VerifiedClaims>() {
+            Some(c) => (
+                c.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            ),
+            None => (None, None),
+        }
+    };
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"}))),
+    };
+    if entity_id.is_empty() {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "authorization context incomplete"})));
+    }
+    let tenant_id = claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"})));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err(HttpResponse::BadGateway().json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"})));
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err(HttpResponse::Forbidden().json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)})));
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
@@ -855,8 +979,6 @@ async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8277);
     let state = web::Data::new(AppState {
         db: pool,
-        entities: Mutex::new(Vec::new()),
-        edges: Mutex::new(Vec::new()),
         falkordb: FalkorDBClient {
             redis_url: env::var("FALKORDB_URL").unwrap_or_else(|_| "localhost:6379".to_string()),
             graph_name: env::var("FALKORDB_GRAPH").unwrap_or_else(|_| "bank54".to_string()),
@@ -955,6 +1077,28 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .ok();
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS graph_entities (
+        entity_id TEXT PRIMARY KEY,
+        entity_type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        risk_score DOUBLE PRECISION,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create graph_entities table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS graph_edges (
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        edge_type TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (from_id, to_id, edge_type)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create graph_edges table");
 }
 
 async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
@@ -987,6 +1131,7 @@ async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
 
 async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    if let Err(resp) = permify_check(&req, "service_config", "collection", "create").await { return resp; }
     let tenant_id = match claims_tenant(&req) {
         Some(t) if !t.is_empty() => t,
         _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
@@ -994,22 +1139,31 @@ async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>
 
     let status = body.status.clone().unwrap_or_else(|| "active".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
     )
     .bind(&tenant_id)
     .bind(&status)
-    .fetch_one(&data.db)
+    .fetch_one(&mut *tx)
     .await;
 
     match result {
         Ok(id) => {
             let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.created")
                 .bind(id.to_string())
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -1038,22 +1192,32 @@ async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: act
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
+    if let Err(resp) = permify_check(&req, "service_config", &id, "update").await { return resp; }
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(&mut *tx)
         .await;
 
     match result {
         Ok(_) => {
             let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+            if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(&mut *tx).await {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+                }
+            if let Err(e) = tx.commit().await {
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+            }
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -1063,18 +1227,29 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+    if let Err(resp) = permify_check(&req, "service_config", &id, "delete").await { return resp; }
+    let mut tx = match data.db.begin().await {
+        Ok(t) => t,
+        Err(e) => { return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})); }
+    };
+    if let Err(e) = sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
+        .execute(&mut *tx)
+        .await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
 
     let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+    if let Err(e) = sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(&mut *tx).await {
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+        }
 
+    if let Err(e) = tx.commit().await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}));
+    }
     HttpResponse::NoContent().finish()
 }

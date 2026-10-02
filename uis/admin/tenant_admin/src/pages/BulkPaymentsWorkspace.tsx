@@ -1,5 +1,5 @@
-import { useState, useRef } from "react";
-import { Layers, Plus, Trash2, Upload, Play, CheckCircle2, XCircle, Loader2 } from "lucide-react";
+import { useState, useRef, useEffect, useCallback } from "react";
+import { Layers, Plus, Trash2, Upload, Play, CheckCircle2, XCircle, Loader2, RefreshCcw, RotateCcw, FileText, Activity } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,7 +7,8 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Separator } from "@/components/ui/separator";
-import { transferApi } from "@/api/paymentsApi";
+import { transferApi, bulkPaymentsApi, bulkPaymentRecordsApi, type BulkPaymentBatch, type BulkPaymentRecord } from "@/api/paymentsApi";
+import { toast } from "sonner";
 
 interface Recipient {
   id: string;
@@ -25,6 +26,210 @@ interface TransferResult {
 
 function makeId() {
   return Math.random().toString(36).slice(2, 9);
+}
+
+/**
+ * W12 A4-P1-A — Batch operations against bulk-payments-rs real routes:
+ * /v1/process, /v1/status, /v1/returns, /v1/stats, /v1/bulk-payments/stats,
+ * /v1/bulk-payments/{id}/retry-failed and the /api/v1/payments record CRUD.
+ */
+function BatchOpsSection() {
+  const [stats, setStats] = useState<Record<string, unknown> | null>(null);
+  const [batches, setBatches] = useState<BulkPaymentBatch[]>([]);
+  const [records, setRecords] = useState<BulkPaymentRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [actionOutput, setActionOutput] = useState<string | null>(null);
+  const [newRecord, setNewRecord] = useState({ reference: "", amount: "", currency: "NGN" });
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [statsRes, batchRes, recordRes] = await Promise.all([
+        bulkPaymentsApi.batchStats().catch(() => null),
+        bulkPaymentsApi.list({ limit: 50 }).catch(() => ({ items: [], total: 0 })),
+        bulkPaymentRecordsApi.list({ limit: 50 }).catch(() => ({ items: [], total: 0 })),
+      ]);
+      setStats((statsRes ?? null) as Record<string, unknown> | null);
+      setBatches(batchRes.items ?? []);
+      setRecords(recordRes.items ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load batch operations data");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function runBatchAction(key: string, fn: () => Promise<unknown>, successMsg: string) {
+    setBusyKey(key);
+    setActionOutput(null);
+    try {
+      const res = await fn();
+      toast.success(successMsg);
+      setActionOutput(JSON.stringify(res, null, 2));
+      await load();
+    } catch (e) {
+      const msg = (e as { response?: { data?: { error?: string; message?: string } } })?.response?.data?.error
+        ?? (e as { response?: { data?: { message?: string } } })?.response?.data?.message
+        ?? (e instanceof Error ? e.message : "Action failed");
+      toast.error(msg);
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function handleCreateRecord() {
+    if (!newRecord.reference || !newRecord.amount) {
+      toast.error("Reference and amount are required");
+      return;
+    }
+    await runBatchAction(
+      "create-record",
+      () =>
+        bulkPaymentRecordsApi.create({
+          reference: newRecord.reference,
+          amount: Number(newRecord.amount),
+          currency: newRecord.currency,
+          status: "pending",
+        }),
+      "Payment record created",
+    );
+    setNewRecord({ reference: "", amount: "", currency: "NGN" });
+  }
+
+  return (
+    <>
+      <Separator />
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Activity className="h-5 w-5 text-orange-600" />
+          <div>
+            <h2 className="text-lg font-semibold">Bulk Batch Operations</h2>
+            <p className="text-sm text-muted-foreground">
+              Process, monitor and retry bulk-payments-rs batches; manage payment records
+            </p>
+          </div>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+          <RefreshCcw className={`h-4 w-4 mr-1 ${loading ? "animate-spin" : ""}`} /> Refresh
+        </Button>
+      </div>
+
+      {error && <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-2 text-sm text-destructive">{error}</div>}
+
+      {stats && (
+        <Card>
+          <CardHeader><CardTitle className="text-base">Engine Stats</CardTitle></CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              {Object.entries(stats).slice(0, 8).map(([k, v]) => (
+                <div key={k} className="rounded-md bg-muted/40 p-3">
+                  <p className="text-xs text-muted-foreground">{k.replace(/_/g, " ")}</p>
+                  <p className="text-lg font-semibold">{typeof v === "object" ? JSON.stringify(v) : String(v)}</p>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader><CardTitle className="text-base">Batches</CardTitle></CardHeader>
+        <CardContent className="space-y-2">
+          {loading ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Loading batches…</div>
+          ) : batches.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No batches found.</p>
+          ) : (
+            batches.map((b) => {
+              const id = String(b.id ?? (b as unknown as { batch_id?: string }).batch_id ?? "");
+              return (
+                <div key={id} className="flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-sm">
+                  <span className="font-mono text-xs">{id}</span>
+                  <Badge variant="outline">{b.status ?? "unknown"}</Badge>
+                  <span className="text-muted-foreground text-xs">
+                    {b.totalCount ?? "—"} items · {b.failedCount ?? 0} failed
+                  </span>
+                  <span className="flex-1" />
+                  <Button size="sm" variant="outline" disabled={busyKey !== null}
+                    onClick={() => void runBatchAction(`status-${id}`, () => bulkPaymentsApi.batchStatus({ batch_id: id }), "Status refreshed")}>
+                    <FileText className="h-3.5 w-3.5 mr-1" /> Status
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={busyKey !== null}
+                    onClick={() => void runBatchAction(`process-${id}`, () => bulkPaymentsApi.process({ batch_id: id }), "Batch processing started")}>
+                    <Play className="h-3.5 w-3.5 mr-1" /> Process
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={busyKey !== null}
+                    onClick={() => void runBatchAction(`retry-${id}`, () => bulkPaymentsApi.retryFailed(id), "Failed legs re-queued")}>
+                    <RotateCcw className="h-3.5 w-3.5 mr-1" /> Retry failed
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={busyKey !== null}
+                    onClick={() => void runBatchAction(`returns-${id}`, () => bulkPaymentsApi.generateReturns({ batch_id: id }), "Return file generated")}>
+                    Returns
+                  </Button>
+                </div>
+              );
+            })
+          )}
+          {actionOutput && (
+            <pre className="mt-2 max-h-48 overflow-auto rounded-md bg-muted/50 p-3 text-xs">{actionOutput}</pre>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle className="text-base">Payment Records</CardTitle></CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex flex-wrap items-end gap-2">
+            <div className="space-y-1">
+              <Label className="text-xs">Reference</Label>
+              <Input value={newRecord.reference} onChange={(e) => setNewRecord((r) => ({ ...r, reference: e.target.value }))} placeholder="REF-001" className="w-40" />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">Amount</Label>
+              <Input type="number" min="0" value={newRecord.amount} onChange={(e) => setNewRecord((r) => ({ ...r, amount: e.target.value }))} className="w-32" />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">Currency</Label>
+              <Input value={newRecord.currency} onChange={(e) => setNewRecord((r) => ({ ...r, currency: e.target.value }))} className="w-24" />
+            </div>
+            <Button size="sm" onClick={() => void handleCreateRecord()} disabled={busyKey !== null}>
+              <Plus className="h-4 w-4 mr-1" /> Add record
+            </Button>
+          </div>
+          {records.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No payment records.</p>
+          ) : (
+            records.map((rec) => {
+              const id = String(rec.id ?? "");
+              return (
+                <div key={id} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
+                  <span className="font-mono text-xs">{id}</span>
+                  <span className="text-xs text-muted-foreground">{String(rec.reference ?? "")} · {String(rec.amount ?? "")} {String(rec.currency ?? "")}</span>
+                  <Badge variant="outline">{String(rec.status ?? "unknown")}</Badge>
+                  <span className="flex-1" />
+                  <Button size="sm" variant="outline" disabled={busyKey !== null}
+                    onClick={() => void runBatchAction(`mark-${id}`, () => bulkPaymentRecordsApi.update(id, { ...rec, status: "processed" }), "Record updated")}>
+                    Mark processed
+                  </Button>
+                  <Button size="sm" variant="ghost" disabled={busyKey !== null}
+                    onClick={() => void runBatchAction(`del-${id}`, () => bulkPaymentRecordsApi.remove(id), "Record deleted")}>
+                    <Trash2 className="h-4 w-4 text-destructive" />
+                  </Button>
+                </div>
+              );
+            })
+          )}
+        </CardContent>
+      </Card>
+    </>
+  );
 }
 
 function emptyRecipient(): Recipient {
@@ -357,6 +562,8 @@ export default function BulkPaymentsWorkspace() {
           </CardContent>
         </Card>
       )}
+
+      <BatchOpsSection />
     </div>
   );
 }

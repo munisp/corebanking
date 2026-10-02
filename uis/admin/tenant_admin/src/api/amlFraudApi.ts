@@ -247,7 +247,7 @@ export const fraudDetectionApi = {
     apiClient.post(`${APISIX.FRAUD_DETECTION}/v1/rules`, body).then((r) => r.data),
 
   getStats: () =>
-    apiClient.get(`${APISIX.FRAUD_DETECTION}/v1/cases/${getTenantId()}`).then((r) => r.data),
+    apiClient.get(`/fraud/v1/cases/${getTenantId()}`).then((r) => r.data),
 };
 
 // ─── AI Fraud Scoring ─────────────────────────────────────────────────────────
@@ -259,7 +259,7 @@ export const aiFraudScoringApi = {
     apiClient.get(`${APISIX.AI_FRAUD_SCORING}/v1/rules`).then((r) => r.data),
 
   getMetrics: () =>
-    apiClient.get(`${APISIX.AI_FRAUD_SCORING}/v1/cases/${getTenantId()}`).then((r) => r.data),
+    apiClient.get(`/fraud/v1/cases/${getTenantId()}`).then((r) => r.data),
 
   getExplanation: (transactionId: string) =>
     apiClient.get(`${APISIX.AI_FRAUD_SCORING}/v1/alerts/${transactionId}`).then((r) => r.data),
@@ -403,4 +403,57 @@ export const kycAmlScreeningApi = {
 
   runBatch: (customerIds: string[]) =>
     apiClient.post(`${APISIX.KYC_AML}/v1/batch/screen`, { customerIds }).then((r) => r.data),
+};
+
+// ─── Txn Monitoring Rules RS (W12 A4-P1-A: /txn-monitoring-rules/*) ─────────
+// Alerts, cases and SAR filing served by txn-monitoring-rules-rs
+// (services/txn-monitoring-rules-rs/src/main.rs).
+
+export interface TxnMonitoringAlert {
+  id: string;
+  [key: string]: unknown;
+}
+
+export interface TxnMonitoringCase {
+  id: string;
+  status?: string;
+  sar_filed?: boolean;
+  outcome?: string;
+  [key: string]: unknown;
+}
+
+export const txnMonitoringOpsApi = {
+  listRules: () =>
+    apiClient.get<{ items: TxnMonitoringAlert[]; total: number }>(`${APISIX.TXN_MONITORING}/api/rules`).then((r) => r.data),
+
+  listAlerts: () =>
+    apiClient.get<{ items: TxnMonitoringAlert[]; total: number }>(`${APISIX.TXN_MONITORING}/api/alerts`).then((r) => r.data),
+
+  listCases: () =>
+    apiClient.get<{ items: TxnMonitoringCase[]; total: number }>(`${APISIX.TXN_MONITORING}/api/cases`).then((r) => r.data),
+
+  fileSar: (caseId: string, body: { sar_reference?: string; filed_by?: string }) =>
+    apiClient.post(`${APISIX.TXN_MONITORING}/api/cases/${caseId}/file-sar`, body).then((r) => r.data),
+};
+
+// ─── Fraud Service transaction checks (W12 A4-P1-A: /fraud/v1/*) ────────────
+// fraud.yaml rule-1 rewrites /fraud/v1/(.*) → /api/v1/fraud/$1 (fraud-service).
+
+export interface FraudTransactionCheck {
+  check_id?: string;
+  transaction_id?: string;
+  risk_score?: number;
+  decision?: string;
+  status?: string;
+  created_at?: string;
+  [key: string]: unknown;
+}
+
+export const fraudTransactionChecksApi = {
+  getTransactionChecks: (transactionId: string) =>
+    apiClient
+      .get<{ transaction_id: string; checks: FraudTransactionCheck[]; total: number }>(
+        `${APISIX.FRAUD_SERVICE}/v1/checks/transaction/${encodeURIComponent(transactionId)}`,
+      )
+      .then((r) => r.data),
 };

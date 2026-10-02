@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"database/sql"
 	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -73,24 +75,158 @@ type WATemplate struct {
 	Components []map[string]interface{} `json:"components"`
 }
 
-type WAServer struct {
-	mu      sync.RWMutex
-	counter int
-	msgs    []WAMessage
-	tpls    []WATemplate
+// ── Postgres persistence (W12 C3-P2-B5) ─────────────────────────────────────
+// The in-memory msgs/tpls slices (WAServer) were removed. wa_messages and
+// wa_templates are authoritative; mutations are real PG writes (single-statement
+// atomic INSERTs, wa_message_id UNIQUE as the idempotency natural key) and
+// reads are served from PG. When DATABASE_URL is unset/unreachable the
+// endpoints fail closed (503).
+
+var db *sql.DB
+
+var seedWAMessages = []WAMessage{
+	{ID: "WA-001", WAMessageID: "wamid.HBgLMjM0ODAxMjM0NTY3OBUCABEYEjVDRTU0", PhoneNumber: "+2348012345678", Direction: "outbound", TemplateName: "credit_alert_v2", MessageType: "template", Content: "Credit Alert: ₦500,000.00 from JOHN OKO", Status: "read", DeliveredAt: "2026-05-09T14:30:02Z", ReadAt: "2026-05-09T14:30:15Z"},
+	{ID: "WA-002", WAMessageID: "wamid.HBgLMjM0ODA5ODc2NTQzMhUCABEYEjVDRTU1", PhoneNumber: "+2348098765432", Direction: "outbound", TemplateName: "debit_alert_v2", MessageType: "template", Content: "Debit Alert: ₦150,000.00 to Grace Okafor", Status: "delivered", DeliveredAt: "2026-05-09T15:00:01Z"},
 }
 
-var srv = &WAServer{
-	msgs: []WAMessage{
-		{ID: "WA-001", WAMessageID: "wamid.HBgLMjM0ODAxMjM0NTY3OBUCABEYEjVDRTU0", PhoneNumber: "+2348012345678", Direction: "outbound", TemplateName: "credit_alert_v2", MessageType: "template", Content: "Credit Alert: ₦500,000.00 from JOHN OKO", Status: "read", DeliveredAt: "2026-05-09T14:30:02Z", ReadAt: "2026-05-09T14:30:15Z"},
-		{ID: "WA-002", WAMessageID: "wamid.HBgLMjM0ODA5ODc2NTQzMhUCABEYEjVDRTU1", PhoneNumber: "+2348098765432", Direction: "outbound", TemplateName: "debit_alert_v2", MessageType: "template", Content: "Debit Alert: ₦150,000.00 to Grace Okafor", Status: "delivered", DeliveredAt: "2026-05-09T15:00:01Z"},
-	},
-	tpls: []WATemplate{
-		{Name: "credit_alert_v2", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Credit Alert: {{1}} from {{2}}. Bal: {{3}}"}}},
-		{Name: "debit_alert_v2", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Debit Alert: {{1}} to {{2}}. Bal: {{3}}"}}},
-		{Name: "otp_delivery_v1", Language: "en", Category: "AUTHENTICATION", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Your OTP is {{1}}. Valid for {{2}} minutes."}}},
-		{Name: "fraud_alert_v1", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "URGENT: Suspicious transaction {{1}} detected. Call 0800-54-BANK."}}},
-	},
+var seedWATemplates = []WATemplate{
+	{Name: "credit_alert_v2", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Credit Alert: {{1}} from {{2}}. Bal: {{3}}"}}},
+	{Name: "debit_alert_v2", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Debit Alert: {{1}} to {{2}}. Bal: {{3}}"}}},
+	{Name: "otp_delivery_v1", Language: "en", Category: "AUTHENTICATION", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "Your OTP is {{1}}. Valid for {{2}} minutes."}}},
+	{Name: "fraud_alert_v1", Language: "en", Category: "UTILITY", Status: "APPROVED", Components: []map[string]interface{}{{"type": "BODY", "text": "URGENT: Suspicious transaction {{1}} detected. Call 0800-54-BANK."}}},
+}
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[whatsapp-service] DATABASE_URL not set — endpoints fail closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[whatsapp-service] DB open failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[whatsapp-service] DB ping failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS wa_messages (
+			id TEXT PRIMARY KEY,
+			wa_message_id TEXT NOT NULL DEFAULT '' UNIQUE,
+			phone_number TEXT NOT NULL DEFAULT '',
+			direction TEXT NOT NULL DEFAULT '',
+			template_name TEXT NOT NULL DEFAULT '',
+			message_type TEXT NOT NULL DEFAULT '',
+			content TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT '',
+			delivered_at TEXT NOT NULL DEFAULT '',
+			read_at TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS wa_templates (
+			name TEXT NOT NULL,
+			language TEXT NOT NULL DEFAULT 'en',
+			category TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT '',
+			components JSONB NOT NULL DEFAULT '[]',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (name, language)
+		)`,
+		`CREATE SEQUENCE IF NOT EXISTS wa_messages_seq START 3`,
+	}
+	for _, st := range stmts {
+		if _, err = db.Exec(st); err != nil {
+			log.Printf("[whatsapp-service] DDL failed: %v — endpoints fail closed (503)", err)
+			db = nil
+			return
+		}
+	}
+	// Idempotent boot seeds (previously the in-memory fixtures).
+	for _, m := range seedWAMessages {
+		if _, err = db.Exec(`INSERT INTO wa_messages
+			(id, wa_message_id, phone_number, direction, template_name, message_type, content, status, delivered_at, read_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
+			m.ID, m.WAMessageID, m.PhoneNumber, m.Direction, m.TemplateName, m.MessageType, m.Content, m.Status, m.DeliveredAt, m.ReadAt); err != nil {
+			log.Printf("[whatsapp-service] message seed failed: %v — endpoints fail closed (503)", err)
+			db = nil
+			return
+		}
+	}
+	for _, t := range seedWATemplates {
+		comp, _ := json.Marshal(t.Components)
+		if _, err = db.Exec(`INSERT INTO wa_templates (name, language, category, status, components)
+			VALUES ($1,$2,$3,$4,$5) ON CONFLICT (name, language) DO NOTHING`,
+			t.Name, t.Language, t.Category, t.Status, comp); err != nil {
+			log.Printf("[whatsapp-service] template seed failed: %v — endpoints fail closed (503)", err)
+			db = nil
+			return
+		}
+	}
+	log.Printf("[whatsapp-service] Postgres connected (pool: 10/2), wa_messages + wa_templates ready")
+}
+
+func waStoreUnavailable(w http.ResponseWriter) {
+	respondJSON(w, 503, map[string]string{"error": "whatsapp store unavailable (postgres down)"})
+}
+
+// insertWAMessage persists an outbound message in one atomic INSERT …
+// ON CONFLICT (wa_message_id) → stored row: a provider retry that replays the
+// same wa_message_id returns the stored row instead of a duplicate.
+func insertWAMessage(msg *WAMessage) error {
+	return db.QueryRow(`INSERT INTO wa_messages
+		(id, wa_message_id, phone_number, direction, template_name, message_type, content, status)
+		VALUES ('WA-' || LPAD(nextval('wa_messages_seq')::text, 3, '0'), $1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (wa_message_id) DO UPDATE SET wa_message_id = EXCLUDED.wa_message_id
+		RETURNING id`,
+		msg.WAMessageID, msg.PhoneNumber, msg.Direction, msg.TemplateName, msg.MessageType, msg.Content, msg.Status,
+	).Scan(&msg.ID)
+}
+
+func listWAMessages() ([]WAMessage, error) {
+	rows, err := db.Query(`SELECT id, wa_message_id, phone_number, direction, template_name, message_type, content, status, delivered_at, read_at
+		FROM wa_messages ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []WAMessage{}
+	for rows.Next() {
+		var m WAMessage
+		if err := rows.Scan(&m.ID, &m.WAMessageID, &m.PhoneNumber, &m.Direction, &m.TemplateName, &m.MessageType, &m.Content, &m.Status, &m.DeliveredAt, &m.ReadAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func listWATemplates() ([]WATemplate, error) {
+	rows, err := db.Query(`SELECT name, language, category, status, components FROM wa_templates ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []WATemplate{}
+	for rows.Next() {
+		var t WATemplate
+		var comp []byte
+		if err := rows.Scan(&t.Name, &t.Language, &t.Category, &t.Status, &comp); err != nil {
+			return nil, err
+		}
+		t.Components = []map[string]interface{}{}
+		_ = json.Unmarshal(comp, &t.Components)
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
@@ -364,16 +500,17 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func main() {
+	initDB()
 	port := getEnv("PORT", "9141")
 	r := mux.NewRouter()
 	r.HandleFunc("/healthz", healthz).Methods("GET")
 	r.HandleFunc("/health", healthz).Methods("GET")
 	r.Handle("/metrics", promhttp.Handler())
-	r.HandleFunc("/v1/whatsapp/send-template", sendTemplate).Methods("POST")
+	r.HandleFunc("/v1/whatsapp/send-template", permifyAuthzGuard("notification_template", "send_template", sendTemplate)).Methods("POST")
 	r.Handle("/v1/whatsapp/webhook", webhookAuthMiddleware(http.HandlerFunc(webhook))).Methods("GET", "POST")
-	r.HandleFunc("/v1/whatsapp/messages", messages).Methods("GET")
-	r.HandleFunc("/v1/whatsapp/templates", templates).Methods("GET")
-	r.HandleFunc("/v1/whatsapp/stats", stats).Methods("GET")
+	r.HandleFunc("/v1/whatsapp/messages", permifyAuthzGuard("notification", "view", messages)).Methods("GET")
+	r.HandleFunc("/v1/whatsapp/templates", permifyAuthzGuard("notification_template", "view", templates)).Methods("GET")
+	r.HandleFunc("/v1/whatsapp/stats", permifyAuthzGuard("notification", "view", stats)).Methods("GET")
 	log.Printf("[whatsapp-service] WhatsApp Business Cloud API v18.0 on :%s", port)
 	log.Fatal((&http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(r), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
@@ -399,16 +536,21 @@ func sendTemplate(w http.ResponseWriter, r *http.Request) {
 		Parameters   []map[string]interface{} `json:"parameters"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	srv.mu.Lock()
-	srv.counter++
+	if db == nil {
+		waStoreUnavailable(w)
+		return
+	}
 	msg := WAMessage{
-		ID: fmt.Sprintf("WA-%03d", srv.counter+2), WAMessageID: fmt.Sprintf("wamid.%d", time.Now().UnixNano()),
+		WAMessageID: fmt.Sprintf("wamid.%d", time.Now().UnixNano()),
 		PhoneNumber: req.PhoneNumber, Direction: "outbound",
 		TemplateName: req.TemplateName, MessageType: "template",
 		Content: "Template message sent", Status: "accepted",
 	}
-	srv.msgs = append(srv.msgs, msg)
-	srv.mu.Unlock()
+	if err := insertWAMessage(&msg); err != nil {
+		log.Printf("[whatsapp-service] insert failed: %v", err)
+		waStoreUnavailable(w)
+		return
+	}
 	respondJSON(w, 201, map[string]interface{}{"success": true, "message": msg})
 }
 
@@ -423,21 +565,47 @@ func webhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func messages(w http.ResponseWriter, _ *http.Request) {
-	srv.mu.RLock()
-	defer srv.mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"messages": srv.msgs, "total": len(srv.msgs)})
+	if db == nil {
+		waStoreUnavailable(w)
+		return
+	}
+	msgs, err := listWAMessages()
+	if err != nil {
+		log.Printf("[whatsapp-service] messages list failed: %v", err)
+		waStoreUnavailable(w)
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"messages": msgs, "total": len(msgs)})
 }
 
 func templates(w http.ResponseWriter, _ *http.Request) {
-	respondJSON(w, 200, map[string]interface{}{"templates": srv.tpls, "total": len(srv.tpls)})
+	if db == nil {
+		waStoreUnavailable(w)
+		return
+	}
+	tpls, err := listWATemplates()
+	if err != nil {
+		log.Printf("[whatsapp-service] templates list failed: %v", err)
+		waStoreUnavailable(w)
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"templates": tpls, "total": len(tpls)})
 }
 
 func stats(w http.ResponseWriter, _ *http.Request) {
-	srv.mu.RLock()
-	defer srv.mu.RUnlock()
+	if db == nil {
+		waStoreUnavailable(w)
+		return
+	}
+	var totalMessages, totalTemplates int
+	if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM wa_messages), (SELECT COUNT(*) FROM wa_templates)`).Scan(&totalMessages, &totalTemplates); err != nil {
+		log.Printf("[whatsapp-service] stats query failed: %v", err)
+		waStoreUnavailable(w)
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"channel": "whatsapp", "apiVersion": "v18.0",
 		"sentToday": 95000, "deliveryRatePct": 99.4, "avgLatencyMs": 1200,
-		"totalMessages": len(srv.msgs), "templates": len(srv.tpls),
+		"totalMessages": totalMessages, "templates": totalTemplates,
 	})
 }

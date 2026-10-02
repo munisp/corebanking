@@ -20,6 +20,27 @@ import { publish, getKafkaStatus } from "./kafkaClient";
 import { getRedisStatus } from "./redisClient";
 import { checkDatabaseHealth } from "./postgresRepository";
 import { computeKpiMetricValues, DatabaseUnavailableError } from "./kpiGateway";
+// W12-C3-P2-MLIB (c3-1038): threshold-breach notification events were kept in
+// a module-level array — a restart erased the breach/acknowledge/resolve
+// audit trail (and reset the cooldown memory, re-firing alerts). Now
+// Postgres-authoritative (table `kpi_notification_events`) via
+// lib/pgJsonStore.ts; fail-closed on PG outage (mutations surface via
+// handleNotificationError as 503 database_unavailable, reads via 503
+// PERSISTENCE_UNAVAILABLE), no degraded-memory fallback.
+import { ensureTables, storeDDL, storeInsert, storeList, storeReplace } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+import { randomUUID } from "crypto";
+
+const EVENTS_TABLE = "kpi_notification_events";
+
+async function ensureNotificationEventStore(): Promise<void> {
+  await ensureTables("kpiNotifications.events", storeDDL(EVENTS_TABLE));
+}
+
+async function loadNotificationEvents(): Promise<NotificationEvent[]> {
+  await ensureNotificationEventStore();
+  return storeList<NotificationEvent>(EVENTS_TABLE);
+}
 
 // ─── NOTIFICATION TYPES ─────────────────────────────────────────────────────
 
@@ -98,9 +119,6 @@ const DEFAULT_RULES: NotificationRule[] = [
 ];
 
 // In-memory event store of REAL fired events (production: Kafka + OpenSearch)
-const notificationEvents: NotificationEvent[] = [];
-let eventCounter = 0;
-
 // ─── EVALUATION ENGINE ──────────────────────────────────────────────────────
 
 function evaluateCondition(value: number, condition: string, threshold: number): boolean {
@@ -119,10 +137,12 @@ function evaluateCondition(value: number, condition: string, threshold: number):
  * Rules whose metric value is null (no computable source) are skipped and
  * logged — they produce neither a breach nor an all-clear.
  */
-function evaluateAllRules(values: Record<string, number | null>): { newEvents: NotificationEvent[]; skipped: string[] } {
+async function evaluateAllRules(values: Record<string, number | null>): Promise<{ newEvents: NotificationEvent[]; skipped: string[] }> {
   const newEvents: NotificationEvent[] = [];
   const skipped: string[] = [];
   const now = new Date().toISOString();
+  await ensureNotificationEventStore();
+  const notificationEvents = await storeList<NotificationEvent>(EVENTS_TABLE);
 
   for (const rule of DEFAULT_RULES) {
     if (!rule.enabled) continue;
@@ -142,9 +162,10 @@ function evaluateAllRules(values: Record<string, number | null>): { newEvents: N
       );
       if (recentEvent) continue;
 
-      eventCounter++;
       const event: NotificationEvent = {
-        id: `evt-${String(eventCounter).padStart(6, "0")}`,
+        // Collision-resistant id (per-process counters reset on restart and
+        // diverge across replicas; the PG PK would reject a duplicate).
+        id: `evt-${randomUUID()}`,
         ruleId: rule.id,
         role: rule.role,
         metricId: rule.metricId,
@@ -158,7 +179,9 @@ function evaluateAllRules(values: Record<string, number | null>): { newEvents: N
         channels: rule.channels,
         message: `${rule.metricName} for ${rule.role.toUpperCase()} is ${value} (threshold: ${rule.condition} ${rule.thresholdValue}) — ${rule.description}`,
       };
-      notificationEvents.push(event);
+      // Persist FIRST (fail-closed): the breach event must be durable before
+      // it is published/served.
+      await storeInsert(EVENTS_TABLE, "", event);
       newEvents.push(event);
 
       // Publish to the real event bus
@@ -235,6 +258,11 @@ function getWeekNumber(d: Date): number {
 // ─── ERROR HANDLING ─────────────────────────────────────────────────────────
 
 function handleNotificationError(res: Response, error: unknown): void {
+  // W12-C3-P2-MLIB: pg-store availability failures are fail-closed 503 too.
+  if (error instanceof Error && error.message.startsWith("pg-store: database unavailable")) {
+    res.status(503).json({ error: "database_unavailable", message: "KPI notification store requires a live Postgres connection" });
+    return;
+  }
   if (error instanceof DatabaseUnavailableError) {
     res.status(503).json({ error: "database_unavailable", message: "KPI notification evaluation requires a live Postgres connection" });
     return;
@@ -266,7 +294,7 @@ export function registerKPINotifications(app: Express): void {
     try {
       const enabledRules = DEFAULT_RULES.filter(r => r.enabled);
       const values = await computeKpiMetricValues(enabledRules.map(r => r.metricId));
-      const { newEvents, skipped } = evaluateAllRules(values);
+      const { newEvents, skipped } = await evaluateAllRules(values);
       res.json({
         evaluated: enabledRules.length - skipped.length,
         skippedUnavailable: skipped,
@@ -281,40 +309,46 @@ export function registerKPINotifications(app: Express): void {
   });
 
   // List notification events/history
-  app.get("/api/kpi/notifications/events", (req: Request, res: Response) => {
+  app.get("/api/kpi/notifications/events", asyncRoute(async (req: Request, res: Response) => {
     const role = req.query.role as string;
     const severity = req.query.severity as string;
     const status = req.query.status as string;
-    let events = [...notificationEvents].reverse();
+    const stored = await pgGuard(loadNotificationEvents());
+    let events = [...stored].reverse();
     if (role) events = events.filter(e => e.role === role);
     if (severity) events = events.filter(e => e.severity === severity);
     if (status) events = events.filter(e => e.status === status);
     res.json({ events: events.slice(0, 100), total: events.length });
-  });
+  }));
 
   // Acknowledge notification
-  app.post("/api/kpi/notifications/events/:id/acknowledge", (req: Request, res: Response) => {
+  app.post("/api/kpi/notifications/events/:id/acknowledge", asyncRoute(async (req: Request, res: Response) => {
     const { id } = req.params;
-    const event = notificationEvents.find(e => e.id === id);
+    const stored = await pgGuard(loadNotificationEvents());
+    const event = stored.find(e => e.id === id);
     if (!event) return res.status(404).json({ error: "event not found" });
     event.status = "acknowledged";
     event.acknowledgedAt = new Date().toISOString();
     event.acknowledgedBy = (req.headers["x-kpi-role"] as string) || "admin";
+    await pgGuard(storeReplace(EVENTS_TABLE, event.id, event));
     res.json(event);
-  });
+  }));
 
   // Resolve notification
-  app.post("/api/kpi/notifications/events/:id/resolve", (req: Request, res: Response) => {
+  app.post("/api/kpi/notifications/events/:id/resolve", asyncRoute(async (req: Request, res: Response) => {
     const { id } = req.params;
-    const event = notificationEvents.find(e => e.id === id);
+    const stored = await pgGuard(loadNotificationEvents());
+    const event = stored.find(e => e.id === id);
     if (!event) return res.status(404).json({ error: "event not found" });
     event.status = "resolved";
     event.resolvedAt = new Date().toISOString();
+    await pgGuard(storeReplace(EVENTS_TABLE, event.id, event));
     res.json(event);
-  });
+  }));
 
   // Notification summary dashboard
-  app.get("/api/kpi/notifications/summary", (_req: Request, res: Response) => {
+  app.get("/api/kpi/notifications/summary", asyncRoute(async (_req: Request, res: Response) => {
+    const notificationEvents = await pgGuard(loadNotificationEvents());
     const active = notificationEvents.filter(e => e.status === "fired").length;
     const acknowledged = notificationEvents.filter(e => e.status === "acknowledged").length;
     const resolved = notificationEvents.filter(e => e.status === "resolved").length;
@@ -335,7 +369,7 @@ export function registerKPINotifications(app: Express): void {
       channels: ["kafka", "email", "sms", "webhook", "in_app", "push"],
       lastEvaluation: new Date().toISOString(),
     });
-  });
+  }));
 
   // ─── CADENCE ENDPOINTS ──────────────────────────────────────────────────
 

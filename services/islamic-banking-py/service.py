@@ -17,6 +17,105 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 import json
 
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(row.get(self.key, "")), row.get(self.tenant_key),
+                          json.dumps(row, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -133,7 +232,7 @@ class MudarabahContract:
 
 # ── State ──
 
-murabaha_contracts: list[MurabahaContract] = [
+_MURABAHA_SEED: list[MurabahaContract] = [
     MurabahaContract(
         id="MRB-001", tenant_id=default_tenant(), customer_id="CUST-001", customer_name="Fatima Abdullahi",
         asset_description="Toyota Hilux 2026", asset_category="vehicle", cost_price=35000000,
@@ -156,7 +255,7 @@ murabaha_contracts: list[MurabahaContract] = [
     ),
 ]
 
-ijara_contracts: list[IjaraContract] = [
+_IJARA_SEED: list[IjaraContract] = [
     IjaraContract(
         id="IJR-001", tenant_id=default_tenant(), customer_id="CUST-002", customer_name="Ibrahim Musa",
         asset_description="Office Equipment Package", asset_category="equipment",
@@ -170,7 +269,7 @@ ijara_contracts: list[IjaraContract] = [
     ),
 ]
 
-mudarabah_contracts: list[MudarabahContract] = [
+_MUDARABAH_SEED: list[MudarabahContract] = [
     MudarabahContract(
         id="MDR-001", tenant_id=default_tenant(), investor_id="CUST-002", investor_name="Ibrahim Musa",
         fund_manager_id="FM-001", investment_purpose="SME Growth Fund",
@@ -184,6 +283,13 @@ mudarabah_contracts: list[MudarabahContract] = [
         created_at="2025-12-20T10:00:00Z", updated_at="2026-04-01T12:00:00Z",
     ),
 ]
+
+
+# W12-C3P2B5: PG-backed domain stores; seed rows are inserted
+# ON CONFLICT (record_id) DO NOTHING on first access (idempotent seed).
+MURABAHA_STORE = _W12Store("murabaha_contracts", seed=[asdict(c) for c in _MURABAHA_SEED])
+IJARA_STORE = _W12Store("ijara_contracts", seed=[asdict(c) for c in _IJARA_SEED])
+MUDARABAH_STORE = _W12Store("mudarabah_contracts", seed=[asdict(c) for c in _MUDARABAH_SEED])
 
 
 # ── Business Logic ──
@@ -402,35 +508,62 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
             })
 
         elif path == "/v1/islamic-banking/murabaha":
-            self._respond(200, {"asOf": now_iso(), "items": [asdict(c) for c in murabaha_contracts], "total": len(murabaha_contracts)})
+            try:
+                _items = MURABAHA_STORE.all()
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._respond(200, {"asOf": now_iso(), "items": _items, "total": len(_items)})
 
         elif path.startswith("/v1/islamic-banking/murabaha/"):
             cid = path.split("/")[-1]
-            contract = next((c for c in murabaha_contracts if c.id == cid), None)
+            try:
+                contract = MURABAHA_STORE.get(cid)
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             if contract:
-                self._respond(200, asdict(contract))
+                self._respond(200, contract)
             else:
                 self._respond(404, {"message": "Murabaha contract not found"})
 
         elif path == "/v1/islamic-banking/ijara":
-            self._respond(200, {"asOf": now_iso(), "items": [asdict(c) for c in ijara_contracts], "total": len(ijara_contracts)})
+            try:
+                _items = IJARA_STORE.all()
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._respond(200, {"asOf": now_iso(), "items": _items, "total": len(_items)})
 
         elif path.startswith("/v1/islamic-banking/ijara/"):
             cid = path.split("/")[-1]
-            contract = next((c for c in ijara_contracts if c.id == cid), None)
+            try:
+                contract = IJARA_STORE.get(cid)
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             if contract:
-                self._respond(200, asdict(contract))
+                self._respond(200, contract)
             else:
                 self._respond(404, {"message": "Ijara contract not found"})
 
         elif path == "/v1/islamic-banking/mudarabah":
-            self._respond(200, {"asOf": now_iso(), "items": [asdict(c) for c in mudarabah_contracts], "total": len(mudarabah_contracts)})
+            try:
+                _items = MUDARABAH_STORE.all()
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
+            self._respond(200, {"asOf": now_iso(), "items": _items, "total": len(_items)})
 
         elif path.startswith("/v1/islamic-banking/mudarabah/"):
             cid = path.split("/")[-1]
-            contract = next((c for c in mudarabah_contracts if c.id == cid), None)
+            try:
+                contract = MUDARABAH_STORE.get(cid)
+            except Exception as _e:
+                self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+                return
             if contract:
-                self._respond(200, asdict(contract))
+                self._respond(200, contract)
             else:
                 self._respond(404, {"message": "Mudarabah contract not found"})
 
@@ -525,7 +658,11 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
             created_at=now_iso(),
             updated_at=now_iso(),
         )
-        murabaha_contracts.append(contract)
+        try:
+            MURABAHA_STORE.put(contract.id, asdict(contract))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(201, asdict(contract))
 
     def _create_ijara(self, body: dict):
@@ -563,7 +700,11 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
             created_at=now_iso(),
             updated_at=now_iso(),
         )
-        ijara_contracts.append(contract)
+        try:
+            IJARA_STORE.put(contract.id, asdict(contract))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(201, asdict(contract))
 
     def _create_mudarabah(self, body: dict):
@@ -609,11 +750,20 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
             created_at=now_iso(),
             updated_at=now_iso(),
         )
-        mudarabah_contracts.append(contract)
+        try:
+            MUDARABAH_STORE.put(contract.id, asdict(contract))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(201, asdict(contract))
 
     def _disburse_murabaha(self, cid: str):
-        contract = next((c for c in murabaha_contracts if c.id == cid), None)
+        try:
+            _row = MURABAHA_STORE.get(cid)
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
+        contract = MurabahaContract(**_row) if _row else None
         if not contract:
             self._respond(404, {"message": "Murabaha contract not found"})
             return
@@ -623,6 +773,11 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
         contract.status = ProductStatus.ACTIVE.value
         contract.disbursement_date = now_iso()
         contract.updated_at = now_iso()
+        try:
+            MURABAHA_STORE.put(contract.id, asdict(contract))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(200, {
             "contract": asdict(contract),
             "ledgerEntry": {
@@ -634,7 +789,12 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
         })
 
     def _repay_murabaha(self, cid: str, body: dict):
-        contract = next((c for c in murabaha_contracts if c.id == cid), None)
+        try:
+            _row = MURABAHA_STORE.get(cid)
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
+        contract = MurabahaContract(**_row) if _row else None
         if not contract:
             self._respond(404, {"message": "Murabaha contract not found"})
             return
@@ -649,6 +809,11 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
             contract.status = ProductStatus.MATURED.value
             contract.outstanding_balance = 0
         contract.updated_at = now_iso()
+        try:
+            MURABAHA_STORE.put(contract.id, asdict(contract))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(200, {
             "contract": asdict(contract),
             "payment": {"applied": payment},
@@ -661,7 +826,12 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
         })
 
     def _distribute_mudarabah(self, cid: str, body: dict):
-        contract = next((c for c in mudarabah_contracts if c.id == cid), None)
+        try:
+            _row = MUDARABAH_STORE.get(cid)
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
+        contract = MudarabahContract(**_row) if _row else None
         if not contract:
             self._respond(404, {"message": "Mudarabah contract not found"})
             return
@@ -685,6 +855,11 @@ class IslamicBankingHandler(BaseHTTPRequestHandler):
         }
         contract.distributions.append(distribution)
         contract.updated_at = now_iso()
+        try:
+            MUDARABAH_STORE.put(contract.id, asdict(contract))
+        except Exception as _e:
+            self._respond(503, {"error": "persistence_unavailable", "detail": str(_e)})
+            return
         self._respond(200, {
             "contract": asdict(contract),
             "distribution": distribution,

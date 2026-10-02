@@ -48,17 +48,6 @@ type FixedAsset struct {
 	Status             string  `json:"status"`
 }
 
-var (
-	mu    sync.RWMutex
-	items = []FixedAsset{
-		{ID: "FA-001", AssetName: "Victoria Island Head Office", Category: "building", Location: "Lagos", PurchaseValue: 25000000000.0, Currency: "NGN", DepreciationMethod: "straight_line", NetBookValue: 20000000000.0, Status: "in_use"},
-		{ID: "FA-002", AssetName: "Core Banking System", Category: "software", Location: "Data Center", PurchaseValue: 5000000000.0, Currency: "NGN", DepreciationMethod: "straight_line", NetBookValue: 3500000000.0, Status: "in_use"},
-		{ID: "FA-003", AssetName: "ATM Fleet (200 units)", Category: "equipment", Location: "Nationwide", PurchaseValue: 3000000000.0, Currency: "NGN", DepreciationMethod: "reducing_balance", NetBookValue: 1800000000.0, Status: "in_use"},
-		{ID: "FA-004", AssetName: "Armoured Vehicles (15)", Category: "vehicle", Location: "Various", PurchaseValue: 1500000000.0, Currency: "NGN", DepreciationMethod: "reducing_balance", NetBookValue: 900000000.0, Status: "in_use"},
-		{ID: "FA-005", AssetName: "Generator Sets (50 units)", Category: "equipment", Location: "Branches", PurchaseValue: 750000000.0, Currency: "NGN", DepreciationMethod: "straight_line", NetBookValue: 450000000.0, Status: "in_use"},
-	}
-)
-
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -66,7 +55,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092")},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379")},
-			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL")},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "connected": pgPing(), "tables": []string{"fixed_assets"}},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200")},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476")},
@@ -80,26 +69,6 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 			"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000")},
 		},
 	})
-}
-
-func listItems(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": items, "total": len(items)})
-}
-
-func getStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	var total, nbv float64
-	for _, d := range items {
-		total += d.PurchaseValue
-		nbv += d.NetBookValue
-	}
-	stats := map[string]interface{}{"total_assets": len(items), "total_purchase_value": total, "total_nbv": nbv}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
 }
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
@@ -277,13 +246,14 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	port := envOr("PORT", "8191")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/v1/fixed-assets-go/list", listItems)
-	http.HandleFunc("/v1/fixed-assets-go/stats", getStats)
+	http.HandleFunc("/v1/fixed-assets-go/list", permifyAuthzGuard("fixed_asset", "view", listItems))
+	http.HandleFunc("/v1/fixed-assets-go/stats", permifyAuthzGuard("fixed_asset", "view", getStats))
 	fmt.Printf("Fixed Assets Service running on port %s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

@@ -1,6 +1,6 @@
 module github.com/54link-dev/platform/services/ops-dashboard
 
-go 1.23
+go 1.22
 
 require (
 	github.com/gin-gonic/gin v1.9.1

@@ -23,9 +23,118 @@ import asyncio
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
+from permify_guard import require_permify  # W12-B5P1DF
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 import uuid
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(row.get(self.key, "")), row.get(self.tenant_key),
+                          json.dumps(row, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_recent(store, limit):
+    """Newest-first read with cap (used for decision-log listing)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} ORDER BY created_at DESC, record_id DESC LIMIT %s",
+        (limit,))
+    return [r["payload"] for r in reversed(rows)]
 
 # Import ML models
 import sys
@@ -438,7 +547,7 @@ async def health_check():
     return {"status": "healthy", "service": "ml-service"}
 
 
-@app.get("/health/detailed")
+@app.get("/health/detailed", dependencies=[Depends(require_permify("model", "view"))])
 async def detailed_health():
     """Detailed health check with model status"""
     return {
@@ -475,7 +584,7 @@ async def prometheus_metrics():
 
 
 # Fraud Detection API
-@app.post("/api/v1/fraud/check", response_model=FraudCheckResponse)
+@app.post("/api/v1/fraud/check", response_model=FraudCheckResponse, dependencies=[Depends(require_permify("model", "check"))])
 async def check_fraud(
     request: FraudCheckRequest,
     background_tasks: BackgroundTasks,
@@ -539,7 +648,7 @@ async def check_fraud(
 
 
 # Credit Scoring API
-@app.post("/api/v1/credit/score", response_model=CreditScoreResponse)
+@app.post("/api/v1/credit/score", response_model=CreditScoreResponse, dependencies=[Depends(require_permify("model", "score"))])
 async def calculate_credit_score(
     request: CreditScoreRequest,
     _: bool = Depends(verify_api_key)
@@ -616,7 +725,7 @@ async def calculate_credit_score(
 
 
 # Transaction Categorization API
-@app.post("/api/v1/categorize", response_model=CategorizationResponse)
+@app.post("/api/v1/categorize", response_model=CategorizationResponse, dependencies=[Depends(require_permify("model", "categorize"))])
 async def categorize_transaction(
     request: CategorizationRequest,
     _: bool = Depends(verify_api_key)
@@ -661,7 +770,7 @@ async def categorize_transaction(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/v1/categorize/batch", response_model=BatchCategorizationResponse)
+@app.post("/api/v1/categorize/batch", response_model=BatchCategorizationResponse, dependencies=[Depends(require_permify("model", "batch"))])
 async def categorize_batch(
     request: BatchCategorizationRequest,
     _: bool = Depends(verify_api_key)
@@ -715,7 +824,7 @@ async def categorize_batch(
 
 
 # Spending Insights API
-@app.post("/api/v1/insights/spending", response_model=SpendingInsightsResponse)
+@app.post("/api/v1/insights/spending", response_model=SpendingInsightsResponse, dependencies=[Depends(require_permify("model", "spending"))])
 async def get_spending_insights(
     request: SpendingInsightsRequest,
     _: bool = Depends(verify_api_key)
@@ -820,7 +929,7 @@ async def get_spending_insights(
 
 
 # Category override API
-@app.post("/api/v1/categorize/override")
+@app.post("/api/v1/categorize/override", dependencies=[Depends(require_permify("model", "override"))])
 async def set_category_override(
     user_id: str,
     merchant_name: str,
@@ -858,7 +967,7 @@ async def set_category_override(
 
 
 # Get available categories
-@app.get("/api/v1/categories")
+@app.get("/api/v1/categories", dependencies=[Depends(require_permify("model", "view"))])
 async def list_categories():
     """List all available transaction categories"""
     return {
@@ -939,11 +1048,13 @@ class FraudDecisionLog(BaseModel):
     model_version: Optional[str]
 
 
-# In-memory event log (in production, use Kafka/PostgreSQL)
-fraud_decision_logs: List[FraudDecisionLog] = []
+# W12-C3P2B5: fraud decision logs (training data) persisted in PG
+# (table fraud_decision_logs; record_id = transaction_id => re-scoring the same
+# transaction is an idempotent upsert). No in-memory shadow.
+DECISION_LOG_STORE = _W12Store("fraud_decision_logs")
 
 
-@app.get("/api/v1/ml/rollout/config", response_model=RolloutConfigResponse)
+@app.get("/api/v1/ml/rollout/config", response_model=RolloutConfigResponse, dependencies=[Depends(require_permify("model", "view"))])
 async def get_rollout_configuration(
     _: bool = Depends(verify_api_key)
 ):
@@ -952,7 +1063,7 @@ async def get_rollout_configuration(
     return RolloutConfigResponse(**config.get_config_summary())
 
 
-@app.post("/api/v1/ml/rollout/config")
+@app.post("/api/v1/ml/rollout/config", dependencies=[Depends(require_permify("model", "config"))])
 async def update_rollout_configuration(
     request: RolloutConfigRequest,
     _: bool = Depends(verify_api_key)
@@ -983,7 +1094,7 @@ async def update_rollout_configuration(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/v1/ml/train", response_model=TrainModelResponse)
+@app.post("/api/v1/ml/train", response_model=TrainModelResponse, dependencies=[Depends(require_permify("model", "train"))])
 async def train_model(
     request: TrainModelRequest,
     background_tasks: BackgroundTasks,
@@ -1051,7 +1162,7 @@ async def train_model(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/v1/ml/registry", response_model=ModelRegistryResponse)
+@app.get("/api/v1/ml/registry", response_model=ModelRegistryResponse, dependencies=[Depends(require_permify("model", "view"))])
 async def get_model_registry_summary(
     _: bool = Depends(verify_api_key)
 ):
@@ -1060,7 +1171,7 @@ async def get_model_registry_summary(
     return ModelRegistryResponse(**registry.get_registry_summary())
 
 
-@app.get("/api/v1/ml/registry/{model_type}")
+@app.get("/api/v1/ml/registry/{model_type}", dependencies=[Depends(require_permify("model", "view"))])
 async def get_models_by_type(
     model_type: str,
     stage: Optional[str] = None,
@@ -1089,7 +1200,7 @@ async def get_models_by_type(
     }
 
 
-@app.post("/api/v1/ml/registry/promote")
+@app.post("/api/v1/ml/registry/promote", dependencies=[Depends(require_permify("model", "promote"))])
 async def promote_model(
     request: PromoteModelRequest,
     _: bool = Depends(verify_api_key)
@@ -1122,7 +1233,7 @@ async def promote_model(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/v1/ml/registry/rollback/{model_type}")
+@app.post("/api/v1/ml/registry/rollback/{model_type}", dependencies=[Depends(require_permify("model", "create"))])
 async def rollback_model(
     model_type: str,
     _: bool = Depends(verify_api_key)
@@ -1150,7 +1261,7 @@ async def rollback_model(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/v1/ml/decisions/logs")
+@app.get("/api/v1/ml/decisions/logs", dependencies=[Depends(require_permify("model", "view"))])
 async def get_fraud_decision_logs(
     limit: int = 100,
     _: bool = Depends(verify_api_key)
@@ -1160,13 +1271,17 @@ async def get_fraud_decision_logs(
     
     These logs are used for training data collection and model evaluation.
     """
+    try:
+        logs = _w12_recent(DECISION_LOG_STORE, limit)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"persistence_unavailable: {e}")
     return {
-        "total": len(fraud_decision_logs),
-        "logs": fraud_decision_logs[-limit:]
+        "total": len(logs),
+        "logs": logs
     }
 
 
-@app.post("/api/v1/ml/decisions/label")
+@app.post("/api/v1/ml/decisions/label", dependencies=[Depends(require_permify("model", "label"))])
 async def label_fraud_decision(
     transaction_id: str,
     is_fraud: bool,
@@ -1177,19 +1292,27 @@ async def label_fraud_decision(
     
     This feedback is used to build training data for model improvement.
     """
-    # In production, this would update a database
-    for log in fraud_decision_logs:
-        if log.transaction_id == transaction_id:
-            # Would update label in database
-            return {
-                "status": "success",
-                "message": f"Labeled {transaction_id} as {'fraud' if is_fraud else 'legitimate'}"
-            }
-    
+    # W12-C3P2B5: real PG update of the stored decision payload.
+    try:
+        DECISION_LOG_STORE.ensure()
+        n = _w12_run(
+            "UPDATE fraud_decision_logs "
+            "SET payload = jsonb_set(payload, '{label}', %s::jsonb), updated_at = NOW() "
+            "WHERE record_id = %s",
+            (json.dumps({"is_fraud": is_fraud, "labeled": True}), transaction_id),
+            fetch=None)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"persistence_unavailable: {e}")
+    if n:
+        return {
+            "status": "success",
+            "message": f"Labeled {transaction_id} as {'fraud' if is_fraud else 'legitimate'}"
+        }
+
     raise HTTPException(status_code=404, detail="Transaction not found in logs")
 
 
-@app.get("/api/v1/ml/feature-store/health")
+@app.get("/api/v1/ml/feature-store/health", dependencies=[Depends(require_permify("model", "view"))])
 async def feature_store_health(
     _: bool = Depends(verify_api_key)
 ):
@@ -1237,7 +1360,7 @@ async def get_user_profile(
 
 
 # Enhanced fraud check with True ML components
-@app.post("/api/v1/fraud/check/v2")
+@app.post("/api/v1/fraud/check/v2", dependencies=[Depends(require_permify("model", "v2"))])
 async def check_fraud_v2(
     request: FraudCheckRequest,
     background_tasks: BackgroundTasks,
@@ -1377,11 +1500,20 @@ async def check_fraud_v2(
             variant=variant.value,
             model_version=ml_model_version,
         )
-        fraud_decision_logs.append(decision_log)
-        
-        # Keep only last 10000 logs in memory
-        if len(fraud_decision_logs) > 10000:
-            fraud_decision_logs.pop(0)
+        # W12-C3P2B5: persist decision log to PG (training data). The fraud
+        # decision itself is already computed; a log-persist failure is a
+        # documented W12-DEGRADED path (logged, request still succeeds) — the
+        # alternative (failing fraud scoring on a logging outage) is worse.
+        try:
+            DECISION_LOG_STORE.put(decision_log.transaction_id, decision_log.dict())
+            # Retention: keep newest 10000 decision logs (training window).
+            _w12_run(
+                "DELETE FROM fraud_decision_logs WHERE record_id NOT IN "
+                "(SELECT record_id FROM fraud_decision_logs "
+                "ORDER BY created_at DESC, record_id LIMIT 10000)",
+                fetch=None)
+        except Exception as e:
+            logger.error("W12-DEGRADED decision-log persist failed: %s", e)
         
         processing_time = (time.time() - start_time) * 1000
         

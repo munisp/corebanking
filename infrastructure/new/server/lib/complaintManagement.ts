@@ -1,7 +1,24 @@
 /**
  * Customer complaints/feedback engine — CBN complaint resolution timelines,
  * categorization, SLA tracking, escalation, NPS scoring.
+ *
+ * W12-C3-P2-MLIB (c3-0981): the 'complaints' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `complaints`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "complaints";
+
+async function ensureComplaintsStore(): Promise<void> {
+  await ensureTables("ensureComplaintsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, COMPLAINTS_SEED, () => "");
+}
+
 
 export interface Complaint {
   id: string;
@@ -24,7 +41,8 @@ export interface Complaint {
   updatedAt: string;
 }
 
-const complaints: Complaint[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const COMPLAINTS_SEED: Complaint[]  = [
   { id: "CMP-001", customerId: "CUST-001", customerName: "Aisha Mohammed", category: "transaction", subject: "Failed NIP transfer — ₦500,000 debited but not credited", description: "Transfer to GTBank account 0123456789 failed but amount was debited from my account", channel: "mobile_app", priority: "high", status: "in_progress", assignedTo: "Ops Team A", branch: "Lagos Island", slaHours: 24, hoursElapsed: 8, slaBreach: false, createdAt: "2026-05-09T06:00:00Z", updatedAt: "2026-05-09T14:00:00Z" },
   { id: "CMP-002", customerId: "CUST-005", customerName: "Fatimah Abdullahi", category: "card", subject: "Unauthorized ATM withdrawal — ₦100,000", description: "ATM withdrawal at Kano mall I did not authorize. Card was in my possession.", channel: "call_center", priority: "critical", status: "escalated", assignedTo: "Fraud Unit", branch: "Kano Central", slaHours: 4, hoursElapsed: 6, slaBreach: true, createdAt: "2026-05-09T08:00:00Z", updatedAt: "2026-05-09T14:00:00Z" },
   { id: "CMP-003", customerId: "CUST-002", customerName: "Ibrahim Musa", category: "charges", subject: "Unexplained SMS charges — ₦16,000 YTD", description: "I am being charged N4 per SMS but never opted in for SMS alerts", channel: "email", priority: "medium", status: "awaiting_customer", assignedTo: "Digital Banking", branch: "Abuja Main", slaHours: 48, hoursElapsed: 20, slaBreach: false, resolution: "Awaiting customer confirmation to switch to push notifications", createdAt: "2026-05-08T10:00:00Z", updatedAt: "2026-05-09T06:00:00Z" },
@@ -34,9 +52,12 @@ const complaints: Complaint[] = [
   { id: "CMP-007", customerId: "CUST-020", customerName: "Olusegun Bakare", category: "fraud", subject: "Phishing — account compromised, ₦2.3M transferred", description: "Received fake email, entered credentials. Three transfers totaling ₦2.3M to unknown accounts.", channel: "cbn_portal", priority: "critical", status: "escalated", assignedTo: "Fraud Unit", branch: "Ikeja", slaHours: 4, hoursElapsed: 2, slaBreach: false, createdAt: "2026-05-09T12:00:00Z", updatedAt: "2026-05-09T14:00:00Z" },
 ];
 
-export function getComplaints() { return complaints; }
+export async function getComplaints(): Promise<Complaint[]> {
+  return pgGuard((async () => { await ensureComplaintsStore(); return storeList<Complaint>(TABLE); })());
+}
 
-export function getComplaintStats() {
+export async function getComplaintStats() {
+  const complaints = await getComplaints();
   const byStatus: Record<string, number> = {};
   const byCategory: Record<string, number> = {};
   const byPriority: Record<string, number> = {};

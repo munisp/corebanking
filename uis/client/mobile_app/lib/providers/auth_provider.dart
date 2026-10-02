@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:dio/dio.dart' show Options;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
@@ -215,7 +216,7 @@ class AuthProvider with ChangeNotifier {
 
     try {
       final response = await _apiService
-          .post('${AppConfig.authEndpoint}/verify-email', data: {
+          .post('${AppConfig.authEndpoint}/auth/verify-email', data: {
         'token': otp, // Web app uses 'token' not 'otp'
       });
 
@@ -247,7 +248,7 @@ class AuthProvider with ChangeNotifier {
     try {
       // Web app uses: ${AppConfig.authEndpoint}/verify-otp
       final response =
-          await _apiService.post('${AppConfig.authEndpoint}/verify-otp', data: {
+          await _apiService.post('${AppConfig.authEndpoint}/auth/verify-otp', data: {
         'otp': otp,
       });
 
@@ -596,8 +597,9 @@ class AuthProvider with ChangeNotifier {
   Future<void> logout() async {
     try {
       // Web app calls: ${AppConfig.authEndpoint}/logout
-      // await _apiService.post('${AppConfig.authEndpoint}/logout');
-      print("logout API called");
+      // W12-A4A: backend endpoint created (auth-service POST /auth/logout);
+      // gateway strips the first /auth segment → double-prefix convention.
+      await _apiService.post('${AppConfig.authEndpoint}/auth/logout');
     } catch (e) {
       // Continue with local logout even if API fails (matching web app)
       debugPrint('Logout API call failed: $e');
@@ -647,11 +649,14 @@ class AuthProvider with ChangeNotifier {
         return false;
       }
 
-      // Web app uses: ${AppConfig.authEndpoint}/refresh
-      final response =
-          await _apiService.post('${AppConfig.authEndpoint}/refresh', data: {
-        'refresh_token': refreshToken,
-      });
+      // W12-A4A: was '${AppConfig.authEndpoint}/refresh' → gateway rewrote to
+      // /refresh which auth-service does not serve (404). auth-service serves
+      // POST /token/refresh (api/v1/token.py:102) with the refresh token in
+      // the Authorization Bearer header.
+      final response = await _apiService.post(
+        '/auth/token/refresh',
+        options: Options(headers: {'Authorization': 'Bearer $refreshToken'}),
+      );
 
       if (response.statusCode == 200) {
         // Web app response structure: response.data.data.access_token
@@ -865,7 +870,7 @@ class AuthProvider with ChangeNotifier {
 
     try {
       final response =
-          await _apiService.post('${AppConfig.authEndpoint}/create-pin', data: {
+          await _apiService.post('${AppConfig.authEndpoint}/auth/create-pin', data: {
         'current_pin': currentPin,
         'new_pin': newPin,
       });
@@ -897,7 +902,7 @@ class AuthProvider with ChangeNotifier {
 
     try {
       final response = await _apiService
-          .post('${AppConfig.authEndpoint}/resend-verification');
+          .post('${AppConfig.authEndpoint}/auth/resend-verification');
 
       if (response.statusCode == 200) {
         _isLoading = false;
@@ -926,7 +931,7 @@ class AuthProvider with ChangeNotifier {
 
     try {
       final response =
-          await _apiService.post('${AppConfig.authEndpoint}/resend-otp');
+          await _apiService.post('${AppConfig.authEndpoint}/auth/resend-otp');
 
       if (response.statusCode == 200) {
         _isLoading = false;

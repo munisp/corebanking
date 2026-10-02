@@ -102,21 +102,32 @@ export const accountStatementService = {
   listAccounts: (): Promise<StatementAccountListResponse> =>
     apiClient.get<StatementAccountListResponse>(`${STATEMENT_BASE}/statements/accounts`).then((r) => r.data),
 
+  // W12-A4-P0-D: account-service serves these under /statements/* (gateway
+  // /account/* -> /*); the bare /account/{transactions,generate,summary,
+  // balance-trend} paths hit no route.
   listTransactions: (accountNumber?: string): Promise<StatementTransactionListResponse> =>
     apiClient
-      .get<StatementTransactionListResponse>(`${STATEMENT_BASE}/transactions`, {
+      .get<StatementTransactionListResponse>(`${STATEMENT_BASE}/statements/transactions`, {
         params: accountNumber ? { accountNumber } : {},
       })
       .then((r) => r.data),
 
   generate: (payload: GenerateStatementPayload): Promise<StatementResponse> =>
-    apiClient.post<StatementResponse>(`${STATEMENT_BASE}/generate`, payload).then((r) => r.data),
+    apiClient.post<StatementResponse>(`${STATEMENT_BASE}/statements/generate`, payload).then((r) => r.data),
 
+  // account-service exposes summary as GET /statements/summary with query
+  // params (accountNumber/startDate/endDate) — not POST /account/summary.
   getSummary: (payload: GenerateStatementPayload): Promise<StatementSummary> =>
-    apiClient.post<StatementSummary>(`${STATEMENT_BASE}/summary`, payload).then((r) => r.data),
+    apiClient.get<StatementSummary>(`${STATEMENT_BASE}/statements/summary`, {
+      params: {
+        accountNumber: payload.accountNumber,
+        startDate: payload.startDate,
+        endDate: payload.endDate,
+      },
+    }).then((r) => r.data),
 
   getBalanceTrend: (accountNumber: string): Promise<BalanceTrendResponse> =>
     apiClient
-      .post<BalanceTrendResponse>(`${STATEMENT_BASE}/balance-trend`, { accountNumber })
+      .post<BalanceTrendResponse>(`${STATEMENT_BASE}/statements/balance-trend`, { accountNumber })
       .then((r) => r.data),
 };

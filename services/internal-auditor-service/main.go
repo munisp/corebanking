@@ -502,7 +502,11 @@ func (s *AuditServer) listPlansHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
 	auditType := r.URL.Query().Get("type")
-	plans := s.planService.ListPlans(tenantID, status, auditType)
+	plans, err := s.planService.ListPlans(tenantID, status, auditType)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"plans": plans})
 }
 
@@ -609,13 +613,21 @@ func (s *AuditServer) getPlansByYearHandler(w http.ResponseWriter, r *http.Reque
 	year := vars["year"]
 	tenantID := getTenantID(r)
 
-	plans := s.planService.GetPlansByYear(tenantID, year)
+	plans, err := s.planService.GetPlansByYear(tenantID, year)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"plans": plans})
 }
 
 func (s *AuditServer) getPlanSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	summary := s.planService.GetSummary(tenantID)
+	summary, err := s.planService.GetSummary(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, summary)
 }
 
@@ -623,7 +635,11 @@ func (s *AuditServer) getPlanSummaryHandler(w http.ResponseWriter, r *http.Reque
 func (s *AuditServer) listEngagementsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
-	engagements := s.engagementService.ListEngagements(tenantID, status)
+	engagements, err := s.engagementService.ListEngagements(tenantID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"engagements": engagements})
 }
 
@@ -728,7 +744,11 @@ func (s *AuditServer) getEngagementControlsHandler(w http.ResponseWriter, r *htt
 	engagementID := vars["engagement_id"]
 	tenantID := getTenantID(r)
 
-	controls := s.controlTestService.GetEngagementControls(tenantID, engagementID)
+	controls, err := s.controlTestService.GetEngagementControls(tenantID, engagementID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"controls": controls})
 }
 
@@ -737,13 +757,21 @@ func (s *AuditServer) getEngagementFindingsHandler(w http.ResponseWriter, r *htt
 	engagementID := vars["engagement_id"]
 	tenantID := getTenantID(r)
 
-	findings := s.findingService.GetEngagementFindings(tenantID, engagementID)
+	findings, err := s.findingService.GetEngagementFindings(tenantID, engagementID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"findings": findings})
 }
 
 func (s *AuditServer) getActiveEngagementsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	engagements := s.engagementService.GetActiveEngagements(tenantID)
+	engagements, err := s.engagementService.GetActiveEngagements(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"engagements": engagements})
 }
 
@@ -751,7 +779,11 @@ func (s *AuditServer) getActiveEngagementsHandler(w http.ResponseWriter, r *http
 func (s *AuditServer) listControlTestsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
-	controls := s.controlTestService.ListControlTests(tenantID, status)
+	controls, err := s.controlTestService.ListControlTests(tenantID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"controls": controls})
 }
 
@@ -852,7 +884,11 @@ func (s *AuditServer) reviewControlTestHandler(w http.ResponseWriter, r *http.Re
 
 func (s *AuditServer) getControlSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	summary := s.controlTestService.GetSummary(tenantID)
+	summary, err := s.controlTestService.GetSummary(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, summary)
 }
 
@@ -861,7 +897,11 @@ func (s *AuditServer) listFindingsHandler(w http.ResponseWriter, r *http.Request
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
 	riskRating := r.URL.Query().Get("risk_rating")
-	findings := s.findingService.ListFindings(tenantID, status, riskRating)
+	findings, err := s.findingService.ListFindings(tenantID, status, riskRating)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"findings": findings})
 }
 
@@ -957,19 +997,31 @@ func (s *AuditServer) closeFindingHandler(w http.ResponseWriter, r *http.Request
 
 func (s *AuditServer) getOpenFindingsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	findings := s.findingService.GetOpenFindings(tenantID)
+	findings, err := s.findingService.GetOpenFindings(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"findings": findings})
 }
 
 func (s *AuditServer) getOverdueFindingsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	findings := s.findingService.GetOverdueFindings(tenantID)
+	findings, err := s.findingService.GetOverdueFindings(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"findings": findings})
 }
 
 func (s *AuditServer) getFindingSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	summary := s.findingService.GetSummary(tenantID)
+	summary, err := s.findingService.GetSummary(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, summary)
 }
 
@@ -977,7 +1029,11 @@ func (s *AuditServer) getFindingSummaryHandler(w http.ResponseWriter, r *http.Re
 func (s *AuditServer) listReportsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
-	reports := s.reportService.ListReports(tenantID, status)
+	reports, err := s.reportService.ListReports(tenantID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"reports": reports})
 }
 
@@ -1083,7 +1139,11 @@ func (s *AuditServer) issueReportHandler(w http.ResponseWriter, r *http.Request)
 func (s *AuditServer) listFollowUpsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
-	followUps := s.followUpService.ListFollowUps(tenantID, status)
+	followUps, err := s.followUpService.ListFollowUps(tenantID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"followUps": followUps})
 }
 
@@ -1143,13 +1203,21 @@ func (s *AuditServer) updateFollowUpHandler(w http.ResponseWriter, r *http.Reque
 
 func (s *AuditServer) getPendingFollowUpsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	followUps := s.followUpService.GetPendingFollowUps(tenantID)
+	followUps, err := s.followUpService.GetPendingFollowUps(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"followUps": followUps})
 }
 
 func (s *AuditServer) getOverdueFollowUpsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	followUps := s.followUpService.GetOverdueFollowUps(tenantID)
+	followUps, err := s.followUpService.GetOverdueFollowUps(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"followUps": followUps})
 }
 
@@ -1157,7 +1225,11 @@ func (s *AuditServer) getOverdueFollowUpsHandler(w http.ResponseWriter, r *http.
 func (s *AuditServer) listRiskAssessmentsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	status := r.URL.Query().Get("status")
-	assessments := s.riskService.ListAssessments(tenantID, status)
+	assessments, err := s.riskService.ListAssessments(tenantID, status)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"assessments": assessments})
 }
 
@@ -1232,7 +1304,11 @@ func (s *AuditServer) approveRiskAssessmentHandler(w http.ResponseWriter, r *htt
 
 func (s *AuditServer) getHighRiskAreasHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	assessments := s.riskService.GetHighRiskAreas(tenantID)
+	assessments, err := s.riskService.GetHighRiskAreas(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"assessments": assessments})
 }
 
@@ -1240,7 +1316,11 @@ func (s *AuditServer) getHighRiskAreasHandler(w http.ResponseWriter, r *http.Req
 func (s *AuditServer) listAuditorsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
 	specialization := r.URL.Query().Get("specialization")
-	auditors := s.auditorService.ListAuditors(tenantID, specialization)
+	auditors, err := s.auditorService.ListAuditors(tenantID, specialization)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"auditors": auditors})
 }
 
@@ -1309,13 +1389,21 @@ func (s *AuditServer) getAuditorWorkloadHandler(w http.ResponseWriter, r *http.R
 // Dashboard handlers
 func (s *AuditServer) getDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	dashboard := s.getDashboard(tenantID)
+	dashboard, err := s.getDashboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, dashboard)
 }
 
 func (s *AuditServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	dashboard := s.getDashboard(tenantID)
+	dashboard, err := s.getDashboard(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	summary := map[string]interface{}{
 		"activeEngagements": dashboard.ActiveEngagements,
 		"openFindings":      dashboard.OpenFindings,
@@ -1327,17 +1415,24 @@ func (s *AuditServer) getDashboardSummaryHandler(w http.ResponseWriter, r *http.
 
 func (s *AuditServer) getAlertsHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	alerts := s.getAlerts(tenantID)
+	alerts, err := s.getAlerts(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"alerts": alerts})
 }
 
-func (s *AuditServer) getDashboard(tenantID string) *AuditDashboard {
+func (s *AuditServer) getDashboard(tenantID string) (*AuditDashboard, error) {
 	dashboard := &AuditDashboard{
 		Date: time.Now(),
 	}
 
 	// Plan summary
-	planSummary := s.planService.GetSummary(tenantID)
+	planSummary, err := s.planService.GetSummary(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if total, ok := planSummary["totalPlans"].(int); ok {
 		dashboard.TotalPlans = total
 	}
@@ -1349,11 +1444,17 @@ func (s *AuditServer) getDashboard(tenantID string) *AuditDashboard {
 	}
 
 	// Engagement summary
-	activeEngagements := s.engagementService.GetActiveEngagements(tenantID)
+	activeEngagements, err := s.engagementService.GetActiveEngagements(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	dashboard.ActiveEngagements = len(activeEngagements)
 
 	// Finding summary
-	findingSummary := s.findingService.GetSummary(tenantID)
+	findingSummary, err := s.findingService.GetSummary(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if open, ok := findingSummary["openFindings"].(int); ok {
 		dashboard.OpenFindings = open
 	}
@@ -1368,7 +1469,10 @@ func (s *AuditServer) getDashboard(tenantID string) *AuditDashboard {
 	}
 
 	// Control summary
-	controlSummary := s.controlTestService.GetSummary(tenantID)
+	controlSummary, err := s.controlTestService.GetSummary(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if tested, ok := controlSummary["totalTested"].(int); ok {
 		dashboard.ControlsTested = tested
 	}
@@ -1380,25 +1484,38 @@ func (s *AuditServer) getDashboard(tenantID string) *AuditDashboard {
 	}
 
 	// Follow-ups
-	pendingFollowUps := s.followUpService.GetPendingFollowUps(tenantID)
+	pendingFollowUps, err := s.followUpService.GetPendingFollowUps(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	dashboard.PendingFollowUps = len(pendingFollowUps)
-	overdueFollowUps := s.followUpService.GetOverdueFollowUps(tenantID)
+	overdueFollowUps, err := s.followUpService.GetOverdueFollowUps(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	dashboard.OverdueFollowUps = len(overdueFollowUps)
 
 	// Resources
-	auditors := s.auditorService.ListAuditors(tenantID, "")
+	auditors, err := s.auditorService.ListAuditors(tenantID, "")
+	if err != nil {
+		return nil, err
+	}
 	dashboard.AuditorsAvailable = len(auditors)
 	dashboard.HoursUtilized = 1200
 	dashboard.HoursBudgeted = 2000
 
-	return dashboard
+	return dashboard, nil
+
 }
 
-func (s *AuditServer) getAlerts(tenantID string) []map[string]interface{} {
+func (s *AuditServer) getAlerts(tenantID string) ([]map[string]interface{}, error) {
 	var alerts []map[string]interface{}
 
 	// Critical findings
-	criticalFindings := s.findingService.ListFindings(tenantID, "open", "critical")
+	criticalFindings, err := s.findingService.ListFindings(tenantID, "open", "critical")
+	if err != nil {
+		return nil, err
+	}
 	if len(criticalFindings) > 0 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "critical_findings",
@@ -1409,7 +1526,10 @@ func (s *AuditServer) getAlerts(tenantID string) []map[string]interface{} {
 	}
 
 	// Overdue findings
-	overdueFindings := s.findingService.GetOverdueFindings(tenantID)
+	overdueFindings, err := s.findingService.GetOverdueFindings(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if len(overdueFindings) > 0 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "overdue_findings",
@@ -1420,7 +1540,10 @@ func (s *AuditServer) getAlerts(tenantID string) []map[string]interface{} {
 	}
 
 	// Overdue follow-ups
-	overdueFollowUps := s.followUpService.GetOverdueFollowUps(tenantID)
+	overdueFollowUps, err := s.followUpService.GetOverdueFollowUps(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if len(overdueFollowUps) > 0 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "overdue_followups",
@@ -1431,7 +1554,10 @@ func (s *AuditServer) getAlerts(tenantID string) []map[string]interface{} {
 	}
 
 	// High risk areas
-	highRiskAreas := s.riskService.GetHighRiskAreas(tenantID)
+	highRiskAreas, err := s.riskService.GetHighRiskAreas(tenantID)
+	if err != nil {
+		return nil, err
+	}
 	if len(highRiskAreas) > 0 {
 		alerts = append(alerts, map[string]interface{}{
 			"type":     "high_risk_areas",
@@ -1441,5 +1567,6 @@ func (s *AuditServer) getAlerts(tenantID string) []map[string]interface{} {
 		})
 	}
 
-	return alerts
+	return alerts, nil
+
 }

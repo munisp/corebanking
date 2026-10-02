@@ -9,7 +9,125 @@ import os
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-SEED_CUSTOMERS = {
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
+
+_SEED_CUSTOMERS = {
     "CUST-001": {
         "customerId": "CUST-001",
         "name": "Fatima Abdullahi",
@@ -136,6 +254,12 @@ def _require_env(name):
             "refusing to start with an insecure default"
         )
     return val
+
+
+# W12-C3P2B5: customer 360 profiles persisted in PG (natural key = customerId;
+# idempotent upsert makes profile-create retries safe).
+CUSTOMER_STORE = _W12Store("customer_profiles", key="customerId",
+                           seed=list(_SEED_CUSTOMERS.values()))
 
 
 MIDDLEWARE_CONFIG = {
@@ -316,16 +440,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"status": "ok", "service": "customer-360", "middleware": MIDDLEWARE_CONFIG, "port": "8133"})
 
         if self.path == "/v1/customer-360/profiles":
-            items = list(SEED_CUSTOMERS.values())
+            try:
+                items = CUSTOMER_STORE.all()
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             return self._json({"items": items, "total": len(items)})
 
         if self.path.startswith("/v1/customer-360/profiles/"):
             cid = self.path.split("/")[-1]
-            if cid in SEED_CUSTOMERS:
-                return self._json(SEED_CUSTOMERS[cid])
+            try:
+                _row = CUSTOMER_STORE.get(cid)
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
+            if _row:
+                return self._json(_row)
             return self._json({"error": "customer not found"}, 404)
 
         if self.path == "/v1/customer-360/segments":
+            try:
+                SEED_CUSTOMERS = {r["customerId"]: r for r in CUSTOMER_STORE.all()}
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             segments = {}
             for c in SEED_CUSTOMERS.values():
                 seg = c["segment"]
@@ -336,6 +471,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(list(segments.values()))
 
         if self.path == "/v1/customer-360/cross-sell":
+            try:
+                SEED_CUSTOMERS = {r["customerId"]: r for r in CUSTOMER_STORE.all()}
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             opportunities = []
             for c in SEED_CUSTOMERS.values():
                 for opp in c.get("crossSellOpportunities", []):
@@ -363,7 +502,12 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(content_len)) if content_len > 0 else {}
 
         if self.path == "/v1/customer-360/profiles":
-            cid = body.get("customerId", f"CUST-{len(SEED_CUSTOMERS)+1:03d}")
+            try:
+                CUSTOMER_STORE.ensure()
+                _n = _w12_run("SELECT COUNT(*) AS n FROM customer_profiles", fetch="one")["n"]
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
+            cid = body.get("customerId", f"CUST-{_n+1:03d}")
             profile = {
                 "customerId": cid,
                 "name": body.get("name", ""),
@@ -384,7 +528,10 @@ class Handler(BaseHTTPRequestHandler):
                 "totalRelationshipValue": 0,
                 "crossSellOpportunities": ["savings", "debit_card"],
             }
-            SEED_CUSTOMERS[cid] = profile
+            try:
+                CUSTOMER_STORE.put(cid, profile)
+            except Exception as _e:
+                return self._json({"error": "persistence_unavailable", "detail": str(_e)}, 503)
             return self._json(profile, 201)
 
         self._json({"error": "not found"}, 404)

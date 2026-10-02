@@ -290,10 +290,10 @@ func main() {
 	http.HandleFunc("/healthz", healthHandler)
 	http.HandleFunc("/readyz", readyzHandler)
 	http.HandleFunc("/metrics", metricsHandler)
-	http.HandleFunc("/api/companies", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/companies", permifyAuthzGuard("cac_realtime_api", "manage", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"items": companies, "total": len(companies)})
-	})
-	http.HandleFunc("/api/companies/search", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	http.HandleFunc("/api/companies/search", permifyAuthzGuard("cac_realtime_api", "view", func(w http.ResponseWriter, r *http.Request) {
 		rc := r.URL.Query().Get("rc")
 		for _, c := range companies {
 			if c.RCNumber == rc {
@@ -303,8 +303,8 @@ func main() {
 		}
 		w.WriteHeader(404)
 		json.NewEncoder(w).Encode(map[string]string{"error": "RC number not found"})
-	})
-	http.HandleFunc("/api/companies/", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	http.HandleFunc("/api/companies/", permifyAuthzGuard("cac_realtime_api", "manage", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, "/api/companies/")
 		for _, c := range companies {
 			if c.ID == id || c.RCNumber == id {
@@ -313,11 +313,11 @@ func main() {
 			}
 		}
 		w.WriteHeader(404)
-	})
-	http.HandleFunc("/api/directors/verify", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	http.HandleFunc("/api/directors/verify", permifyAuthzGuard("cac_realtime_api", "verify", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{"message": "Director verification initiated", "checks": []string{"BVN_match", "NIN_match", "PEP_screen", "sanctions_screen"}})
-	})
-	http.HandleFunc("/api/annual-returns/status", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	http.HandleFunc("/api/annual-returns/status", permifyAuthzGuard("cac_realtime_api", "view", func(w http.ResponseWriter, r *http.Request) {
 		overdue := []map[string]string{}
 		for _, c := range companies {
 			if !c.AnnualReturnsUpToDate {
@@ -325,7 +325,7 @@ func main() {
 			}
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"overdue_companies": overdue, "total_overdue": len(overdue)})
-	})
+	}))
 	fmt.Printf("cac-realtime-api-go listening on :%s\n", port)
 	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }

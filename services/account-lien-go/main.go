@@ -490,8 +490,8 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/api/v1/lien/place", placeLien)
-	mux.HandleFunc("/api/v1/lien/release", releaseLien)
+	mux.HandleFunc("/api/v1/lien/place", permifyAuthzGuard("lien", "place", placeLien))
+	mux.HandleFunc("/api/v1/lien/release", permifyAuthzGuard("lien", "release", releaseLien))
 	mux.HandleFunc("/api/v1/lien/account", getAccountLiens)
 	srv := &http.Server{
 		Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux)),

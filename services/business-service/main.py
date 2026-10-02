@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 from fastapi import Depends
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.gzip import GZipMiddleware
 
 from utils import config, BusinessServiceException, BusinessNotFoundError
@@ -350,7 +352,7 @@ app.include_router(
 )
 
 
-@app.post("/business/kyb/complete")
+@app.post("/business/kyb/complete", dependencies=[Depends(require_permify("kyb_application", "submit"))])
 def complete_kyb(request: Request, db: Session = Depends(get_session)):
     """Internal: called by orchestrator after KYB verification passes."""
     tenant_id  = request.headers.get("x-tenant-id")

@@ -26,6 +26,7 @@ import {
   generateBillingInvoicesAdvanced,
   getBillingExtendedDashboard,
   getBillingInvoiceExportUrl,
+  upsertBillingProfile,
   ingestBillingUsageEvent,
   queueBillingInvoiceErpPost,
   resolveBillingDispute,
@@ -152,6 +153,20 @@ export default function BillingEngineWorkspace() {
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Unable to generate the advanced invoice run.");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // W12 A4-P1-A: wires PUT /billing/ (createProfile) — previously orphaned.
+  async function handleEnsureProfile() {
+    setBusy("profile");
+    try {
+      await upsertBillingProfile({ plan: "standard", billingPeriod: "monthly" });
+      setMessage("Billing profile provisioned for this tenant (standard plan, monthly billing).");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to provision the billing profile.");
     } finally {
       setBusy(null);
     }
@@ -387,6 +402,14 @@ export default function BillingEngineWorkspace() {
               ))}
             </select>
           </label>
+          <button
+            type="button"
+            onClick={() => void handleEnsureProfile()}
+            disabled={busy === "profile"}
+            className="inline-flex items-center gap-2 rounded-full border border-white/30 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
+          >
+            <ShieldCheck size={16} /> {busy === "profile" ? "Provisioning…" : "Provision billing profile"}
+          </button>
           <button
             type="button"
             onClick={() => void refresh()}

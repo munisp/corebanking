@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -108,48 +109,74 @@ var (
 	)
 )
 
-// Idempotency store for employee onboarding
+// Idempotency store for employee onboarding (c3-0515).
+// Records live in redis: `idem:employee:{X-Idempotency-Key}` JSON, TTL 24h
+// (unchanged). The previous in-process map lost replay protection on restart
+// and was per-replica. Failure policy: checkIdempotency is FAIL-CLOSED (the
+// handler answers 503 on store outage — a duplicate onboarding is worse than
+// a rejected one); storeIdempotency logs CRITICAL on failure.
 var (
-	idempotencyStore    = make(map[string]IdempotencyRecord)
-	idempotencyMutex    sync.RWMutex
 	employeeKafkaClient *EmployeeKafkaClient
 )
 
-// IdempotencyRecord stores the result of an idempotent operation
-type IdempotencyRecord struct {
-	Key       string
-	Result    interface{}
-	CreatedAt time.Time
-	ExpiresAt time.Time
+// Pooled go-redis client (canonical fleet pattern).
+var (
+	redisAddr       string
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
+)
+
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
 }
 
-// checkIdempotency checks if an operation was already performed
-func checkIdempotency(key string) (interface{}, bool) {
-	idempotencyMutex.RLock()
-	defer idempotencyMutex.RUnlock()
-
-	record, exists := idempotencyStore[key]
-	if !exists {
-		return nil, false
-	}
-
-	if time.Now().After(record.ExpiresAt) {
-		return nil, false
-	}
-
-	return record.Result, true
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
 }
 
-// storeIdempotency stores the result of an idempotent operation
+func idempotencyRedisKey(key string) string { return "idem:employee:" + key }
+
+// checkIdempotency checks if an operation was already performed.
+// Returns an error when the store is unavailable (fail-closed at call site).
+func checkIdempotency(key string) (interface{}, bool, error) {
+	data, err := getRedisClient().Get(redisCtx, idempotencyRedisKey(key)).Result()
+	if err == redis.Nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var result interface{}
+	if err := json.Unmarshal([]byte(data), &result); err != nil {
+		return nil, false, fmt.Errorf("idempotency record undecodable: %w", err)
+	}
+	return result, true, nil
+}
+
+// storeIdempotency stores the result of an idempotent operation.
+// Failures are logged CRITICAL: without the record, a retried submission
+// would re-execute the onboarding.
 func storeIdempotency(key string, result interface{}, ttl time.Duration) {
-	idempotencyMutex.Lock()
-	defer idempotencyMutex.Unlock()
-
-	idempotencyStore[key] = IdempotencyRecord{
-		Key:       key,
-		Result:    result,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(ttl),
+	data, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("CRITICAL: cannot marshal idempotency record for key %s: %v", key, err)
+		return
+	}
+	if err := getRedisClient().Set(redisCtx, idempotencyRedisKey(key), data, ttl).Err(); err != nil {
+		log.Printf("CRITICAL: idempotency record store failed for key %s — retried submissions will NOT be deduplicated: %v", key, err)
 	}
 }
 
@@ -457,11 +484,11 @@ func main() {
 	router.Use(auditMiddleware)
 	router.HandleFunc("/health", healthHandler).Methods("GET")
 	router.Handle("/metrics", promhttp.Handler()).Methods("GET")
-	router.HandleFunc("/employees", service.onboardEmployeeHandler).Methods("POST")
-	router.HandleFunc("/employees", service.listEmployeesHandler).Methods("GET")
-	router.HandleFunc("/employees/{employee_id}", service.getEmployeeHandler).Methods("GET")
-	router.HandleFunc("/employees/{employee_id}", service.updateEmployeeHandler).Methods("PUT")
-	router.HandleFunc("/employees/{employee_id}/status", service.updateEmployeeStatusHandler).Methods("PATCH")
+	router.HandleFunc("/employees", permifyAuthzGuard("employee_service", "create", service.onboardEmployeeHandler)).Methods("POST")
+	router.HandleFunc("/employees", permifyAuthzGuard("employee_service", "view", service.listEmployeesHandler)).Methods("GET")
+	router.HandleFunc("/employees/{employee_id}", permifyAuthzGuard("employee_service", "view", service.getEmployeeHandler)).Methods("GET")
+	router.HandleFunc("/employees/{employee_id}", permifyAuthzGuard("employee_service", "update", service.updateEmployeeHandler)).Methods("PUT")
+	router.HandleFunc("/employees/{employee_id}/status", permifyAuthzGuard("employee_service", "update", service.updateEmployeeStatusHandler)).Methods("PATCH")
 
 	// Start HTTP server
 	port := os.Getenv("PORT")
@@ -643,7 +670,14 @@ func (s *EmployeeService) onboardEmployeeHandler(w http.ResponseWriter, r *http.
 	// Check idempotency key from header
 	idempotencyKey := r.Header.Get("X-Idempotency-Key")
 	if idempotencyKey != "" {
-		if result, exists := checkIdempotency(idempotencyKey); exists {
+		result, exists, err := checkIdempotency(idempotencyKey)
+		if err != nil {
+			// fail-closed: without the store we cannot deduplicate submissions
+			log.Printf("CRITICAL: idempotency store unavailable (fail-closed 503): %v", err)
+			http.Error(w, "Idempotency store unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if exists {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Idempotent-Replay", "true")
 			w.WriteHeader(http.StatusOK)

@@ -414,6 +414,90 @@ fn check_jwt(request: &str, path: &str) -> Result<serde_json::Value, (u16, Strin
     verify_jwt_token(token)
 }
 
+// --- Permify authorization (W12-B5-P1-D-B) ---
+// Mutating HTTP verbs (POST/PUT/PATCH/DELETE) on non-probe paths are gated by
+// a REAL Permify permission check AFTER the fail-closed JWT gate. Subject =
+// verified JWT sub, tenant = verified JWT tenant claim (fallback
+// PERMIFY_DEFAULT_TENANT, "bpmgd"). 30s in-process decision cache keyed
+// (tenant, entity_type, entity_id, permission, subject); errors NEVER cached.
+// FAIL-CLOSED: Permify unreachable/non-200 => 502; denied => 403.
+// Canonical pattern: W12-B5-P0-D2 (permify REST check), sync variant for this
+// service's raw TcpListener dispatch (no async runtime on the request path).
+struct PermifyDecision {
+    allowed: bool,
+    expires_at: std::time::Instant,
+}
+
+static PERMIFY_DECISIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>>> = std::sync::OnceLock::new();
+
+fn permify_decisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, PermifyDecision>> {
+    PERMIFY_DECISIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+fn permify_check_sync(claims: &serde_json::Value, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), (u16, String)> {
+    let subject = claims.get("sub").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let subject = match subject {
+        Some(s) => s.to_string(),
+        None => return Err((403, serde_json::json!({"error": "authorization context incomplete"}).to_string())),
+    };
+    if entity_id.is_empty() {
+        return Err((403, serde_json::json!({"error": "authorization context incomplete"}).to_string()));
+    }
+    let tenant_id = claims.get("tenant_id").or_else(|| claims.get("tenant")).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string())
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let cache_key = format!("{}|{}|{}|{}|{}", tenant_id, entity_type, entity_id, permission, subject);
+    {
+        let cache = permify_decisions().lock().unwrap();
+        if let Some(d) = cache.get(&cache_key) {
+            if d.expires_at > std::time::Instant::now() {
+                if d.allowed { return Ok(()); }
+                return Err((403, serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)}).to_string()));
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err((502, serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}).to_string())),
+    };
+    let resp = match client.post(&url).json(&payload).send() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err((502, serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"}).to_string()));
+        }
+    };
+    if !resp.status().is_success() {
+        return Err((502, serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"}).to_string()));
+    }
+    let body = resp.json::<serde_json::Value>().unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    // Errors are never cached; only concrete allow/deny decisions (30s TTL).
+    permify_decisions().lock().unwrap().insert(cache_key, PermifyDecision {
+        allowed,
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
+    });
+    if !allowed {
+        return Err((403, serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)}).to_string()));
+    }
+    Ok(())
+}
+
 fn main() {
     let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
     if !db_url.is_empty() { println!("[billing-enforcement-rs] DB configured: {}", &db_url[..db_url.len().min(30)]); }
@@ -444,18 +528,40 @@ fn main() {
             let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
             // N-2: fail-closed JWT auth on every route except health probes.
-            if let Err((code, body)) = check_jwt(&request, path) {
-                let st = match code {
-                    401 => "401 Unauthorized",
-                    503 => "503 Service Unavailable",
-                    _ => "500 Internal Server Error",
-                };
-                let response = format!(
-                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    st, body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes());
-                return;
+            let claims = match check_jwt(&request, path) {
+                Ok(c) => c,
+                Err((code, body)) => {
+                    let st = match code {
+                        401 => "401 Unauthorized",
+                        503 => "503 Service Unavailable",
+                        _ => "500 Internal Server Error",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        st, body.len(), body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    return;
+                }
+            };
+
+            // W12-B5-P1-D-B: Permify authorization gate for mutating verbs
+            // (fail-closed: permify unreachable => 502, denied => 403).
+            let http_method = first_line.split_whitespace().next().unwrap_or("");
+            if matches!(http_method, "POST" | "PUT" | "PATCH" | "DELETE") {
+                if let Err((code, body)) = permify_check_sync(&claims, "billing_enforcement", "collection", "enforce") {
+                    let st = match code {
+                        403 => "403 Forbidden",
+                        502 => "502 Bad Gateway",
+                        _ => "500 Internal Server Error",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        st, body.len(), body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    return;
+                }
             }
 
             let response_body = match path {

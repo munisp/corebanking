@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { asyncHandler } from "../../middlewares/async";
+import { authenticateRequest } from "../../middlewares/auth";
 import { billingDashboardController } from "../../controllers/billingDashboardController";
 import { billingAccountController } from "../../controllers/billingAccountController";
 import { billingPlanCatalogController } from "../../controllers/billingPlanCatalogController";
@@ -16,7 +17,8 @@ const router = Router();
 // ─── Profile & info (Dapr + direct HTTP consumers) ────────────────────────────
 router.get("/status", asyncHandler(billingDashboardController.getStatus.bind(billingDashboardController)));
 router.get("/info", asyncHandler(billingAccountController.getBillingInfo.bind(billingAccountController)));
-router.put("/", asyncHandler(billingAccountController.createProfile.bind(billingAccountController)));
+// W12-B5-P0-A: billing profile creation was anonymous — now requires verified JWT / service token.
+router.put("/", authenticateRequest, asyncHandler(billingAccountController.createProfile.bind(billingAccountController)));
 router.get("/plan-catalog", asyncHandler(billingPlanCatalogController.list.bind(billingPlanCatalogController)));
 
 // ─── Dashboard ─────────────────────────────────────────────────────────────────
@@ -25,10 +27,12 @@ router.get("/dashboard", asyncHandler(billingDashboardController.getDashboard.bi
 
 // ─── Rate cards ───────────────────────────────────────────────────────────────
 router.get("/rate-cards", asyncHandler(billingRateCardController.list.bind(billingRateCardController)));
-router.post("/rate-cards", asyncHandler(billingRateCardController.create.bind(billingRateCardController)));
+// W12-B5-P0-A: rate-card creation (pricing control) was anonymous — now authenticated.
+router.post("/rate-cards", authenticateRequest, asyncHandler(billingRateCardController.create.bind(billingRateCardController)));
 
 // ─── Usage events ─────────────────────────────────────────────────────────────
-router.post("/usage-events/ingest", asyncHandler(billingUsageEventController.ingest.bind(billingUsageEventController)));
+// W12-B5-P0-A: usage-event ingest (drives metering/billing) was anonymous — now authenticated.
+router.post("/usage-events/ingest", authenticateRequest, asyncHandler(billingUsageEventController.ingest.bind(billingUsageEventController)));
 router.get("/usage-events", asyncHandler(billingUsageEventController.list.bind(billingUsageEventController)));
 router.post("/usage-events", asyncHandler(billingUsageEventController.create.bind(billingUsageEventController)));
 
@@ -37,9 +41,11 @@ router.get("/accruals", asyncHandler(billingContractController.listAccruals.bind
 
 // ─── Invoices ─────────────────────────────────────────────────────────────────
 router.post("/invoices/generate-advanced", asyncHandler(billingInvoiceController.generateAdvanced.bind(billingInvoiceController)));
-router.post("/invoices/generate", asyncHandler(billingInvoiceController.generate.bind(billingInvoiceController)));
+// W12-B5-P0-A: invoice generation was anonymous — now authenticated.
+router.post("/invoices/generate", authenticateRequest, asyncHandler(billingInvoiceController.generate.bind(billingInvoiceController)));
 router.get("/invoices", asyncHandler(billingInvoiceController.list.bind(billingInvoiceController)));
-router.get("/v1/invoices", asyncHandler(billingInvoiceController.list.bind(billingInvoiceController)));
+// W12 A4-P1-A RETIRED: GET /v1/invoices was an orphan duplicate alias of
+// GET /invoices (identical handler binding); the live UI calls /billings/invoices.
 router.post("/invoices/:invoiceId/approvals/:approvalId", asyncHandler(billingInvoiceController.resolveApproval.bind(billingInvoiceController)));
 router.get("/invoices/:invoiceId/export", asyncHandler(billingInvoiceController.exportInvoice.bind(billingInvoiceController)));
 router.post("/invoices/:invoiceId/erp-post", asyncHandler(billingInvoiceController.queueErpPost.bind(billingInvoiceController)));

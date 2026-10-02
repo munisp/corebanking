@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/redis/go-redis/v9"
 	"log"
 	"math/big"
 	"net/http"
@@ -99,36 +100,69 @@ func (cb *CircuitBreaker) RecordFailure() {
 var circuitBreaker = newCircuitBreaker()
 
 // --- Rate Limiter ---
+// W12 C3-P1-B3: redis fixed-window limiter (key ratelimit:{svc}:{subject},
+// TTL = window). The map is gone — limits are now enforced globally across
+// replicas and survive restarts (previously each replica had its own
+// per-process counts, so effective limits multiplied by replica count).
 type RateLimiter struct {
-	mu       sync.Mutex
-	requests map[string][]time.Time
-	max      int
-	window   time.Duration
+	max    int
+	window time.Duration
 }
 
 func newRateLimiter() *RateLimiter {
-	return &RateLimiter{requests: make(map[string][]time.Time), max: 200, window: time.Minute}
+	return &RateLimiter{max: 200, window: time.Minute}
 }
 
 func (rl *RateLimiter) Allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	now := time.Now()
-	reqs := rl.requests[ip]
-	var valid []time.Time
-	for _, t := range reqs {
-		if now.Sub(t) < rl.window {
-			valid = append(valid, t)
-		}
-	}
-	if len(valid) >= rl.max {
-		return false
-	}
-	rl.requests[ip] = append(valid, now)
-	return true
+	return rateLimitAllow(fmt.Sprintf("ratelimit:%s:%s", serviceName, ip), rl.max, rl.window)
 }
 
 var rateLimiter = newRateLimiter()
+
+// W12 C3-P1-B3: pooled go-redis client (canonical pattern per
+// services/cooperative-meetings-go/main.go). Limits/state now hold across
+// restarts and replicas (previously per-process memory).
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+)
+
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		addr := os.Getenv("REDIS_URL")
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         addr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
+}
+
+// rateLimitIncr atomically increments the fixed-window counter for key and
+// sets the window TTL on first hit (INCR + PEXPIRE via Lua).
+var rateLimitIncrScript = redis.NewScript(`local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return c`)
+
+func rateLimitAllow(key string, max int, window time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	count, err := rateLimitIncrScript.Run(ctx, getRedisClient(), []string{key}, int64(window/time.Millisecond)).Int64()
+	if err != nil {
+		// FAIL OPEN: rate limiting is not a revocation control — on redis
+		// outage the request proceeds (logged) rather than taking the
+		// service down with the cache layer.
+		log.Printf("[%s] rate-limiter redis error, failing open: %v", serviceName, err)
+		return true
+	}
+	return count <= int64(max)
+}
 
 // --- EventBus ---
 // Events are really published to Kafka via sarama. Emit NEVER pretends to
@@ -666,17 +700,39 @@ func handlePostJournal(w http.ResponseWriter, r *http.Request) {
 			"narration": req.Narration, "currency": req.Currency, "legs": req.Legs,
 			"totalAmount": debits,
 		})
-		if _, err := db.ExecContext(r.Context(),
+		// Journal record + outbox event in ONE transaction: either both are
+		// recorded or neither is; an outbox error aborts the tx (fail closed).
+		tx, err := db.BeginTx(r.Context(), nil)
+		if err != nil {
+			log.Printf("[%s] journal persist tx begin failed (ledger posting DID commit): %v", serviceName, err)
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": "journal_persist_failed", "journalId": journalID})
+			return
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(r.Context(),
 			`INSERT INTO journal_postings (journal_id, tenant_id, transaction_ref, narration, currency, total_amount, leg_count, payload)
 			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 			 ON CONFLICT (journal_id) DO NOTHING`,
 			journalID, req.TenantID, req.TransactionRef, req.Narration, req.Currency, int64(debits), len(req.Legs), string(payload)); err != nil {
 			log.Printf("[%s] journal record persist failed (ledger posting DID commit): %v", serviceName, err)
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": "journal_persist_failed", "journalId": journalID})
+			return
 		}
-		if _, err := db.ExecContext(r.Context(),
+		if _, err := tx.ExecContext(r.Context(),
 			`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ('journal.posted', $1, $2)`,
 			journalID, string(payload)); err != nil {
-			log.Printf("[%s] outbox insert failed: %v", serviceName, err)
+			log.Printf("[%s] outbox insert failed (journal record rolled back; ledger posting DID commit): %v", serviceName, err)
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": "journal_persist_failed", "journalId": journalID})
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			log.Printf("[%s] journal persist tx commit failed (ledger posting DID commit): %v", serviceName, err)
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"error": "journal_persist_failed", "journalId": journalID})
+			return
 		}
 	}
 

@@ -1,7 +1,24 @@
 /**
  * Account dormancy management — CBN dormancy rules, reactivation workflow,
  * unclaimed balance reporting, and regulatory notification.
+ *
+ * W12-C3-P2-MLIB (c3-0988): the 'dormantAccounts' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `dormant_accounts`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "dormant_accounts";
+
+async function ensureDormantaccountsStore(): Promise<void> {
+  await ensureTables("ensureDormantaccountsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, DORMANTACCOUNTS_SEED, () => "");
+}
+
 
 export interface DormantAccount {
   id: string;
@@ -20,7 +37,8 @@ export interface DormantAccount {
   reactivationEligible: boolean;
 }
 
-const dormantAccounts: DormantAccount[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const DORMANTACCOUNTS_SEED: DormantAccount[]  = [
   { id: "DA-001", accountNumber: "5400100001", accountName: "Musa Aliyu", accountType: "savings", balance: 45_000, currency: "NGN", lastTransactionDate: "2025-08-15", dormancySince: "2026-02-15", dormancyStage: "inactive", daysInactive: 267, branch: "Abuja Main", notificationsSent: 2, lastNotificationDate: "2026-04-15", reactivationEligible: true },
   { id: "DA-002", accountNumber: "5400200015", accountName: "Grace Okafor", accountType: "current", balance: 2_350_000, currency: "NGN", lastTransactionDate: "2024-11-20", dormancySince: "2025-05-20", dormancyStage: "dormant", daysInactive: 536, branch: "Lagos Island", notificationsSent: 4, lastNotificationDate: "2026-03-20", reactivationEligible: true },
   { id: "DA-003", accountNumber: "5400300042", accountName: "Bashir Yusuf", accountType: "savings", balance: 890_000, currency: "NGN", lastTransactionDate: "2023-06-10", dormancySince: "2023-12-10", dormancyStage: "unclaimed", daysInactive: 1065, branch: "Kano Central", notificationsSent: 6, lastNotificationDate: "2025-12-10", reactivationEligible: false },
@@ -28,9 +46,12 @@ const dormantAccounts: DormantAccount[] = [
   { id: "DA-005", accountNumber: "5400500123", accountName: "Adamu Bello", accountType: "savings", balance: 12_500, currency: "NGN", lastTransactionDate: "2024-01-15", dormancySince: "2024-07-15", dormancyStage: "dormant", daysInactive: 664, branch: "Kaduna", notificationsSent: 3, lastNotificationDate: "2025-07-15", reactivationEligible: true },
 ];
 
-export function getDormantAccounts() { return dormantAccounts; }
+export async function getDormantAccounts(): Promise<DormantAccount[]> {
+  return pgGuard((async () => { await ensureDormantaccountsStore(); return storeList<DormantAccount>(TABLE); })());
+}
 
-export function getDormancyStats() {
+export async function getDormancyStats() {
+  const dormantAccounts = await getDormantAccounts();
   const byStage = { inactive: 0, dormant: 0, unclaimed: 0 };
   let totalBalance = 0;
   for (const a of dormantAccounts) {

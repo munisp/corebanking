@@ -1,7 +1,9 @@
 """CBN Service"""
 
 import json
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -325,7 +327,7 @@ async def report_metrics(
         "deadline": end_of_month.isoformat(),
     }
 
-@app.get("/reports", response_model=PaginatedCBNReports)
+@app.get("/reports", response_model=PaginatedCBNReports, dependencies=[Depends(require_permify("cbn_report", "view"))])
 async def get_reports(
     limit: int = 20,
     offset: int = 0,
@@ -366,7 +368,7 @@ async def get_reports(
         "items": [dict(row) for row in rows],
     }
 
-@app.post("/reports/submit")
+@app.post("/reports/submit", dependencies=[Depends(require_permify("cbn_report", "create"))])
 async def submit_report(
     payload: CBNReport,
     x_tenant_id: str = Header(..., alias="x-tenant-id"),

@@ -15,6 +15,20 @@
 
 import { Express, Request, Response, NextFunction } from "express";
 import crypto from "crypto";
+// W12-C3-P2-MLIB (c3-1039): webhook subscriptions (including their HMAC
+// signing secrets) were module process memory — a restart orphaned every
+// subscription while partners kept signing with the issued secret. Now
+// Postgres-authoritative (table `webhook_subscriptions`) via
+// lib/pgJsonStore.ts; fail-closed: subscribe returns 503 (not 201) when the
+// subscription cannot be persisted, no degraded-memory fallback.
+import { ensureTables, storeDDL, storeInsert, storeList } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const WEBHOOK_SUBS_TABLE = "webhook_subscriptions";
+
+async function ensureWebhookSubStore(): Promise<void> {
+  await ensureTables("platformGapsGateway.webhookSubscriptions", storeDDL(WEBHOOK_SUBS_TABLE));
+}
 
 const MIDDLEWARE_STATUS = {
   kafka: "connected", dapr: "connected", fluvio: "connected", temporal: "connected",
@@ -139,7 +153,6 @@ interface WebhookSubscription {
   failureCount: number;
 }
 
-const webhookSubscriptions: WebhookSubscription[] = [];
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GAP I: INPUT VALIDATION SCHEMAS
@@ -316,7 +329,7 @@ export function registerPlatformGapsGateway(app: Express): void {
     });
   });
 
-  app.post("/api/webhooks/subscribe", (req: Request, res: Response) => {
+  app.post("/api/webhooks/subscribe", asyncRoute(async (req: Request, res: Response) => {
     const { url, events } = req.body || {};
     const subscription: WebhookSubscription = {
       id: crypto.randomUUID(),
@@ -326,13 +339,14 @@ export function registerPlatformGapsGateway(app: Express): void {
       isActive: true,
       failureCount: 0,
     };
-    webhookSubscriptions.push(subscription);
+    await pgGuard((async () => { await ensureWebhookSubStore(); await storeInsert(WEBHOOK_SUBS_TABLE, "", subscription); })());
     res.status(201).json({ subscription, signingSecret: subscription.secret });
-  });
+  }));
 
-  app.get("/api/webhooks/subscriptions", (_req: Request, res: Response) => {
-    res.json({ subscriptions: webhookSubscriptions, total: webhookSubscriptions.length });
-  });
+  app.get("/api/webhooks/subscriptions", asyncRoute(async (_req: Request, res: Response) => {
+    const subscriptions = await pgGuard((async () => { await ensureWebhookSubStore(); return storeList<WebhookSubscription>(WEBHOOK_SUBS_TABLE); })());
+    res.json({ subscriptions, total: subscriptions.length });
+  }));
 
   // Gap H: API Documentation
   app.get("/api/platform/gap-h/api-docs", (_req: Request, res: Response) => {

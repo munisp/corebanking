@@ -1,11 +1,29 @@
 """
 Failed Login Attempt Tracking and Account Suspension Service
+
+Redis-backed, distributed failed-attempt tracking (c3-0883).
+The previous implementation kept the attempt counter in an in-process dict,
+so counters were lost on restart and were per-replica (a brute-force attacker
+could multiply MAX_ATTEMPTS by the replica count).
+
+Counter semantics: redis INCR on `failed_login:{tenant}:{email}` with
+EXPIRE set on the first increment of the window (TTL 900s).
+DEVIATION: the in-memory window was LOCKOUT_DURATION_MINUTES=30; the redis
+window is 900s (15 min) per remediation register c3-0883.
+
+Failure policy: fail-CLOSED. If redis is unavailable, record_failed_attempt()
+and get_remaining_attempts() raise LoginTrackerUnavailable rather than
+silently losing count state. reset_attempts() logs-only (a lost reset only
+extends a lockout, never weakens one).
 """
 
-import json
+import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict
+
+import redis as redis_lib
 from sqlalchemy.orm import Session
+
 from utils.helpers import create_logger
 from utils.external_api_client import ExternalAPIClient
 from utils.config import get_config
@@ -13,17 +31,45 @@ from utils.config import get_config
 logger = create_logger(__name__)
 config = get_config()
 
+_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+# Sync ConnectionPool: the tracker API is synchronous (matches
+# utils/otp_service.py redis usage, redis==5.2.1).
+_redis_pool: Optional[redis_lib.ConnectionPool] = None
+
+
+class LoginTrackerUnavailable(Exception):
+    """Raised when the redis-backed failed-login tracker cannot be reached.
+
+    Fail-closed signal: callers must treat this as 'attempt state unknown'
+    and refuse the login attempt rather than bypassing the counter.
+    """
+
+
+def _get_redis() -> redis_lib.Redis:
+    """Lazy sync redis client backed by a shared ConnectionPool."""
+    global _redis_pool
+    if _redis_pool is None:
+        _redis_pool = redis_lib.ConnectionPool.from_url(
+            _REDIS_URL, decode_responses=True, max_connections=20
+        )
+    return redis_lib.Redis(connection_pool=_redis_pool)
+
 
 class FailedLoginTracker:
     """Tracks failed login attempts and triggers account suspension after threshold"""
 
     MAX_ATTEMPTS = 6
-    LOCKOUT_DURATION_MINUTES = 30  # How long to track failed attempts
+    LOCKOUT_DURATION_MINUTES = 30  # legacy in-memory window (superseded)
+    WINDOW_SECONDS = 900  # redis counter window (c3-0883); see module docstring
 
-    def __init__(self, db: Session):
+    _KEY = "failed_login:{tenant_id}:{email}"
+
+    def __init__(self, db: Session, redis_client: Optional[redis_lib.Redis] = None):
         self.db = db
-        self._cache = {}  # In-memory cache for failed attempts
-        # Note: For production, use Redis for distributed tracking
+        self._redis = redis_client  # None -> lazy module-level pooled client
+
+    def _client(self) -> redis_lib.Redis:
+        return self._redis if self._redis is not None else _get_redis()
 
     def record_failed_attempt(
         self, email: str, tenant_id: str, keycloak_id: Optional[str] = None
@@ -43,47 +89,43 @@ class FailedLoginTracker:
                 'suspended': bool,
                 'lockout_until': datetime (if suspended)
             }
+
+        Raises:
+            LoginTrackerUnavailable: if the redis counter store is unreachable
+                (fail-closed; the attempt is NOT silently dropped).
         """
-        cache_key = f"{tenant_id}:{email}"
+        key = self._KEY.format(tenant_id=tenant_id, email=email)
 
-        # Get or initialize attempt data
-        if cache_key not in self._cache:
-            self._cache[cache_key] = {
-                "attempts": 0,
-                "first_attempt": datetime.utcnow(),
-                "keycloak_id": keycloak_id,
-            }
-
-        attempt_data = self._cache[cache_key]
-
-        # Check if lockout period has expired
-        if datetime.utcnow() - attempt_data["first_attempt"] > timedelta(
-            minutes=self.LOCKOUT_DURATION_MINUTES
-        ):
-            # Reset counter if lockout period has passed
-            logger.info(
-                f"Lockout period expired for {email}. Resetting failed attempt counter."
+        try:
+            r = self._client()
+            attempts = r.incr(key)
+            if attempts == 1:
+                # First failure of the window: arm the sliding-window TTL.
+                r.expire(key, self.WINDOW_SECONDS)
+        except redis_lib.RedisError as e:
+            logger.critical(
+                f"Failed-login tracker unavailable (redis) for {email} "
+                f"(tenant: {tenant_id}): {e}"
             )
-            attempt_data["attempts"] = 0
-            attempt_data["first_attempt"] = datetime.utcnow()
+            raise LoginTrackerUnavailable(
+                "failed-login counter store unavailable"
+            ) from e
 
-        # Increment attempts
-        attempt_data["attempts"] += 1
-        remaining = max(0, self.MAX_ATTEMPTS - attempt_data["attempts"])
+        remaining = max(0, self.MAX_ATTEMPTS - attempts)
 
         logger.warning(
-            f"Failed login attempt {attempt_data['attempts']}/{self.MAX_ATTEMPTS} for {email} (tenant: {tenant_id})"
+            f"Failed login attempt {attempts}/{self.MAX_ATTEMPTS} for {email} (tenant: {tenant_id})"
         )
 
         result = {
-            "attempts": attempt_data["attempts"],
+            "attempts": attempts,
             "remaining": remaining,
             "suspended": False,
             "lockout_until": None,
         }
 
         # Trigger suspension if max attempts reached
-        if attempt_data["attempts"] >= self.MAX_ATTEMPTS:
+        if attempts >= self.MAX_ATTEMPTS:
             logger.critical(
                 f"Max failed login attempts reached for {email}. Triggering account suspension."
             )
@@ -99,35 +141,51 @@ class FailedLoginTracker:
                     f"Cannot suspend account for {email} - keycloak_id not available"
                 )
 
-            lockout_until = datetime.utcnow() + timedelta(
-                minutes=self.LOCKOUT_DURATION_MINUTES
+            result["lockout_until"] = datetime.utcnow() + timedelta(
+                seconds=self.WINDOW_SECONDS
             )
-            result["lockout_until"] = lockout_until
 
         return result
 
     def reset_attempts(self, email: str, tenant_id: str):
-        """Reset failed attempts counter (e.g., after successful login)"""
-        cache_key = f"{tenant_id}:{email}"
-        if cache_key in self._cache:
-            logger.info(f"Resetting failed login attempts for {email}")
-            del self._cache[cache_key]
+        """Reset failed attempts counter (e.g., after successful login).
+
+        Failure policy: logs-only. A lost reset only extends an existing
+        lockout window; it never weakens the counter, so this never raises.
+        """
+        key = self._KEY.format(tenant_id=tenant_id, email=email)
+        try:
+            deleted = self._client().delete(key)
+            if deleted:
+                logger.info(f"Resetting failed login attempts for {email}")
+        except redis_lib.RedisError as e:
+            logger.error(
+                f"Could not reset failed-login counter for {email} "
+                f"(tenant: {tenant_id}); counter window will expire via TTL: {e}"
+            )
 
     def get_remaining_attempts(self, email: str, tenant_id: str) -> int:
-        """Get remaining login attempts before suspension"""
-        cache_key = f"{tenant_id}:{email}"
-        if cache_key not in self._cache:
+        """Get remaining login attempts before suspension.
+
+        Raises:
+            LoginTrackerUnavailable: if the redis counter store is unreachable
+                (fail-closed).
+        """
+        key = self._KEY.format(tenant_id=tenant_id, email=email)
+        try:
+            raw = self._client().get(key)
+        except redis_lib.RedisError as e:
+            logger.critical(
+                f"Failed-login tracker unavailable (redis) for {email} "
+                f"(tenant: {tenant_id}): {e}"
+            )
+            raise LoginTrackerUnavailable(
+                "failed-login counter store unavailable"
+            ) from e
+
+        if raw is None:
             return self.MAX_ATTEMPTS
-
-        attempt_data = self._cache[cache_key]
-
-        # Check if lockout period has expired
-        if datetime.utcnow() - attempt_data["first_attempt"] > timedelta(
-            minutes=self.LOCKOUT_DURATION_MINUTES
-        ):
-            return self.MAX_ATTEMPTS
-
-        return max(0, self.MAX_ATTEMPTS - attempt_data["attempts"])
+        return max(0, self.MAX_ATTEMPTS - int(raw))
 
     def _suspend_account(
         self, keycloak_id: str, tenant_id: str, email: str

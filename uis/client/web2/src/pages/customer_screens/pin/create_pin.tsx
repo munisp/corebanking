@@ -79,7 +79,9 @@ const CreatePinScreen = () => {
         console.log('Using Keycloak flow with customer ID:', customerId);
 
         // Submit PIN to dedicated endpoint
-        const pinResponse = await apiService.post(`${AppConfig.accountEndpoint}/account/setup-pin`, {
+        // W12-A4-P0-D: drop the extra /account segment — service route is
+        // POST /account/setup-pin (UI path /account/account/setup-pin).
+        const pinResponse = await apiService.post(`${AppConfig.accountEndpoint}/setup-pin`, {
           pin: pin,
         });
 

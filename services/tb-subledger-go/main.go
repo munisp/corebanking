@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -72,12 +73,53 @@ var productLedgers = map[string]uint32{
 }
 
 var (
-	db        *sql.DB
-	tbClient  *tbclient.Client
-	ledgersMu sync.RWMutex
-	ledgers   map[uint32]*SubLedger
-	accounts  map[string]*SubLedgerAccount
+	db       *sql.DB
+	tbClient *tbclient.Client
 )
+
+// detID derives a deterministic TB Uint128 from a human-meaningful key
+// (SHA-256, first 128 bits) ⇒ idempotent retries and stable account identity
+// across restarts (C3-P0-B1).
+func detID(key string) tbclient.Uint128 {
+	sum := sha256.Sum256([]byte(key))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	return tbclient.BytesToUint128(b)
+}
+
+// subLedgerAccountTBID is the deterministic TigerBeetle account id for a
+// platform account assigned to a product sub-ledger. Stable across restarts
+// so the PG assignment row and the TB account never diverge (replaces the old
+// random NewUint128() account that was lost on every restart).
+func subLedgerAccountTBID(accountID string) tbclient.Uint128 {
+	return detID("tb-subledger-go/account/" + accountID)
+}
+
+// ensureTBAccount idempotently creates the TB account on the given product
+// ledger (AccountExists tolerated). Customer accounts carry
+// DEBITS_MUST_NOT_EXCEED_CREDITS so they can never be overdrawn at the ledger
+// level (canonical C3 pattern).
+func ensureTBAccount(ctx context.Context, accountID string, ledgerID uint32) (tbclient.Uint128, error) {
+	if tbClient == nil {
+		return tbclient.Uint128{}, fmt.Errorf("tigerbeetle ledger unavailable")
+	}
+	tbID := subLedgerAccountTBID(accountID)
+	results, err := tbClient.CreateAccounts(ctx, []tbclient.Account{{
+		ID:     tbID,
+		Ledger: ledgerID,
+		Code:   1,
+		Flags:  tbclient.AccountFlags{DebitsMustNotExceedCredits: true, History: true}.ToUint16(),
+	}})
+	if err != nil {
+		return tbclient.Uint128{}, fmt.Errorf("tigerbeetle create account: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tbclient.AccountCreated && r.Status != tbclient.AccountExists {
+			return tbclient.Uint128{}, fmt.Errorf("tigerbeetle account rejected: status=%d", uint32(r.Status))
+		}
+	}
+	return tbID, nil
+}
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -119,42 +161,25 @@ func initDB() {
 	log.Println("[tb-subledger] Schema initialized with default ledgers")
 }
 
-func loadLedgers() {
-	ledgers = make(map[uint32]*SubLedger)
-	accounts = make(map[string]*SubLedgerAccount)
+func listLedgersHandler(w http.ResponseWriter, r *http.Request) {
 	if db == nil {
-		for prodType, ledgerID := range productLedgers {
-			ledgers[ledgerID] = &SubLedger{
-				LedgerID: ledgerID, ProductType: prodType,
-				ProductName: fmt.Sprintf("54Bank %s Ledger", prodType),
-				Currency:    "NGN", CreatedAt: time.Now(),
-			}
-		}
+		http.Error(w, `{"error":"sub-ledger projection store unavailable"}`, 503)
 		return
 	}
-	rows, err := db.Query(`SELECT ledger_id, product_type, product_name, currency, description, created_at, account_count FROM tb_sub_ledgers`)
+	rows, err := db.QueryContext(r.Context(), `SELECT ledger_id, product_type, product_name, currency, description, created_at, account_count FROM tb_sub_ledgers`)
 	if err != nil {
-		log.Printf("Load ledgers error: %v", err)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
 		return
 	}
 	defer rows.Close()
+	list := make([]*SubLedger, 0)
 	for rows.Next() {
 		var l SubLedger
 		if err := rows.Scan(&l.LedgerID, &l.ProductType, &l.ProductName, &l.Currency, &l.Description, &l.CreatedAt, &l.AccountCount); err != nil {
 			continue
 		}
-		ledgers[l.LedgerID] = &l
+		list = append(list, &l)
 	}
-	log.Printf("[tb-subledger] Loaded %d sub-ledgers from DB", len(ledgers))
-}
-
-func listLedgersHandler(w http.ResponseWriter, r *http.Request) {
-	ledgersMu.RLock()
-	list := make([]*SubLedger, 0, len(ledgers))
-	for _, l := range ledgers {
-		list = append(list, l)
-	}
-	ledgersMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"ledgers": list, "count": len(list)})
 }
@@ -169,9 +194,28 @@ func assignAccountHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid request"}`, 400)
 		return
 	}
+	if req.AccountID == "" || req.CustomerID == "" {
+		http.Error(w, `{"error":"account_id and customer_id are required"}`, 400)
+		return
+	}
 	ledgerID, ok := productLedgers[req.ProductType]
 	if !ok {
 		http.Error(w, `{"error":"unknown product type"}`, 400)
+		return
+	}
+	if db == nil || tbClient == nil {
+		http.Error(w, `{"error":"store or ledger unavailable — assignment NOT performed"}`, 503)
+		return
+	}
+
+	// AUTHORITATIVE LEDGER STEP (TigerBeetle): create the account on the
+	// product sub-ledger FIRST, with a deterministic id — AccountExists makes
+	// retries idempotent. Only after the cluster confirms is the PG projection
+	// row written (C3-P0-B1 canonical).
+	tbID, err := ensureTBAccount(r.Context(), req.AccountID, ledgerID)
+	if err != nil {
+		log.Printf("[tb-subledger] TB account provisioning FAILED account=%s: %v", req.AccountID, err)
+		http.Error(w, `{"error":"ledger account provisioning failed — assignment NOT performed"}`, 502)
 		return
 	}
 
@@ -181,41 +225,40 @@ func assignAccountHandler(w http.ResponseWriter, r *http.Request) {
 		CustomerID: req.CustomerID,
 	}
 
-	if db != nil {
-		_, err := db.Exec(`INSERT INTO tb_sub_ledger_accounts (account_id, ledger_id, customer_id)
-			VALUES ($1, $2, $3) ON CONFLICT (account_id) DO UPDATE SET ledger_id=$2`,
-			acct.AccountID, acct.LedgerID, acct.CustomerID)
-		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
-			return
-		}
-		db.Exec(`UPDATE tb_sub_ledgers SET account_count = (SELECT COUNT(*) FROM tb_sub_ledger_accounts WHERE ledger_id = $1) WHERE ledger_id = $1`, ledgerID)
+	// PG projection (query side). If this fails after the TB account was
+	// created, the account exists on the cluster but is unassigned: log at
+	// CRITICAL for reconciliation — a retry converges (AccountExists tolerated
+	// + upsert).
+	if _, err := db.ExecContext(r.Context(), `INSERT INTO tb_sub_ledger_accounts (account_id, ledger_id, customer_id)
+		VALUES ($1, $2, $3) ON CONFLICT (account_id) DO UPDATE SET ledger_id=$2, customer_id=$3`,
+		acct.AccountID, acct.LedgerID, acct.CustomerID); err != nil {
+		log.Printf("[tb-subledger] CRITICAL: PG projection insert FAILED after TB account %s created for %s: %v — retry to converge",
+			u128Hex(tbID), req.AccountID, err)
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
 	}
+	db.ExecContext(r.Context(), `UPDATE tb_sub_ledgers SET account_count = (SELECT COUNT(*) FROM tb_sub_ledger_accounts WHERE ledger_id = $1) WHERE ledger_id = $1`, ledgerID)
 
-	// Create account in TigerBeetle on the correct sub-ledger
-	if tbClient != nil {
-		tbAcct := tbclient.Account{
-			ID: tbclient.NewUint128(), Ledger: ledgerID, Code: tbclient.CodeLiability,
-			Flags: tbclient.AccountHistory | tbclient.AccountCreditsMustNotExceedDebits,
-		}
-		results, err := tbClient.CreateAccounts(context.Background(), []tbclient.Account{tbAcct})
-		if err != nil {
-			log.Printf("[tb-subledger] TB CreateAccounts error: %v", err)
-		} else if len(results) > 0 {
-			log.Printf("[tb-subledger] TB CreateAccounts partial error: %d results", len(results))
-		}
-	}
-
-	ledgersMu.Lock()
-	accounts[req.AccountID] = acct
-	ledgersMu.Unlock()
+	var ledger SubLedger
+	db.QueryRowContext(r.Context(), `SELECT ledger_id, product_type, product_name, currency, description, created_at, account_count FROM tb_sub_ledgers WHERE ledger_id = $1`, ledgerID).
+		Scan(&ledger.LedgerID, &ledger.ProductType, &ledger.ProductName, &ledger.Currency, &ledger.Description, &ledger.CreatedAt, &ledger.AccountCount)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(201)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"account": acct,
-		"ledger":  ledgers[ledgerID],
+		"account":       acct,
+		"ledger":        ledger,
+		"tb_account_id": u128Hex(tbID),
 	})
+}
+
+// u128Hex renders a TB Uint128 as a 32-char big-endian hex string.
+func u128Hex(u tbclient.Uint128) string {
+	b := u.Bytes()
+	for i, j := 0, 15; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func productTrialBalanceHandler(w http.ResponseWriter, r *http.Request) {
@@ -225,19 +268,45 @@ func productTrialBalanceHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unknown product type"}`, 400)
 		return
 	}
+	if db == nil || tbClient == nil {
+		http.Error(w, `{"error":"store or ledger unavailable — trial balance unavailable"}`, 503)
+		return
+	}
 
-	ledgersMu.RLock()
-	totalDebits := int64(0)
-	totalCredits := int64(0)
-	acctCount := 0
-	for _, a := range accounts {
-		if a.LedgerID == ledgerID {
-			totalDebits += a.DebitBalance
-			totalCredits += a.CreditBalance
-			acctCount++
+	// Account set comes from the PG projection; the BALANCES come from the
+	// TigerBeetle cluster (authoritative) via LookupAccounts on the
+	// deterministic account ids — never from process memory.
+	rows, err := db.QueryContext(r.Context(), `SELECT account_id FROM tb_sub_ledger_accounts WHERE ledger_id = $1`, ledgerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
+	}
+	accountIDs := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			accountIDs = append(accountIDs, id)
 		}
 	}
-	ledgersMu.RUnlock()
+	rows.Close()
+
+	tbIDs := make([]tbclient.Uint128, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		tbIDs = append(tbIDs, subLedgerAccountTBID(id))
+	}
+	totalDebits := int64(0)
+	totalCredits := int64(0)
+	if len(tbIDs) > 0 {
+		accts, err := tbClient.LookupAccounts(r.Context(), tbIDs)
+		if err != nil {
+			http.Error(w, `{"error":"tigerbeetle lookup failed — trial balance unavailable"}`, 502)
+			return
+		}
+		for _, a := range accts {
+			totalDebits += int64(tbclient.Uint128Low(a.DebitsPosted))
+			totalCredits += int64(tbclient.Uint128Low(a.CreditsPosted))
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -246,8 +315,9 @@ func productTrialBalanceHandler(w http.ResponseWriter, r *http.Request) {
 		"total_debits_kobo":  totalDebits,
 		"total_credits_kobo": totalCredits,
 		"net_balance_kobo":   totalDebits - totalCredits,
-		"account_count":      acctCount,
+		"account_count":      len(accountIDs),
 		"balanced":           totalDebits == totalCredits,
+		"source":             "tigerbeetle",
 	})
 }
 
@@ -257,14 +327,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func initTBClient() {
-	cfg := tbclient.DefaultConfig()
+	var cfg tbclient.Config
 	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
 		cfg.Addresses = []string{addr}
 	}
 	var err error
 	tbClient, err = tbclient.NewClient(cfg)
 	if err != nil {
-		log.Printf("[tb-subledger] TB client init failed: %v", err)
+		log.Printf("[tb-subledger] TB client init failed (assign/trial-balance fail closed): %v", err)
 	}
 }
 
@@ -446,11 +516,10 @@ func main() {
 
 	initDB()
 	initTBClient()
-	loadLedgers()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/tb-subledger/ledgers", listLedgersHandler)
-	mux.HandleFunc("/v1/tb-subledger/assign", assignAccountHandler)
+	mux.HandleFunc("/v1/tb-subledger/assign", permifyAuthzGuard("ledger", "assign", assignAccountHandler))
 	mux.HandleFunc("/v1/tb-subledger/trial-balance", productTrialBalanceHandler)
 	mux.HandleFunc("/healthz", healthHandler)
 

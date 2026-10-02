@@ -1,5 +1,29 @@
 // B6: Islamic Banking Expansion — Sukuk, Takaful, Wakala, Sharia Compliance Engine
+//
+// W12-C3-P2-MLIB (c3-0979, c3-0980): the sukuk and takaful registries were
+// module process memory (lost on restart, divergent across replicas). Now
+// Postgres-authoritative (tables `sukuk_bonds`, `takaful_policies`) via
+// lib/pgJsonStore.ts; fail-closed 503 on PG outage, no degraded-memory
+// fallback. (wakalaInvestments is out of this batch's scope.)
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const SUKUK_TABLE = "sukuk_bonds";
+const TAKAFUL_TABLE = "takaful_policies";
+
+async function ensureIslamicStores(): Promise<void> {
+  await ensureTables("islamicBankingExpansion", [...storeDDL(SUKUK_TABLE), ...storeDDL(TAKAFUL_TABLE)]);
+  await storeSeed(SUKUK_TABLE, SUKUK_BONDS_SEED, () => "");
+  await storeSeed(TAKAFUL_TABLE, TAKAFUL_POLICIES_SEED, () => "");
+}
+
+async function loadSukukBonds(): Promise<SukukBond[]> {
+  await ensureIslamicStores(); return storeList<SukukBond>(SUKUK_TABLE);
+}
+async function loadTakafulPolicies(): Promise<TakafulPolicy[]> {
+  await ensureIslamicStores(); return storeList<TakafulPolicy>(TAKAFUL_TABLE);
+}
 
 interface SukukBond {
   id: string; sukukType: string; issuer: string; faceValue: number; currency: string;
@@ -23,14 +47,15 @@ interface ShariaScreenResult {
   screenedBy: string; timestamp: string;
 }
 
-const sukukBonds: SukukBond[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const SUKUK_BONDS_SEED: SukukBond[] = [
   { id: "SKK-001", sukukType: "ijara", issuer: "FGN Sukuk Company", faceValue: 150000000000, currency: "NGN", couponRate: 11.2, maturityDate: "2031-06-15", assetBacking: "Federal road projects", status: "active", shariaAdvisor: "ISRA Advisory", rating: "AAA" },
   { id: "SKK-002", sukukType: "mudarabah", issuer: "Osun State", faceValue: 11400000000, currency: "NGN", couponRate: 14.75, maturityDate: "2027-09-01", assetBacking: "State revenue", status: "active", shariaAdvisor: "Lotus Capital", rating: "A+" },
   { id: "SKK-003", sukukType: "wakala", issuer: "Africa Finance Corp", faceValue: 500000000, currency: "USD", couponRate: 5.5, maturityDate: "2029-03-15", assetBacking: "Infrastructure portfolio", status: "active", shariaAdvisor: "IIRA", rating: "A" },
   { id: "SKK-004", sukukType: "musharakah", issuer: "FMDQ Listed Corp", faceValue: 20000000000, currency: "NGN", couponRate: 13.0, maturityDate: "2028-12-01", assetBacking: "Real estate portfolio", status: "matured", shariaAdvisor: "Lotus Capital", rating: "BBB" },
 ];
 
-const takafulPolicies: TakafulPolicy[] = [
+const TAKAFUL_POLICIES_SEED: TakafulPolicy[] = [
   { id: "TKF-001", policyType: "family_takaful", participant: "Alhaji Ibrahim Musa", contribution: 500000, currency: "NGN", coverageAmount: 25000000, surplusShare: 60, tabarruFund: 200000, status: "active" },
   { id: "TKF-002", policyType: "general_takaful", participant: "Dangote Cement Plc", contribution: 5000000, currency: "NGN", coverageAmount: 500000000, surplusShare: 50, tabarruFund: 2000000, status: "active" },
   { id: "TKF-003", policyType: "health_takaful", participant: "JAIZ Bank Staff", contribution: 250000, currency: "NGN", coverageAmount: 10000000, surplusShare: 40, tabarruFund: 100000, status: "active" },
@@ -46,26 +71,30 @@ const wakalaInvestments: WakalaInvestment[] = [
 const shariaProhibited = ["alcohol", "gambling", "pork", "tobacco", "weapons", "conventional_interest", "speculation"];
 
 export function registerIslamicBankingExpansion(app: Express) {
-  app.get("/api/platform/islamic/sukuk", (_: Request, res: Response) => {
+  app.get("/api/platform/islamic/sukuk", asyncRoute(async (_: Request, res: Response) => {
+    const sukukBonds = await pgGuard(loadSukukBonds());
     res.json({ items: sukukBonds, total: sukukBonds.length });
-  });
+  }));
 
-  app.get("/api/platform/islamic/sukuk/stats", (_: Request, res: Response) => {
+  app.get("/api/platform/islamic/sukuk/stats", asyncRoute(async (_: Request, res: Response) => {
+    const sukukBonds = await pgGuard(loadSukukBonds());
     const totalFaceValue = sukukBonds.reduce((s, b) => s + b.faceValue, 0);
     const activeBonds = sukukBonds.filter(b => b.status === "active").length;
     const avgCoupon = sukukBonds.reduce((s, b) => s + b.couponRate, 0) / sukukBonds.length;
     res.json({ total_sukuk: sukukBonds.length, active: activeBonds, total_face_value: totalFaceValue, avg_coupon_rate: Math.round(avgCoupon * 100) / 100 });
-  });
+  }));
 
-  app.get("/api/platform/islamic/takaful", (_: Request, res: Response) => {
+  app.get("/api/platform/islamic/takaful", asyncRoute(async (_: Request, res: Response) => {
+    const takafulPolicies = await pgGuard(loadTakafulPolicies());
     res.json({ items: takafulPolicies, total: takafulPolicies.length });
-  });
+  }));
 
-  app.get("/api/platform/islamic/takaful/stats", (_: Request, res: Response) => {
+  app.get("/api/platform/islamic/takaful/stats", asyncRoute(async (_: Request, res: Response) => {
+    const takafulPolicies = await pgGuard(loadTakafulPolicies());
     const totalContributions = takafulPolicies.reduce((s, p) => s + p.contribution, 0);
     const totalTabarru = takafulPolicies.reduce((s, p) => s + p.tabarruFund, 0);
     res.json({ total_policies: takafulPolicies.length, total_contributions: totalContributions, total_tabarru_fund: totalTabarru });
-  });
+  }));
 
   app.get("/api/platform/islamic/wakala", (_: Request, res: Response) => {
     res.json({ items: wakalaInvestments, total: wakalaInvestments.length });

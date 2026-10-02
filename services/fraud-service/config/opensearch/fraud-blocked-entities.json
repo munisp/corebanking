@@ -1,0 +1,53 @@
+{
+  "_readme": "W12 B5-P1-F: OpenSearch index mapping for blocked fraud entities (replaces entity_id ILIKE in fraud-service main.py list_blocked_entities). Documents are dual-written with the INSERT INTO blocked_entities flow and backfilled from Postgres on boot / via POST /api/v1/fraud/opensearch/reindex; natural _id = '{tenant_id}:{entity_type}:{entity_id}'. Analyzer note: compose image opensearchproject/opensearch:2.19.0 has NO phonetic plugin; built-in edge_ngram + match fuzziness=AUTO are used instead. max_ngram_diff must be >= (max_gram - min_gram).",
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "max_ngram_diff": 9,
+    "analysis": {
+      "tokenizer": {
+        "id_edge_tokenizer": {
+          "type": "edge_ngram",
+          "min_gram": 3,
+          "max_gram": 12,
+          "token_chars": ["letter", "digit"]
+        }
+      },
+      "analyzer": {
+        "id_index_analyzer": {
+          "type": "custom",
+          "tokenizer": "id_edge_tokenizer",
+          "filter": ["lowercase", "asciifolding"]
+        },
+        "id_search_analyzer": {
+          "type": "custom",
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "_meta": {
+      "owner": "fraud-service",
+      "source_table": "blocked_entities",
+      "natural_id": "{tenant_id}:{entity_type}:{entity_id}",
+      "wave": "W12-B5-P1-F"
+    },
+    "properties": {
+      "entity_id": {
+        "type": "text",
+        "analyzer": "id_index_analyzer",
+        "search_analyzer": "id_search_analyzer",
+        "fields": {"raw": {"type": "keyword"}}
+      },
+      "entity_type": {"type": "keyword"},
+      "tenant_id": {"type": "keyword"},
+      "reason": {"type": "text", "analyzer": "standard"},
+      "blocked_by": {"type": "keyword"},
+      "blocked_until": {"type": "date"},
+      "is_permanent": {"type": "boolean"},
+      "created_at": {"type": "date"}
+    }
+  }
+}

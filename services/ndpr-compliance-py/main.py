@@ -6,6 +6,7 @@ import os, json, logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime
+from permify_guard import check_permission, PermifyUnavailableError  # W12-B5-P1-D-C
 
 logging.basicConfig(level=logging.INFO, format='[ndpr-compliance-py] %(levelname)s %(message)s')
 PORT = int(os.environ.get("PORT", "9440"))
@@ -235,6 +236,31 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             self._json(401, {"error": "unauthorized", "detail": err})
             return False
+        self._jwt_claims = claims  # W12-B5-P1-D-C: subject/tenant for the Permify guard
+        return True
+
+    def _permify(self, entity_id, permission):
+        """W12-B5-P1-D-C: real Permify check AFTER JWT auth. Fail-closed:
+        unreachable/non-200 -> 503, denied -> 403."""
+        claims = getattr(self, "_jwt_claims", None) or {}
+        subject = (claims.get("sub") or claims.get("keycloak_id")
+                   or self.headers.get("x-keycloak-id"))
+        tenant = (claims.get("tenant_id") or claims.get("tenant")
+                  or self.headers.get("x-tenant-id") or "")
+        if not subject:
+            self._json(403, {"error": "forbidden", "detail": "missing authenticated subject"})
+            return False
+        eid = str(entity_id or ("scope:" + self.path.split("?", 1)[0].lstrip("/")))
+        try:
+            allowed = check_permission(tenant, "ndpr_dsr", eid, permission, subject)
+        except PermifyUnavailableError as exc:
+            logging.error("permify check failed (fail-closed): %s", exc)
+            self._json(503, {"error": "authorization_unavailable"})
+            return False
+        if not allowed:
+            self._json(403, {"error": "forbidden",
+                             "detail": f"permify: {permission} denied on ndpr_dsr:{eid}"})
+            return False
         return True
 
     def do_GET(self):
@@ -247,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
                              "storage": "postgres" if DATABASE_URL else "NOT CONFIGURED"})
             return
         if path == "/v1/ndpr/stats" or path == "/v1/ndpr-compliance/stats":
+            if not self._permify("stats", "view"):  # W12-B5-P1-D-C
+                return
             # CP-08: computed from the real table — never hardcoded.
             rows = _query("SELECT type, status, COUNT(*) AS n FROM dsr_requests GROUP BY type, status")
             if rows is None:
@@ -261,6 +289,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/v1/ndpr/dsr/"):
             dsr_id = path.rsplit("/", 1)[-1]
+            if not self._permify(dsr_id, "view"):  # W12-B5-P1-D-C
+                return
             row = _query("SELECT * FROM dsr_requests WHERE id=%s", (dsr_id,), fetch="one")
             if row is None:
                 self._json(503, {"error": "database unavailable"})
@@ -278,6 +308,8 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs
             qs = parse_qs(parsed.query)
             tenant = (qs.get("tenant_id") or [None])[0]
+            if not self._permify(tenant or "list", "view"):  # W12-B5-P1-D-C
+                return
             if tenant:
                 rows = _query("SELECT * FROM dsr_requests WHERE tenant_id=%s ORDER BY created_at DESC LIMIT 200", (tenant,))
             else:
@@ -314,6 +346,8 @@ class Handler(BaseHTTPRequestHandler):
             if dsr_type not in DSR_TYPES or not tenant or not subject:
                 self._json(400, {"error": "type (access|erasure|portability), tenant_id and subject_id are required"})
                 return
+            if not self._permify(tenant, "create"):  # W12-B5-P1-D-C
+                return
             dsr_id = "DSR-" + uuid.uuid4().hex[:12].upper()
             row = _query(
                 """INSERT INTO dsr_requests (id, tenant_id, subject_id, type, identity_proof_ref, detail)
@@ -330,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.endswith("/verify-identity"):
             dsr_id = path.split("/")[-2]
+            if not self._permify(dsr_id, "manage"):  # W12-B5-P1-D-C
+                return
             proof = body.get("identity_proof_ref")
             if not proof:
                 self._json(400, {"error": "identity_proof_ref required"})
@@ -349,6 +385,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.endswith("/fulfil"):
             dsr_id = path.split("/")[-2]
+            if not self._permify(dsr_id, "manage"):  # W12-B5-P1-D-C
+                return
             row = _query("SELECT * FROM dsr_requests WHERE id=%s", (dsr_id,), fetch="one")
             if row is None:
                 self._json(503, {"error": "database unavailable"})
@@ -386,6 +424,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.endswith("/legal-hold"):
             dsr_id = path.split("/")[-2]
+            if not self._permify(dsr_id, "manage"):  # W12-B5-P1-D-C
+                return
             held = bool(body.get("held", True))
             row = _query("UPDATE dsr_requests SET legal_hold=%s WHERE id=%s RETURNING id",
                          (held, dsr_id), fetch="one")

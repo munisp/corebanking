@@ -25,7 +25,7 @@ import (
 // StressTestService handles stress testing operations
 type StressTestService struct {
 	tenantID string
-	tests    map[string]*StressTest
+	tests    *repo[StressTest]
 	mu       sync.RWMutex
 	db       *sql.DB
 }
@@ -35,7 +35,7 @@ type StressTestService struct {
 func NewStressTestService(tenantID string) *StressTestService {
 	svc := &StressTestService{
 		tenantID: tenantID,
-		tests:    make(map[string]*StressTest),
+		tests:    newRepo[StressTest](serviceDB, "stress_tests"),
 	}
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
 		if db, err := sql.Open("postgres", dsn); err == nil && db.Ping() == nil {
@@ -85,12 +85,14 @@ func (s *StressTestService) portfolioBaseline(tenantID string) (int64, int64, in
 }
 
 // ListTests returns stress tests based on filters
-func (s *StressTestService) ListTests(tenantID, testType string) []*StressTest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *StressTestService) ListTests(tenantID, testType string) ([]*StressTest, error) {
 
 	var result []*StressTest
-	for _, test := range s.tests {
+	__ALL__, __ERR__ := s.tests.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, test := range __ALL__ {
 		if test.TenantID != tenantID {
 			continue
 		}
@@ -99,16 +101,14 @@ func (s *StressTestService) ListTests(tenantID, testType string) []*StressTest {
 		}
 		result = append(result, test)
 	}
-	return result
+	return result, nil
 }
 
 // GetTest retrieves a stress test by ID
 func (s *StressTestService) GetTest(tenantID, testID string) (*StressTest, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	test, exists := s.tests[testID]
-	if !exists || test.TenantID != tenantID {
+	test, err := s.tests.get(tenantID, testID)
+	if err != nil {
 		return nil, errors.New("test not found")
 	}
 	return test, nil
@@ -116,8 +116,6 @@ func (s *StressTestService) GetTest(tenantID, testID string) (*StressTest, error
 
 // CreateTest creates a new stress test
 func (s *StressTestService) CreateTest(tenantID, userID string, req *CreateStressTestRequest) (*StressTest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	test := &StressTest{
 		TestID:     uuid.New().String(),
@@ -133,7 +131,9 @@ func (s *StressTestService) CreateTest(tenantID, userID string, req *CreateStres
 		UpdatedAt:  time.Now(),
 	}
 
-	s.tests[test.TestID] = test
+	if err := s.tests.put(tenantID, test.TestID, test); err != nil {
+		return nil, err
+	}
 	return test, nil
 }
 
@@ -147,11 +147,9 @@ func (s *StressTestService) CreateTest(tenantID, userID string, req *CreateStres
 //
 // Status thresholds (CBN): >=15% passed, >=10% warning, else failed.
 func (s *StressTestService) RunTest(tenantID, testID, userID string) (*StressTest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	test, exists := s.tests[testID]
-	if !exists || test.TenantID != tenantID {
+	test, err := s.tests.get(tenantID, testID)
+	if err != nil {
 		return nil, errors.New("test not found")
 	}
 
@@ -165,6 +163,9 @@ func (s *StressTestService) RunTest(tenantID, testID, userID string) (*StressTes
 		test.Status = "failed"
 		test.Metadata["error"] = "insufficient_data"
 		test.Metadata["errorDetail"] = err.Error()
+		if err := s.tests.put(tenantID, test.TestID, test); err != nil {
+			return nil, err
+		}
 		return test, nil
 	}
 
@@ -174,6 +175,9 @@ func (s *StressTestService) RunTest(tenantID, testID, userID string) (*StressTes
 		test.Status = "failed"
 		test.Metadata["error"] = "insufficient_data"
 		test.Metadata["errorDetail"] = "zero risk-weighted exposure on record"
+		if err := s.tests.put(tenantID, test.TestID, test); err != nil {
+			return nil, err
+		}
 		return test, nil
 	}
 
@@ -211,6 +215,9 @@ func (s *StressTestService) RunTest(tenantID, testID, userID string) (*StressTes
 	test.Metadata["fxExposure_kobo"] = fxExposure
 	test.Metadata["rwa_kobo"] = int64(rwa)
 
+	if err := s.tests.put(tenantID, test.TestID, test); err != nil {
+		return nil, err
+	}
 	return test, nil
 }
 
@@ -263,14 +270,16 @@ func (s *StressTestService) GetScenarios() []map[string]interface{} {
 }
 
 // GetResults returns stress test results summary
-func (s *StressTestService) GetResults(tenantID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *StressTestService) GetResults(tenantID string) (map[string]interface{}, error) {
 
 	var passedCount, warningCount, failedCount int
 	var results []map[string]interface{}
 
-	for _, test := range s.tests {
+	__ALL__, __ERR__ := s.tests.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, test := range __ALL__ {
 		if test.TenantID != tenantID {
 			continue
 		}
@@ -302,5 +311,5 @@ func (s *StressTestService) GetResults(tenantID string) map[string]interface{} {
 		"failedTests":  failedCount,
 		"results":      results,
 		"timestamp":    time.Now().Format(time.RFC3339),
-	}
+	}, nil
 }

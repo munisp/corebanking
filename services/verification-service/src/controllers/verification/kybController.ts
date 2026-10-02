@@ -58,9 +58,9 @@ export const initializeKybSession = asyncHandler(async (req: Request, res: Respo
     }
   }
 
-  const session = createSession(metadata, linkedId);
+  const session = await createSession(metadata, linkedId);
   if (linkedId) {
-    updateSession(session.id, { linkedVerificationId: linkedId });
+    await updateSession(session.id, { linkedVerificationId: linkedId });
     logger.info(`[kybController] session ${session.id} linked to workflow ${linkedId}`);
   }
 
@@ -77,7 +77,7 @@ export const initializeKybSession = asyncHandler(async (req: Request, res: Respo
 
 /** GET /api/v1/kyb/:id/session */
 export const getKybSession = asyncHandler(async (req: Request, res: Response) => {
-  const session = getSession(req.params.id);
+  const session = await getSession(req.params.id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "KYB session not found", "KYB-404-01", "verification-service");
 
   return res.json({
@@ -98,7 +98,7 @@ export const getKybSession = asyncHandler(async (req: Request, res: Response) =>
  */
 export const uploadKybDocument = asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "KYB session not found", "KYB-404-01", "verification-service");
 
   const file = req.file;
@@ -109,7 +109,7 @@ export const uploadKybDocument = asyncHandler(async (req: Request, res: Response
 
   logger.info(`[kybController] uploadKybDocument — session=${id} docType=${docType} size=${file.size}`);
 
-  const doc = addDocument(id, {
+  const doc = await addDocument(id, {
     side:       "front",
     base64:     `data:${file.mimetype};base64,${base64}`,
     mimeType:   file.mimetype,
@@ -117,7 +117,7 @@ export const uploadKybDocument = asyncHandler(async (req: Request, res: Response
   });
 
   // Tag the document with its KYB type so the submit handler can find it
-  updateSession(id, {
+  await updateSession(id, {
     documentType: docType,
     [`kybDoc_${docType}`]: `data:${file.mimetype};base64,${base64}`,
   } as any);
@@ -136,14 +136,14 @@ export const processKybOcr = asyncHandler(async (req: Request, res: Response) =>
   const { id } = req.params;
   const { documentType } = req.body || {};
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "KYB session not found", "KYB-404-01", "verification-service");
 
   const frontDoc = session.documents.at(-1); // most recently uploaded
   if (!frontDoc) throw new ApiError(httpStatus.BAD_REQUEST, "No document uploaded yet", "KYB-400-02", "verification-service");
 
-  const job = createOcrJob(id)!;
-  updateOcrJob(id, job.jobId, { status: "processing" });
+  const job = (await createOcrJob(id))!;
+  await updateOcrJob(id, job.jobId, { status: "processing" });
 
   // Run OCR in background
   runKybOcrJob(id, job.jobId, {
@@ -161,10 +161,10 @@ export const processKybOcr = asyncHandler(async (req: Request, res: Response) =>
 export const getKybOcrResult = asyncHandler(async (req: Request, res: Response) => {
   const { id, jobId } = req.params;
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "KYB session not found", "KYB-404-01", "verification-service");
 
-  const job = getOcrJob(id, jobId);
+  const job = await getOcrJob(id, jobId);
   if (!job) throw new ApiError(httpStatus.NOT_FOUND, "OCR job not found", "KYB-404-02", "verification-service");
 
   if (job.status === "failed")    return res.json({ status: "failed", jobId, error: job.error });
@@ -190,10 +190,10 @@ export const submitKybVerification = asyncHandler(async (req: Request, res: Resp
   const { id } = req.params;
   const { metadata } = req.body || {};
 
-  const session = getSession(id);
+  const session = await getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "KYB session not found", "KYB-404-01", "verification-service");
 
-  if (metadata) updateSession(id, { metadata });
+  if (metadata) await updateSession(id, { metadata });
 
   logger.info(`[kybSubmit:${id}] linkedVerificationId=${session.linkedVerificationId ?? "none"} sessionMeta=${JSON.stringify(session.metadata)}`);
 
@@ -239,7 +239,7 @@ export const submitKybVerification = asyncHandler(async (req: Request, res: Resp
         await handle.signal(process_business_kyb_signal, signalPayload);
         logger.info(`[kybSubmit:${id}] signal sent OK`);
 
-        updateSession(id, { status: "processing" });
+        await updateSession(id, { status: "processing" });
         return res.json({
           status:         "processing",
           sessionId:      id,
@@ -260,7 +260,7 @@ export const submitKybVerification = asyncHandler(async (req: Request, res: Resp
   const score       = Number(((hasCac ? 0.5 : 0) + (hasTin ? 0.3 : 0) + (hasDirector ? 0.2 : 0)).toFixed(3));
   const status      = score >= 0.5 ? "verified" : score >= 0.3 ? "manual_review" : "rejected";
 
-  updateSession(id, { status: status as any, score });
+  await updateSession(id, { status: status as any, score });
 
   // Notify orchestrator so business-service gets marked VERIFIED
   if (status === "verified") {
@@ -297,7 +297,7 @@ export const submitKybVerification = asyncHandler(async (req: Request, res: Resp
 
 /** GET /api/v1/kyb/:id/status */
 export const getKybStatus = asyncHandler(async (req: Request, res: Response) => {
-  const session = getSession(req.params.id);
+  const session = await getSession(req.params.id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "KYB session not found", "KYB-404-01", "verification-service");
 
   return res.json({
@@ -332,11 +332,11 @@ async function runKybOcrJob(
         hasGlare:   false,
       },
     };
-    updateOcrJob(sessionId, jobId, { status: "completed", result: ocrResult });
+    await updateOcrJob(sessionId, jobId, { status: "completed", result: ocrResult });
   } catch (err: any) {
     // M-54: provider/upstream error details stay in server logs; the client only
     // ever sees a generic failure message.
     logger.error(`[kybOcrJob:${jobId}] document processing failed`, { error: String(err?.message ?? err) });
-    updateOcrJob(sessionId, jobId, { status: "failed", error: "Document processing failed" });
+    await updateOcrJob(sessionId, jobId, { status: "failed", error: "Document processing failed" });
   }
 }

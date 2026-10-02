@@ -1,0 +1,23 @@
+# OR-09 follow-up (W12-B5-P1-G): nfiu-ctr-str-filing-py referenced component
+# 'nfiu-pubsub' (main.py:80, DAPR_PUBSUB default) with NO component manifest —
+# added here. Broker chosen by evidence, not guess: every topic the service
+# publishes via this component (nfiu.ctr-filed main.py:933, nfiu.filing-failed :948,
+# nfiu.str-filed :983, nfiu.ctr-generated :1083/:1208, nfiu.str-generated :1263,
+# nfiu.sla-breach :277/:1304) is a harvested Kafka literal with a KafkaTopic CRD
+# (work/w12/kafka-topic-catalog.json; infrastructure/kafka + new/k8s/kafka CRDs,
+# W12-B5-P1-A), so the component is pubsub.kafka, mirroring eod-pubsub.yaml.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: nfiu-pubsub
+  namespace: 54bank
+spec:
+  type: pubsub.kafka
+  version: v1
+  metadata:
+    - name: brokers
+      value: "localhost:9092"
+    - name: consumerGroup
+      value: "54bank-nfiu"
+    - name: authType
+      value: "none"

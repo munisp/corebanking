@@ -25,6 +25,10 @@ import signal
 import socket as _socket
 import urllib.request
 
+# W12 B5-P1-F: real OpenSearch PEP matching (replaces ILIKE '%'||name||'%').
+# Import is side-effect free (env-only); network happens per call.
+import opensearch_screening as _os_screen
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("pep-enhanced-dd-py")
 
@@ -47,7 +51,10 @@ DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
-OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+# W12 B5-P1-F: OPENSEARCH_URL is the fleet-canonical env; OPENSEARCH_ENDPOINT
+# kept for back-compat (mirrors opensearch_screening.py's resolution).
+OPENSEARCH_URL = (os.getenv("OPENSEARCH_URL")
+                  or os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")).rstrip("/")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 PORT = int(os.getenv("PORT", "8574"))
 
@@ -313,9 +320,64 @@ def init_schema():
         logger.error(f"init_schema failed: {e}")
 
 
+# ── W12 B5-P1-F: OpenSearch pep-names sync (replaces ILIKE screening) ──
+_os_sync_lock = threading.Lock()
+_os_sync_state: dict = {"synced_at": None, "docs": 0}
+
+
+def sync_pep_index(force: bool = False) -> dict:
+    """Bulk-index the real pep_entries rows into the shared pep-names index.
+
+    Source of truth: the pep_entries Postgres table (the exact data the
+    retired ILIKE query read). Idempotent via natural _id (entry-{uuid});
+    pep_entries is upsert-only (ON CONFLICT DO UPDATE, active=TRUE), so
+    upsert-by-natural-id keeps the index consistent. Runs once per process
+    unless forced (POST /api/v1/pep/opensearch/reindex).
+    Raises OpenSearchUnavailable on cluster failure (fail closed)."""
+    if not force and _os_sync_state["synced_at"]:
+        return {"status": "already_synced", "docs": _os_sync_state["docs"],
+                "syncedAt": _os_sync_state["synced_at"].isoformat()}
+    with _os_sync_lock:
+        if not force and _os_sync_state["synced_at"]:
+            return {"status": "already_synced", "docs": _os_sync_state["docs"],
+                    "syncedAt": _os_sync_state["synced_at"].isoformat()}
+        _os_screen.ensure_index()
+        conn = get_db()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, full_name, name_normalized, position, tier, country, "
+                    "source, active, created_at FROM pep_entries WHERE active")
+                rows = [dict(r) for r in cur.fetchall()]
+        finally:
+            release_db(conn)
+        docs = [_os_screen.entry_doc(r["id"], r["full_name"], r["name_normalized"],
+                                     r["position"], r["tier"], r["country"],
+                                     r["source"], r["active"], r["created_at"])
+                for r in rows]
+        indexed = _os_screen.bulk_index(docs) if docs else 0
+        _os_sync_state["synced_at"] = datetime.now(timezone.utc)
+        _os_sync_state["docs"] = indexed
+        return {"status": "synced", "docs": indexed,
+                "syncedAt": _os_sync_state["synced_at"].isoformat()}
+
+
+def _ensure_pep_index_synced() -> None:
+    if not _os_sync_state["synced_at"]:
+        sync_pep_index()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_schema()
+    # W12 B5-P1-F: warm the pep-names index in the background; failure here is
+    # not fatal — the screening path lazily re-syncs and fails closed (503).
+    def _boot_opensearch_sync():
+        try:
+            logger.info("[pep-enhanced-dd-py] opensearch sync: %s", sync_pep_index())
+        except Exception as e:
+            logger.warning("[pep-enhanced-dd-py] opensearch boot sync deferred: %s", e)
+    threading.Thread(target=_boot_opensearch_sync, daemon=True).start()
     logger.info(f"[pep-enhanced-dd-py] ready on :%d", PORT)
     logger.info(f"[pep-enhanced-dd-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
@@ -406,7 +468,30 @@ class UpdateRequest(BaseModel):
 
 @app.get("/healthz")
 def health():
-    return {"status": "healthy", "service": "pep-enhanced-dd-py", "version": "1.0.0"}
+    """W12 B5-P1-F: report REAL dependency reachability (Postgres + the
+    OpenSearch cluster screening now depends on) instead of a static payload."""
+    pg_ok, pg_detail = True, ""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        finally:
+            release_db(conn)
+    except Exception as e:
+        pg_ok, pg_detail = False, str(e)
+    os_ok, os_detail = _os_screen.ping()
+    return {
+        "status": "healthy" if (pg_ok and os_ok) else "degraded",
+        "service": "pep-enhanced-dd-py",
+        "version": "1.0.0",
+        "components": {
+            "postgres": {"status": "connected" if pg_ok else "unavailable",
+                         **({"detail": pg_detail} if pg_detail else {})},
+            "opensearch": {"status": "connected" if os_ok else "unavailable",
+                           **({"detail": os_detail} if os_detail else {})},
+        },
+    }
 
 
 @app.get("/readyz")
@@ -817,32 +902,34 @@ def pep_screen(body: PepScreenRequest, x_tenant_id: Optional[str] = Header(None)
     name_norm = _normalize_name(body.name)
     position_key = (body.position or "").lower().replace(" ", "_") or None
 
-    conn = get_db()
+    # 1) Person-level match against the curated PEP list — W12 B5-P1-F: real
+    # OpenSearch query (match + fuzziness=AUTO over the edge_ngram-analyzed
+    # name field, restricted to active curated pep_entries docs on the shared
+    # pep-names index) replacing the ILIKE '%'||name||'%' substring scan.
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # 1) Person-level match against the curated PEP list.
-            cur.execute(
-                """SELECT id, full_name, position, tier, country, source FROM pep_entries
-                   WHERE active AND (
-                       name_normalized = %s
-                       OR %s ILIKE '%%' || name_normalized || '%%'
-                       OR name_normalized ILIKE '%%' || %s || '%%'
-                   ) ORDER BY LENGTH(name_normalized) DESC LIMIT 5""",
-                (name_norm, name_norm, name_norm),
-            )
-            entries = [dict(r) for r in cur.fetchall()]
-            # 2) Function-level classification (server-side table).
-            tier_by_position = None
-            if position_key:
+        _ensure_pep_index_synced()
+        entries = [_os_screen.hit_to_entry(h)
+                   for h in _os_screen.search_pep_candidates(body.name, name_norm)]
+    except _os_screen.OpenSearchUnavailable as e:
+        logger.error("pep screen opensearch query failed: %s", e)
+        raise HTTPException(status_code=503,
+                            detail="PEP screening backend unavailable — screening failed closed")
+
+    # 2) Function-level classification (server-side table).
+    tier_by_position = None
+    if position_key:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
                 cur.execute("SELECT tier FROM pep_position_tiers WHERE position_key = %s", (position_key,))
                 row = cur.fetchone()
                 if row:
                     tier_by_position = row["tier"]
-    except Exception as e:
-        logger.error("pep screen query failed: %s", e)
-        raise HTTPException(status_code=503, detail="PEP database unavailable — screening failed closed")
-    finally:
-        release_db(conn)
+        except Exception as e:
+            logger.error("pep position tier query failed: %s", e)
+            raise HTTPException(status_code=503, detail="PEP database unavailable — screening failed closed")
+        finally:
+            release_db(conn)
 
     entry_tier = entries[0]["tier"] if entries else None
     tier = entry_tier or tier_by_position
@@ -908,7 +995,34 @@ def add_pep_entry(body: PepEntryRequest):
         conn.commit()
     finally:
         release_db(conn)
-    return {"id": str(entry_id), "status": "upserted"}
+
+    # W12 B5-P1-F: dual-write to the shared pep-names index so screening sees
+    # the entry immediately (Postgres stays the source of truth; a failed
+    # index write is backfilled by the boot sync / POST .../opensearch/reindex).
+    indexed = False
+    try:
+        _os_screen.ensure_index()
+        doc_id, doc = _os_screen.entry_doc(
+            entry_id, body.full_name, _normalize_name(body.full_name),
+            body.position, body.tier, body.country, body.source, True)
+        _os_screen.index_entry(doc_id, doc)
+        _os_sync_state["synced_at"] = _os_sync_state["synced_at"] or datetime.now(timezone.utc)
+        indexed = True
+    except Exception as e:
+        logger.error("pep_entries dual-write to opensearch failed (resync will backfill): %s", e)
+    return {"id": str(entry_id), "status": "upserted", "opensearch_indexed": indexed}
+
+
+@app.post("/api/v1/pep/opensearch/reindex")
+def reindex_pep_opensearch():
+    """W12 B5-P1-F admin endpoint: force a full pep_entries -> OpenSearch
+    resync (idempotent, natural _id). Fail closed: 503 when the cluster or
+    the source table is unavailable."""
+    try:
+        return sync_pep_index(force=True)
+    except Exception as e:
+        logger.error("pep opensearch reindex failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"PEP opensearch reindex failed: {e}")
 
 
 @app.get("/api/v1/pep/entries")

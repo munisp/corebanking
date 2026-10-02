@@ -973,6 +973,23 @@ export async function createBillPayment(input: any) {
   return input;
 }
 
+// W12-C3-P0-B3R: status transitions on an existing bill payment (e.g. a
+// scheduled bill flipping to "paid" when its approval is resolved). Mirrors
+// the updateTransfer style; the customerBillPayments table has no updatedAt
+// column, so only the mutated business fields are written.
+export async function updateBillPayment(paymentId: string, payload: any) {
+  const db = await getDb();
+  if (!db) return null;
+  await db.update(customerBillPayments).set({
+    ...(payload.status !== undefined ? { status: payload.status } : {}),
+    ...(payload.paidAt !== undefined ? { paidAt: toRequiredDate(payload.paidAt) } : {}),
+    ...(payload.evidenceStatus !== undefined ? { evidenceStatus: payload.evidenceStatus } : {}),
+    ...(payload.scheduledFor !== undefined ? { scheduledFor: toDate(payload.scheduledFor) } : {}),
+  }).where(eq(customerBillPayments.paymentId, paymentId));
+  const [row] = await db.select().from(customerBillPayments).where(eq(customerBillPayments.paymentId, paymentId)).limit(1);
+  return row ?? null;
+}
+
 export async function listCustomerTransfers(customerId: string) {
   const db = await getDb();
   if (!db) return [];
@@ -1419,6 +1436,24 @@ export async function createExportJobRecord(input: any) {
     signedBy: input.signedBy ?? [],
   });
   return input;
+}
+
+// W12-C3-P0-B3R: lifecycle transitions on an existing export job (e.g. a
+// statement export flipping to Ready/Signed when its approval is resolved).
+// Mirrors the updateWorkflowCase style; the exportJobs table has no updatedAt
+// column, so only the mutated business fields are written.
+export async function updateExportJobRecord(exportJobId: string, payload: any) {
+  const db = await getDb();
+  if (!db) return null;
+  await db.update(exportJobs).set({
+    ...(payload.status !== undefined ? { status: payload.status } : {}),
+    ...(payload.approvalState !== undefined ? { approvalState: payload.approvalState } : {}),
+    ...(payload.approvalSignature !== undefined ? { approvalSignature: payload.approvalSignature } : {}),
+    ...(payload.signedBy !== undefined ? { signedBy: payload.signedBy } : {}),
+    ...(payload.downloadUrl !== undefined ? { downloadUrl: payload.downloadUrl } : {}),
+  }).where(eq(exportJobs.exportJobId, exportJobId));
+  const [row] = await db.select().from(exportJobs).where(eq(exportJobs.exportJobId, exportJobId)).limit(1);
+  return row ?? null;
 }
 
 export async function createStatementExportRecord(input: any) {

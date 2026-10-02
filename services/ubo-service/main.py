@@ -7,7 +7,7 @@ import os
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import structlog
@@ -215,6 +215,72 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
 
 
 app.add_middleware(JWTAuthMiddleware)
+# --- Permify authorization (W12-B5-P0-D2) ---
+# Every mutating handler performs a REAL Permify permission check AFTER
+# JWTAuthMiddleware has authenticated the caller. Subject = verified JWT sub,
+# tenant = verified tenant claim, resource = domain entity id, permission per
+# action (schema entities: services/auth-service/schemas/permify/
+# v2-kyc-compliance.fragment). FAIL-CLOSED: Permify unreachable/non-200 => 503;
+# denied => 403. Canonical pattern: services/auth-service/adapters/permify.py
+# check_permission (REST /v1/tenants/{tenant}/permissions/check).
+import json as _permify_json
+import logging as _permify_logging
+import urllib.request as _permify_urlreq
+
+
+def _permify_http_post(url, payload):
+    """POST a Permify check; returns (status, json_body) or None on transport/error."""
+    data = _permify_json.dumps(payload).encode()
+    req = _permify_urlreq.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with _permify_urlreq.urlopen(req, timeout=5) as resp:
+            try:
+                return resp.status, _permify_json.loads(resp.read().decode() or "{}")
+            except Exception:
+                return resp.status, None
+    except _permify_urlreq.HTTPError as exc:  # non-2xx still yields a status
+        return exc.code, None
+    except Exception as exc:
+        _permify_logging.getLogger(__name__).error("permify check unreachable: %s", exc)
+        return None
+
+_PERMIFY_URL = os.getenv("PERMIFY_URL", "http://permify:3476").rstrip("/")
+_PERMIFY_DEFAULT_TENANT = os.getenv("PERMIFY_DEFAULT_TENANT", "bpmgd")
+_permify_logger = _permify_logging.getLogger(__name__)
+
+
+def permify_authorize(request, entity_type, entity_id, permission):
+    """Enforce <permission> on entity_type:entity_id for the JWT-verified caller.
+
+    Raises HTTPException(403) on denial and HTTPException(503) when Permify is
+    unreachable or errors (fail-closed). Returns True when allowed.
+    """
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    subject = claims.get("sub") or claims.get("keycloak_id") or ""
+    tenant_id = claims.get("tenant_id") or claims.get("tenant") or _PERMIFY_DEFAULT_TENANT
+    entity_id = str(entity_id or "")
+    if not subject or not entity_id:
+        raise HTTPException(status_code=403, detail="authorization context incomplete")
+    payload = {
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    }
+    url = f"{_PERMIFY_URL}/v1/tenants/{tenant_id}/permissions/check"
+    resp = _permify_http_post(url, payload)
+    if resp is None:
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify unreachable (fail-closed)")
+    status, body = resp
+    if status != 200:
+        _permify_logger.error("permify check %s on %s:%s http=%s", permission, entity_type, entity_id, status)
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify check failed (fail-closed)")
+    can = (body or {}).get("can")
+    allowed = can == "CHECK_RESULT_ALLOWED" or can is True
+    if not allowed:
+        raise HTTPException(status_code=403, detail=f"permify: {permission} denied on {entity_type}:{entity_id}")
+    return True
+
 
 
 class OwnershipNode(BaseModel):
@@ -233,10 +299,11 @@ async def health_check():
     return {"status": "healthy"}
 
 @app.post("/api/v1/identify-ubo")
-async def identify_ubo(request: OwnershipStructureRequest, x_tenant_id: str = Header(...)):
+async def identify_ubo(request: OwnershipStructureRequest, http_request: Request, x_tenant_id: str = Header(...)):
     """
     Identify Ultimate Beneficial Owners (individuals with >25% ownership)
     """
+    permify_authorize(http_request, "ubo_graph", request.company_rc_number, "identify")
     try:
         # Build ownership graph
         G = nx.DiGraph()

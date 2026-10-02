@@ -10,6 +10,7 @@ import sys
 import asyncpg
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from permify_guard import require_permify
 from fastapi.middleware.cors import CORSMiddleware
 from audit_middleware import AuditMiddleware
 from pydantic import BaseModel, Field
@@ -601,7 +602,7 @@ async def readiness_check(db: asyncpg.Pool = Depends(get_db)) -> dict[str, Any]:
     }
 
 
-@app.post("/bootstrap")
+@app.post("/bootstrap", dependencies=[Depends(require_permify("fx_conversion", "manage"))])
 async def bootstrap(db: asyncpg.Pool = Depends(get_db)) -> dict[str, Any]:
     async with db.acquire() as conn:
         return await seed_bootstrap(conn)
@@ -651,7 +652,7 @@ async def get_all_rates(
     return {"tenant_id": tenant_id, "base_currency": normalized_base, "rates": rates, "count": len(rates)}
 
 
-@app.post("/api/v1/fx/rates/seed")
+@app.post("/api/v1/fx/rates/seed", dependencies=[Depends(require_permify("fx_conversion", "manage"))])
 async def seed_manual_rate(payload: RateSeed, x_tenant_id: str = Depends(require_tenant), db: asyncpg.Pool = Depends(get_db)) -> dict[str, Any]:
     if payload.tenant_id != x_tenant_id:
         raise HTTPException(status_code=403, detail="tenant mismatch")
@@ -670,7 +671,7 @@ async def seed_manual_rate(payload: RateSeed, x_tenant_id: str = Depends(require
     return {"status": "seeded", "tenant_id": payload.tenant_id, "from_currency": normalized_from, "to_currency": normalized_to, "rate": float(payload.rate)}
 
 
-@app.post("/api/v1/fx/exchange")
+@app.post("/api/v1/fx/exchange", dependencies=[Depends(require_permify("fx_conversion", "convert"))])
 async def exchange_currency(
     req: ExchangeRequest,
     x_tenant_id: str = Depends(require_tenant),

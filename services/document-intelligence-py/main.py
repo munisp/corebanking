@@ -11,7 +11,8 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5P1DF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -412,7 +413,7 @@ def metrics():
         return {"service": "document-intelligence-py", "total_records": 0}
 
 
-@app.get("/api/v1/service_configs")
+@app.get("/api/v1/service_configs", dependencies=[Depends(require_permify("document", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
@@ -562,17 +563,17 @@ class _ParseRequest(BaseModel):
     content_b64: Optional[str] = None
 
 
-@app.post("/v1/ocr/extract")
+@app.post("/v1/ocr/extract", dependencies=[Depends(require_permify("document", "extract"))])
 def ocr_extract_route(req: _OcrRequest):
     return ocr_extract(req.image_b64, req.doc_type, req.template)
 
 
-@app.post("/v1/vlm/classify")
+@app.post("/v1/vlm/classify", dependencies=[Depends(require_permify("document", "classify"))])
 def vlm_classify_route(req: _VlmRequest):
     return vlm_classify(req.image_b64, req.expected_class)
 
 
-@app.post("/v1/docling/parse")
+@app.post("/v1/docling/parse", dependencies=[Depends(require_permify("document", "parse"))])
 def docling_parse_route(req: _ParseRequest):
     return docling_parse(req.doc_type, req.content_b64)
 

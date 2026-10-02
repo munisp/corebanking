@@ -11,7 +11,7 @@ import (
 // CampaignService handles campaign operations
 type CampaignService struct {
 	tenantID  string
-	campaigns map[string]*Campaign
+	campaigns *repo[Campaign]
 	mu        sync.RWMutex
 }
 
@@ -19,7 +19,7 @@ type CampaignService struct {
 func NewCampaignService(tenantID string) *CampaignService {
 	svc := &CampaignService{
 		tenantID:  tenantID,
-		campaigns: make(map[string]*Campaign),
+		campaigns: newRepo[Campaign](serviceDB, "campaigns"),
 	}
 	svc.initializeDefaultData(tenantID)
 	return svc
@@ -27,7 +27,7 @@ func NewCampaignService(tenantID string) *CampaignService {
 
 func (s *CampaignService) initializeDefaultData(tenantID string) {
 	// Active credit card campaign
-	s.campaigns["camp-001"] = &Campaign{
+	s.campaigns.seed(tenantID, "camp-001", &Campaign{
 		CampaignID:      "camp-001",
 		TenantID:        tenantID,
 		CampaignName:    "Premium Credit Card Acquisition",
@@ -47,10 +47,10 @@ func (s *CampaignService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, -1, 0),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
 	// Active fixed deposit campaign
-	s.campaigns["camp-002"] = &Campaign{
+	s.campaigns.seed(tenantID, "camp-002", &Campaign{
 		CampaignID:      "camp-002",
 		TenantID:        tenantID,
 		CampaignName:    "High-Yield Fixed Deposit Drive",
@@ -70,10 +70,10 @@ func (s *CampaignService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, 0, -15),
 		UpdatedAt:       time.Now(),
-	}
+	})
 
 	// Completed loan campaign
-	s.campaigns["camp-003"] = &Campaign{
+	s.campaigns.seed(tenantID, "camp-003", &Campaign{
 		CampaignID:      "camp-003",
 		TenantID:        tenantID,
 		CampaignName:    "SME Working Capital Campaign",
@@ -93,10 +93,10 @@ func (s *CampaignService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, -3, 0),
 		UpdatedAt:       time.Now().AddDate(0, -1, 0),
-	}
+	})
 
 	// Win-back campaign
-	s.campaigns["camp-004"] = &Campaign{
+	s.campaigns.seed(tenantID, "camp-004", &Campaign{
 		CampaignID:      "camp-004",
 		TenantID:        tenantID,
 		CampaignName:    "Dormant Customer Reactivation",
@@ -116,16 +116,18 @@ func (s *CampaignService) initializeDefaultData(tenantID string) {
 		Metadata:        make(map[string]interface{}),
 		CreatedAt:       time.Now().AddDate(0, 0, -7),
 		UpdatedAt:       time.Now(),
-	}
+	})
 }
 
 // ListCampaigns returns campaigns based on filters
-func (s *CampaignService) ListCampaigns(tenantID, status string) []*Campaign {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *CampaignService) ListCampaigns(tenantID, status string) ([]*Campaign, error) {
 
 	var result []*Campaign
-	for _, campaign := range s.campaigns {
+	__ALL__, __ERR__ := s.campaigns.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, campaign := range __ALL__ {
 		if campaign.TenantID != tenantID {
 			continue
 		}
@@ -134,16 +136,14 @@ func (s *CampaignService) ListCampaigns(tenantID, status string) []*Campaign {
 		}
 		result = append(result, campaign)
 	}
-	return result
+	return result, nil
 }
 
 // GetCampaign retrieves a campaign by ID
 func (s *CampaignService) GetCampaign(tenantID, campaignID string) (*Campaign, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	campaign, exists := s.campaigns[campaignID]
-	if !exists || campaign.TenantID != tenantID {
+	campaign, err := s.campaigns.get(tenantID, campaignID)
+	if err != nil {
 		return nil, errors.New("campaign not found")
 	}
 	return campaign, nil
@@ -151,8 +151,6 @@ func (s *CampaignService) GetCampaign(tenantID, campaignID string) (*Campaign, e
 
 // CreateCampaign creates a new campaign
 func (s *CampaignService) CreateCampaign(tenantID string, campaign *Campaign) (*Campaign, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	campaign.CampaignID = uuid.New().String()
 	campaign.TenantID = tenantID
@@ -165,24 +163,23 @@ func (s *CampaignService) CreateCampaign(tenantID string, campaign *Campaign) (*
 	campaign.CreatedAt = time.Now()
 	campaign.UpdatedAt = time.Now()
 
-	s.campaigns[campaign.CampaignID] = campaign
+	if err := s.campaigns.put(tenantID, campaign.CampaignID, campaign); err != nil {
+		return nil, err
+	}
 	return campaign, nil
 }
 
 // UpdateCampaign updates a campaign
 func (s *CampaignService) UpdateCampaign(campaign *Campaign) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.campaigns[campaign.CampaignID]
-	if !exists || existing.TenantID != campaign.TenantID {
+	existing, err := s.campaigns.get(campaign.TenantID, campaign.CampaignID)
+	if err != nil {
 		return errors.New("campaign not found")
 	}
 
 	campaign.CreatedAt = existing.CreatedAt
 	campaign.UpdatedAt = time.Now()
-	s.campaigns[campaign.CampaignID] = campaign
-	return nil
+	return s.campaigns.put(campaign.TenantID, campaign.CampaignID, campaign)
 }
 
 // GetCampaignLeads returns leads for a campaign
@@ -217,11 +214,9 @@ func (s *CampaignService) GetCampaignLeads(tenantID, campaignID string) []map[st
 
 // GetCampaignPerformance returns campaign performance metrics
 func (s *CampaignService) GetCampaignPerformance(tenantID, campaignID string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	campaign, exists := s.campaigns[campaignID]
-	if !exists || campaign.TenantID != tenantID {
+	campaign, err := s.campaigns.get(tenantID, campaignID)
+	if err != nil {
 		return map[string]interface{}{"error": "campaign not found"}
 	}
 

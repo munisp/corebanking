@@ -6,7 +6,22 @@
  * 3. Query Federation — services can read back analytics from lakehouse tables
  * 4. Materialized Views — pre-computed aggregations for dashboards
  * 5. Data Lineage — full dependency graph of which service feeds which table
+ *
+ * W12-C3-P2-MLIB (c3-0964/0965/0966/0967/0968): the 'domainCDCConfigs',
+ * 'federatedQueries', 'materializedViews', 'lineageNodes' and 'lineageEdges'
+ * registries were module process memory (lost on restart, divergent across
+ * replicas). They are now Postgres-authoritative (tables
+ * `lakehouse_domain_cdc_configs`, `lakehouse_federated_queries`,
+ * `lakehouse_materialized_views`, `lakehouse_lineage_nodes`,
+ * `lakehouse_lineage_edges`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT
+ * EXISTS at first use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage
+ * fails the request (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
+ * STORE conversions ONLY: 'sharedClients' stays static descriptive config and
+ * 'recentCDCEvents' stays an in-process recent-events sample — the real CDC
+ * publisher path is B5-P3 scope; its interfaces are intentionally untouched.
  */
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
 
 // ── 1. CDC Event Schemas per Banking Domain ──
 
@@ -33,7 +48,7 @@ interface DomainCDCConfig {
   avgPayloadBytes: number;
 }
 
-const domainCDCConfigs: DomainCDCConfig[] = [
+const DOMAIN_CDC_CONFIGS_SEED: DomainCDCConfig[] = [
   {
     domain: "core_banking",
     services: ["core-banking-go", "account-opening-go", "dormancy-check-py"],
@@ -225,7 +240,7 @@ interface FederatedQuery {
   lastExecuted: string;
 }
 
-const federatedQueries: FederatedQuery[] = [
+const FEDERATED_QUERIES_SEED: FederatedQuery[] = [
   { id: "FQ-001", name: "Customer Risk Profile", sql: "SELECT customer_id, risk_score, last_kyc_date, aml_alert_count, fraud_score FROM compliance_risk_scores WHERE risk_category IN ('high', 'pep') ORDER BY risk_score DESC", sourceTable: "compliance_risk_scores", consumingService: "kyc-engine-py", purpose: "CDD/EDD tiering for KYC reviews", executionFrequency: "on-demand", avgExecutionMs: 120, rowsReturned: 2500, lastExecuted: new Date().toISOString() },
   { id: "FQ-002", name: "Transaction Feature Vectors", sql: "SELECT customer_id, feature_vector, label FROM transaction_features WHERE date >= CURRENT_DATE - INTERVAL 90 DAY", sourceTable: "transaction_features", consumingService: "fraud-detection-py", purpose: "ML model training data for fraud detection", executionFrequency: "daily", avgExecutionMs: 3500, rowsReturned: 8000000, lastExecuted: new Date().toISOString() },
   { id: "FQ-003", name: "Portfolio PAR Analysis", sql: "SELECT product_type, vintage_month, par_1_30, par_31_60, par_61_90, par_90_plus, ecl_stage FROM portfolio_performance WHERE month >= '2026-01'", sourceTable: "portfolio_performance", consumingService: "lending-engine-go", purpose: "IFRS9 staging and provisioning calculations", executionFrequency: "monthly", avgExecutionMs: 890, rowsReturned: 4500, lastExecuted: new Date().toISOString() },
@@ -253,7 +268,7 @@ interface MaterializedView {
   status: string;
 }
 
-const materializedViews: MaterializedView[] = [
+const MATERIALIZED_VIEWS_SEED: MaterializedView[] = [
   { id: "MV-001", name: "daily_transaction_summary", sourceTable: "payments_cdc", targetTable: "mv_daily_txn_summary", refreshSchedule: "0 */1 * * *", lastRefreshed: new Date().toISOString(), rowCount: 365, sizeBytes: 45000, ttlHours: 2, consumers: ["dashboard", "core-banking-go"], sql: "SELECT date, channel, COUNT(*) as txn_count, SUM(amount) as total_volume, AVG(amount) as avg_amount FROM payments_cdc GROUP BY date, channel", status: "active" },
   { id: "MV-002", name: "customer_360_summary", sourceTable: "customer_360", targetTable: "mv_customer_360", refreshSchedule: "0 2 * * *", lastRefreshed: new Date().toISOString(), rowCount: 2500000, sizeBytes: 850000000, ttlHours: 24, consumers: ["core-banking-go", "kyc-engine-py", "fraud-detection-py"], sql: "SELECT customer_id, full_name, region, product_count, total_balance, risk_score, last_txn_date FROM customer_360", status: "active" },
   { id: "MV-003", name: "loan_portfolio_par", sourceTable: "portfolio_performance", targetTable: "mv_loan_par", refreshSchedule: "0 3 1 * *", lastRefreshed: new Date().toISOString(), rowCount: 4500, sizeBytes: 1200000, ttlHours: 720, consumers: ["lending-engine-go", "basel-engine-rs", "ifrs9-engine-rs"], sql: "SELECT product_type, vintage_month, par_1_30, par_31_60, par_61_90, par_90_plus, ecl_stage, provision_amount FROM portfolio_performance", status: "active" },
@@ -284,7 +299,7 @@ interface LineageEdge {
   avgLatencyMs: number;
 }
 
-const lineageNodes: LineageNode[] = [
+const LINEAGE_NODES_SEED: LineageNode[] = [
   // Services
   { id: "svc:core-banking-go", name: "Core Banking (Go)", type: "service", domain: "core_banking", metadata: { port: "8101", language: "go" } },
   { id: "svc:payments-hub-go", name: "Payments Hub (Go)", type: "service", domain: "payments", metadata: { port: "8107", language: "go" } },
@@ -321,7 +336,7 @@ const lineageNodes: LineageNode[] = [
   { id: "dash:executive", name: "Executive Dashboard", type: "dashboard", domain: "platform", metadata: { consumers: "5" } },
 ];
 
-const lineageEdges: LineageEdge[] = [
+const LINEAGE_EDGES_SEED: LineageEdge[] = [
   // Service → Kafka
   { id: "LE-001", source: "svc:core-banking-go", target: "kafka:cdc.core-banking.accounts", transformType: "cdc_publish", description: "Account lifecycle CDC events", frequency: "real-time", avgLatencyMs: 5 },
   { id: "LE-002", source: "svc:payments-hub-go", target: "kafka:cdc.payments.transfers", transformType: "cdc_publish", description: "Payment transfer CDC events", frequency: "real-time", avgLatencyMs: 3 },
@@ -363,21 +378,83 @@ const recentCDCEvents: CDCEvent[] = [
   { eventId: "CDC-005", eventType: "kyc_completed", domain: "kyc_aml", service: "kyc-engine-py", table: "kyc_verifications", schema: "bronze", kafkaTopic: "cdc.kyc.verifications", partitionKey: "TEN-ACCESS", payload: { verificationId: "KYC-6601", customerId: "CUS-8801", verificationType: "bvn_nin_match", result: "verified", bvnMatch: true, ninMatch: true }, metadata: { tenantId: "TEN-ACCESS", userId: "USR-7701", correlationId: "COR-3301", timestamp: new Date().toISOString(), version: 1 } },
 ];
 
+// ── Postgres-backed registries (fail-closed via pgJsonStore) ──
+
+const DOMAIN_CDC_CONFIGS_TABLE = "lakehouse_domain_cdc_configs";
+const FEDERATED_QUERIES_TABLE = "lakehouse_federated_queries";
+const MATERIALIZED_VIEWS_TABLE = "lakehouse_materialized_views";
+const LINEAGE_NODES_TABLE = "lakehouse_lineage_nodes";
+const LINEAGE_EDGES_TABLE = "lakehouse_lineage_edges";
+
+async function ensureDomainCDCConfigsStore(): Promise<void> {
+  await ensureTables("lakehouseIntegration.domainCDCConfigs", storeDDL(DOMAIN_CDC_CONFIGS_TABLE));
+  // DomainCDCConfig has no id field; the domain name is the natural key.
+  await storeSeed(DOMAIN_CDC_CONFIGS_TABLE, DOMAIN_CDC_CONFIGS_SEED.map((d) => ({ id: d.domain, ...d })), () => "");
+}
+
+export async function loadDomainCDCConfigs(): Promise<DomainCDCConfig[]> {
+  await ensureDomainCDCConfigsStore();
+  const rows = await storeList<DomainCDCConfig & { id: string }>(DOMAIN_CDC_CONFIGS_TABLE);
+  return rows.map(({ id: _id, ...d }) => d);
+}
+
+async function ensureFederatedQueriesStore(): Promise<void> {
+  await ensureTables("lakehouseIntegration.federatedQueries", storeDDL(FEDERATED_QUERIES_TABLE));
+  await storeSeed(FEDERATED_QUERIES_TABLE, FEDERATED_QUERIES_SEED, () => "");
+}
+
+export async function loadFederatedQueries(): Promise<FederatedQuery[]> {
+  await ensureFederatedQueriesStore();
+  return storeList<FederatedQuery>(FEDERATED_QUERIES_TABLE);
+}
+
+async function ensureMaterializedViewsStore(): Promise<void> {
+  await ensureTables("lakehouseIntegration.materializedViews", storeDDL(MATERIALIZED_VIEWS_TABLE));
+  await storeSeed(MATERIALIZED_VIEWS_TABLE, MATERIALIZED_VIEWS_SEED, () => "");
+}
+
+export async function loadMaterializedViews(): Promise<MaterializedView[]> {
+  await ensureMaterializedViewsStore();
+  return storeList<MaterializedView>(MATERIALIZED_VIEWS_TABLE);
+}
+
+async function ensureLineageNodesStore(): Promise<void> {
+  await ensureTables("lakehouseIntegration.lineageNodes", storeDDL(LINEAGE_NODES_TABLE));
+  await storeSeed(LINEAGE_NODES_TABLE, LINEAGE_NODES_SEED, () => "");
+}
+
+export async function loadLineageNodes(): Promise<LineageNode[]> {
+  await ensureLineageNodesStore();
+  return storeList<LineageNode>(LINEAGE_NODES_TABLE);
+}
+
+async function ensureLineageEdgesStore(): Promise<void> {
+  await ensureTables("lakehouseIntegration.lineageEdges", storeDDL(LINEAGE_EDGES_TABLE));
+  await storeSeed(LINEAGE_EDGES_TABLE, LINEAGE_EDGES_SEED, () => "");
+}
+
+export async function loadLineageEdges(): Promise<LineageEdge[]> {
+  await ensureLineageEdgesStore();
+  return storeList<LineageEdge>(LINEAGE_EDGES_TABLE);
+}
+
 // ── Express Registration ──
 
 export function registerLakehouseIntegration(app: any) {
   // Domain CDC configs
-  app.get("/api/platform/lakehouse/domains", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/domains", asyncRoute(async (_req: any, res: any) => {
+    const domainCDCConfigs = await pgGuard(loadDomainCDCConfigs());
     res.json({ items: domainCDCConfigs, total: domainCDCConfigs.length });
-  });
+  }));
 
-  app.get("/api/platform/lakehouse/domains/stats", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/domains/stats", asyncRoute(async (_req: any, res: any) => {
+    const domainCDCConfigs = await pgGuard(loadDomainCDCConfigs());
     const totalTables = domainCDCConfigs.reduce((s, d) => s + d.tables.length, 0);
     const totalTopics = domainCDCConfigs.reduce((s, d) => s + d.kafkaTopics.length, 0);
     const totalEvents = domainCDCConfigs.reduce((s, d) => s + d.avgEventsPerDay, 0);
     const totalServices = domainCDCConfigs.reduce((s, d) => s + d.services.length, 0);
     res.json({ domains: domainCDCConfigs.length, totalTables, totalTopics, totalEventsPerDay: totalEvents, totalServices, avgPayloadBytes: 4096 });
-  });
+  }));
 
   // Shared clients
   app.get("/api/platform/lakehouse/clients", (_req: any, res: any) => {
@@ -389,45 +466,53 @@ export function registerLakehouseIntegration(app: any) {
   });
 
   // Query federation
-  app.get("/api/platform/lakehouse/queries", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/queries", asyncRoute(async (_req: any, res: any) => {
+    const federatedQueries = await pgGuard(loadFederatedQueries());
     res.json({ items: federatedQueries, total: federatedQueries.length });
-  });
+  }));
 
-  app.get("/api/platform/lakehouse/queries/stats", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/queries/stats", asyncRoute(async (_req: any, res: any) => {
+    const federatedQueries = await pgGuard(loadFederatedQueries());
     const totalRows = federatedQueries.reduce((s, q) => s + q.rowsReturned, 0);
     const avgMs = federatedQueries.reduce((s, q) => s + q.avgExecutionMs, 0) / federatedQueries.length;
     res.json({ totalQueries: federatedQueries.length, totalRowsReturned: totalRows, avgExecutionMs: Math.round(avgMs) });
-  });
+  }));
 
   // Materialized views
-  app.get("/api/platform/lakehouse/materialized-views", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/materialized-views", asyncRoute(async (_req: any, res: any) => {
+    const materializedViews = await pgGuard(loadMaterializedViews());
     res.json({ items: materializedViews, total: materializedViews.length });
-  });
+  }));
 
-  app.get("/api/platform/lakehouse/materialized-views/stats", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/materialized-views/stats", asyncRoute(async (_req: any, res: any) => {
+    const materializedViews = await pgGuard(loadMaterializedViews());
     const totalRows = materializedViews.reduce((s, v) => s + v.rowCount, 0);
     const totalSize = materializedViews.reduce((s, v) => s + v.sizeBytes, 0);
     res.json({ totalViews: materializedViews.length, totalRows, totalSizeBytes: totalSize, active: materializedViews.filter(v => v.status === "active").length });
-  });
+  }));
 
   // Data lineage
-  app.get("/api/platform/lakehouse/lineage/nodes", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/lineage/nodes", asyncRoute(async (_req: any, res: any) => {
+    const lineageNodes = await pgGuard(loadLineageNodes());
     res.json({ items: lineageNodes, total: lineageNodes.length });
-  });
+  }));
 
-  app.get("/api/platform/lakehouse/lineage/edges", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/lineage/edges", asyncRoute(async (_req: any, res: any) => {
+    const lineageEdges = await pgGuard(loadLineageEdges());
     res.json({ items: lineageEdges, total: lineageEdges.length });
-  });
+  }));
 
-  app.get("/api/platform/lakehouse/lineage/stats", (_req: any, res: any) => {
+  app.get("/api/platform/lakehouse/lineage/stats", asyncRoute(async (_req: any, res: any) => {
+    const lineageNodes = await pgGuard(loadLineageNodes());
+    const lineageEdges = await pgGuard(loadLineageEdges());
     const nodesByType: Record<string, number> = {};
     lineageNodes.forEach(n => { nodesByType[n.type] = (nodesByType[n.type] || 0) + 1; });
     const edgesByType: Record<string, number> = {};
     lineageEdges.forEach(e => { edgesByType[e.transformType] = (edgesByType[e.transformType] || 0) + 1; });
     res.json({ totalNodes: lineageNodes.length, totalEdges: lineageEdges.length, nodesByType, edgesByType });
-  });
+  }));
 
-  // Recent CDC events
+  // Recent CDC events (B5-P3 publisher path — intentionally left in-process)
   app.get("/api/platform/lakehouse/cdc-events", (_req: any, res: any) => {
     res.json({ items: recentCDCEvents, total: recentCDCEvents.length });
   });

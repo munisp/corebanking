@@ -37,10 +37,11 @@ var (
 
 // Re-export SDK status constants.
 var (
-	AccountCreated  = tb.AccountCreated
-	AccountExists   = tb.AccountExists
-	TransferCreated = tb.TransferCreated
-	TransferExists  = tb.TransferExists
+	AccountCreated         = tb.AccountCreated
+	AccountExists          = tb.AccountExists
+	TransferCreated        = tb.TransferCreated
+	TransferExists         = tb.TransferExists
+	TransferExceedsCredits = tb.TransferExceedsCredits
 )
 
 // ID generates a TigerBeetle time-based unique identifier.

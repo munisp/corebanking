@@ -4,10 +4,9 @@ go 1.22
 
 require (
 	github.com/confluentinc/confluent-kafka-go/v2 v2.3.0
-	github.com/go-redis/redis/v8 v8.11.5
 	github.com/jackc/pgx/v5 v5.5.1
 	github.com/prometheus/client_golang v1.18.0
-	github.com/tigerbeetle/tigerbeetle-go v0.15.3
+	github.com/redis/go-redis/v9 v9.7.0
 )
 
 require (

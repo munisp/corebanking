@@ -5,21 +5,23 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
+	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -69,7 +71,14 @@ type RedeemPointsResponse struct {
 	RewardDetails   map[string]interface{} `json:"reward_details"`
 }
 
-type LeaderboardEntry struct {
+// NOTE (C3-P2-B5-go-2): these three API types were renamed
+// (LeaderboardEntry→leaderboardRow, Achievement→achievementDef,
+// Challenge→challengeDef) because gamification.go declares same-named types
+// with incompatible shapes — the pristine tree did not compile (pre-existing
+// duplicate-declaration break). JSON tags are unchanged, so the wire contract
+// is preserved.
+
+type leaderboardRow struct {
 	Rank       int      `json:"rank"`
 	CustomerID string   `json:"customer_id"`
 	Name       string   `json:"name"`
@@ -78,7 +87,7 @@ type LeaderboardEntry struct {
 	Badges     []string `json:"badges"`
 }
 
-type Achievement struct {
+type achievementDef struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -87,7 +96,7 @@ type Achievement struct {
 	UnlockedAt  string `json:"unlocked_at,omitempty"`
 }
 
-type Challenge struct {
+type challengeDef struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -115,33 +124,44 @@ func (s *GamificationServer) setupRoutes() {
 	api := s.router.PathPrefix("/api/v1").Subrouter()
 
 	// Points management
-	api.HandleFunc("/gamification/points/award", s.awardPointsHandler).Methods("POST")
-	api.HandleFunc("/gamification/points/redeem", s.redeemPointsHandler).Methods("POST")
-	api.HandleFunc("/gamification/points/{customerId}", s.getPointsHandler).Methods("GET")
-	api.HandleFunc("/gamification/points/{customerId}/history", s.getPointsHistoryHandler).Methods("GET")
+	api.HandleFunc("/gamification/points/award", permifyAuthzGuard("gamification_service", "award", s.awardPointsHandler)).Methods("POST")
+	api.HandleFunc("/gamification/points/redeem", permifyAuthzGuard("gamification_service", "redeem", s.redeemPointsHandler)).Methods("POST")
+	api.HandleFunc("/gamification/points/{customerId}", permifyAuthzGuard("gamification_service", "view", s.getPointsHandler)).Methods("GET")
+	api.HandleFunc("/gamification/points/{customerId}/history", permifyAuthzGuard("gamification_service", "view", s.getPointsHistoryHandler)).Methods("GET")
 
 	// Leaderboards
-	api.HandleFunc("/gamification/leaderboard", s.getLeaderboardHandler).Methods("GET")
-	api.HandleFunc("/gamification/leaderboard/{customerId}/rank", s.getCustomerRankHandler).Methods("GET")
+	api.HandleFunc("/gamification/leaderboard", permifyAuthzGuard("gamification_service", "view", s.getLeaderboardHandler)).Methods("GET")
+	api.HandleFunc("/gamification/leaderboard/{customerId}/rank", permifyAuthzGuard("gamification_service", "view", s.getCustomerRankHandler)).Methods("GET")
 
 	// Achievements and badges
-	api.HandleFunc("/gamification/achievements", s.getAchievementsHandler).Methods("GET")
-	api.HandleFunc("/gamification/achievements/{customerId}", s.getCustomerAchievementsHandler).Methods("GET")
-	api.HandleFunc("/gamification/badges/{customerId}", s.getCustomerBadgesHandler).Methods("GET")
+	api.HandleFunc("/gamification/achievements", permifyAuthzGuard("gamification_service", "view", s.getAchievementsHandler)).Methods("GET")
+	api.HandleFunc("/gamification/achievements/{customerId}", permifyAuthzGuard("gamification_service", "view", s.getCustomerAchievementsHandler)).Methods("GET")
+	api.HandleFunc("/gamification/badges/{customerId}", permifyAuthzGuard("gamification_service", "view", s.getCustomerBadgesHandler)).Methods("GET")
 
 	// Challenges
-	api.HandleFunc("/gamification/challenges", s.getChallengesHandler).Methods("GET")
-	api.HandleFunc("/gamification/challenges/{customerId}", s.getCustomerChallengesHandler).Methods("GET")
-	api.HandleFunc("/gamification/challenges/{challengeId}/join", s.joinChallengeHandler).Methods("POST")
-	api.HandleFunc("/gamification/challenges/{challengeId}/progress", s.updateChallengeProgressHandler).Methods("POST")
+	api.HandleFunc("/gamification/challenges", permifyAuthzGuard("gamification_service", "view", s.getChallengesHandler)).Methods("GET")
+	api.HandleFunc("/gamification/challenges/{customerId}", permifyAuthzGuard("gamification_service", "view", s.getCustomerChallengesHandler)).Methods("GET")
+	api.HandleFunc("/gamification/challenges/{challengeId}/join", permifyAuthzGuard("gamification_service", "join", s.joinChallengeHandler)).Methods("POST")
+	api.HandleFunc("/gamification/challenges/{challengeId}/progress", permifyAuthzGuard("gamification_service", "progress", s.updateChallengeProgressHandler)).Methods("POST")
 
 	// Rewards catalog
-	api.HandleFunc("/gamification/rewards", s.getRewardsCatalogHandler).Methods("GET")
-	api.HandleFunc("/gamification/rewards/{rewardId}", s.getRewardDetailsHandler).Methods("GET")
+	api.HandleFunc("/gamification/rewards", permifyAuthzGuard("gamification_service", "view", s.getRewardsCatalogHandler)).Methods("GET")
+	api.HandleFunc("/gamification/rewards/{rewardId}", permifyAuthzGuard("gamification_service", "view", s.getRewardDetailsHandler)).Methods("GET")
 
 	// Levels and tiers
-	api.HandleFunc("/gamification/levels", s.getLevelsHandler).Methods("GET")
-	api.HandleFunc("/gamification/levels/{customerId}", s.getCustomerLevelHandler).Methods("GET")
+	api.HandleFunc("/gamification/levels", permifyAuthzGuard("gamification_service", "view", s.getLevelsHandler)).Methods("GET")
+	api.HandleFunc("/gamification/levels/{customerId}", permifyAuthzGuard("gamification_service", "view", s.getCustomerLevelHandler)).Methods("GET")
+}
+
+// writeEngineError maps engine errors to responses: store failures
+// (errStore) fail closed with 503 persistence_unavailable; domain errors keep
+// the caller-supplied status (C3-P2-B5-go-2).
+func writeEngineError(w http.ResponseWriter, err error, status int) {
+	if errors.Is(err, errStore) {
+		http.Error(w, `{"error":"persistence_unavailable"}`, http.StatusServiceUnavailable)
+		return
+	}
+	http.Error(w, err.Error(), status)
 }
 
 func (s *GamificationServer) healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -161,7 +181,7 @@ func (s *GamificationServer) awardPointsHandler(w http.ResponseWriter, r *http.R
 
 	result, err := s.engine.AwardPoints(req.TenantID, req.CustomerID, req.Action, req.Points)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -177,7 +197,7 @@ func (s *GamificationServer) redeemPointsHandler(w http.ResponseWriter, r *http.
 
 	result, err := s.engine.RedeemPoints(req.TenantID, req.CustomerID, req.Points, req.RewardID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -191,7 +211,7 @@ func (s *GamificationServer) getPointsHandler(w http.ResponseWriter, r *http.Req
 
 	points, err := s.engine.GetPoints(tenantID, customerID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -205,7 +225,7 @@ func (s *GamificationServer) getPointsHistoryHandler(w http.ResponseWriter, r *h
 
 	history, err := s.engine.GetPointsHistory(tenantID, customerID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -221,7 +241,7 @@ func (s *GamificationServer) getLeaderboardHandler(w http.ResponseWriter, r *htt
 
 	leaderboard, err := s.engine.GetLeaderboard(tenantID, period)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -235,7 +255,7 @@ func (s *GamificationServer) getCustomerRankHandler(w http.ResponseWriter, r *ht
 
 	rank, err := s.engine.GetCustomerRank(tenantID, customerID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -247,7 +267,7 @@ func (s *GamificationServer) getAchievementsHandler(w http.ResponseWriter, r *ht
 
 	achievements, err := s.engine.GetAllAchievements(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -261,7 +281,7 @@ func (s *GamificationServer) getCustomerAchievementsHandler(w http.ResponseWrite
 
 	achievements, err := s.engine.GetCustomerAchievements(tenantID, customerID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -275,7 +295,7 @@ func (s *GamificationServer) getCustomerBadgesHandler(w http.ResponseWriter, r *
 
 	badges, err := s.engine.GetCustomerBadges(tenantID, customerID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -287,7 +307,7 @@ func (s *GamificationServer) getChallengesHandler(w http.ResponseWriter, r *http
 
 	challenges, err := s.engine.GetActiveChallenges(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -301,7 +321,7 @@ func (s *GamificationServer) getCustomerChallengesHandler(w http.ResponseWriter,
 
 	challenges, err := s.engine.GetCustomerChallenges(tenantID, customerID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -323,7 +343,7 @@ func (s *GamificationServer) joinChallengeHandler(w http.ResponseWriter, r *http
 
 	result, err := s.engine.JoinChallenge(tenantID, req.CustomerID, challengeID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -346,7 +366,7 @@ func (s *GamificationServer) updateChallengeProgressHandler(w http.ResponseWrite
 
 	result, err := s.engine.UpdateChallengeProgress(tenantID, req.CustomerID, challengeID, req.Progress)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -358,7 +378,7 @@ func (s *GamificationServer) getRewardsCatalogHandler(w http.ResponseWriter, r *
 
 	rewards, err := s.engine.GetRewardsCatalog(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -372,7 +392,7 @@ func (s *GamificationServer) getRewardDetailsHandler(w http.ResponseWriter, r *h
 
 	reward, err := s.engine.GetRewardDetails(tenantID, rewardID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -384,7 +404,7 @@ func (s *GamificationServer) getLevelsHandler(w http.ResponseWriter, r *http.Req
 
 	levels, err := s.engine.GetLevels(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -398,7 +418,7 @@ func (s *GamificationServer) getCustomerLevelHandler(w http.ResponseWriter, r *h
 
 	level, err := s.engine.GetCustomerLevel(tenantID, customerID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err, http.StatusNotFound)
 		return
 	}
 
@@ -662,12 +682,6 @@ func main() {
 	log.Println("Gamification service stopped")
 }
 
-type pointsEvent struct {
-	Action    string    `json:"action"`
-	Points    int       `json:"points"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
 type rewardCatalogEntry struct {
 	ID             string `json:"id"`
 	Name           string `json:"name"`
@@ -675,108 +689,335 @@ type rewardCatalogEntry struct {
 	Type           string `json:"type"`
 }
 
-type customerChallengeState struct {
-	Challenge Challenge
-	Joined    bool
-}
+// errStore is returned by every engine method when Postgres is unavailable.
+// Gamification points are money-like balances: the engine fails closed (HTTP
+// 503 via writeEngineError) rather than falling back to volatile in-memory
+// state (C3-P2-B5-go-2).
+var errStore = errors.New("persistence_unavailable")
 
+// GamificationEngine is backed by Postgres: gamification_points +
+// gamification_points_history (money-like customer balances, keyed by
+// tenant+customer), gamification_achievements / gamification_reward_catalog /
+// gamification_challenges (global catalogs, seeded idempotently at boot), and
+// gamification_customer_challenges (per-customer join/progress state). All
+// balance mutations are transactional upserts / conditional decrements —
+// data survives restart; the former in-memory maps were removed.
 type GamificationEngine struct {
-	mu                 sync.RWMutex
-	points             map[string]int
-	history            map[string][]pointsEvent
-	achievements       []Achievement
-	rewardCatalog      []rewardCatalogEntry
-	challenges         []Challenge
-	customerChallenges map[string]map[string]*customerChallengeState
+	db *sql.DB
 }
 
 func NewGamificationEngine() *GamificationEngine {
-	return &GamificationEngine{
-		points:  map[string]int{},
-		history: map[string][]pointsEvent{},
-		achievements: []Achievement{
-			{ID: "first_transfer", Name: "First Transfer", Description: "Complete your first transfer", Points: 50, Icon: "transfer"},
-			{ID: "saver_1000", Name: "Saver 1000", Description: "Reach 1,000 points", Points: 100, Icon: "trophy"},
-		},
-		rewardCatalog: []rewardCatalogEntry{
-			{ID: "airtime_100", Name: "Airtime 100", PointsRequired: 500, Type: "airtime"},
-			{ID: "cashback_500", Name: "Cashback 500", PointsRequired: 2000, Type: "cashback"},
-		},
-		challenges: []Challenge{
-			{ID: "weekly_saver", Name: "Weekly Saver", Description: "Complete five qualifying savings actions this week", Target: 5, Reward: 100, ExpiresAt: time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339), Status: "active"},
-			{ID: "roundup_champion", Name: "Round-Up Champion", Description: "Complete ten round-up savings events", Target: 10, Reward: 250, ExpiresAt: time.Now().Add(14 * 24 * time.Hour).Format(time.RFC3339), Status: "active"},
-		},
-		customerChallenges: map[string]map[string]*customerChallengeState{},
+	e := &GamificationEngine{}
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[gamification] DATABASE_URL not set — persistence unavailable (fail-closed)")
+		return e
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[gamification] db open failed: %v — persistence unavailable (fail-closed)", err)
+		return e
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err := db.Ping(); err != nil {
+		log.Printf("[gamification] db ping failed: %v — persistence unavailable (fail-closed)", err)
+		return e
+	}
+	e.db = db
+	e.initSchema()
+	log.Printf("[gamification] Postgres connected (pool: 25/5)")
+	return e
+}
+
+// initSchema creates the gamification tables idempotently and seeds the
+// catalogs that were previously hard-coded in the engine constructor.
+func (e *GamificationEngine) initSchema() {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS gamification_points (
+			tenant_id TEXT NOT NULL,
+			customer_id TEXT NOT NULL,
+			points INTEGER NOT NULL DEFAULT 0,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (tenant_id, customer_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS gamification_points_history (
+			id BIGSERIAL PRIMARY KEY,
+			tenant_id TEXT NOT NULL,
+			customer_id TEXT NOT NULL,
+			action TEXT NOT NULL,
+			points INTEGER NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gam_points_history_cust ON gamification_points_history(tenant_id, customer_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS gamification_achievements (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			points INTEGER NOT NULL DEFAULT 0,
+			icon TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS gamification_reward_catalog (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			points_required INTEGER NOT NULL DEFAULT 0,
+			type TEXT NOT NULL DEFAULT ''
+		)`,
+		`CREATE TABLE IF NOT EXISTS gamification_challenges (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			target INTEGER NOT NULL DEFAULT 0,
+			reward INTEGER NOT NULL DEFAULT 0,
+			expires_at TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'active'
+		)`,
+		`CREATE TABLE IF NOT EXISTS gamification_customer_challenges (
+			tenant_id TEXT NOT NULL,
+			customer_id TEXT NOT NULL,
+			challenge_id TEXT NOT NULL,
+			progress INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'active',
+			challenge JSONB NOT NULL DEFAULT '{}'::jsonb,
+			joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (tenant_id, customer_id, challenge_id)
+		)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := e.db.Exec(stmt); err != nil {
+			log.Fatalf("[gamification] schema init failed: %v", err)
+		}
+	}
+	// Idempotent catalog seeds (previously in-memory constructor literals).
+	seeds := []string{
+		`INSERT INTO gamification_achievements (id, name, description, points, icon) VALUES
+			('first_transfer', 'First Transfer', 'Complete your first transfer', 50, 'transfer'),
+			('saver_1000', 'Saver 1000', 'Reach 1,000 points', 100, 'trophy')
+			ON CONFLICT (id) DO NOTHING`,
+		`INSERT INTO gamification_reward_catalog (id, name, points_required, type) VALUES
+			('airtime_100', 'Airtime 100', 500, 'airtime'),
+			('cashback_500', 'Cashback 500', 2000, 'cashback')
+			ON CONFLICT (id) DO NOTHING`,
+		fmt.Sprintf(`INSERT INTO gamification_challenges (id, name, description, target, reward, expires_at, status) VALUES
+			('weekly_saver', 'Weekly Saver', 'Complete five qualifying savings actions this week', 5, 100, '%s', 'active'),
+			('roundup_champion', 'Round-Up Champion', 'Complete ten round-up savings events', 10, 250, '%s', 'active')
+			ON CONFLICT (id) DO NOTHING`,
+			time.Now().Add(7*24*time.Hour).Format(time.RFC3339),
+			time.Now().Add(14*24*time.Hour).Format(time.RFC3339)),
+	}
+	for _, stmt := range seeds {
+		if _, err := e.db.Exec(stmt); err != nil {
+			log.Printf("[gamification] catalog seed (may already exist): %v", err)
+		}
 	}
 }
 
+// normTenant keeps a stable partition key when the caller carries no tenant
+// identity (the pre-PG engine ignored tenantID entirely; customer data is now
+// keyed by (tenant_id, customer_id)).
+func normTenant(t string) string {
+	if t == "" {
+		return "default"
+	}
+	return t
+}
+
+// pointsOf reads the current balance (0 when the customer has no row yet).
+func (e *GamificationEngine) pointsOf(tenantID, customerID string) (int, error) {
+	var points int
+	err := e.db.QueryRow(`SELECT points FROM gamification_points WHERE tenant_id = $1 AND customer_id = $2`,
+		normTenant(tenantID), customerID).Scan(&points)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		log.Printf("[gamification] pointsOf failed: %v", err)
+		return 0, errStore
+	}
+	return points, nil
+}
+
 func (e *GamificationEngine) AwardPoints(tenantID, customerID, action string, points int) (*AwardPointsResponse, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if points <= 0 {
 		return nil, fmt.Errorf("points must be positive")
 	}
-	e.points[customerID] += points
-	e.history[customerID] = append(e.history[customerID], pointsEvent{Action: action, Points: points, Timestamp: time.Now()})
-	level := levelForPoints(e.points[customerID])
+	if e.db == nil {
+		return nil, errStore
+	}
+	tenantID = normTenant(tenantID)
+	// Transactional: balance upsert + history entry commit atomically.
+	tx, err := e.db.Begin()
+	if err != nil {
+		log.Printf("[gamification] AwardPoints begin tx failed: %v", err)
+		return nil, errStore
+	}
+	defer tx.Rollback()
+	var total int
+	err = tx.QueryRow(
+		`INSERT INTO gamification_points (tenant_id, customer_id, points)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (tenant_id, customer_id)
+		 DO UPDATE SET points = gamification_points.points + EXCLUDED.points, updated_at = NOW()
+		 RETURNING points`, tenantID, customerID, points).Scan(&total)
+	if err != nil {
+		log.Printf("[gamification] AwardPoints upsert failed: %v", err)
+		return nil, errStore
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO gamification_points_history (tenant_id, customer_id, action, points) VALUES ($1, $2, $3, $4)`,
+		tenantID, customerID, action, points); err != nil {
+		log.Printf("[gamification] AwardPoints history failed: %v", err)
+		return nil, errStore
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[gamification] AwardPoints commit failed: %v", err)
+		return nil, errStore
+	}
 	return &AwardPointsResponse{
 		TransactionID: fmt.Sprintf("txn_%s_%d", customerID, time.Now().UnixNano()),
 		CustomerID:    customerID,
 		PointsAwarded: points,
-		TotalPoints:   e.points[customerID],
-		NewLevel:      level,
+		TotalPoints:   total,
+		NewLevel:      levelForPoints(total),
 	}, nil
 }
 
 func (e *GamificationEngine) RedeemPoints(tenantID, customerID string, points int, rewardID string) (*RedeemPointsResponse, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if points <= 0 {
 		return nil, fmt.Errorf("points must be positive")
 	}
-	if e.points[customerID] < points {
+	if e.db == nil {
+		return nil, errStore
+	}
+	tenantID = normTenant(tenantID)
+	// Transactional conditional decrement: the balance row is locked FOR
+	// UPDATE, sufficiency is re-checked under the lock, and the reward is
+	// validated before any deduction — money-like semantics, no double-spend.
+	tx, err := e.db.Begin()
+	if err != nil {
+		log.Printf("[gamification] RedeemPoints begin tx failed: %v", err)
+		return nil, errStore
+	}
+	defer tx.Rollback()
+	var balance int
+	err = tx.QueryRow(
+		`SELECT points FROM gamification_points WHERE tenant_id = $1 AND customer_id = $2 FOR UPDATE`,
+		tenantID, customerID).Scan(&balance)
+	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("insufficient points")
 	}
-	reward, ok := e.findReward(rewardID)
-	if !ok {
+	if err != nil {
+		log.Printf("[gamification] RedeemPoints balance failed: %v", err)
+		return nil, errStore
+	}
+	if balance < points {
+		return nil, fmt.Errorf("insufficient points")
+	}
+	var reward rewardCatalogEntry
+	err = tx.QueryRow(
+		`SELECT id, name, points_required, type FROM gamification_reward_catalog WHERE id = $1`, rewardID).
+		Scan(&reward.ID, &reward.Name, &reward.PointsRequired, &reward.Type)
+	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("reward not found")
 	}
-	e.points[customerID] -= points
-	e.history[customerID] = append(e.history[customerID], pointsEvent{Action: "redeem:" + rewardID, Points: -points, Timestamp: time.Now()})
+	if err != nil {
+		log.Printf("[gamification] RedeemPoints reward lookup failed: %v", err)
+		return nil, errStore
+	}
+	var remaining int
+	err = tx.QueryRow(
+		`UPDATE gamification_points SET points = points - $3, updated_at = NOW()
+		 WHERE tenant_id = $1 AND customer_id = $2 AND points >= $3
+		 RETURNING points`, tenantID, customerID, points).Scan(&remaining)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("insufficient points")
+	}
+	if err != nil {
+		log.Printf("[gamification] RedeemPoints decrement failed: %v", err)
+		return nil, errStore
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO gamification_points_history (tenant_id, customer_id, action, points) VALUES ($1, $2, $3, $4)`,
+		tenantID, customerID, "redeem:"+rewardID, -points); err != nil {
+		log.Printf("[gamification] RedeemPoints history failed: %v", err)
+		return nil, errStore
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[gamification] RedeemPoints commit failed: %v", err)
+		return nil, errStore
+	}
 	return &RedeemPointsResponse{
 		TransactionID:   fmt.Sprintf("txn_%s_%d", customerID, time.Now().UnixNano()),
 		PointsRedeemed:  points,
-		RemainingPoints: e.points[customerID],
+		RemainingPoints: remaining,
 		RewardDetails:   map[string]interface{}{"reward_id": reward.ID, "name": reward.Name, "type": reward.Type},
 	}, nil
 }
 
 func (e *GamificationEngine) GetPoints(tenantID, customerID string) (map[string]interface{}, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	points := e.points[customerID]
+	if e.db == nil {
+		return nil, errStore
+	}
+	points, err := e.pointsOf(tenantID, customerID)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]interface{}{"customer_id": customerID, "total_points": points, "level": levelForPoints(points)}, nil
 }
 
 func (e *GamificationEngine) GetPointsHistory(tenantID, customerID string) ([]map[string]interface{}, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	events := e.history[customerID]
-	result := make([]map[string]interface{}, 0, len(events))
-	for _, event := range events {
-		result = append(result, map[string]interface{}{"action": event.Action, "points": event.Points, "timestamp": event.Timestamp.Format(time.RFC3339)})
+	if e.db == nil {
+		return nil, errStore
+	}
+	rows, err := e.db.Query(
+		`SELECT action, points, created_at FROM gamification_points_history
+		 WHERE tenant_id = $1 AND customer_id = $2 ORDER BY created_at ASC, id ASC`,
+		normTenant(tenantID), customerID)
+	if err != nil {
+		log.Printf("[gamification] GetPointsHistory failed: %v", err)
+		return nil, errStore
+	}
+	defer rows.Close()
+	result := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var action string
+		var points int
+		var createdAt time.Time
+		if err := rows.Scan(&action, &points, &createdAt); err != nil {
+			log.Printf("[gamification] GetPointsHistory scan failed: %v", err)
+			return nil, errStore
+		}
+		result = append(result, map[string]interface{}{"action": action, "points": points, "timestamp": createdAt.Format(time.RFC3339)})
 	}
 	return result, nil
 }
 
-func (e *GamificationEngine) GetLeaderboard(tenantID, period string) ([]LeaderboardEntry, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	entries := make([]LeaderboardEntry, 0, len(e.points))
-	for customerID, points := range e.points {
-		entries = append(entries, LeaderboardEntry{CustomerID: customerID, Name: customerID, Points: points, Level: levelForPoints(points), Badges: badgesForPoints(points)})
+func (e *GamificationEngine) GetLeaderboard(tenantID, period string) ([]leaderboardRow, error) {
+	if e.db == nil {
+		return nil, errStore
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Points > entries[j].Points })
+	rows, err := e.db.Query(
+		`SELECT customer_id, points FROM gamification_points WHERE tenant_id = $1 ORDER BY points DESC, customer_id ASC`,
+		normTenant(tenantID))
+	if err != nil {
+		log.Printf("[gamification] GetLeaderboard failed: %v", err)
+		return nil, errStore
+	}
+	defer rows.Close()
+	entries := make([]leaderboardRow, 0)
+	for rows.Next() {
+		var entry leaderboardRow
+		if err := rows.Scan(&entry.CustomerID, &entry.Points); err != nil {
+			log.Printf("[gamification] GetLeaderboard scan failed: %v", err)
+			return nil, errStore
+		}
+		entry.Name = entry.CustomerID
+		entry.Level = levelForPoints(entry.Points)
+		entry.Badges = badgesForPoints(entry.Points)
+		entries = append(entries, entry)
+	}
 	for i := range entries {
 		entries[i].Rank = i + 1
 	}
@@ -796,19 +1037,50 @@ func (e *GamificationEngine) GetCustomerRank(tenantID, customerID string) (map[s
 	return map[string]interface{}{"rank": 0, "total_participants": len(entries)}, nil
 }
 
-func (e *GamificationEngine) GetAllAchievements(tenantID string) ([]Achievement, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return append([]Achievement(nil), e.achievements...), nil
+func (e *GamificationEngine) GetAllAchievements(tenantID string) ([]achievementDef, error) {
+	if e.db == nil {
+		return nil, errStore
+	}
+	rows, err := e.db.Query(`SELECT id, name, description, points, icon FROM gamification_achievements ORDER BY id`)
+	if err != nil {
+		log.Printf("[gamification] GetAllAchievements failed: %v", err)
+		return nil, errStore
+	}
+	defer rows.Close()
+	result := make([]achievementDef, 0)
+	for rows.Next() {
+		var a achievementDef
+		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.Points, &a.Icon); err != nil {
+			log.Printf("[gamification] GetAllAchievements scan failed: %v", err)
+			return nil, errStore
+		}
+		result = append(result, a)
+	}
+	return result, nil
 }
 
-func (e *GamificationEngine) GetCustomerAchievements(tenantID, customerID string) ([]Achievement, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	points := e.points[customerID]
-	unlocked := []Achievement{}
-	for _, achievement := range e.achievements {
-		if achievement.ID == "first_transfer" && len(e.history[customerID]) > 0 {
+func (e *GamificationEngine) GetCustomerAchievements(tenantID, customerID string) ([]achievementDef, error) {
+	if e.db == nil {
+		return nil, errStore
+	}
+	points, err := e.pointsOf(tenantID, customerID)
+	if err != nil {
+		return nil, err
+	}
+	var historyCount int
+	if err := e.db.QueryRow(
+		`SELECT COUNT(*) FROM gamification_points_history WHERE tenant_id = $1 AND customer_id = $2`,
+		normTenant(tenantID), customerID).Scan(&historyCount); err != nil {
+		log.Printf("[gamification] GetCustomerAchievements history count failed: %v", err)
+		return nil, errStore
+	}
+	catalog, err := e.GetAllAchievements(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	unlocked := []achievementDef{}
+	for _, achievement := range catalog {
+		if achievement.ID == "first_transfer" && historyCount > 0 {
 			achievement.UnlockedAt = time.Now().Format(time.RFC3339)
 			unlocked = append(unlocked, achievement)
 		}
@@ -821,78 +1093,197 @@ func (e *GamificationEngine) GetCustomerAchievements(tenantID, customerID string
 }
 
 func (e *GamificationEngine) GetCustomerBadges(tenantID, customerID string) ([]string, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return badgesForPoints(e.points[customerID]), nil
+	if e.db == nil {
+		return nil, errStore
+	}
+	points, err := e.pointsOf(tenantID, customerID)
+	if err != nil {
+		return nil, err
+	}
+	return badgesForPoints(points), nil
 }
 
-func (e *GamificationEngine) GetActiveChallenges(tenantID string) ([]Challenge, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return append([]Challenge(nil), e.challenges...), nil
-}
-
-func (e *GamificationEngine) GetCustomerChallenges(tenantID, customerID string) ([]Challenge, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	states := e.customerChallenges[customerID]
-	result := make([]Challenge, 0, len(e.challenges))
-	for _, challenge := range e.challenges {
-		if state, ok := states[challenge.ID]; ok {
-			result = append(result, state.Challenge)
-		} else {
-			result = append(result, challenge)
+func (e *GamificationEngine) GetActiveChallenges(tenantID string) ([]challengeDef, error) {
+	if e.db == nil {
+		return nil, errStore
+	}
+	rows, err := e.db.Query(`SELECT id, name, description, target, reward, expires_at, status FROM gamification_challenges ORDER BY id`)
+	if err != nil {
+		log.Printf("[gamification] GetActiveChallenges failed: %v", err)
+		return nil, errStore
+	}
+	defer rows.Close()
+	result := make([]challengeDef, 0)
+	for rows.Next() {
+		var c challengeDef
+		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Target, &c.Reward, &c.ExpiresAt, &c.Status); err != nil {
+			log.Printf("[gamification] GetActiveChallenges scan failed: %v", err)
+			return nil, errStore
 		}
+		result = append(result, c)
+	}
+	return result, nil
+}
+
+func (e *GamificationEngine) GetCustomerChallenges(tenantID, customerID string) ([]challengeDef, error) {
+	if e.db == nil {
+		return nil, errStore
+	}
+	// Catalog challenges LEFT JOIN per-customer state: joined customers see
+	// their persisted snapshot (progress/status), others see the catalog row.
+	rows, err := e.db.Query(
+		`SELECT c.id, c.name, c.description, c.target, c.reward, c.expires_at, c.status, cc.challenge
+		 FROM gamification_challenges c
+		 LEFT JOIN gamification_customer_challenges cc
+		   ON cc.challenge_id = c.id AND cc.tenant_id = $1 AND cc.customer_id = $2
+		 ORDER BY c.id`, normTenant(tenantID), customerID)
+	if err != nil {
+		log.Printf("[gamification] GetCustomerChallenges failed: %v", err)
+		return nil, errStore
+	}
+	defer rows.Close()
+	result := make([]challengeDef, 0)
+	for rows.Next() {
+		var c challengeDef
+		var snapshot []byte
+		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Target, &c.Reward, &c.ExpiresAt, &c.Status, &snapshot); err != nil {
+			log.Printf("[gamification] GetCustomerChallenges scan failed: %v", err)
+			return nil, errStore
+		}
+		if len(snapshot) > 0 {
+			var persisted challengeDef
+			if err := json.Unmarshal(snapshot, &persisted); err == nil {
+				c = persisted
+			}
+		}
+		result = append(result, c)
 	}
 	return result, nil
 }
 
 func (e *GamificationEngine) JoinChallenge(tenantID, customerID, challengeID string) (map[string]interface{}, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	challenge, ok := e.findChallenge(challengeID)
+	if e.db == nil {
+		return nil, errStore
+	}
+	challenge, ok, err := e.findChallenge(challengeID)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("challenge not found")
 	}
-	if e.customerChallenges[customerID] == nil {
-		e.customerChallenges[customerID] = map[string]*customerChallengeState{}
-	}
 	copied := challenge
 	copied.Progress = 0
-	e.customerChallenges[customerID][challengeID] = &customerChallengeState{Challenge: copied, Joined: true}
+	snapshot, _ := json.Marshal(copied)
+	// Idempotent join: re-joining replays cleanly (ON CONFLICT DO NOTHING).
+	if _, err := e.db.Exec(
+		`INSERT INTO gamification_customer_challenges (tenant_id, customer_id, challenge_id, progress, status, challenge)
+		 VALUES ($1, $2, $3, 0, 'active', $4)
+		 ON CONFLICT (tenant_id, customer_id, challenge_id) DO NOTHING`,
+		normTenant(tenantID), customerID, challengeID, string(snapshot)); err != nil {
+		log.Printf("[gamification] JoinChallenge failed: %v", err)
+		return nil, errStore
+	}
 	return map[string]interface{}{"joined": true, "challenge_id": challengeID}, nil
 }
 
 func (e *GamificationEngine) UpdateChallengeProgress(tenantID, customerID, challengeID string, progress int) (map[string]interface{}, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.customerChallenges[customerID] == nil || e.customerChallenges[customerID][challengeID] == nil {
+	if e.db == nil {
+		return nil, errStore
+	}
+	tenantID = normTenant(tenantID)
+	// Transactional: state row locked FOR UPDATE; completion reward is a
+	// balance upsert in the same tx, awarded ONLY on the transition into
+	// 'completed' (the pre-PG code re-credited the reward on every call while
+	// completed — money-like balances must not double-credit).
+	tx, err := e.db.Begin()
+	if err != nil {
+		log.Printf("[gamification] UpdateChallengeProgress begin tx failed: %v", err)
+		return nil, errStore
+	}
+	defer tx.Rollback()
+	var status string
+	var snapshot []byte
+	err = tx.QueryRow(
+		`SELECT status, challenge FROM gamification_customer_challenges
+		 WHERE tenant_id = $1 AND customer_id = $2 AND challenge_id = $3 FOR UPDATE`,
+		tenantID, customerID, challengeID).Scan(&status, &snapshot)
+	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("challenge not joined")
 	}
-	state := e.customerChallenges[customerID][challengeID]
-	state.Challenge.Progress = progress
-	completed := progress >= state.Challenge.Target
+	if err != nil {
+		log.Printf("[gamification] UpdateChallengeProgress load failed: %v", err)
+		return nil, errStore
+	}
+	var challenge challengeDef
+	if err := json.Unmarshal(snapshot, &challenge); err != nil {
+		log.Printf("[gamification] UpdateChallengeProgress snapshot decode failed: %v", err)
+		return nil, errStore
+	}
+	challenge.Progress = progress
+	completed := progress >= challenge.Target
+	newStatus := status
 	if completed {
-		state.Challenge.Status = "completed"
-		e.points[customerID] += state.Challenge.Reward
+		challenge.Status = "completed"
+		newStatus = "completed"
+	}
+	newSnapshot, _ := json.Marshal(challenge)
+	if _, err := tx.Exec(
+		`UPDATE gamification_customer_challenges
+		 SET progress = $4, status = $5, challenge = $6, updated_at = NOW()
+		 WHERE tenant_id = $1 AND customer_id = $2 AND challenge_id = $3`,
+		tenantID, customerID, challengeID, progress, newStatus, string(newSnapshot)); err != nil {
+		log.Printf("[gamification] UpdateChallengeProgress update failed: %v", err)
+		return nil, errStore
+	}
+	if completed && status != "completed" {
+		if _, err := tx.Exec(
+			`INSERT INTO gamification_points (tenant_id, customer_id, points)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (tenant_id, customer_id)
+			 DO UPDATE SET points = gamification_points.points + EXCLUDED.points, updated_at = NOW()`,
+			tenantID, customerID, challenge.Reward); err != nil {
+			log.Printf("[gamification] UpdateChallengeProgress reward failed: %v", err)
+			return nil, errStore
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("[gamification] UpdateChallengeProgress commit failed: %v", err)
+		return nil, errStore
 	}
 	return map[string]interface{}{"progress": progress, "completed": completed}, nil
 }
 
 func (e *GamificationEngine) GetRewardsCatalog(tenantID string) ([]map[string]interface{}, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	result := make([]map[string]interface{}, 0, len(e.rewardCatalog))
-	for _, reward := range e.rewardCatalog {
+	if e.db == nil {
+		return nil, errStore
+	}
+	rows, err := e.db.Query(`SELECT id, name, points_required, type FROM gamification_reward_catalog ORDER BY id`)
+	if err != nil {
+		log.Printf("[gamification] GetRewardsCatalog failed: %v", err)
+		return nil, errStore
+	}
+	defer rows.Close()
+	result := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var reward rewardCatalogEntry
+		if err := rows.Scan(&reward.ID, &reward.Name, &reward.PointsRequired, &reward.Type); err != nil {
+			log.Printf("[gamification] GetRewardsCatalog scan failed: %v", err)
+			return nil, errStore
+		}
 		result = append(result, map[string]interface{}{"id": reward.ID, "name": reward.Name, "points_required": reward.PointsRequired, "type": reward.Type})
 	}
 	return result, nil
 }
 
 func (e *GamificationEngine) GetRewardDetails(tenantID, rewardID string) (map[string]interface{}, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	reward, ok := e.findReward(rewardID)
+	if e.db == nil {
+		return nil, errStore
+	}
+	reward, ok, err := e.findReward(rewardID)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, fmt.Errorf("reward not found")
 	}
@@ -904,29 +1295,49 @@ func (e *GamificationEngine) GetLevels(tenantID string) ([]map[string]interface{
 }
 
 func (e *GamificationEngine) GetCustomerLevel(tenantID, customerID string) (map[string]interface{}, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	points := e.points[customerID]
+	if e.db == nil {
+		return nil, errStore
+	}
+	points, err := e.pointsOf(tenantID, customerID)
+	if err != nil {
+		return nil, err
+	}
 	nextLevel, pointsToNext := nextLevelForPoints(points)
 	return map[string]interface{}{"level": levelForPoints(points), "points": points, "next_level": nextLevel, "points_to_next": pointsToNext}, nil
 }
 
-func (e *GamificationEngine) findReward(rewardID string) (rewardCatalogEntry, bool) {
-	for _, reward := range e.rewardCatalog {
-		if reward.ID == rewardID {
-			return reward, true
-		}
+// findReward looks up a catalog reward in Postgres. The bool reports
+// existence; a non-nil error means the store failed (mapped to 503).
+func (e *GamificationEngine) findReward(rewardID string) (rewardCatalogEntry, bool, error) {
+	var reward rewardCatalogEntry
+	err := e.db.QueryRow(
+		`SELECT id, name, points_required, type FROM gamification_reward_catalog WHERE id = $1`, rewardID).
+		Scan(&reward.ID, &reward.Name, &reward.PointsRequired, &reward.Type)
+	if err == sql.ErrNoRows {
+		return rewardCatalogEntry{}, false, nil
 	}
-	return rewardCatalogEntry{}, false
+	if err != nil {
+		log.Printf("[gamification] findReward failed: %v", err)
+		return rewardCatalogEntry{}, false, errStore
+	}
+	return reward, true, nil
 }
 
-func (e *GamificationEngine) findChallenge(challengeID string) (Challenge, bool) {
-	for _, challenge := range e.challenges {
-		if challenge.ID == challengeID {
-			return challenge, true
-		}
+// findChallenge looks up a catalog challenge in Postgres (same contract as
+// findReward).
+func (e *GamificationEngine) findChallenge(challengeID string) (challengeDef, bool, error) {
+	var challenge challengeDef
+	err := e.db.QueryRow(
+		`SELECT id, name, description, target, reward, expires_at, status FROM gamification_challenges WHERE id = $1`, challengeID).
+		Scan(&challenge.ID, &challenge.Name, &challenge.Description, &challenge.Target, &challenge.Reward, &challenge.ExpiresAt, &challenge.Status)
+	if err == sql.ErrNoRows {
+		return challengeDef{}, false, nil
 	}
-	return Challenge{}, false
+	if err != nil {
+		log.Printf("[gamification] findChallenge failed: %v", err)
+		return challengeDef{}, false, errStore
+	}
+	return challenge, true, nil
 }
 
 func levelForPoints(points int) string {

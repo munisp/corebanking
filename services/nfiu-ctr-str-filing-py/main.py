@@ -605,6 +605,68 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
 
 
 app.add_middleware(JWTAuthMiddleware)
+# --- Permify authorization (W12-B5-P0-D2) ---
+# Every mutating handler performs a REAL Permify permission check AFTER
+# JWTAuthMiddleware has authenticated the caller. Subject = verified JWT sub,
+# tenant = verified tenant claim, resource = domain entity id, permission per
+# action (schema entities: services/auth-service/schemas/permify/
+# v2-kyc-compliance.fragment). FAIL-CLOSED: Permify unreachable/non-200 => 503;
+# denied => 403. Canonical pattern: services/auth-service/adapters/permify.py
+# check_permission (REST /v1/tenants/{tenant}/permissions/check).
+import logging as _permify_logging
+
+import httpx as _permify_httpx
+
+
+def _permify_http_post(url, payload):
+    """POST a Permify check; returns (status, json_body) or None on transport error."""
+    try:
+        resp = _permify_httpx.post(url, json=payload, timeout=5.0)
+        try:
+            return resp.status_code, resp.json()
+        except Exception:
+            return resp.status_code, None
+    except Exception as exc:
+        _permify_logger.error("permify check unreachable: %s", exc)
+        return None
+
+_PERMIFY_URL = os.getenv("PERMIFY_URL", "http://permify:3476").rstrip("/")
+_PERMIFY_DEFAULT_TENANT = os.getenv("PERMIFY_DEFAULT_TENANT", "bpmgd")
+_permify_logger = _permify_logging.getLogger(__name__)
+
+
+def permify_authorize(request, entity_type, entity_id, permission):
+    """Enforce <permission> on entity_type:entity_id for the JWT-verified caller.
+
+    Raises HTTPException(403) on denial and HTTPException(503) when Permify is
+    unreachable or errors (fail-closed). Returns True when allowed.
+    """
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    subject = claims.get("sub") or claims.get("keycloak_id") or ""
+    tenant_id = claims.get("tenant_id") or claims.get("tenant") or _PERMIFY_DEFAULT_TENANT
+    entity_id = str(entity_id or "")
+    if not subject or not entity_id:
+        raise HTTPException(status_code=403, detail="authorization context incomplete")
+    payload = {
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    }
+    url = f"{_PERMIFY_URL}/v1/tenants/{tenant_id}/permissions/check"
+    resp = _permify_http_post(url, payload)
+    if resp is None:
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify unreachable (fail-closed)")
+    status, body = resp
+    if status != 200:
+        _permify_logger.error("permify check %s on %s:%s http=%s", permission, entity_type, entity_id, status)
+        raise HTTPException(status_code=503, detail="authorization_unavailable: permify check failed (fail-closed)")
+    can = (body or {}).get("can")
+    allowed = can == "CHECK_RESULT_ALLOWED" or can is True
+    if not allowed:
+        raise HTTPException(status_code=403, detail=f"permify: {permission} denied on {entity_type}:{entity_id}")
+    return True
+
 
 
 app.add_middleware(
@@ -1021,6 +1083,7 @@ async def healthz():
 
 @app.post("/api/ctrs", status_code=201)
 async def create_ctr(
+    request: Request,
     body: CTRRequest,
     background_tasks: BackgroundTasks,
     tenant_id: str = Depends(require_tenant),
@@ -1036,6 +1099,7 @@ async def create_ctr(
 
     After creation, XML generation and NFIU submission run in the background.
     """
+    permify_authorize(request, "regulatory_filing", tenant_id, "file")
     threshold = (
         CTR_INDIVIDUAL_THRESHOLD_KOBO
         if body.customer_type == "individual"
@@ -1148,6 +1212,7 @@ async def intake_transaction_event(
         return {"created": False, "reason": "malformed_event"}
 
     tenant_id = data.get("tenantId") or data.get("tenant_id")
+    permify_authorize(request, "regulatory_filing", tenant_id, "file")
     amount_kobo = data.get("amountKobo") or data.get("amount_kobo")
     transaction_id = (
         data.get("reference") or data.get("transactionId") or data.get("transaction_id")
@@ -1220,6 +1285,7 @@ async def intake_transaction_event(
 
 @app.post("/api/strs", status_code=201)
 async def create_str(
+    request: Request,
     body: STRRequest,
     tenant_id: str = Depends(require_tenant),
     x_user_id: str = Header(default="system", alias="x-keycloak-id"),
@@ -1233,6 +1299,7 @@ async def create_str(
 
     Tipping-off restriction is enforced: the customer must not be informed.
     """
+    permify_authorize(request, "regulatory_filing", tenant_id, "file")
     pool = await get_pool()
     fiu_ref = next_ref("STR")
     str_id = uuid.uuid4()
@@ -1279,12 +1346,14 @@ async def create_str(
 
 @app.post("/api/strs/{str_id}/approve")
 async def approve_str(
+    request: Request,
     str_id: str,
     background_tasks: BackgroundTasks,
     tenant_id: str = Depends(require_tenant),
     x_user_id: str = Header(default="officer", alias="x-keycloak-id"),
 ):
     """Compliance officer approves an STR for submission to NFIU."""
+    permify_authorize(request, "regulatory_filing", str_id, "approve")
     pool = await get_pool()
     row = await pool.fetchrow(
         "SELECT status, sla_breached, filing_deadline FROM nfiu_strs WHERE id=$1 AND tenant_id=$2",
@@ -1422,10 +1491,12 @@ async def list_retention_policies(tenant_id: str = Depends(require_tenant)):
 
 @app.put("/api/retention/policies/{record_class}")
 async def upsert_retention_policy(
+    request: Request,
     record_class: str,
     body: RetentionPolicyUpdate,
     tenant_id: str = Depends(require_tenant),
 ):
+    permify_authorize(request, "regulatory_filing", record_class, "legal_hold")
     if record_class not in _PURGEABLE_TABLES:
         raise HTTPException(status_code=400, detail=f"unknown record_class {record_class}")
     pool = await get_pool()
@@ -1452,11 +1523,13 @@ async def list_destruction_certificates(
 
 @app.post("/api/ctrs/{ctr_id}/legal-hold")
 async def set_ctr_legal_hold(
+    request: Request,
     ctr_id: str,
     body: LegalHoldUpdate,
     tenant_id: str = Depends(require_tenant),
     x_user_id: str = Header(default="system", alias="x-keycloak-id"),
 ):
+    permify_authorize(request, "regulatory_filing", ctr_id, "legal_hold")
     pool = await get_pool()
     res = await pool.execute(
         "UPDATE nfiu_ctrs SET legal_hold=$1 WHERE id=$2 AND tenant_id=$3",
@@ -1476,11 +1549,13 @@ async def set_ctr_legal_hold(
 
 @app.post("/api/strs/{str_id}/legal-hold")
 async def set_str_legal_hold(
+    request: Request,
     str_id: str,
     body: LegalHoldUpdate,
     tenant_id: str = Depends(require_tenant),
     x_user_id: str = Header(default="system", alias="x-keycloak-id"),
 ):
+    permify_authorize(request, "regulatory_filing", str_id, "legal_hold")
     pool = await get_pool()
     res = await pool.execute(
         "UPDATE nfiu_strs SET legal_hold=$1 WHERE id=$2 AND tenant_id=$3",

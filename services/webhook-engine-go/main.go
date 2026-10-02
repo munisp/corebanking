@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 // sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
@@ -54,9 +57,112 @@ type WebhookDelivery struct {
 	DeliveredAt  string `json:"deliveredAt"`
 }
 
-var endpoints = []WebhookEndpoint{}
+// ── Postgres persistence (W12 C3-P2-B5) ─────────────────────────────────────
+// The in-memory endpoints/deliveries slices were removed. PG is authoritative
+// (register proposed a single `webhooks` name for two distinct shapes — split
+// into per-domain `webhooks` + `webhook_deliveries`). Reads are served from
+// PG; when DATABASE_URL is unset/unreachable the endpoints fail closed (503).
+// (Read-only service: endpoint/delivery registration is performed by the
+// provisioning pipeline, no mutation endpoints exist here.)
 
-var deliveries = []WebhookDelivery{}
+var db *sql.DB
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[webhook-engine-go] DATABASE_URL not set — webhook endpoints fail closed (503)")
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[webhook-engine-go] DB open failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[webhook-engine-go] DB ping failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS webhooks (
+		id TEXT PRIMARY KEY,
+		tenant_id TEXT NOT NULL DEFAULT '',
+		url TEXT NOT NULL DEFAULT '',
+		events JSONB NOT NULL DEFAULT '[]',
+		secret TEXT NOT NULL DEFAULT '',
+		active BOOLEAN NOT NULL DEFAULT TRUE,
+		version TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		log.Printf("[webhook-engine-go] webhooks DDL failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	if _, err = db.Exec(`CREATE TABLE IF NOT EXISTS webhook_deliveries (
+		id TEXT PRIMARY KEY,
+		endpoint_id TEXT NOT NULL DEFAULT '',
+		event_type TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT '',
+		http_status INT NOT NULL DEFAULT 0,
+		attempts INT NOT NULL DEFAULT 0,
+		response_time_ms INT NOT NULL DEFAULT 0,
+		delivered_at TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[webhook-engine-go] deliveries DDL failed: %v — endpoints fail closed (503)", err)
+		db = nil
+		return
+	}
+	log.Printf("[webhook-engine-go] Postgres connected (pool: 10/2), webhooks + webhook_deliveries ready")
+}
+
+func listWebhookEndpoints() ([]WebhookEndpoint, error) {
+	rows, err := db.Query(`SELECT id, tenant_id, url, events, secret, active, version, created_at FROM webhooks ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []WebhookEndpoint{}
+	for rows.Next() {
+		var e WebhookEndpoint
+		var events []byte
+		if err := rows.Scan(&e.ID, &e.TenantID, &e.URL, &events, &e.Secret, &e.Active, &e.Version, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.Events = []string{}
+		_ = json.Unmarshal(events, &e.Events)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func listWebhookDeliveries() ([]WebhookDelivery, error) {
+	rows, err := db.Query(`SELECT id, endpoint_id, event_type, status, http_status, attempts, response_time_ms, delivered_at
+		FROM webhook_deliveries ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []WebhookDelivery{}
+	for rows.Next() {
+		var d WebhookDelivery
+		if err := rows.Scan(&d.ID, &d.EndpointID, &d.EventType, &d.Status, &d.HTTPStatus, &d.Attempts, &d.ResponseTime, &d.DeliveredAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func storeUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(503)
+	json.NewEncoder(w).Encode(map[string]string{"error": "webhook store unavailable (postgres down)"})
+}
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
 
@@ -233,6 +339,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initDB()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -245,7 +352,17 @@ func main() {
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/endpoints", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/endpoints", permifyAuthzGuard("webhook_subscription", "endpoints", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			storeUnavailable(w)
+			return
+		}
+		endpoints, err := listWebhookEndpoints()
+		if err != nil {
+			log.Printf("[webhook-engine-go] endpoints list failed: %v", err)
+			storeUnavailable(w)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		active := 0
 		for _, e := range endpoints {
@@ -254,9 +371,19 @@ func main() {
 			}
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"items": endpoints, "total": len(endpoints), "active": active})
-	})
+	}))
 
-	mux.HandleFunc("/v1/deliveries", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/deliveries", permifyAuthzGuard("webhook_subscription", "deliveries", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			storeUnavailable(w)
+			return
+		}
+		deliveries, err := listWebhookDeliveries()
+		if err != nil {
+			log.Printf("[webhook-engine-go] deliveries list failed: %v", err)
+			storeUnavailable(w)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		delivered := 0
 		for _, d := range deliveries {
@@ -265,9 +392,25 @@ func main() {
 			}
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"items": deliveries, "total": len(deliveries), "delivered": delivered, "failed": len(deliveries) - delivered})
-	})
+	}))
 
-	mux.HandleFunc("/v1/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/stats", permifyAuthzGuard("webhook_subscription", "view", func(w http.ResponseWriter, r *http.Request) {
+		if db == nil {
+			storeUnavailable(w)
+			return
+		}
+		endpoints, err := listWebhookEndpoints()
+		if err != nil {
+			log.Printf("[webhook-engine-go] stats endpoints query failed: %v", err)
+			storeUnavailable(w)
+			return
+		}
+		deliveries, err := listWebhookDeliveries()
+		if err != nil {
+			log.Printf("[webhook-engine-go] stats deliveries query failed: %v", err)
+			storeUnavailable(w)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		active := 0
 		for _, e := range endpoints {
@@ -294,7 +437,7 @@ func main() {
 			"avg_response_time_ms":  avgRT,
 			"delivery_success_rate": fmt.Sprintf("%.1f%%", float64(delivered)/float64(len(deliveries))*100),
 		})
-	})
+	}))
 
 	log.Printf("webhook-engine-go listening on :%s", port)
 	log.Fatal((&http.Server{Addr: fmt.Sprintf(":%s", port), Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())

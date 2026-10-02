@@ -1,7 +1,24 @@
 /**
  * Limit management — transaction limits, channel limits, customer tier limits.
  * Enforces CBN-mandated daily/weekly/monthly ceilings per customer tier and channel.
+ *
+ * W12-C3-P2-MLIB (c3-1005): the 'limits' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `limits`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "limits";
+
+async function ensureLimitsStore(): Promise<void> {
+  await ensureTables("ensureLimitsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, LIMITS_SEED, () => "");
+}
+
 
 export interface TransactionLimit {
   id: string;
@@ -32,7 +49,8 @@ export interface LimitUtilization {
   lastTransaction: string;
 }
 
-const limits: TransactionLimit[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const LIMITS_SEED: TransactionLimit[]  = [
   { id: "TL-001", name: "Tier 1 Mobile", tier: "Tier 1", channel: "mobile", dailyLimit: 50_000, singleTransactionLimit: 50_000, weeklyLimit: 300_000, monthlyLimit: 300_000, currency: "NGN", status: "active", effectiveDate: "2026-01-01" },
   { id: "TL-002", name: "Tier 1 USSD", tier: "Tier 1", channel: "ussd", dailyLimit: 50_000, singleTransactionLimit: 50_000, weeklyLimit: 300_000, monthlyLimit: 300_000, currency: "NGN", status: "active", effectiveDate: "2026-01-01" },
   { id: "TL-003", name: "Tier 2 Mobile", tier: "Tier 2", channel: "mobile", dailyLimit: 200_000, singleTransactionLimit: 200_000, weeklyLimit: 1_000_000, monthlyLimit: 5_000_000, currency: "NGN", status: "active", effectiveDate: "2026-01-01" },
@@ -50,10 +68,13 @@ const utilizations: LimitUtilization[] = [
   { id: "LU-004", customerId: "CUST-050", customerName: "Zenith Construction Ltd", tier: "Corporate", channel: "api", dailyUsed: 125_000_000, dailyLimit: 500_000_000, dailyPct: 25, weeklyUsed: 680_000_000, weeklyLimit: 2_000_000_000, weeklyPct: 34, lastTransaction: "2026-05-09T15:00:00Z" },
 ];
 
-export function getTransactionLimits() { return limits; }
+export async function getTransactionLimits(): Promise<TransactionLimit[]> {
+  return pgGuard((async () => { await ensureLimitsStore(); return storeList<TransactionLimit>(TABLE); })());
+}
 export function getLimitUtilizations() { return utilizations; }
 
-export function checkLimit(tier: string, channel: string, amount: number): { allowed: boolean; reason?: string } {
+export async function checkLimit(tier: string, channel: string, amount: number): Promise<{ allowed: boolean; reason?: string }> {
+  const limits = await getTransactionLimits();
   const limit = limits.find((l) => l.tier === tier && l.channel === channel && l.status === "active");
   if (!limit) return { allowed: false, reason: `No limit configured for ${tier}/${channel}` };
   if (amount > limit.singleTransactionLimit) return { allowed: false, reason: `Amount ₦${amount.toLocaleString()} exceeds single transaction limit ₦${limit.singleTransactionLimit.toLocaleString()}` };

@@ -11,8 +11,8 @@ import (
 // ScheduleService handles schedule and leave operations
 type ScheduleService struct {
 	tenantID      string
-	schedules     map[string]*StaffSchedule
-	leaveRequests map[string]*LeaveRequest
+	schedules     *repo[StaffSchedule]
+	leaveRequests *repo[LeaveRequest]
 	mu            sync.RWMutex
 }
 
@@ -20,18 +20,20 @@ type ScheduleService struct {
 func NewScheduleService(tenantID string) *ScheduleService {
 	return &ScheduleService{
 		tenantID:      tenantID,
-		schedules:     make(map[string]*StaffSchedule),
-		leaveRequests: make(map[string]*LeaveRequest),
+		schedules:     newRepo[StaffSchedule](serviceDB, "staff_schedules"),
+		leaveRequests: newRepo[LeaveRequest](serviceDB, "leave_requests"),
 	}
 }
 
 // ListSchedules returns schedules based on filters
-func (s *ScheduleService) ListSchedules(tenantID, branchID, date string) []*StaffSchedule {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ScheduleService) ListSchedules(tenantID, branchID, date string) ([]*StaffSchedule, error) {
 
 	var result []*StaffSchedule
-	for _, schedule := range s.schedules {
+	__ALL__, __ERR__ := s.schedules.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, schedule := range __ALL__ {
 		if schedule.TenantID != tenantID {
 			continue
 		}
@@ -46,16 +48,14 @@ func (s *ScheduleService) ListSchedules(tenantID, branchID, date string) []*Staf
 		}
 		result = append(result, schedule)
 	}
-	return result
+	return result, nil
 }
 
 // GetSchedule retrieves a schedule by ID
 func (s *ScheduleService) GetSchedule(tenantID, scheduleID string) (*StaffSchedule, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	schedule, exists := s.schedules[scheduleID]
-	if !exists || schedule.TenantID != tenantID {
+	schedule, err := s.schedules.get(tenantID, scheduleID)
+	if err != nil {
 		return nil, errors.New("schedule not found")
 	}
 	return schedule, nil
@@ -63,8 +63,6 @@ func (s *ScheduleService) GetSchedule(tenantID, scheduleID string) (*StaffSchedu
 
 // CreateSchedule creates a new schedule
 func (s *ScheduleService) CreateSchedule(tenantID, branchID, userID string, req *CreateScheduleRequest) (*StaffSchedule, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	schedDate, err := time.Parse("2006-01-02", req.ScheduleDate)
 	if err != nil {
@@ -88,46 +86,38 @@ func (s *ScheduleService) CreateSchedule(tenantID, branchID, userID string, req 
 		UpdatedAt:    time.Now(),
 	}
 
-	s.schedules[schedule.ScheduleID] = schedule
+	if err := s.schedules.put(tenantID, schedule.ScheduleID, schedule); err != nil {
+		return nil, err
+	}
 	return schedule, nil
 }
 
 // UpdateSchedule updates a schedule
 func (s *ScheduleService) UpdateSchedule(schedule *StaffSchedule) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.schedules[schedule.ScheduleID]
-	if !exists || existing.TenantID != schedule.TenantID {
+	existing, err := s.schedules.get(schedule.TenantID, schedule.ScheduleID)
+	if err != nil {
 		return errors.New("schedule not found")
 	}
 
 	schedule.CreatedAt = existing.CreatedAt
 	schedule.CreatedBy = existing.CreatedBy
 	schedule.UpdatedAt = time.Now()
-	s.schedules[schedule.ScheduleID] = schedule
-	return nil
+	return s.schedules.put(schedule.TenantID, schedule.ScheduleID, schedule)
 }
 
 // UpdateScheduleStatus updates schedule status
 func (s *ScheduleService) UpdateScheduleStatus(tenantID, scheduleID, status string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	schedule, exists := s.schedules[scheduleID]
-	if !exists || schedule.TenantID != tenantID {
-		return errors.New("schedule not found")
-	}
-
-	schedule.Status = status
-	schedule.UpdatedAt = time.Now()
-	return nil
+	_, err := s.schedules.update(tenantID, scheduleID, func(schedule *StaffSchedule) error {
+		schedule.Status = status
+		schedule.UpdatedAt = time.Now()
+		return nil
+	})
+	return err
 }
 
 // GetWeeklySchedule returns weekly schedule
-func (s *ScheduleService) GetWeeklySchedule(tenantID, branchID, startDate string) map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ScheduleService) GetWeeklySchedule(tenantID, branchID, startDate string) (map[string]interface{}, error) {
 
 	var start time.Time
 	if startDate != "" {
@@ -149,7 +139,11 @@ func (s *ScheduleService) GetWeeklySchedule(tenantID, branchID, startDate string
 		weeklySchedule[dayStr] = []*StaffSchedule{}
 	}
 
-	for _, schedule := range s.schedules {
+	__ALL__, __ERR__ := s.schedules.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, schedule := range __ALL__ {
 		if schedule.TenantID != tenantID {
 			continue
 		}
@@ -167,7 +161,7 @@ func (s *ScheduleService) GetWeeklySchedule(tenantID, branchID, startDate string
 		"startDate": start.Format("2006-01-02"),
 		"endDate":   end.Format("2006-01-02"),
 		"schedule":  weeklySchedule,
-	}
+	}, nil
 }
 
 // GenerateSchedule auto-generates schedules for a date range
@@ -181,7 +175,10 @@ func (s *ScheduleService) GenerateSchedule(tenantID, branchID, userID, startDate
 		return nil, errors.New("invalid end date")
 	}
 
-	staff := staffService.ListStaff(tenantID, branchID, "", "active")
+	staff, err := staffService.ListStaff(tenantID, branchID, "", "active")
+	if err != nil {
+		return nil, err
+	}
 	if len(staff) == 0 {
 		return nil, errors.New("no active staff found")
 	}
@@ -237,9 +234,9 @@ func (s *ScheduleService) GenerateSchedule(tenantID, branchID, userID, startDate
 				UpdatedAt:    time.Now(),
 			}
 
-			s.mu.Lock()
-			s.schedules[schedule.ScheduleID] = schedule
-			s.mu.Unlock()
+			if err := s.schedules.put(tenantID, schedule.ScheduleID, schedule); err != nil {
+				return nil, err
+			}
 
 			schedules = append(schedules, schedule)
 		}
@@ -249,12 +246,14 @@ func (s *ScheduleService) GenerateSchedule(tenantID, branchID, userID, startDate
 }
 
 // ListLeaveRequests returns leave requests
-func (s *ScheduleService) ListLeaveRequests(tenantID, branchID, status string) []*LeaveRequest {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *ScheduleService) ListLeaveRequests(tenantID, branchID, status string) ([]*LeaveRequest, error) {
 
 	var result []*LeaveRequest
-	for _, req := range s.leaveRequests {
+	__ALL__, __ERR__ := s.leaveRequests.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, req := range __ALL__ {
 		if req.TenantID != tenantID {
 			continue
 		}
@@ -266,16 +265,14 @@ func (s *ScheduleService) ListLeaveRequests(tenantID, branchID, status string) [
 		}
 		result = append(result, req)
 	}
-	return result
+	return result, nil
 }
 
 // GetLeaveRequest retrieves a leave request
 func (s *ScheduleService) GetLeaveRequest(tenantID, requestID string) (*LeaveRequest, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	req, exists := s.leaveRequests[requestID]
-	if !exists || req.TenantID != tenantID {
+	req, err := s.leaveRequests.get(tenantID, requestID)
+	if err != nil {
 		return nil, errors.New("leave request not found")
 	}
 	return req, nil
@@ -283,8 +280,6 @@ func (s *ScheduleService) GetLeaveRequest(tenantID, requestID string) (*LeaveReq
 
 // CreateLeaveRequest creates a new leave request
 func (s *ScheduleService) CreateLeaveRequest(tenantID, branchID string, req *CreateLeaveRequest, staffService *StaffService) (*LeaveRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	startDate, err := time.Parse("2006-01-02", req.StartDate)
 	if err != nil {
@@ -320,73 +315,57 @@ func (s *ScheduleService) CreateLeaveRequest(tenantID, branchID string, req *Cre
 		UpdatedAt: time.Now(),
 	}
 
-	s.leaveRequests[leaveReq.RequestID] = leaveReq
+	if err := s.leaveRequests.put(tenantID, leaveReq.RequestID, leaveReq); err != nil {
+		return nil, err
+	}
 	return leaveReq, nil
 }
 
 // ApproveLeaveRequest approves a leave request
 func (s *ScheduleService) ApproveLeaveRequest(tenantID, requestID, userID string) (*LeaveRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.leaveRequests.update(tenantID, requestID, func(req *LeaveRequest) error {
+		if req.Status != "pending" {
+			return errors.New("can only approve pending requests")
+		}
 
-	req, exists := s.leaveRequests[requestID]
-	if !exists || req.TenantID != tenantID {
-		return nil, errors.New("leave request not found")
-	}
+		now := time.Now()
+		req.Status = "approved"
+		req.ApprovedBy = userID
+		req.ApprovedAt = &now
+		req.UpdatedAt = time.Now()
 
-	if req.Status != "pending" {
-		return nil, errors.New("can only approve pending requests")
-	}
-
-	now := time.Now()
-	req.Status = "approved"
-	req.ApprovedBy = userID
-	req.ApprovedAt = &now
-	req.UpdatedAt = time.Now()
-
-	return req, nil
+		return nil
+	})
 }
 
 // RejectLeaveRequest rejects a leave request
 func (s *ScheduleService) RejectLeaveRequest(tenantID, requestID, userID, reason string) (*LeaveRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.leaveRequests.update(tenantID, requestID, func(req *LeaveRequest) error {
+		if req.Status != "pending" {
+			return errors.New("can only reject pending requests")
+		}
 
-	req, exists := s.leaveRequests[requestID]
-	if !exists || req.TenantID != tenantID {
-		return nil, errors.New("leave request not found")
-	}
+		now := time.Now()
+		req.Status = "rejected"
+		req.ApprovedBy = userID
+		req.ApprovedAt = &now
+		req.RejectionNote = reason
+		req.UpdatedAt = time.Now()
 
-	if req.Status != "pending" {
-		return nil, errors.New("can only reject pending requests")
-	}
-
-	now := time.Now()
-	req.Status = "rejected"
-	req.ApprovedBy = userID
-	req.ApprovedAt = &now
-	req.RejectionNote = reason
-	req.UpdatedAt = time.Now()
-
-	return req, nil
+		return nil
+	})
 }
 
 // CancelLeaveRequest cancels a leave request
 func (s *ScheduleService) CancelLeaveRequest(tenantID, requestID string) (*LeaveRequest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.leaveRequests.update(tenantID, requestID, func(req *LeaveRequest) error {
+		if req.Status != "pending" && req.Status != "approved" {
+			return errors.New("cannot cancel this request")
+		}
 
-	req, exists := s.leaveRequests[requestID]
-	if !exists || req.TenantID != tenantID {
-		return nil, errors.New("leave request not found")
-	}
+		req.Status = "cancelled"
+		req.UpdatedAt = time.Now()
 
-	if req.Status != "pending" && req.Status != "approved" {
-		return nil, errors.New("cannot cancel this request")
-	}
-
-	req.Status = "cancelled"
-	req.UpdatedAt = time.Now()
-
-	return req, nil
+		return nil
+	})
 }

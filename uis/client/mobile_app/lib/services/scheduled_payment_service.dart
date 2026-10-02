@@ -1,10 +1,42 @@
+import 'package:dio/dio.dart' show Response;
+
+import '../config/app_config.dart';
 import '../models/scheduled_payment.dart';
 import 'api_service.dart';
 
+// W12-A4B: scheduled payments are served by standing-orders-go
+// (AppConfig.scheduledPaymentEndpoint = /standing-orders/v1/standing-orders).
+// The backend model is a recurring StandingOrder — payload mapping happens
+// here, not in the backend.
 class ScheduledPaymentService {
   final ApiService _apiService;
 
   ScheduledPaymentService(this._apiService);
+
+  /// Maps a standing-orders-go StandingOrder (camelCase) to the snake_case
+  /// map [ScheduledPayment.fromJson] expects.
+  static Map<String, dynamic> _fromStandingOrder(Map<String, dynamic> so) {
+    String? emptyToNull(dynamic v) => (v == null || v.toString().isEmpty) ? null : v.toString();
+    return {
+      'id': so['id'] ?? '',
+      'user_id': so['userId'] ?? '',
+      'account_id': so['accountId'] ?? '',
+      'recipient_name': so['beneficiaryName'] ?? '',
+      'recipient_account': so['beneficiaryId'] ?? '',
+      'recipient_bank': so['recipient_bank'] ?? '',
+      'amount': so['amount'] ?? 0.0,
+      'frequency': so['frequency'] == 'annually' ? 'yearly' : (so['frequency'] ?? 'once'),
+      'start_date': so['startDate'],
+      'end_date': emptyToNull(so['endDate']),
+      'description': so['narration'],
+      'status': so['status'] ?? 'active',
+      'last_execution_date': emptyToNull(so['lastExecutedAt']),
+      'next_execution_date': emptyToNull(so['nextExecutionAt']),
+      'execution_count': so['executionCount'] ?? 0,
+      'max_executions': (so['maxExecutions'] ?? 0) == 0 ? null : so['maxExecutions'],
+      'created_at': so['createdAt'],
+    };
+  }
 
   // Create scheduled payment
   Future<Map<String, dynamic>> createScheduledPayment({
@@ -20,29 +52,29 @@ class ScheduledPaymentService {
     int? maxExecutions,
   }) async {
     try {
-      final response = await _apiService.post('/payment-processing/scheduled-payments', data: {
-        'account_id': accountId,
-        'recipient_name': recipientName,
-        'recipient_account': recipientAccount,
-        'recipient_bank': recipientBank,
+      final response = await _apiService.post(AppConfig.scheduledPaymentEndpoint, data: {
+        'accountId': accountId,
+        'beneficiaryName': recipientName,
+        'beneficiaryId': recipientAccount,
         'amount': amount,
-        'frequency': frequency,
-        'start_date': startDate.toIso8601String(),
-        'end_date': endDate?.toIso8601String(),
-        'description': description,
-        'max_executions': maxExecutions,
+        // standing-orders-go accepts daily|weekly|biweekly|monthly|quarterly|annually
+        'frequency': frequency == 'yearly' ? 'annually' : frequency,
+        'startDate': startDate.toIso8601String().substring(0, 10),
+        'endDate': endDate == null ? '' : endDate.toIso8601String().substring(0, 10),
+        'narration': description ?? 'Scheduled payment to $recipientName',
+        'maxExecutions': maxExecutions ?? 0,
       });
 
-      if (response.data['success'] == true) {
+      if (response.statusCode == 201 && response.data is Map && response.data['id'] != null) {
         return {
           'success': true,
-          'message': response.data['message'] ?? 'Scheduled payment created successfully',
-          'data': response.data['data'],
+          'message': 'Scheduled payment created successfully',
+          'data': ScheduledPayment.fromJson(_fromStandingOrder(Map<String, dynamic>.from(response.data as Map))),
         };
       } else {
         return {
           'success': false,
-          'message': response.data['message'] ?? 'Failed to create scheduled payment',
+          'message': (response.data is Map ? response.data['error'] : null) ?? 'Failed to create scheduled payment',
         };
       }
     } catch (e) {
@@ -56,21 +88,19 @@ class ScheduledPaymentService {
   // Get all scheduled payments
   Future<List<ScheduledPayment>> getScheduledPayments({String? accountId, String? status}) async {
     try {
-      String endpoint = '/payment-processing/scheduled-payments';
-      final params = <String>[];
-      
-      if (accountId != null) params.add('account_id=$accountId');
-      if (status != null) params.add('status=$status');
-      
-      if (params.isNotEmpty) {
-        endpoint += '?${params.join('&')}';
-      }
+      // W12-A4B: standing-orders-go GET /v1/standing-orders ->
+      // { items: [...], total }. No server-side filtering; filter the real
+      // result set client-side.
+      final response = await _apiService.get(AppConfig.scheduledPaymentEndpoint);
 
-      final response = await _apiService.get(endpoint);
-
-      if (response.data['success'] == true) {
-        final paymentsData = response.data['data'] as List;
-        return paymentsData.map((json) => ScheduledPayment.fromJson(json)).toList();
+      if (response.statusCode == 200 && response.data is Map) {
+        final items = (response.data['items'] ?? []) as List;
+        var payments = items
+            .map((json) => ScheduledPayment.fromJson(_fromStandingOrder(Map<String, dynamic>.from(json as Map))))
+            .toList();
+        if (accountId != null) payments = payments.where((p) => p.accountId == accountId).toList();
+        if (status != null) payments = payments.where((p) => p.status == status).toList();
+        return payments;
       }
       return [];
     } catch (e) {
@@ -84,19 +114,31 @@ class ScheduledPaymentService {
     required String status,
   }) async {
     try {
-      final response = await _apiService.put('/payment-processing/scheduled-payments/$paymentId/status', data: {
-        'status': status,
-      });
+      // W12-A4B: no status-update route exists; map to standing-orders-go
+      // pause/resume/cancel endpoints (orderId body / ?id= query).
+      final Response response;
+      if (status == 'paused') {
+        response = await _apiService.post('${AppConfig.scheduledPaymentEndpoint}/pause', data: {'orderId': paymentId});
+      } else if (status == 'active') {
+        response = await _apiService.post('${AppConfig.scheduledPaymentEndpoint}/resume', data: {'orderId': paymentId});
+      } else if (status == 'cancelled') {
+        response = await _apiService.delete('${AppConfig.scheduledPaymentEndpoint}/order', queryParameters: {'id': paymentId});
+      } else {
+        return {
+          'success': false,
+          'message': 'Unsupported status transition: $status',
+        };
+      }
 
-      if (response.data['success'] == true) {
+      if (response.statusCode == 200 && response.data is Map && response.data['status'] == status) {
         return {
           'success': true,
-          'message': response.data['message'] ?? 'Status updated successfully',
+          'message': 'Status updated successfully',
         };
       } else {
         return {
           'success': false,
-          'message': response.data['message'] ?? 'Failed to update status',
+          'message': (response.data is Map ? response.data['error'] : null) ?? 'Failed to update status',
         };
       }
     } catch (e) {
@@ -110,17 +152,19 @@ class ScheduledPaymentService {
   // Delete scheduled payment
   Future<Map<String, dynamic>> deleteScheduledPayment(String paymentId) async {
     try {
-      final response = await _apiService.delete('/payment-processing/scheduled-payments/$paymentId');
+      // W12-A4B: soft-cancel via the new standing-orders-go
+      // DELETE /v1/standing-orders/order?id=... handler.
+      final response = await _apiService.delete('${AppConfig.scheduledPaymentEndpoint}/order', queryParameters: {'id': paymentId});
 
-      if (response.data['success'] == true) {
+      if (response.statusCode == 200 && response.data is Map && response.data['status'] == 'cancelled') {
         return {
           'success': true,
-          'message': response.data['message'] ?? 'Scheduled payment deleted successfully',
+          'message': 'Scheduled payment deleted successfully',
         };
       } else {
         return {
           'success': false,
-          'message': response.data['message'] ?? 'Failed to delete scheduled payment',
+          'message': (response.data is Map ? response.data['error'] : null) ?? 'Failed to delete scheduled payment',
         };
       }
     } catch (e) {
@@ -134,10 +178,12 @@ class ScheduledPaymentService {
   // Get scheduled payment details
   Future<ScheduledPayment?> getPaymentDetails(String paymentId) async {
     try {
-      final response = await _apiService.get('/payment-processing/scheduled-payments/$paymentId');
+      // W12-A4B: item fetch via the new standing-orders-go
+      // GET /v1/standing-orders/order?id=... handler (raw StandingOrder JSON).
+      final response = await _apiService.get('${AppConfig.scheduledPaymentEndpoint}/order', queryParameters: {'id': paymentId});
 
-      if (response.data['success'] == true) {
-        return ScheduledPayment.fromJson(response.data['data']);
+      if (response.statusCode == 200 && response.data is Map && response.data['id'] != null) {
+        return ScheduledPayment.fromJson(_fromStandingOrder(Map<String, dynamic>.from(response.data as Map)));
       }
       return null;
     } catch (e) {

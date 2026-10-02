@@ -1,7 +1,24 @@
 /**
  * Channel management — mobile, internet, USSD, ATM, POS, branch, agent banking.
  * Real-time status monitoring, uptime tracking, transaction volumes.
+ *
+ * W12-C3-P2-MLIB (c3-0993): the 'channels' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `channels`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "channels";
+
+async function ensureChannelsStore(): Promise<void> {
+  await ensureTables("ensureChannelsStore", storeDDL(TABLE));
+  await storeSeed(TABLE, CHANNELS_SEED, () => "");
+}
+
 
 export interface Channel {
   id: string;
@@ -19,7 +36,8 @@ export interface Channel {
   endpoints: number;
 }
 
-const channels: Channel[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const CHANNELS_SEED: Channel[]  = [
   { id: "CH-001", name: "Mobile Banking App", type: "mobile_app", status: "online", uptime30d: 99.92, currentTPS: 245, peakTPS: 1_200, dailyTransactions: 850_000, dailyVolume: 42_500_000_000, activeUsers: 2_100_000, version: "4.2.1", endpoints: 48 },
   { id: "CH-002", name: "Internet Banking Portal", type: "internet_banking", status: "online", uptime30d: 99.85, currentTPS: 120, peakTPS: 600, dailyTransactions: 320_000, dailyVolume: 68_000_000_000, activeUsers: 450_000, version: "3.8.0", endpoints: 35 },
   { id: "CH-003", name: "USSD (*901#)", type: "ussd", status: "online", uptime30d: 99.97, currentTPS: 380, peakTPS: 2_000, dailyTransactions: 1_200_000, dailyVolume: 18_000_000_000, activeUsers: 5_800_000, endpoints: 12 },
@@ -30,9 +48,12 @@ const channels: Channel[] = [
   { id: "CH-008", name: "Open Banking API", type: "api", status: "online", uptime30d: 99.98, currentTPS: 550, peakTPS: 3_000, dailyTransactions: 2_200_000, dailyVolume: 35_000_000_000, activeUsers: 180, version: "2.1.0", endpoints: 62 },
 ];
 
-export function getChannels() { return channels; }
+export async function getChannels(): Promise<Channel[]> {
+  return pgGuard((async () => { await ensureChannelsStore(); return storeList<Channel>(TABLE); })());
+}
 
-export function getChannelSummary() {
+export async function getChannelSummary() {
+  const channels = await getChannels();
   let totalDailyTxn = 0;
   let totalDailyVol = 0;
   let totalActiveUsers = 0;

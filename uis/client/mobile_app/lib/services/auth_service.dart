@@ -158,8 +158,10 @@ class AuthService {
     );
 
     // Setup password
+    // W12-A4A: prefix bug — endpoint exists at auth-service /auth/setup-password
+    // (api/v1/auth.py:173); gateway strips the first /auth segment.
     await _apiService.post(
-      '${AppConfig.authEndpoint}/setup-password',
+      '${AppConfig.authEndpoint}/auth/setup-password',
       data: {
         "password": password,
         "confirm_password": password,
@@ -191,7 +193,7 @@ class AuthService {
   // Logout
   Future<void> logout() async {
     try {
-      await _apiService.post('${AppConfig.authEndpoint}/logout');
+      await _apiService.post('${AppConfig.authEndpoint}/auth/logout');
     } catch (e) {
       // Continue with local logout even if API call fails
     } finally {
@@ -261,13 +263,13 @@ class AuthService {
   // Verify email
   Future<void> verifyEmail(String token) async {
     await _apiService.post(
-      '${AppConfig.authEndpoint}/verify-email',
+      '${AppConfig.authEndpoint}/auth/verify-email',
       data: {'token': token},
     );
   }
 
   // Resend verification email
   Future<void> resendVerificationEmail() async {
-    await _apiService.post('${AppConfig.authEndpoint}/resend-verification');
+    await _apiService.post('${AppConfig.authEndpoint}/auth/resend-verification');
   }
 }

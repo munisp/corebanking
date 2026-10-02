@@ -22,10 +22,10 @@ export const APISIX = {
   // ── Operations ────────────────────────────────────────────────────────────
   ACCOUNT:              "/account",               // account-service :80
   TELLER:               "/teller",                // teller-service :80
-  TELLER_OPERATIONS:    "/teller",                // merged → teller-service :80
+  TELLER_OPERATIONS:    "/teller-operations",     // teller-operations-go :8080
   BRANCH_OPERATIONS:    "/branch-manager",        // merged → branch-manager-service :80
   BRANCH_MANAGER:       "/branch-manager",        // branch-manager-service :80
-  ATM:                  "/account",               // no dedicated APISIX route — routed via account-service
+  ATM:                  "/atm-management",        // W12-A4-P0-D: dedicated route — atm-management-go (was wrongly routed via account-service)
   CARD:                 "/card",                  // card-service :80
   CARD_MANAGEMENT:      "/card",                  // merged → card-service :80
   POS:                  "/pos",                   // pos-terminal-go :8901
@@ -138,6 +138,15 @@ export const APISIX = {
   GNN_FRAUD:            "/fraud-detection",       // merged → fraud-service :8000
   ANOMALY_DETECTOR:     "/fraud-detection",       // merged → fraud-service :8000
   TXN_MONITORING:       "/txn-monitoring-rules",  // txn-monitoring-rules-rs :8285
+  // ── W12 A4-P1-A: dedicated prefixes for previously-orphaned money-path services ──
+  BILLING_ENGINE:       "/billings",              // billing-service :80 (billings.yaml → /billing/$1)
+  MERCHANT:             "/merchant",              // merchant-service :80
+  CREDIT_SERVICE:       "/credit",                // credit-service :80
+  CREDIT_SCORING_PY:    "/credit-scoring",        // credit-scoring-py :80
+  CLEARING_OPS:         "/banking-clearing-ops",  // banking-clearing-ops-rs :1105
+  FRAUD_SERVICE:        "/fraud",                 // fraud-service :8000 (fraud.yaml → /api/v1/fraud/$1)
+  CARBON:               "/carbon",                // carbon-service :80
+  BANKING_OPS_PIPELINE: "/banking-operations-pipeline", // banking-operations-pipeline-py :80
   TXN_PATTERN:          "/compliance",            // merged → compliance-service :80
   TYPOLOGY_DETECTOR:    "/compliance",            // merged → compliance-service :80
   CTR_AUTO_FILER:       "/ctr",                   // merged → nfiu-ctr-str-filing-py :8283
@@ -197,9 +206,12 @@ export const APISIX = {
   LEDGER_RECONCILIATION:"/ledger-reconciliation", // ledger-reconciliation-rs :8100
 
   // ── Cooperative & Groups ───────────────────────────────────────────────────
-  COOPERATIVE_MGMT:     "/omini",                 // merged → omini-service :80
-  COOPERATIVE_FINANCIALS:"/omini",                // merged → omini-service :80
-  COOPERATIVE_MEETINGS: "/omini",                 // merged → omini-service :80
+  // W12-A4-P0-G: cooperatives routes live in agricultural-service
+  // (/api/v1/agriculture/cooperatives*), NOT omini-service (whatsapp/telegram only).
+  // Gateway agricultural-service.yaml matches /agricultural/* and strips one segment.
+  COOPERATIVE_MGMT:     "/agricultural",          // merged → agricultural-service :8015
+  COOPERATIVE_FINANCIALS:"/agricultural",         // merged → agricultural-service :8015
+  COOPERATIVE_MEETINGS: "/agricultural",          // merged → agricultural-service :8015
 
   // ── Agriculture (dedicated APISIX routes derived from apisix-resources/routes/) ─
   AGENT_FARMER_ONBOARDING:    "/agriculture",               // merged → agricultural-service :8015
@@ -456,6 +468,12 @@ export const ROUTE_REGISTRY: RouteRegistryEntry[] = [
   { uiPath: "/gnn-fraud-detection",     label: "GNN Fraud Detection",  apisixPrefix: APISIX.GNN_FRAUD,         backendService: "gnn-fraud-detection-py",    port: 9271, section: "AML & Fraud", featureFlag: "fraud_detection", permission: "VIEW_ALL_DATA" },
   { uiPath: "/anomaly-detector",        label: "Anomaly Detector",     apisixPrefix: APISIX.ANOMALY_DETECTOR,  backendService: "anomaly-detector-py",       port: 9209, section: "AML & Fraud", featureFlag: "fraud_detection", permission: "VIEW_ALL_DATA" },
   { uiPath: "/txn-monitoring-rules",    label: "Txn Monitoring Rules", apisixPrefix: APISIX.TXN_MONITORING,    backendService: "txn-monitoring-rules-rs",   port: 8285, section: "AML & Fraud", featureFlag: "aml_compliance",  permission: "VIEW_ALL_DATA" },
+  // ── W12 A4-P1-A: newly-wired previously-orphan money-path routes ──────────
+  { uiPath: "/txn-monitoring-cases",    label: "Txn Monitoring Cases", apisixPrefix: APISIX.TXN_MONITORING,    backendService: "txn-monitoring-rules-rs",   port: 8285, section: "AML & Fraud", featureFlag: "aml_compliance",  permission: "VIEW_ALL_DATA" },
+  { uiPath: "/credit-operations",       label: "Credit Operations",    apisixPrefix: APISIX.CREDIT_SERVICE,    backendService: "credit-service",            port: 80,   section: "Credit & Risk", featureFlag: "loans",          permission: "VIEW_ALL_DATA" },
+  { uiPath: "/merchant-settlements",    label: "Merchant Settlements", apisixPrefix: APISIX.MERCHANT,          backendService: "merchant-service",          port: 80,   section: "Payments Hub",  featureFlag: "payments",       permission: "VIEW_ALL_DATA" },
+  { uiPath: "/clearing-ops",            label: "Clearing Operations",  apisixPrefix: APISIX.CLEARING_OPS,      backendService: "banking-clearing-ops-rs",   port: 1105, section: "Settlement & Clearing", featureFlag: "payments", permission: "VIEW_ALL_DATA" },
+  { uiPath: "/ops-pipeline",            label: "Ops Pipeline (EOD)",   apisixPrefix: APISIX.BANKING_OPS_PIPELINE, backendService: "banking-operations-pipeline-py", port: 80, section: "Settlement & Clearing", featureFlag: "accounts", permission: "VIEW_ALL_DATA" },
   { uiPath: "/txn-pattern-analyzer",    label: "Pattern Analyzer",     apisixPrefix: APISIX.TXN_PATTERN,       backendService: "txn-pattern-analyzer-py",   port: 9333, section: "AML & Fraud", featureFlag: "fraud_detection", permission: "VIEW_ALL_DATA" },
   { uiPath: "/typology-detector",       label: "Typology Detector",    apisixPrefix: APISIX.TYPOLOGY_DETECTOR, backendService: "typology-detector-rs",      port: 9314, section: "AML & Fraud", featureFlag: "aml_compliance",  permission: "VIEW_ALL_DATA" },
   { uiPath: "/sar-filing-engine",       label: "SAR Filing Engine",    apisixPrefix: APISIX.SAR_FILING,        backendService: "sar-filing-engine-go",      port: 9159, section: "AML & Fraud", featureFlag: "aml_compliance",  permission: "VIEW_ALL_DATA" },

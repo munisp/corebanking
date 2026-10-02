@@ -987,9 +987,9 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
 	})
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/interest/accrue", runAccrualBatch)
+	mux.HandleFunc("/v1/interest/accrue", permifyAuthzGuard("interest_batch", "accrue", runAccrualBatch))
 	mux.HandleFunc("/v1/interest/batches", listHandler)
-	mux.HandleFunc("/v1/interest/sync-eligible-accounts", syncEligibleAccountsHandler) // MN-09
+	mux.HandleFunc("/v1/interest/sync-eligible-accounts", permifyAuthzGuard("interest_batch", "sync", syncEligibleAccountsHandler)) // MN-09
 
 	server := &http.Server{
 		Addr:              ":" + port,

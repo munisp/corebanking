@@ -1,7 +1,24 @@
 /**
  * D4: Comprehensive audit trail — immutable event log for all system actions.
  * Supports filtering, search, export, and regulatory compliance reporting.
+ *
+ * W12-C3-P2-MLIB (c3-1000): the 'auditEntries' store was module process memory
+ * (lost on restart, divergent across replicas). It is now Postgres-authoritative
+ * (table `audit_entries`) via lib/pgJsonStore.ts — CREATE TABLE IF NOT EXISTS at first
+ * use, seeds ON CONFLICT DO NOTHING. Fail-closed: a PG outage fails the request
+ * (503 PERSISTENCE_UNAVAILABLE); no degraded-memory fallback.
  */
+
+import { ensureTables, storeDDL, storeGet, storeInsert, storeList, storeReplace, storeDelete, storeSeed } from "./pgJsonStore";
+import { pgGuard } from "./pgSupport";
+
+const TABLE = "audit_entries";
+
+async function ensureAuditentriesStore(): Promise<void> {
+  await ensureTables("ensureAuditentriesStore", storeDDL(TABLE));
+  await storeSeed(TABLE, AUDITENTRIES_SEED, () => "");
+}
+
 
 export interface AuditEntry {
   id: string;
@@ -20,7 +37,8 @@ export interface AuditEntry {
   correlationId?: string;
 }
 
-const auditEntries: AuditEntry[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const AUDITENTRIES_SEED: AuditEntry[]  = [
   {
     id: "AUD-001", timestamp: "2026-05-09T08:00:01Z", actor: "CUST-001", actorType: "user",
     action: "login", resource: "session", resourceId: "SES-001",
@@ -93,8 +111,11 @@ const auditEntries: AuditEntry[] = [
   },
 ];
 
-export function getAuditEntries() { return auditEntries; }
-export function getAuditStats() {
+export async function getAuditEntries(): Promise<AuditEntry[]> {
+  return pgGuard((async () => { await ensureAuditentriesStore(); return storeList<AuditEntry>(TABLE); })());
+}
+export async function getAuditStats() {
+  const auditEntries = await getAuditEntries();
   const byResult = { success: 0, failure: 0, denied: 0 };
   const byRisk = { low: 0, medium: 0, high: 0, critical: 0 };
   const byChannel: Record<string, number> = {};

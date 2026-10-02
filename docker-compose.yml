@@ -124,9 +124,16 @@ services:
       retries: 5
 
   # APISIX — API Gateway with dynamic routing, rate limiting, TLS
+  # B5-P0-C: host port 9080 is no longer published directly here. Edge traffic
+  # now enters through the openappsec WAF (see the openappsec service below),
+  # which reverse-proxies inspected requests to apisix:9080 on the internal
+  # compose network. Service-to-service calls to http://apisix:9080 inside the
+  # network are unaffected.
+  # RESIDUAL GAP: 9443 (TLS) is still published directly and bypasses the WAF
+  # until the agent terminates TLS — tracked as follow-up hardening.
   apisix:
     image: apache/apisix:3.11.0-debian  # CVE-2024-32638, CVE-2026-39999 fixes
-    ports: ["9080:9080", "9443:9443", "9180:9180"]
+    ports: ["9443:9443", "9180:9180"]
     volumes:
       - ./config/apisix.yml:/usr/local/apisix/conf/apisix.yaml:ro
     healthcheck:
@@ -192,15 +199,54 @@ services:
     profiles: ["monitoring"]
 
   # OpenAppSec — Open-source ML-based WAF (Web Application Firewall)
+  # B5-P0-C: graduated from the `security` profile into the DEFAULT request
+  # path. This service has no `profiles:` entry, so it starts with a plain
+  # `docker compose up` and now publishes the gateway edge port.
+  #
+  # Request path:  client -> host:9080 -> openappsec agent (inspect, prevent)
+  #                -> OPENAPPSEC_UPSTREAM (http://apisix:9080) -> services.
+  # The agent runs as an in-path reverse proxy in front of APISIX; APISIX no
+  # longer publishes 9080 on the host (see the apisix service above).
+  #
+  # MODE / ROLLBACK SWITCH: OPENAPPSEC_MODE=prevent (default) | learning.
+  #   Rollback to detect-only:  OPENAPPSEC_MODE=learning docker compose up -d openappsec
+  # OPENAPPSEC_PREVENT_MODE / OPENAPPSEC_LEARNING_MODE are the boolean env keys
+  # consumed by the agent and by the BFF WAF lib
+  # (infrastructure/new/server/lib/openappsecWaf.ts) and are kept consistent
+  # with OPENAPPSEC_MODE; the lib also accepts OPENAPPSEC_MODE directly.
+  #
+  # FAIL MODE (documented decision):
+  #   - Agent container down/unhealthy: host :9080 has no listener, so the edge
+  #     fails CLOSED by topology (there is no alternate published path to
+  #     apisix:9080). depends_on keeps the agent from proxying to a dead APISIX.
+  #   - Agent up but inspection errors/timeouts: fail mode is decided by the
+  #     policy in config/openappsec/policy.json (mode: prevent). ASSUMPTION —
+  #     no fail-mode key exists anywhere in this repo's openappsec config or
+  #     plugin schema, so the agent's vendor default for inspection errors is
+  #     assumed fail-open at the agent layer; verify against the deployed agent
+  #     version's docs. The BFF middleware (openappsecWaf.ts) compensates:
+  #     mutating requests to money paths fail CLOSED (503) when the WAF is
+  #     unreachable (OPENAPPSEC_FAIL_CLOSED_PATHS).
+  #   - Alerting hook: security events -> syslog -> vector-openappsec
+  #     (infrastructure/observability/middleware/openappsec/vector-openappsec.yaml)
+  #     -> Loki -> Grafana alert on Prevent events (see that dir's README).
   openappsec:
     image: openappsec/agent:latest
-    ports: ["8085:8080"]
+    # 9080 = WAF-fronted gateway edge (was apisix); 8085 = agent management/API.
+    ports: ["9080:9080", "8085:8080"]
     environment:
       OPENAPPSEC_TOKEN: "${OPENAPPSEC_TOKEN:-local-dev-token}"
+      # Reverse-proxy upstream: inspected traffic is forwarded to APISIX.
       OPENAPPSEC_UPSTREAM: "http://apisix:9080"
+      # Port the agent's reverse-proxy listener binds. ASSUMPTION: the agent
+      # honors this key (consistent with the repo's existing env-key model);
+      # no schema in the repo defines it — verify against the deployed agent.
+      OPENAPPSEC_LISTEN_PORT: "9080"
       OPENAPPSEC_LOG_LEVEL: "info"
-      OPENAPPSEC_LEARNING_MODE: "true"
-      OPENAPPSEC_PREVENT_MODE: "false"
+      # Prevent mode ON by default (learning OFF); see rollback switch above.
+      OPENAPPSEC_MODE: "${OPENAPPSEC_MODE:-prevent}"
+      OPENAPPSEC_PREVENT_MODE: "${OPENAPPSEC_PREVENT_MODE:-true}"
+      OPENAPPSEC_LEARNING_MODE: "${OPENAPPSEC_LEARNING_MODE:-false}"
     volumes:
       - ./config/openappsec:/etc/openappsec
     depends_on:
@@ -210,7 +256,6 @@ services:
       interval: 15s
       timeout: 10s
       retries: 5
-    profiles: ["security"]
 
   # Dapr Dashboard — Web UI for Dapr observability
   dapr-dashboard:
@@ -244,6 +289,10 @@ services:
       FLUVIO_ENDPOINT: "fluvio:9003"
       MOJALOOP_HUB_URL: "http://mojaloop-hub:4000"
       OPENAPPSEC_URL: "http://openappsec:8080"
+      # B5-P0-C: keep the BFF WAF lib (openappsecWaf.ts) in the same mode as the
+      # agent — prevent by default, learning via the same rollback switch.
+      OPENAPPSEC_MODE: "${OPENAPPSEC_MODE:-prevent}"
+      OPENAPPSEC_PREVENT_MODE: "${OPENAPPSEC_PREVENT_MODE:-true}"
       LAKEHOUSE_API_URL: "http://lakehouse:8020"
     depends_on:
       postgres: { condition: service_healthy }

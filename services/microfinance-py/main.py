@@ -10,7 +10,8 @@ import os
 import json
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5P1DD
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -274,7 +275,7 @@ def metrics():
         return {"service": "microfinance-py", "total_records": 0}
 
 
-@app.get("/api/v1/service_configs")
+@app.get("/api/v1/service_configs", dependencies=[Depends(require_permify("loan_application", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None)):
     conn = get_db()
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

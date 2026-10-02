@@ -4,10 +4,130 @@ import time
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+import os
+import json
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _rid = row.get("_rid", row.get(self.key, ""))
+                _payload = {k: v for k, v in row.items() if k != "_rid"}
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(_rid), row.get(self.tenant_key),
+                          json.dumps(_payload, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+def _w12_get_by(store, field, value):
+    """First row whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    row = _w12_run(f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s LIMIT 1",
+                   (field, value), fetch="one")
+    return row["payload"] if row else None
+
+
+def _w12_all_by(store, field, value, limit=100000):
+    """All rows whose payload field matches (jsonb ->> lookup)."""
+    store.ensure()
+    rows = _w12_run(
+        f"SELECT payload FROM {store.table} WHERE payload ->> %s = %s ORDER BY created_at, record_id LIMIT %s",
+        (field, value, limit))
+    return [r["payload"] for r in rows]
 
 billing_router = APIRouter()
 
-_INVOICES = [
+_INVOICE_SEED = [
     {
         "id": "INV-2026-001", "tenantId": "tenant-001", "accountNumber": "0012345678",
         "customerName": "Fatima Abdullahi", "invoiceType": "service_charge",
@@ -66,6 +186,31 @@ class PayInvoiceRequest(BaseModel):
     paymentChannel: str = "account_debit"
 
 
+# W12-C3P2B5: invoices persisted in PG (idempotent seed; natural key = invoice id).
+INVOICE_STORE = _W12Store("invoices", seed=_INVOICE_SEED)
+
+
+def _inv_all():
+    try:
+        return INVOICE_STORE.all()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"persistence_unavailable: {e}")
+
+
+def _inv_get(invoice_id):
+    try:
+        return INVOICE_STORE.get(invoice_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"persistence_unavailable: {e}")
+
+
+def _inv_put(invoice_id, inv):
+    try:
+        INVOICE_STORE.put(invoice_id, inv)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"persistence_unavailable: {e}")
+
+
 _BILLING_PLAN = {
     "billing_info": {
         "plan": "premium",
@@ -99,7 +244,7 @@ def update_billing_plan(req: UpdatePlanRequest):
 
 @billing_router.get("/v1/billing/invoices")
 def list_billing_invoices(status: Optional[str] = None, page: int = 1, pageSize: int = 20):
-    results = list(_INVOICES)
+    results = _inv_all()
     if status:
         results = [i for i in results if i["status"] == status]
     total = len(results)
@@ -109,6 +254,7 @@ def list_billing_invoices(status: Optional[str] = None, page: int = 1, pageSize:
 
 @billing_router.get("/v1/stats")
 def get_billing_stats():
+    _INVOICES = _inv_all()
     paid = sum(i["paidAmount"] for i in _INVOICES)
     outstanding = sum(i["amount"] - i["paidAmount"] for i in _INVOICES if i["status"] != "paid")
     return {
@@ -144,7 +290,7 @@ def list_invoices(
     page: int = 1,
     pageSize: int = 20,
 ):
-    results = list(_INVOICES)
+    results = _inv_all()
     if status:
         results = [i for i in results if i["status"] == status]
     if invoiceType:
@@ -158,6 +304,7 @@ def list_invoices(
 
 @billing_router.get("/invoices/summary")
 def invoice_summary():
+    _INVOICES = _inv_all()
     total = len(_INVOICES)
     paid = sum(1 for i in _INVOICES if i["status"] == "paid")
     pending = sum(1 for i in _INVOICES if i["status"] == "pending")
@@ -173,7 +320,7 @@ def invoice_summary():
 
 @billing_router.get("/invoices/{invoice_id}")
 def get_invoice(invoice_id: str):
-    inv = next((i for i in _INVOICES if i["id"] == invoice_id), None)
+    inv = _inv_get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="invoice not found")
     return inv
@@ -200,13 +347,13 @@ def create_invoice(req: CreateInvoiceRequest):
         "createdAt": now,
         "updatedAt": now,
     }
-    _INVOICES.append(inv)
+    _inv_put(inv["id"], inv)
     return inv
 
 
 @billing_router.post("/invoices/{invoice_id}/pay")
 def pay_invoice(invoice_id: str, req: PayInvoiceRequest):
-    inv = next((i for i in _INVOICES if i["id"] == invoice_id), None)
+    inv = _inv_get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="invoice not found")
     if inv["status"] == "paid":
@@ -220,12 +367,13 @@ def pay_invoice(invoice_id: str, req: PayInvoiceRequest):
     if req.paymentReference:
         inv["paymentReference"] = req.paymentReference
     inv["paymentChannel"] = req.paymentChannel
+    _inv_put(invoice_id, inv)
     return {"status": "paid", "invoiceId": invoice_id, "amountPaid": inv["amount"], "paidAt": now}
 
 
 @billing_router.post("/invoices/{invoice_id}/cancel")
 def cancel_invoice(invoice_id: str):
-    inv = next((i for i in _INVOICES if i["id"] == invoice_id), None)
+    inv = _inv_get(invoice_id)
     if not inv:
         raise HTTPException(status_code=404, detail="invoice not found")
     if inv["status"] == "paid":
@@ -234,4 +382,5 @@ def cancel_invoice(invoice_id: str):
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     inv["status"] = "cancelled"
     inv["updatedAt"] = now
+    _inv_put(invoice_id, inv)
     return {"status": "cancelled", "invoiceId": invoice_id}

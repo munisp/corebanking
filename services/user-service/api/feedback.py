@@ -1,6 +1,8 @@
 import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Header
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional
@@ -17,7 +19,7 @@ logger = create_logger(__name__)
 feedback_router = APIRouter()
 
 
-@feedback_router.get("")
+@feedback_router.get("", dependencies=[Depends(require_permify("user_feedback", "view"))])
 def list_feedback(
     status: Optional[str] = None,
     category: Optional[str] = None,
@@ -61,7 +63,7 @@ def list_feedback(
     )
 
 
-@feedback_router.post("")
+@feedback_router.post("", dependencies=[Depends(require_permify("user_feedback", "create"))])
 def create_feedback(
     payload: CreateFeedbackSchema,
     db: Session = Depends(get_session),
@@ -111,7 +113,7 @@ def create_feedback(
     )
 
 
-@feedback_router.get("/summary")
+@feedback_router.get("/summary", dependencies=[Depends(require_permify("user_feedback", "view"))])
 def get_feedback_summary(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -151,7 +153,7 @@ def get_feedback_summary(
     )
 
 
-@feedback_router.get("/{feedback_id}")
+@feedback_router.get("/{feedback_id}", dependencies=[Depends(require_permify("user_feedback", "view"))])
 def get_feedback(
     feedback_id: str,
     db: Session = Depends(get_session),
@@ -180,7 +182,7 @@ def get_feedback(
     )
 
 
-@feedback_router.post("/{feedback_id}/respond")
+@feedback_router.post("/{feedback_id}/respond", dependencies=[Depends(require_permify("user_feedback", "manage"))])
 def respond_to_feedback(
     feedback_id: str,
     payload: RespondToFeedbackSchema,

@@ -1,6 +1,12 @@
-import { TrendingUp, Info } from 'lucide-react';
+import { useState } from 'react';
+import { TrendingUp, Info, Loader2, Calculator } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { toast } from 'sonner';
+import { creditAdvisoryApi, type CreditAdvisoryResult } from '@/api/creditRiskApi';
 
 const SCORING_MODELS = [
   { name: 'PD/LGD/EAD Model', status: 'planned', description: 'Probability of default, loss given default, and exposure at default calculation using Basel III framework' },
@@ -19,6 +25,136 @@ const DATA_SOURCES = [
   { source: 'NBS Agricultural Statistics', purpose: 'Commodity price indices, regional yield data' },
   { source: 'NIRSAL / AGSMEIS', purpose: 'Guarantee status, cooperative credit history' },
 ];
+
+/**
+ * W12 A4-P1-A — live advisory scoring against credit-scoring-py:
+ * POST /api/v1/score/advisory and POST /api/v1/affordability/advisory
+ * (previously orphaned; services/credit-scoring-py/main.py:475,486).
+ */
+function AdvisoryScoringSection() {
+  const [scoreForm, setScoreForm] = useState({ income: '', debt: '', employment_years: '', loan_history_count: '', defaults: '0', age: '' });
+  const [affForm, setAffForm] = useState({ monthly_income: '', monthly_expenses: '', proposed_emi: '' });
+  const [scoreResult, setScoreResult] = useState<CreditAdvisoryResult | null>(null);
+  const [affResult, setAffResult] = useState<CreditAdvisoryResult | null>(null);
+  const [loans, setLoans] = useState<unknown>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function loadLoans() {
+    setBusy('loans');
+    try {
+      setLoans(await creditAdvisoryApi.listLoans());
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to load loans');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const scoreReady = ['income', 'debt', 'employment_years', 'loan_history_count', 'defaults', 'age']
+    .every((k) => scoreForm[k as keyof typeof scoreForm] !== '');
+  const affReady = affForm.monthly_income !== '' && affForm.monthly_expenses !== '' && affForm.proposed_emi !== '';
+
+  async function runScore() {
+    setBusy('score');
+    setScoreResult(null);
+    try {
+      const res = await creditAdvisoryApi.scoreAdvisory({
+        income: Number(scoreForm.income),
+        debt: Number(scoreForm.debt),
+        employment_years: Number(scoreForm.employment_years),
+        loan_history_count: Number(scoreForm.loan_history_count),
+        defaults: Number(scoreForm.defaults),
+        age: Number(scoreForm.age),
+      });
+      setScoreResult(res);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Advisory scoring failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function runAffordability() {
+    setBusy('affordability');
+    setAffResult(null);
+    try {
+      const res = await creditAdvisoryApi.affordabilityAdvisory({
+        monthly_income: Number(affForm.monthly_income),
+        monthly_expenses: Number(affForm.monthly_expenses),
+        proposed_emi: Number(affForm.proposed_emi),
+      });
+      setAffResult(res);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Affordability check failed');
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const numInput = (value: string, onChange: (v: string) => void, placeholder?: string) => (
+    <Input type="number" min="0" value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
+  );
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <Card>
+        <CardHeader><CardTitle className="text-base">Advisory Credit Score (live)</CardTitle></CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1"><Label className="text-xs">Annual income (₦)</Label>{numInput(scoreForm.income, (v) => setScoreForm((f) => ({ ...f, income: v })))}</div>
+            <div className="space-y-1"><Label className="text-xs">Total debt (₦)</Label>{numInput(scoreForm.debt, (v) => setScoreForm((f) => ({ ...f, debt: v })))}</div>
+            <div className="space-y-1"><Label className="text-xs">Employment years</Label>{numInput(scoreForm.employment_years, (v) => setScoreForm((f) => ({ ...f, employment_years: v })))}</div>
+            <div className="space-y-1"><Label className="text-xs">Loan history count</Label>{numInput(scoreForm.loan_history_count, (v) => setScoreForm((f) => ({ ...f, loan_history_count: v })))}</div>
+            <div className="space-y-1"><Label className="text-xs">Defaults</Label>{numInput(scoreForm.defaults, (v) => setScoreForm((f) => ({ ...f, defaults: v })))}</div>
+            <div className="space-y-1"><Label className="text-xs">Age</Label>{numInput(scoreForm.age, (v) => setScoreForm((f) => ({ ...f, age: v })))}</div>
+          </div>
+          <Button size="sm" disabled={!scoreReady || busy !== null} onClick={() => void runScore()}>
+            {busy === 'score' ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Calculator className="h-4 w-4 mr-1" />}
+            Compute advisory score
+          </Button>
+          {scoreResult && (
+            <pre className="max-h-48 overflow-auto rounded-md bg-muted/40 p-3 text-xs">{JSON.stringify(scoreResult, null, 2)}</pre>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle className="text-base">Affordability Advisory (live)</CardTitle></CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid grid-cols-3 gap-3">
+            <div className="space-y-1"><Label className="text-xs">Monthly income (₦)</Label>{numInput(affForm.monthly_income, (v) => setAffForm((f) => ({ ...f, monthly_income: v })))}</div>
+            <div className="space-y-1"><Label className="text-xs">Monthly expenses (₦)</Label>{numInput(affForm.monthly_expenses, (v) => setAffForm((f) => ({ ...f, monthly_expenses: v })))}</div>
+            <div className="space-y-1"><Label className="text-xs">Proposed EMI (₦)</Label>{numInput(affForm.proposed_emi, (v) => setAffForm((f) => ({ ...f, proposed_emi: v })))}</div>
+          </div>
+          <Button size="sm" disabled={!affReady || busy !== null} onClick={() => void runAffordability()}>
+            {busy === 'affordability' ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Calculator className="h-4 w-4 mr-1" />}
+            Check affordability
+          </Button>
+          {affResult && (
+            <pre className="max-h-48 overflow-auto rounded-md bg-muted/40 p-3 text-xs">{JSON.stringify(affResult, null, 2)}</pre>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="lg:col-span-2">
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle className="text-base">Loan Book (credit-scoring-py /api/v1/loans)</CardTitle>
+          <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void loadLoans()}>
+            {busy === 'loans' ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : null}
+            Load loans
+          </Button>
+        </CardHeader>
+        <CardContent>
+          {loans === null ? (
+            <p className="text-sm text-muted-foreground">Press "Load loans" to query the scoring service loan book.</p>
+          ) : (
+            <pre className="max-h-64 overflow-auto rounded-md bg-muted/40 p-3 text-xs">{JSON.stringify(loans, null, 2)}</pre>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
 
 export default function CreditScoringWorkspace() {
   return (
@@ -53,6 +189,8 @@ export default function CreditScoringWorkspace() {
           </CardContent></Card>
         ))}
       </div>
+
+      <AdvisoryScoringSection />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Card>

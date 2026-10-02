@@ -973,60 +973,60 @@ func main() {
 	}).Methods("GET")
 
 	// Risk scoring — APISIX strips /risk-scoring/ prefix
-	r.HandleFunc("/v1/scores", srv.listAssessmentsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/risk/assessments", srv.listAssessmentsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/risk/score", srv.scoreEntityHandler).Methods("POST", "OPTIONS")
-	r.HandleFunc("/v1/risk/portfolio", srv.portfolioHandler).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/scores", permifyAuthzGuard("credit_service", "view", srv.listAssessmentsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/risk/assessments", permifyAuthzGuard("credit_service", "view", srv.listAssessmentsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/risk/score", permifyAuthzGuard("credit_service", "score", srv.scoreEntityHandler)).Methods("POST", "OPTIONS")
+	r.HandleFunc("/v1/risk/portfolio", permifyAuthzGuard("credit_service", "view", srv.portfolioHandler)).Methods("GET", "OPTIONS")
 
 	// Credit bureau — APISIX strips /credit-bureau/ prefix
-	r.HandleFunc("/v1/credit-bureau/reports", srv.listCreditReportsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/credit-bureau/facilities", srv.listBureauFacilitiesHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/credit-bureau/stats", srv.bureauStatsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/credit-bureau/score-check", srv.scoreCheckHandler).Methods("POST", "OPTIONS")
+	r.HandleFunc("/v1/credit-bureau/reports", permifyAuthzGuard("credit_service", "view", srv.listCreditReportsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/credit-bureau/facilities", permifyAuthzGuard("credit_service", "view", srv.listBureauFacilitiesHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/credit-bureau/stats", permifyAuthzGuard("credit_service", "view", srv.bureauStatsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/credit-bureau/score-check", permifyAuthzGuard("credit_service", "score_check", srv.scoreCheckHandler)).Methods("POST", "OPTIONS")
 
 	// Credit facility — APISIX strips /credit-facility/ prefix
-	r.HandleFunc("/v1/facilities", srv.listFacilitiesHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/facilities", srv.createFacilityHandler).Methods("POST")
-	r.HandleFunc("/v1/facilities/{id}", srv.getFacilityHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/stats", srv.facilityStatsHandler).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/facilities", permifyAuthzGuard("credit_service", "view", srv.listFacilitiesHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/facilities", permifyAuthzGuard("credit_service", "create", srv.createFacilityHandler)).Methods("POST")
+	r.HandleFunc("/v1/facilities/{id}", permifyAuthzGuard("credit_service", "view", srv.getFacilityHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/stats", permifyAuthzGuard("credit_service", "view", srv.facilityStatsHandler)).Methods("GET", "OPTIONS")
 
 	// NIRSAL Credit Guarantee
-	r.HandleFunc("/v1/nirsal-credit-guarantee/list", srv.nirsalListHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/nirsal-credit-guarantee/stats", srv.nirsalStatsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/nirsal-credit-guarantee/create", srv.nirsalCreateHandler).Methods("POST", "OPTIONS")
+	r.HandleFunc("/v1/nirsal-credit-guarantee/list", permifyAuthzGuard("credit_service", "view", srv.nirsalListHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/nirsal-credit-guarantee/stats", permifyAuthzGuard("credit_service", "view", srv.nirsalStatsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/nirsal-credit-guarantee/create", permifyAuthzGuard("credit_service", "create", srv.nirsalCreateHandler)).Methods("POST", "OPTIONS")
 
 	// Cooperative Credit Scoring
-	r.HandleFunc("/v1/cooperative-credit-scoring/list", srv.coopListHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/cooperative-credit-scoring/stats", srv.coopStatsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/cooperative-credit-scoring/create", srv.coopCreateHandler).Methods("POST", "OPTIONS")
+	r.HandleFunc("/v1/cooperative-credit-scoring/list", permifyAuthzGuard("credit_service", "view", srv.coopListHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/cooperative-credit-scoring/stats", permifyAuthzGuard("credit_service", "view", srv.coopStatsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/cooperative-credit-scoring/create", permifyAuthzGuard("credit_service", "create", srv.coopCreateHandler)).Methods("POST", "OPTIONS")
 
 	// Equipment Leasing
-	r.HandleFunc("/v1/equipment-leasing/list", srv.equipmentListHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/equipment-leasing/stats", srv.equipmentStatsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/equipment-leasing/create", srv.equipmentCreateHandler).Methods("POST", "OPTIONS")
+	r.HandleFunc("/v1/equipment-leasing/list", permifyAuthzGuard("credit_service", "view", srv.equipmentListHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/equipment-leasing/stats", permifyAuthzGuard("credit_service", "view", srv.equipmentStatsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/equipment-leasing/create", permifyAuthzGuard("credit_service", "create", srv.equipmentCreateHandler)).Methods("POST", "OPTIONS")
 
 	// Collateral Valuation
-	r.HandleFunc("/v1/valuations", srv.collateralListHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/valuations/summary", srv.collateralSummaryHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/valuations/compute-fsv", srv.computeFSVHandler).Methods("POST", "OPTIONS")
+	r.HandleFunc("/v1/valuations", permifyAuthzGuard("credit_service", "view", srv.collateralListHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/valuations/summary", permifyAuthzGuard("credit_service", "view", srv.collateralSummaryHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/valuations/compute-fsv", permifyAuthzGuard("credit_service", "compute_fsv", srv.computeFSVHandler)).Methods("POST", "OPTIONS")
 
 	// Multicurrency Revaluation
-	r.HandleFunc("/v1/multicurrency/revaluation", srv.multicurrencyRevaluationHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/multicurrency/run", srv.multicurrencyRunHandler).Methods("POST", "OPTIONS")
+	r.HandleFunc("/v1/multicurrency/revaluation", permifyAuthzGuard("credit_service", "view", srv.multicurrencyRevaluationHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/multicurrency/run", permifyAuthzGuard("credit_service", "run", srv.multicurrencyRunHandler)).Methods("POST", "OPTIONS")
 
 	// OTC Derivatives
-	r.HandleFunc("/v1/otc/derivatives", srv.otcDerivativesHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/otc/derivatives", srv.otcCreateHandler).Methods("POST")
-	r.HandleFunc("/v1/otc/stats", srv.otcStatsHandler).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/otc/derivatives", permifyAuthzGuard("credit_service", "view", srv.otcDerivativesHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/otc/derivatives", permifyAuthzGuard("credit_service", "create", srv.otcCreateHandler)).Methods("POST")
+	r.HandleFunc("/v1/otc/stats", permifyAuthzGuard("credit_service", "view", srv.otcStatsHandler)).Methods("GET", "OPTIONS")
 
 	// ETD Trading
-	r.HandleFunc("/v1/etd/trades", srv.etdTradesHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/etd/stats", srv.etdStatsHandler).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/etd/trades", permifyAuthzGuard("credit_service", "view", srv.etdTradesHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/etd/stats", permifyAuthzGuard("credit_service", "view", srv.etdStatsHandler)).Methods("GET", "OPTIONS")
 
 	// Banking Clearing Ops
-	r.HandleFunc("/v1/banking-clearing-ops/instructions", srv.clearingInstructionsHandler).Methods("GET", "OPTIONS")
-	r.HandleFunc("/v1/banking-clearing-ops/instructions", srv.clearingCreateHandler).Methods("POST")
-	r.HandleFunc("/v1/banking-clearing-ops/stats", srv.clearingStatsHandler).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/banking-clearing-ops/instructions", permifyAuthzGuard("credit_service", "view", srv.clearingInstructionsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/banking-clearing-ops/instructions", permifyAuthzGuard("credit_service", "create", srv.clearingCreateHandler)).Methods("POST")
+	r.HandleFunc("/v1/banking-clearing-ops/stats", permifyAuthzGuard("credit_service", "view", srv.clearingStatsHandler)).Methods("GET", "OPTIONS")
 
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

@@ -12,11 +12,17 @@ from schemas import (
     SupplyChainFinancingPaymentSchema,
 )
 from services import PaymentService
-from schemas.payment import ExternalTransferSchema, ExternalDebitSchema
+from schemas.payment import (
+    ExternalTransferSchema,
+    ExternalDebitSchema,
+    ExternalAmount,
+    InitiateWithdrawalSchema,
+)
 from utils import get_config
 from dapr.clients import DaprClient
 import json
 import hashlib
+import uuid
 
 config = get_config()
 logger = create_logger(__name__)
@@ -208,6 +214,66 @@ def deposit_with_account_number(
             "deposit_account_number_failed tenant=%s error=%s", tenant_id, str(e),
         )
         raise HTTPException(status_code=500, detail="Deposit failed.")
+
+
+@payment_router.post("/withdraw")
+def withdraw(
+    payload: InitiateWithdrawalSchema,
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_id: str = Header(..., alias="x-keycloak-id"),
+    ledger_id: str = Header(..., alias="x-ledger-id"),
+    mint_account_id: str = Header(..., alias="x-mint-account-id"),
+    idempotency_key: str = Header(None, alias="x-idempotency-key"),
+):
+    """Withdrawal handler (W12-A4B). Mirrors /payment/deposit: debits the
+    customer account into the mint account via the existing
+    PaymentService.process_external_debit path (same rail as
+    /transfers/withdraw but with the simple customer payload the UI sends).
+    Idempotent when x-idempotency-key header is supplied."""
+
+    context = Context(
+        tenant_id=tenant_id,
+        keycloak_id=keycloak_id,
+        ledger_id=ledger_id,
+        mint_account_id=mint_account_id,
+    )
+
+    idem_key = (
+        f"idempotency:withdraw:{idempotency_key}"
+        if idempotency_key
+        else _idempotency_key_for_payload(
+            "withdraw", tenant_id, keycloak_id,
+            str(getattr(payload, "amount_kobo", "")),
+            str(getattr(payload, "recipient", "")),
+        )
+    )
+
+    cached = _check_idempotency(idem_key, "withdraw")
+    if cached is not None:
+        return cached
+
+    try:
+        payment_service = PaymentService()
+        reference = payment_service.process_external_debit(
+            ExternalDebitSchema(
+                transactionId=payload.reference or f"withdraw-{uuid.uuid4().hex}",
+                payer=str(payload.recipient),
+                amount=ExternalAmount(currency="NGN", amount_kobo=payload.amount_kobo),
+                metadata={"note": payload.note},
+            ),
+            context,
+        )
+        resp_body = {"message": "success", "reference": reference}
+        _save_idempotency(idem_key, resp_body, "withdraw")
+        return responses.JSONResponse(content=resp_body, status_code=200)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(
+            "withdraw_failed tenant=%s keycloak=%s error=%s",
+            tenant_id, keycloak_id, str(e),
+        )
+        raise HTTPException(status_code=500, detail="Withdrawal failed.")
 
 
 @payment_router.post("/transfer")

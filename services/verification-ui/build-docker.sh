@@ -9,7 +9,14 @@ fi
 
 # Set default values if not in .env
 VITE_VERIFICATION_API_URL=${VITE_VERIFICATION_API_URL:-https://54link-dev.upi.dev/verification}
-VITE_KYC_FLOW_API_KEY=${VITE_KYC_FLOW_API_KEY:-Zr6lIvOEuGDlzlDyV+/dEDcUX7cChZKs}
+# W12-A4-P0-E: default baked-in API key removed — the literal was compromised
+# (shipped in the client bundle) and must be rotated. Build now fails loudly
+# when no key is provided instead of silently embedding a known credential.
+VITE_KYC_FLOW_API_KEY=${VITE_KYC_FLOW_API_KEY:-${VITE_VERIFICATION_API_KEY:-}}
+if [ -z "$VITE_KYC_FLOW_API_KEY" ]; then
+  echo "ERROR: VITE_VERIFICATION_API_KEY (or VITE_KYC_FLOW_API_KEY) must be set in the build environment" >&2
+  exit 1
+fi
 
 # Get version from argument or use default
 VERSION=${1:-0.0.10}

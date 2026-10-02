@@ -235,10 +235,10 @@ type TenantEntitlement struct {
 	ProvisionedBy   string    `json:"provisionedBy"`
 }
 
-var (
-	entitlementStore = map[string]*TenantEntitlement{}
-	storeMu          sync.RWMutex
-)
+// W12 C3-P2-B5: the entitlementStore map + boot-hydrated cache were removed.
+// All entitlement reads are served from Postgres (tenant_entitlements);
+// mutations UPSERT through persistEntitlement and fail closed (503) without PG.
+// A cross-replica write is now visible immediately (no stale per-process cache).
 
 // PL-08: fabricated seed entitlements for real banks (TEN-ZENITH, TEN-UBA,
 // TEN-LAPO-MFB, WL-MONIEPOINT, WL-KUDA, WL-OPAY) deleted. Entitlements are
@@ -270,11 +270,11 @@ func getEntitlements(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
-	storeMu.RLock()
-	defer storeMu.RUnlock()
-	items := make([]*TenantEntitlement, 0, len(entitlementStore))
-	for _, v := range entitlementStore {
-		items = append(items, v)
+	items, err := dbListEntitlements()
+	if err != nil {
+		log.Printf("[%s] entitlement list failed: %v", serviceName, err)
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
+		return
 	}
 	respondJSON(w, map[string]interface{}{"items": items, "total": len(items)})
 }
@@ -285,11 +285,13 @@ func getEntitlement(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
-	storeMu.RLock()
-	ent, ok := entitlementStore[tenantId]
-	storeMu.RUnlock()
-	if !ok {
+	ent, err := dbGetEntitlement(tenantId)
+	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+	if err != nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
 	respondJSON(w, ent)
@@ -303,11 +305,13 @@ func checkFeatureAccess(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
-	storeMu.RLock()
-	ent, ok := entitlementStore[tenantId]
-	storeMu.RUnlock()
-	if !ok {
+	ent, err := dbGetEntitlement(tenantId)
+	if err == sql.ErrNoRows {
 		respondJSON(w, map[string]interface{}{"allowed": false, "reason": "tenant_not_found"})
+		return
+	}
+	if err != nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
 	if ent.BillingStatus == "suspended" || ent.BillingStatus == "overdue_90d" {
@@ -396,9 +400,6 @@ func provisionTenant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"failed to persist entitlement"}`, 500)
 		return
 	}
-	storeMu.Lock()
-	entitlementStore[req.TenantID] = ent
-	storeMu.Unlock()
 
 	// PL-08: the fabricated 17-step "provisioningSteps" list was deleted. This
 	// endpoint provisions ONLY the entitlement record — real tenant provisioning
@@ -428,11 +429,13 @@ func purchaseAddOn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	storeMu.Lock()
-	ent, ok := entitlementStore[req.TenantID]
-	if !ok {
-		storeMu.Unlock()
+	ent, err := dbGetEntitlement(req.TenantID)
+	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+	if err != nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
 
@@ -455,7 +458,6 @@ func purchaseAddOn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if addOnFee == 0 {
-		storeMu.Unlock()
 		http.Error(w, `{"error":"feature not available as add-on for this tier"}`, 400)
 		return
 	}
@@ -463,7 +465,6 @@ func purchaseAddOn(w http.ResponseWriter, r *http.Request) {
 	ent.PurchasedAddOns = append(ent.PurchasedAddOns, req.Feature)
 	ent.EnabledFeatures = append(ent.EnabledFeatures, req.Feature)
 	ent.MonthlyBill += addOnFee
-	storeMu.Unlock()
 	if err := persistEntitlement(ent); err != nil {
 		http.Error(w, `{"error":"failed to persist entitlement"}`, 500)
 		return
@@ -494,11 +495,13 @@ func upgradeTier(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	storeMu.Lock()
-	ent, ok := entitlementStore[req.TenantID]
-	if !ok {
-		storeMu.Unlock()
+	ent, err := dbGetEntitlement(req.TenantID)
+	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+	if err != nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
 
@@ -511,7 +514,6 @@ func upgradeTier(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if newTier == nil {
-		storeMu.Unlock()
 		http.Error(w, `{"error":"invalid new tier ID"}`, 400)
 		return
 	}
@@ -524,7 +526,6 @@ func upgradeTier(w http.ResponseWriter, r *http.Request) {
 	ent.MaxTPS = newTier.MaxTPS
 	ent.MonthlyBill = newTier.MonthlyFeeNGN
 	ent.PurchasedAddOns = []string{}
-	storeMu.Unlock()
 	if err := persistEntitlement(ent); err != nil {
 		http.Error(w, `{"error":"failed to persist entitlement"}`, 500)
 		return
@@ -576,11 +577,13 @@ func featureUsageSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantId := r.URL.Query().Get("tenantId")
-	storeMu.RLock()
-	ent, ok := entitlementStore[tenantId]
-	storeMu.RUnlock()
-	if !ok {
+	ent, err := dbGetEntitlement(tenantId)
+	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+	if err != nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
 	usage := []map[string]interface{}{}
@@ -658,7 +661,7 @@ func respondJSON(w http.ResponseWriter, data interface{}) {
 func healthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, map[string]interface{}{
 		"status": "healthy", "service": "feature-entitlement-go", "version": "1.0.0",
-		"tenants": len(entitlementStore),
+		"tenants": entitlementCount(),
 		"capabilities": []string{
 			"tier_pricing", "feature_gating", "addon_purchase",
 			"white_label_provisioning", "usage_tracking", "upgrade_downgrade",
@@ -757,36 +760,59 @@ func initDB() {
 	)`); err != nil {
 		log.Printf("[%s] tenant_entitlements DDL failed: %v", serviceName, err)
 	}
-	loadEntitlements()
 }
 
-// PL-08: Postgres-backed entitlement persistence. The in-memory map is a
-// write-through cache ONLY — the DB is authoritative. With no DB the
-// entitlement endpoints fail closed (503) rather than serving stale memory.
+// PL-08: Postgres-backed entitlement persistence — the DB is authoritative.
+// With no DB the entitlement endpoints fail closed (503) rather than serving
+// stale memory. (W12 C3-P2-B5: reads now query PG directly; the in-memory
+// write-through cache was removed.)
 
-func loadEntitlements() {
-	rows, err := db.Query(`SELECT data FROM tenant_entitlements`)
+// dbGetEntitlement reads one entitlement; sql.ErrNoRows when absent.
+func dbGetEntitlement(tenantID string) (*TenantEntitlement, error) {
+	var raw []byte
+	err := db.QueryRow(`SELECT data FROM tenant_entitlements WHERE tenant_id = $1`, tenantID).Scan(&raw)
 	if err != nil {
-		log.Printf("[%s] entitlement load failed: %v", serviceName, err)
-		return
+		return nil, err
+	}
+	var ent TenantEntitlement
+	if err := json.Unmarshal(raw, &ent); err != nil {
+		return nil, err
+	}
+	return &ent, nil
+}
+
+// entitlementCount returns the PG entitlement count (-1 when unavailable).
+func entitlementCount() int {
+	if db == nil {
+		return -1
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tenant_entitlements`).Scan(&n); err != nil {
+		return -1
+	}
+	return n
+}
+
+// dbListEntitlements reads all entitlements from Postgres.
+func dbListEntitlements() ([]*TenantEntitlement, error) {
+	rows, err := db.Query(`SELECT data FROM tenant_entitlements ORDER BY tenant_id`)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
-	loaded := 0
-	storeMu.Lock()
-	defer storeMu.Unlock()
+	out := []*TenantEntitlement{}
 	for rows.Next() {
 		var raw []byte
 		if err := rows.Scan(&raw); err != nil {
-			continue
+			return nil, err
 		}
 		var ent TenantEntitlement
 		if err := json.Unmarshal(raw, &ent); err != nil {
-			continue
+			return nil, err
 		}
-		entitlementStore[ent.TenantID] = &ent
-		loaded++
+		out = append(out, &ent)
 	}
-	log.Printf("[%s] loaded %d entitlements from postgres", serviceName, loaded)
+	return out, rows.Err()
 }
 
 func persistEntitlement(ent *TenantEntitlement) error {
@@ -1569,17 +1595,17 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "manage", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", healthz)
-	mux.Handle("/v1/entitlements/tiers", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(getTiers)))
-	mux.Handle("/v1/entitlements/all", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(getEntitlements)))
-	mux.Handle("/v1/entitlements/tenant", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(getEntitlement)))
-	mux.Handle("/v1/entitlements/check", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(checkFeatureAccess)))
-	mux.Handle("/v1/entitlements/provision", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(provisionTenant)))
-	mux.Handle("/v1/entitlements/purchase-addon", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(purchaseAddOn)))
-	mux.Handle("/v1/entitlements/upgrade", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(upgradeTier)))
-	mux.Handle("/v1/entitlements/usage", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(featureUsageSummary)))
+	mux.Handle("/v1/entitlements/tiers", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "manage", http.HandlerFunc(getTiers))))
+	mux.Handle("/v1/entitlements/all", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "view", http.HandlerFunc(getEntitlements))))
+	mux.Handle("/v1/entitlements/tenant", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "tenant", http.HandlerFunc(getEntitlement))))
+	mux.Handle("/v1/entitlements/check", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "check", http.HandlerFunc(checkFeatureAccess))))
+	mux.Handle("/v1/entitlements/provision", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "provision", http.HandlerFunc(provisionTenant))))
+	mux.Handle("/v1/entitlements/purchase-addon", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "purchase_addon", http.HandlerFunc(purchaseAddOn))))
+	mux.Handle("/v1/entitlements/upgrade", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "upgrade", http.HandlerFunc(upgradeTier))))
+	mux.Handle("/v1/entitlements/usage", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("feature_entitlement", "usage", http.HandlerFunc(featureUsageSummary))))
 	log.Printf("Feature Entitlement Engine (Go) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

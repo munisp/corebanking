@@ -59,11 +59,121 @@ type SweepResult struct {
 var (
 	db             *sql.DB
 	tbClient       *tbclient.Client
-	pendingMu      sync.RWMutex
-	pendingTxns    map[string]*PendingTransfer
-	sweepResults   []SweepResult
 	sweepInterval  = 30 * time.Second
 	defaultTimeout = 5 * time.Minute
+)
+
+// TB ACCOUNT/LEDGER MAPPING (C3-P0-B1): pending transfers are REAL
+// TigerBeetle PENDING transfers on the NGN main ledger (id 1, shared with the
+// core ledger services). Debit/credit platform account identifiers map to
+// deterministic TB account ids via the shared "54bank/ledger/account/"
+// namespace (same mapping as the other repatriated services), so the pending
+// hold is enforced by the cluster, not by process memory. Transfer ids are
+// deterministic (detID of the caller's transfer_id) ⇒ register/resolve/sweep
+// are all idempotent. PG (tb_pending_transfers / tb_sweep_results) is the
+// query + audit projection only.
+const tbSweeperLedgerID uint32 = 1
+
+// detID derives a deterministic TB Uint128 from a human-meaningful key
+// (SHA-256, first 128 bits) ⇒ idempotent retries.
+func detID(key string) tbclient.Uint128 {
+	sum := sha256.Sum256([]byte(key))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	return tbclient.BytesToUint128(b)
+}
+
+// pendingTBID is the deterministic TB id of the PENDING transfer for a
+// caller-supplied transfer_id.
+func pendingTBID(transferID string) tbclient.Uint128 {
+	return detID("tb-pending-sweeper-go/pending/" + transferID)
+}
+
+// platformAccountTBID maps a platform account identifier to its TB account
+// id (canonical shared namespace).
+func platformAccountTBID(accountID string) tbclient.Uint128 {
+	return detID("54bank/ledger/account/" + accountID)
+}
+
+// ensureSweepAccount idempotently creates a TB account (AccountExists
+// tolerated). debit=true accounts carry DEBITS_MUST_NOT_EXCEED_CREDITS so the
+// hold can never overdraw the account at the ledger level.
+func ensureSweepAccount(ctx context.Context, accountID string, debit bool) (tbclient.Uint128, error) {
+	tbID := platformAccountTBID(accountID)
+	var flags uint16
+	if debit {
+		flags = tbclient.AccountFlags{DebitsMustNotExceedCredits: true}.ToUint16()
+	}
+	results, err := tbClient.CreateAccounts(ctx, []tbclient.Account{{ID: tbID, Ledger: tbSweeperLedgerID, Code: 1, Flags: flags}})
+	if err != nil {
+		return tbclient.Uint128{}, fmt.Errorf("tigerbeetle create account: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tbclient.AccountCreated && r.Status != tbclient.AccountExists {
+			return tbclient.Uint128{}, fmt.Errorf("tigerbeetle account rejected: status=%d", uint32(r.Status))
+		}
+	}
+	return tbID, nil
+}
+
+// voidPendingTB voids a pending transfer at the cluster. Idempotent: the void
+// transfer has a deterministic id (TransferExists tolerated) and the terminal
+// pending-state rejections (already voided/posted/expired, not pending) are
+// reported as the TB status so callers can converge their projection.
+func voidPendingTB(ctx context.Context, transferID string, idemSuffix string) (uint32, error) {
+	results, err := tbClient.CreateTransfers(ctx, []tbclient.Transfer{{
+		ID:        detID("tb-pending-sweeper-go/void/" + transferID + idemSuffix),
+		PendingID: pendingTBID(transferID),
+		Amount:    tbclient.ToUint128(0),
+		Ledger:    tbSweeperLedgerID,
+		Code:      1,
+		Flags:     tbclient.TransferFlags{VoidPendingTransfer: true}.ToUint16(),
+	}})
+	if err != nil {
+		return 0, fmt.Errorf("tigerbeetle void transfer: %w", err)
+	}
+	for _, r := range results {
+		s := uint32(r.Status)
+		if r.Status == tbclient.TransferCreated || r.Status == tbclient.TransferExists {
+			return s, nil
+		}
+		return s, fmt.Errorf("tigerbeetle void rejected: status=%d", s)
+	}
+	return uint32(tbclient.TransferCreated), nil
+}
+
+// postPendingTB posts (commits) a pending transfer at the cluster. Idempotent
+// via a deterministic post id.
+func postPendingTB(ctx context.Context, transferID string) (uint32, error) {
+	results, err := tbClient.CreateTransfers(ctx, []tbclient.Transfer{{
+		ID:        detID("tb-pending-sweeper-go/post/" + transferID),
+		PendingID: pendingTBID(transferID),
+		Amount:    tbclient.ToUint128(0),
+		Ledger:    tbSweeperLedgerID,
+		Code:      1,
+		Flags:     tbclient.TransferFlags{PostPendingTransfer: true}.ToUint16(),
+	}})
+	if err != nil {
+		return 0, fmt.Errorf("tigerbeetle post transfer: %w", err)
+	}
+	for _, r := range results {
+		s := uint32(r.Status)
+		if r.Status == tbclient.TransferCreated || r.Status == tbclient.TransferExists {
+			return s, nil
+		}
+		return s, fmt.Errorf("tigerbeetle post rejected: status=%d", s)
+	}
+	return uint32(tbclient.TransferCreated), nil
+}
+
+// TB CreateTransferStatus values (tigerbeetle-go v0.17.0 enum) used to
+// converge the PG projection when the cluster already resolved a transfer.
+const (
+	tbStatusPendingTransferNotFound      uint32 = 25
+	tbStatusPendingTransferNotPending    uint32 = 26
+	tbStatusPendingTransferAlreadyPosted uint32 = 33
+	tbStatusPendingTransferAlreadyVoided uint32 = 34
+	tbStatusPendingTransferExpired       uint32 = 35
 )
 
 func initDB() {
@@ -98,69 +208,73 @@ func initDB() {
 	log.Println("[tb-pending-sweeper] Schema initialized")
 }
 
-func loadPending() {
-	pendingTxns = make(map[string]*PendingTransfer)
-	if db == nil {
-		return
+// sweepExpired voids every expired PENDING transfer at the TigerBeetle
+// cluster and records the outcome in the PG projection. The candidate set
+// comes from the tb_pending_transfers projection (durable across restarts),
+// NOT from process memory. TB is authoritative: terminal cluster states
+// (already posted/voided/expired) converge the projection instead of being
+// treated as failures.
+func sweepExpired() int {
+	if db == nil || tbClient == nil {
+		return 0
 	}
-	rows, err := db.Query(`SELECT transfer_id, debit_account_id, credit_account_id, amount_kobo, created_at, timeout_secs, status
+	now := time.Now()
+	rows, err := db.Query(`SELECT transfer_id, created_at, timeout_secs
 		FROM tb_pending_transfers WHERE status = 'pending'`)
 	if err != nil {
-		log.Printf("Load pending error: %v", err)
-		return
+		log.Printf("[sweeper] pending query failed: %v", err)
+		return 0
 	}
-	defer rows.Close()
-	count := 0
+	type cand struct {
+		id        string
+		createdAt time.Time
+		timeout   int
+	}
+	cands := []cand{}
 	for rows.Next() {
-		var p PendingTransfer
-		if err := rows.Scan(&p.TransferID, &p.DebitAcct, &p.CreditAcct, &p.AmountKobo, &p.CreatedAt, &p.TimeoutSecs, &p.Status); err != nil {
-			continue
+		var c cand
+		if err := rows.Scan(&c.id, &c.createdAt, &c.timeout); err == nil {
+			cands = append(cands, c)
 		}
-		pendingTxns[p.TransferID] = &p
-		count++
 	}
-	log.Printf("[tb-pending-sweeper] Loaded %d pending transfers from DB", count)
-}
-
-func sweepExpired() int {
-	now := time.Now()
-	pendingMu.Lock()
-	defer pendingMu.Unlock()
+	rows.Close()
 
 	swept := 0
-	for id, p := range pendingTxns {
-		if p.Status != "pending" {
-			continue
-		}
-		timeout := time.Duration(p.TimeoutSecs) * time.Second
+	for _, c := range cands {
+		timeout := time.Duration(c.timeout) * time.Second
 		if timeout == 0 {
 			timeout = defaultTimeout
 		}
-		age := now.Sub(p.CreatedAt)
-		if age > timeout {
-			p.Status = "expired"
-			result := SweepResult{
-				SweptAt:    now,
-				TransferID: id,
-				Action:     "voided",
-				AgeSeconds: age.Seconds(),
-			}
-			sweepResults = append(sweepResults, result)
-			if db != nil {
-				db.Exec(`UPDATE tb_pending_transfers SET status = 'expired' WHERE transfer_id = $1`, id)
-				db.Exec(`INSERT INTO tb_sweep_results (swept_at, transfer_id, action, age_seconds) VALUES ($1, $2, $3, $4)`,
-					result.SweptAt, result.TransferID, result.Action, result.AgeSeconds)
-			}
-			// Void in TigerBeetle
-			if tbClient != nil {
-				pendingID := tbclient.NewUint128()
-				if err := tbClient.VoidPendingTransfer(pendingID); err != nil {
-					log.Printf("[sweeper] TB void failed for %s: %v", id, err)
-				}
-			}
-			log.Printf("[sweeper] voided expired transfer %s (age: %.0fs, timeout: %ds)", id, age.Seconds(), p.TimeoutSecs)
-			swept++
+		age := now.Sub(c.createdAt)
+		if age <= timeout {
+			continue
 		}
+		// AUTHORITATIVE STEP: void the expired pending transfer at the
+		// cluster (idempotent void id).
+		status, verr := voidPendingTB(context.Background(), c.id, "")
+		newStatus := "expired"
+		action := "voided"
+		if verr != nil {
+			switch status {
+			case tbStatusPendingTransferAlreadyPosted:
+				newStatus, action = "posted", "already-posted"
+			case tbStatusPendingTransferAlreadyVoided, tbStatusPendingTransferExpired, tbStatusPendingTransferNotPending, tbStatusPendingTransferNotFound:
+				newStatus, action = "voided", "already-resolved"
+			default:
+				log.Printf("[sweeper] TB void failed for %s: %v", c.id, verr)
+				continue
+			}
+		}
+		// Projection updates after cluster confirmation.
+		if _, err := db.Exec(`UPDATE tb_pending_transfers SET status = $1 WHERE transfer_id = $2 AND status = 'pending'`, newStatus, c.id); err != nil {
+			log.Printf("[sweeper] projection status update failed for %s: %v", c.id, err)
+		}
+		if _, err := db.Exec(`INSERT INTO tb_sweep_results (swept_at, transfer_id, action, age_seconds) VALUES ($1, $2, $3, $4)`,
+			now, c.id, action, age.Seconds()); err != nil {
+			log.Printf("[sweeper] sweep audit insert failed for %s: %v", c.id, err)
+		}
+		log.Printf("[sweeper] %s expired transfer %s (age: %.0fs, timeout: %ds)", action, c.id, age.Seconds(), c.timeout)
+		swept++
 	}
 	return swept
 }
@@ -194,8 +308,58 @@ func registerPendingHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid request"}`, 400)
 		return
 	}
+	if req.TransferID == "" || req.DebitAcct == "" || req.CreditAcct == "" {
+		http.Error(w, `{"error":"transfer_id, debit_account_id and credit_account_id are required"}`, 400)
+		return
+	}
+	if req.AmountKobo <= 0 {
+		http.Error(w, `{"error":"amount_kobo must be positive"}`, 400)
+		return
+	}
 	if req.TimeoutSecs == 0 {
 		req.TimeoutSecs = 300
+	}
+	if db == nil || tbClient == nil {
+		http.Error(w, `{"error":"store or ledger unavailable — pending transfer NOT registered"}`, 503)
+		return
+	}
+
+	// AUTHORITATIVE LEDGER STEP (TigerBeetle) FIRST: create a REAL PENDING
+	// transfer — the cluster holds the funds (debits_pending) and auto-expires
+	// the hold after Timeout seconds. Deterministic id ⇒ TransferExists makes
+	// a retried registration idempotent.
+	debitTB, err := ensureSweepAccount(r.Context(), req.DebitAcct, true)
+	if err != nil {
+		log.Printf("[tb-pending-sweeper] debit account provisioning FAILED for %s: %v", req.TransferID, err)
+		http.Error(w, `{"error":"ledger account provisioning failed — NOT registered"}`, 502)
+		return
+	}
+	creditTB, err := ensureSweepAccount(r.Context(), req.CreditAcct, false)
+	if err != nil {
+		log.Printf("[tb-pending-sweeper] credit account provisioning FAILED for %s: %v", req.TransferID, err)
+		http.Error(w, `{"error":"ledger account provisioning failed — NOT registered"}`, 502)
+		return
+	}
+	tresults, err := tbClient.CreateTransfers(r.Context(), []tbclient.Transfer{{
+		ID:              pendingTBID(req.TransferID),
+		DebitAccountID:  debitTB,
+		CreditAccountID: creditTB,
+		Amount:          tbclient.ToUint128(uint64(req.AmountKobo)),
+		Timeout:         uint32(req.TimeoutSecs),
+		Ledger:          tbSweeperLedgerID,
+		Code:            1,
+		Flags:           tbclient.TransferFlags{Pending: true}.ToUint16(),
+	}})
+	if err != nil {
+		log.Printf("[tb-pending-sweeper] TB pending transfer FAILED for %s: %v", req.TransferID, err)
+		http.Error(w, `{"error":"ledger hold failed — NOT registered"}`, 502)
+		return
+	}
+	for _, res := range tresults {
+		if res.Status != tbclient.TransferCreated && res.Status != tbclient.TransferExists {
+			http.Error(w, fmt.Sprintf(`{"error":"ledger hold rejected: status=%d"}`, uint32(res.Status)), 502)
+			return
+		}
 	}
 
 	p := &PendingTransfer{
@@ -208,15 +372,19 @@ func registerPendingHandler(w http.ResponseWriter, r *http.Request) {
 		Status:      "pending",
 	}
 
-	pendingMu.Lock()
-	pendingTxns[req.TransferID] = p
-	pendingMu.Unlock()
-
-	if db != nil {
-		db.Exec(`INSERT INTO tb_pending_transfers (transfer_id, debit_account_id, credit_account_id, amount_kobo, created_at, timeout_secs, status)
-			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-			ON CONFLICT (transfer_id) DO NOTHING`,
-			p.TransferID, p.DebitAcct, p.CreditAcct, p.AmountKobo, p.CreatedAt, p.TimeoutSecs)
+	// PG projection (query + audit) after cluster confirmation. On failure,
+	// compensate: void the hold we just created (idempotent "-REV" void id).
+	if _, err := db.Exec(`INSERT INTO tb_pending_transfers (transfer_id, debit_account_id, credit_account_id, amount_kobo, created_at, timeout_secs, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+		ON CONFLICT (transfer_id) DO NOTHING`,
+		p.TransferID, p.DebitAcct, p.CreditAcct, p.AmountKobo, p.CreatedAt, p.TimeoutSecs); err != nil {
+		if _, verr := voidPendingTB(context.Background(), req.TransferID, "-REV"); verr != nil {
+			log.Printf("[tb-pending-sweeper] CRITICAL: compensation void FAILED for %s: %v — manual reconciliation required", req.TransferID, verr)
+		} else {
+			log.Printf("[tb-pending-sweeper] compensation void posted for %s (projection insert failed)", req.TransferID)
+		}
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -233,53 +401,92 @@ func resolvePendingHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid request"}`, 400)
 		return
 	}
+	if req.Action != "post" && req.Action != "void" {
+		http.Error(w, `{"error":"action must be post or void"}`, 400)
+		return
+	}
+	if db == nil || tbClient == nil {
+		http.Error(w, `{"error":"store or ledger unavailable — resolution NOT performed"}`, 503)
+		return
+	}
 
-	pendingMu.Lock()
-	p, ok := pendingTxns[req.TransferID]
-	if !ok {
-		pendingMu.Unlock()
+	// Current state comes from the durable projection, never process memory.
+	var current string
+	err := db.QueryRowContext(r.Context(), `SELECT status FROM tb_pending_transfers WHERE transfer_id = $1`, req.TransferID).Scan(&current)
+	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"transfer not found"}`, 404)
 		return
 	}
-	if p.Status != "pending" {
-		pendingMu.Unlock()
-		http.Error(w, fmt.Sprintf(`{"error":"transfer already %s"}`, p.Status), 409)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
 		return
 	}
-	p.Status = req.Action + "ed"
-	pendingMu.Unlock()
+	if current != "pending" {
+		http.Error(w, fmt.Sprintf(`{"error":"transfer already %s"}`, current), 409)
+		return
+	}
 
-	if db != nil {
-		db.Exec(`UPDATE tb_pending_transfers SET status = $1 WHERE transfer_id = $2`, p.Status, req.TransferID)
+	// AUTHORITATIVE STEP (TigerBeetle): post or void the pending transfer at
+	// the cluster. Deterministic ids make retries idempotent; terminal-state
+	// rejections mean the cluster already resolved it (converge, don't fail).
+	newStatus := req.Action + "ed"
+	var tbStatus uint32
+	if req.Action == "post" {
+		tbStatus, err = postPendingTB(r.Context(), req.TransferID)
+	} else {
+		tbStatus, err = voidPendingTB(r.Context(), req.TransferID, "")
+	}
+	if err != nil {
+		switch tbStatus {
+		case tbStatusPendingTransferAlreadyPosted:
+			newStatus = "posted"
+		case tbStatusPendingTransferAlreadyVoided, tbStatusPendingTransferExpired, tbStatusPendingTransferNotPending:
+			newStatus = "voided"
+		default:
+			log.Printf("[tb-pending-sweeper] TB %s FAILED for %s: %v", req.Action, req.TransferID, err)
+			http.Error(w, `{"error":"ledger resolution failed — NOT resolved"}`, 502)
+			return
+		}
+	}
+
+	// Projection update after cluster confirmation. If it fails, TB remains
+	// authoritative: the sweeper converges terminal states on its next pass.
+	if _, err := db.Exec(`UPDATE tb_pending_transfers SET status = $1 WHERE transfer_id = $2 AND status = 'pending'`, newStatus, req.TransferID); err != nil {
+		log.Printf("[tb-pending-sweeper] CRITICAL: projection update FAILED after TB %s for %s: %v — sweeper will converge", req.Action, req.TransferID, err)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"transfer_id": req.TransferID, "status": p.Status})
+	json.NewEncoder(w).Encode(map[string]interface{}{"transfer_id": req.TransferID, "status": newStatus})
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
-	pendingMu.RLock()
-	pending, expired, posted, voided := 0, 0, 0, 0
-	for _, p := range pendingTxns {
-		switch p.Status {
-		case "pending":
-			pending++
-		case "expired":
-			expired++
-		case "posted":
-			posted++
-		case "voided":
-			voided++
+	if db == nil {
+		http.Error(w, `{"error":"projection store unavailable"}`, 503)
+		return
+	}
+	counts := map[string]int{"pending": 0, "expired": 0, "posted": 0, "voided": 0}
+	rows, err := db.QueryContext(r.Context(), `SELECT status, COUNT(*) FROM tb_pending_transfers GROUP BY status`)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), 500)
+		return
+	}
+	for rows.Next() {
+		var s string
+		var n int
+		if err := rows.Scan(&s, &n); err == nil {
+			counts[s] = n
 		}
 	}
-	pendingMu.RUnlock()
+	rows.Close()
+	totalSweeps := 0
+	db.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM tb_sweep_results`).Scan(&totalSweeps)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"pending": pending, "expired": expired, "posted": posted, "voided": voided,
+		"pending": counts["pending"], "expired": counts["expired"], "posted": counts["posted"], "voided": counts["voided"],
 		"sweep_interval_secs":  sweepInterval.Seconds(),
 		"default_timeout_secs": defaultTimeout.Seconds(),
-		"total_sweeps":         len(sweepResults),
+		"total_sweeps":         totalSweeps,
 	})
 }
 
@@ -289,14 +496,14 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func initTBClient() {
-	cfg := tbclient.DefaultConfig()
+	var cfg tbclient.Config
 	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
 		cfg.Addresses = []string{addr}
 	}
 	var err error
 	tbClient, err = tbclient.NewClient(cfg)
 	if err != nil {
-		log.Printf("[tb-pending-sweeper] TB client init failed: %v", err)
+		log.Printf("[tb-pending-sweeper] TB client init failed (register/resolve/sweep fail closed): %v", err)
 	}
 }
 
@@ -478,14 +685,13 @@ func main() {
 
 	initDB()
 	initTBClient()
-	loadPending()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go sweepLoop(ctx)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/tb-sweeper/register", registerPendingHandler)
-	mux.HandleFunc("/v1/tb-sweeper/resolve", resolvePendingHandler)
+	mux.HandleFunc("/v1/tb-sweeper/register", permifyAuthzGuard("sweep", "register", registerPendingHandler))
+	mux.HandleFunc("/v1/tb-sweeper/resolve", permifyAuthzGuard("sweep", "resolve", resolvePendingHandler))
 	mux.HandleFunc("/v1/tb-sweeper/status", statusHandler)
 	mux.HandleFunc("/healthz", healthHandler)
 

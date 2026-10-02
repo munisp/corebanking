@@ -572,11 +572,11 @@ func main() {
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/api/v1/canary/check", handleCheckResource)
-	mux.HandleFunc("/api/v1/canary/create", handleCreateToken)
-	mux.HandleFunc("/api/v1/canary/tokens", handleListTokens)
-	mux.HandleFunc("/api/v1/canary/triggers", handleListTriggers)
-	mux.HandleFunc("/api/v1/canary/stats", handleStats)
+	mux.HandleFunc("/api/v1/canary/check", permifyAuthzGuard("canary_token", "check", handleCheckResource))
+	mux.HandleFunc("/api/v1/canary/create", permifyAuthzGuard("canary_token", "create", handleCreateToken))
+	mux.HandleFunc("/api/v1/canary/tokens", permifyAuthzGuard("canary_token", "manage", handleListTokens))
+	mux.HandleFunc("/api/v1/canary/triggers", permifyAuthzGuard("canary_token", "manage", handleListTriggers))
+	mux.HandleFunc("/api/v1/canary/stats", permifyAuthzGuard("canary_token", "view", handleStats))
 	handler := panicMW(rateLimitMW(loggingMW(mux)))
 	srv := &http.Server{
 		Addr: ":" + port, Handler: jwtAuthMiddleware(handler), ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second,

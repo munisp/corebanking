@@ -283,6 +283,17 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 
 		`CREATE INDEX IF NOT EXISTS idx_tenant_coa_mappings_tenant_id ON tenant_coa_mappings(tenant_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_tenant_coa_mappings_key ON tenant_coa_mappings(tenant_id, mapping_key)`,
+
+		// W12-C3-P2-B2 (GO-SVC-FIELD-MAPS): per-tenant COA↔TigerBeetle
+		// reconciliation status — was ChartOfAccountsService.reconciliationStatus
+		// map[string]ReconciliationStatus (service.go:31), lost on restart.
+		`CREATE TABLE IF NOT EXISTS reconciliation_status (
+			tenant_id VARCHAR(255) PRIMARY KEY,
+			last_reconciliation TIMESTAMP WITH TIME ZONE,
+			status VARCHAR(50) NOT NULL,
+			discrepancy_count INTEGER NOT NULL DEFAULT 0,
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 
 	for _, migration := range migrations {
@@ -296,6 +307,34 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 
 func (s *PostgresStore) Close() error {
 	return s.db.Close()
+}
+
+// UpsertReconciliationStatus persists the latest per-tenant reconciliation
+// outcome (W12-C3-P2-B2). Idempotent: keyed on tenant_id.
+func (s *PostgresStore) UpsertReconciliationStatus(ctx context.Context, st ReconciliationStatus) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO reconciliation_status
+		(tenant_id, last_reconciliation, status, discrepancy_count, updated_at)
+		VALUES ($1,$2,$3,$4,CURRENT_TIMESTAMP)
+		ON CONFLICT (tenant_id) DO UPDATE SET
+			last_reconciliation = EXCLUDED.last_reconciliation,
+			status = EXCLUDED.status,
+			discrepancy_count = EXCLUDED.discrepancy_count,
+			updated_at = CURRENT_TIMESTAMP`,
+		st.TenantID, st.LastReconciliation, st.Status, st.DiscrepancyCount)
+	return err
+}
+
+// GetReconciliationStatus reads the per-tenant reconciliation status from PG.
+// Returns sql.ErrNoRows when reconciliation has never run for the tenant.
+func (s *PostgresStore) GetReconciliationStatus(ctx context.Context, tenantID string) (*ReconciliationStatus, error) {
+	var st ReconciliationStatus
+	err := s.db.QueryRowContext(ctx, `SELECT tenant_id, last_reconciliation, status, discrepancy_count
+		FROM reconciliation_status WHERE tenant_id = $1`, tenantID).
+		Scan(&st.TenantID, &st.LastReconciliation, &st.Status, &st.DiscrepancyCount)
+	if err != nil {
+		return nil, err
+	}
+	return &st, nil
 }
 
 func (s *PostgresStore) UpsertCOAMapping(ctx context.Context, m TenantCOAMapping) error {

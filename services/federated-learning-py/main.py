@@ -15,7 +15,9 @@ import psycopg2.extras
 import threading
 
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import Depends, FastAPI, HTTPException, Header, Request
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -86,6 +88,14 @@ class _PooledConn:
     def close(self):
         raw, self._raw = self._raw, None
         if raw is not None:
+            # B5-P1-B: with autocommit off, an uncommitted transaction
+            # (read-only, or aborted by an error) must be rolled back
+            # before the connection returns to the pool, otherwise the
+            # next borrower inherits an idle/aborted transaction.
+            try:
+                raw.rollback()
+            except Exception:
+                pass
             try:
                 _get_db_pool().putconn(raw)
             except Exception:
@@ -101,9 +111,17 @@ class _PooledConn:
             pass
 
 def get_db():
-    """Borrow a connection from the pool (thread-safe)."""
+    """Borrow a connection from the pool (thread-safe).
+
+    B5-P1-B: autocommit is OFF. Multi-statement write blocks (domain
+    write + INSERT INTO outbox) now commit as ONE transaction via the
+    explicit conn.commit() at the end of each block. Previously
+    autocommit=True made every execute() its own transaction and the
+    trailing conn.commit() a no-op, so a crash between the domain
+    write and the outbox insert silently lost the event (or the row).
+    """
     raw = _get_db_pool().getconn()
-    raw.autocommit = True
+    raw.autocommit = False
     return _PooledConn(raw)
 
 def release_db(conn):
@@ -408,7 +426,7 @@ def metrics():
         return {"service": "federated-learning-py", "total_records": 0}
 
 
-@app.get("/api/v1/service_configs")
+@app.get("/api/v1/service_configs", dependencies=[Depends(require_permify("service_config", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None)):
     conn = get_db()
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -428,7 +446,7 @@ def list_records(x_tenant_id: Optional[str] = Header(None)):
     return {"data": records, "count": len(records)}
 
 
-@app.post("/api/v1/service_configs", status_code=201)
+@app.post("/api/v1/service_configs", status_code=201, dependencies=[Depends(require_permify("service_config", "create"))])
 def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
     tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
     status = body.status or "active"
@@ -450,7 +468,7 @@ def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)
     return {"id": record_id, "status": "created"}
 
 
-@app.get("/api/v1/service_configs/{record_id}")
+@app.get("/api/v1/service_configs/{record_id}", dependencies=[Depends(require_permify("service_config", "view"))])
 def get_record(record_id: str):
     conn = get_db()
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -461,7 +479,7 @@ def get_record(record_id: str):
     return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
 
 
-@app.put("/api/v1/service_configs/{record_id}")
+@app.put("/api/v1/service_configs/{record_id}", dependencies=[Depends(require_permify("service_config", "update"))])
 def update_record(record_id: str, body: UpdateRequest):
     status = body.status or "updated"
     conn = get_db()
@@ -479,7 +497,7 @@ def update_record(record_id: str, body: UpdateRequest):
     return {"id": record_id, "status": status}
 
 
-@app.delete("/api/v1/service_configs/{record_id}", status_code=204)
+@app.delete("/api/v1/service_configs/{record_id}", status_code=204, dependencies=[Depends(require_permify("service_config", "delete"))])
 def delete_record(record_id: str):
     conn = get_db()
     with conn.cursor() as cur:

@@ -96,7 +96,8 @@ import 'screens/splash_screen.dart';
 
 // Auth Screens
 import 'screens/auth/premium_login_screen.dart';
-// import 'screens/auth/register_screen.dart'; // Deprecated - using multi-step registration
+// W12-A4P2MOBILE: deprecated auth/register_screen.dart RETIREd (dead file removed;
+// multi-step registration register_step1..3 is the live flow).
 import 'screens/auth/register_step1_screen.dart';
 import 'screens/auth/register_step2_screen.dart';
 import 'screens/auth/register_step3_screen.dart';
@@ -112,6 +113,9 @@ import 'screens/customer_screens/settings/settings_screen.dart';
 import 'screens/customer_screens/settings/language_selection_screen.dart';
 import 'screens/customer_screens/transfers/transfer_screen.dart';
 import 'screens/customer_screens/transfers/bulk_transfer_screen.dart';
+// W12-A4-P0-E: BeneficiariesScreen — pushed via pushNamed('/beneficiaries')
+// from transfer_screen.dart; route-table entry added below.
+import 'screens/customer_screens/transfers/beneficiaries_screen.dart';
 import 'screens/customer_screens/notification/notification_screen.dart';
 import 'screens/customer_screens/accounts/add_account_screen.dart';
 import 'screens/customer_screens/cheques/cheques_screen.dart';
@@ -162,6 +166,14 @@ import 'screens/customer_screens/voice_banking/voice_ivr_menu_screen.dart';
 import 'screens/customer_screens/voice_banking/voice_nlu_banking_screen.dart';
 import 'screens/customer_screens/voice_banking/voice_banking_gateway_screen.dart';
 import 'screens/customer_screens/voice_banking/voice_agent_escalation_screen.dart';
+// W12-A4P2MOBILE: previously unrouted screens (P2-B WIRE batch) — route entries
+// added below so the more_actions dispatch table can reach them.
+import 'screens/customer_screens/agriculture/agricultural_insurance_screen.dart';
+import 'screens/customer_screens/account/bank_details.dart';
+import 'screens/customer_screens/deposit/deposit_screen.dart';
+import 'screens/education_banking/education_loan_update_screen.dart';
+import 'screens/customer_screens/insurance/insurance_claims_screen.dart';
+import 'screens/customer_screens/insurance/insurance_premium_payments_screen.dart';
 
 import 'screens/customer_screens/esusu/esusu_screen.dart';
 import 'screens/customer_screens/van/van_management_screen.dart';
@@ -313,7 +325,11 @@ class FiveFourBankApp extends StatelessWidget {
               '/active-loans': (context) => const ActiveLoansScreen(),
               '/active-lpos': (context) => const ActiveLPOsScreen(),
               '/add-account': (context) => const AddAccountScreen(),
+              '/bank-details': (context) => const BankDetailsScreen(),
               '/bank-statement': (context) => const BankStatementScreen(),
+              // W12-A4-P0-E: was missing — pushNamed('/beneficiaries') in
+              // transfer_screen.dart:427 failed with "generator for route".
+              '/beneficiaries': (context) => const BeneficiariesScreen(),
               '/bills': (context) => const BillPaymentScreen(),
               '/bvn': (context) => const BvnScreen(),
               '/bvn-verification': (context) => const BvnVerificationScreen(),
@@ -328,6 +344,7 @@ class FiveFourBankApp extends StatelessWidget {
                 return CreatePinScreen(isOnboarding: isOnboarding);
               },
               '/dashboard': (context) => const MainNavigationScreen(),
+              '/deposit': (context) => const DepositScreen(),
               '/bnpl': (context) => const bnpl.BNPLListScreen(),
               '/bnpl/apply': (context) => const bnpl.BNPLApplyScreen(),
               '/bnpl/details': (context) {
@@ -351,6 +368,13 @@ class FiveFourBankApp extends StatelessWidget {
                 final app = ModalRoute.of(context)?.settings.arguments;
                 return edu_loan_detail.EducationLoanDetailScreen(application: app as EducationLoanApplication);
               },
+              // W12-A4P2MOBILE: requires the application object — pushed with
+              // arguments from EducationLoanDetailScreen ("Update Application").
+              '/education-loan/update': (context) {
+                final app = ModalRoute.of(context)?.settings.arguments;
+                return EducationLoanUpdateScreen(
+                    application: app as EducationLoanApplication);
+              },
               '/disputes': (context) => const DisputesListScreen(),
               '/email-otp': (context) => const EmailOtpScreen(),
               '/face-scan': (context) => const FaceScanningScreen(),
@@ -364,6 +388,9 @@ class FiveFourBankApp extends StatelessWidget {
               '/forgot-pin': (context) => const ForgotPinScreen(),
               '/fx': (context) => const FXScreen(),
               '/insurance': (context) => const InsuranceScreen(),
+              '/insurance/claims': (context) => const InsuranceClaimsScreen(),
+              '/insurance/premium-payments': (context) =>
+                  const InsurancePremiumPaymentsScreen(),
               '/input-pin': (context) => const InputPinScreen(),
               '/investments': (context) => const InvestmentsScreen(),
               '/kyc-address': (context) => const AddressVerificationScreen(),
@@ -453,6 +480,9 @@ class FiveFourBankApp extends StatelessWidget {
               '/agriculture/satellite-monitor': (context) => const SatelliteCropMonitorScreen(),
               '/agriculture/soil-analysis': (context) => const SoilAnalysisScreen(),
               '/agriculture/fisheries': (context) => const FisheriesAquacultureScreen(),
+              // W12-A4P2MOBILE: new route entries for previously unrouted screens
+              '/agriculture/insurance': (context) =>
+                  const AgriculturalInsuranceScreen(),
               '/equipment-leasing/apply': (context) =>
                   const EquipmentLeasingApplyScreen(),
               '/diaspora-banking': (context) => const DiasporaBankingScreen(),

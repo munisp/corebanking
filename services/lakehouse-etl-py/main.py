@@ -12,7 +12,8 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header
+from permify_guard import require_permify  # W12-B5P1DF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -393,7 +394,7 @@ def metrics():
         return {"service": "lakehouse-etl-py", "total_records": 0}
 
 
-@app.get("/api/v1/service_configs")
+@app.get("/api/v1/service_configs", dependencies=[Depends(require_permify("dataset", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
@@ -709,7 +710,7 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-@app.post("/api/v1/service_configs", status_code=201)
+@app.post("/api/v1/service_configs", status_code=201, dependencies=[Depends(require_permify("dataset", "service_configs"))])
 def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
     tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
     status = body.status or "active"

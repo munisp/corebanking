@@ -118,20 +118,21 @@ type IPCheckResult struct {
 
 // IPSecurityManager manages IP-based security
 type IPSecurityManager struct {
-	db           *sql.DB
-	config       IPSecurityConfig
-	tenantConfig map[string]IPSecurityConfig
-	ipCache      map[string]*IPInfo
-	mu           sync.RWMutex
+	db      *sql.DB
+	config  IPSecurityConfig
+	ipCache map[string]*IPInfo
+	mu      sync.RWMutex
+	// tenantConfig moved to redis cache-aside `config:ipsec:{tenantID}`
+	// (c3-0766, see redis_store.go); mu is RETAINED — it guards the
+	// untouched ipCache.
 }
 
 // NewIPSecurityManager creates a new IP security manager
 func NewIPSecurityManager(db *sql.DB) *IPSecurityManager {
 	ism := &IPSecurityManager{
-		db:           db,
-		config:       DefaultIPSecurityConfig,
-		tenantConfig: make(map[string]IPSecurityConfig),
-		ipCache:      make(map[string]*IPInfo),
+		db:      db,
+		config:  DefaultIPSecurityConfig,
+		ipCache: make(map[string]*IPInfo),
 	}
 
 	// Load environment overrides
@@ -266,6 +267,9 @@ func (ism *IPSecurityManager) createTables() {
 	}
 }
 
+// loadTenantConfigs pre-warms the redis config cache (c3-0766). Reads at
+// runtime are cache-aside (redis -> PG -> default), so a pre-warm failure
+// only means the first lookup per tenant hits Postgres.
 func (ism *IPSecurityManager) loadTenantConfigs() {
 	rows, err := ism.db.Query(`SELECT tenant_id, config FROM ip_security_config WHERE tenant_id IS NOT NULL`)
 	if err != nil {
@@ -274,9 +278,6 @@ func (ism *IPSecurityManager) loadTenantConfigs() {
 	}
 	defer rows.Close()
 
-	ism.mu.Lock()
-	defer ism.mu.Unlock()
-
 	for rows.Next() {
 		var tenantID string
 		var configJSON []byte
@@ -284,22 +285,36 @@ func (ism *IPSecurityManager) loadTenantConfigs() {
 			continue
 		}
 
-		var config IPSecurityConfig
-		if err := json.Unmarshal(configJSON, &config); err != nil {
-			continue
-		}
-
-		ism.tenantConfig[tenantID] = config
+		configCacheSet(configIPSecKey(tenantID), string(configJSON))
 	}
 }
 
-// GetConfig returns the applicable IP security config
-func (ism *IPSecurityManager) GetConfig(tenantID string) IPSecurityConfig {
-	ism.mu.RLock()
-	defer ism.mu.RUnlock()
+// lookupTenantConfig resolves a tenant's IP security config cache-aside:
+// redis `config:ipsec:{tenantID}` -> Postgres ip_security_config -> not found.
+func (ism *IPSecurityManager) lookupTenantConfig(tenantID string) (IPSecurityConfig, bool) {
+	var config IPSecurityConfig
+	if raw, ok := configCacheGet(configIPSecKey(tenantID)); ok {
+		if err := json.Unmarshal([]byte(raw), &config); err == nil {
+			return config, true
+		}
+		// undecodable entry: fall through to PG and refresh
+	}
+	var configJSON []byte
+	err := ism.db.QueryRow(`SELECT config FROM ip_security_config WHERE tenant_id = $1`, tenantID).Scan(&configJSON)
+	if err != nil {
+		return config, false
+	}
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		return config, false
+	}
+	configCacheSet(configIPSecKey(tenantID), string(configJSON))
+	return config, true
+}
 
+// GetConfig returns the applicable IP security config (cache-aside via redis, c3-0766)
+func (ism *IPSecurityManager) GetConfig(tenantID string) IPSecurityConfig {
 	if tenantID != "" {
-		if config, ok := ism.tenantConfig[tenantID]; ok {
+		if config, ok := ism.lookupTenantConfig(tenantID); ok {
 			return config
 		}
 	}
@@ -307,7 +322,9 @@ func (ism *IPSecurityManager) GetConfig(tenantID string) IPSecurityConfig {
 	return ism.config
 }
 
-// SetTenantConfig sets a custom IP security config for a tenant
+// SetTenantConfig sets a custom IP security config for a tenant.
+// Postgres remains the store of record; the redis cache is refreshed
+// WRITE-THROUGH after a successful DB write (c3-0766).
 func (ism *IPSecurityManager) SetTenantConfig(tenantID string, config IPSecurityConfig) error {
 	configJSON, err := json.Marshal(config)
 	if err != nil {
@@ -326,9 +343,7 @@ func (ism *IPSecurityManager) SetTenantConfig(tenantID string, config IPSecurity
 		return err
 	}
 
-	ism.mu.Lock()
-	ism.tenantConfig[tenantID] = config
-	ism.mu.Unlock()
+	configCacheSet(configIPSecKey(tenantID), string(configJSON))
 
 	return nil
 }

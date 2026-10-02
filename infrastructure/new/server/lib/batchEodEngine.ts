@@ -2,8 +2,25 @@
  * Batch Processing / EOD Engine — End-of-day processing for banking operations.
  * Interest accrual, GL posting, dormancy checks, standing orders,
  * reconciliation, and regulatory data extraction.
+ *
+ * W12-C3-P2-MLIB (c3-1011): the EOD job registry was module process memory
+ * (lost on restart, divergent across replicas). Now Postgres-authoritative
+ * (table `eod_jobs`) via lib/pgJsonStore.ts; fail-closed 503 on PG outage, no
+ * degraded-memory fallback. (BATCH_RUNS is out of this batch's scope.)
  */
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const JOBS_TABLE = "eod_jobs";
+
+async function loadEodJobs(): Promise<EODJob[]> {
+  return pgGuard((async () => {
+    await ensureTables("batchEodEngine", storeDDL(JOBS_TABLE));
+    await storeSeed(JOBS_TABLE, EOD_JOBS_SEED, () => "");
+    return storeList<EODJob>(JOBS_TABLE);
+  })());
+}
 
 interface EODJob {
   id: string;
@@ -30,7 +47,8 @@ interface EODBatchRun {
   triggeredBy: string;
 }
 
-const EOD_JOBS: EODJob[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const EOD_JOBS_SEED: EODJob[] = [
   { id: "EOD-001", name: "Interest Accrual — Savings", description: "Calculate and accrue daily interest on all savings accounts based on tiered rates", order: 1, type: "interest_accrual", schedule: "0 0 * * *", lastRunAt: "2026-05-09T00:00:30Z", lastRunDurationMs: 45000, lastRunStatus: "success", affectedRecords: 12500, dependencies: [] },
   { id: "EOD-002", name: "Interest Accrual — Loans", description: "Calculate and accrue daily interest on all active loan accounts per contract rate", order: 2, type: "interest_accrual", schedule: "0 0 * * *", lastRunAt: "2026-05-09T00:01:15Z", lastRunDurationMs: 32000, lastRunStatus: "success", affectedRecords: 4370, dependencies: [] },
   { id: "EOD-003", name: "Interest Accrual — Fixed Deposits", description: "Accrue interest on all FD contracts based on negotiated rates and tenor", order: 3, type: "interest_accrual", schedule: "0 0 * * *", lastRunAt: "2026-05-09T00:01:47Z", lastRunDurationMs: 8000, lastRunStatus: "success", affectedRecords: 890, dependencies: [] },
@@ -49,19 +67,20 @@ const BATCH_RUNS: EODBatchRun[] = [
   {
     id: "BATCH-20260509", businessDate: "2026-05-09", startedAt: "2026-05-09T00:00:00Z", completedAt: "2026-05-09T03:15:00Z",
     status: "completed", totalRecordsProcessed: 126995, triggeredBy: "system-scheduler",
-    jobs: EOD_JOBS.map((j) => ({ jobId: j.id, name: j.name, status: "completed" as const, durationMs: j.lastRunDurationMs, recordsProcessed: j.affectedRecords, errors: 0 })),
+    jobs: EOD_JOBS_SEED.map((j) => ({ jobId: j.id, name: j.name, status: "completed" as const, durationMs: j.lastRunDurationMs, recordsProcessed: j.affectedRecords, errors: 0 })),
   },
   {
     id: "BATCH-20260508", businessDate: "2026-05-08", startedAt: "2026-05-08T00:00:00Z", completedAt: "2026-05-08T03:12:00Z",
     status: "completed", totalRecordsProcessed: 124500, triggeredBy: "system-scheduler",
-    jobs: EOD_JOBS.map((j) => ({ jobId: j.id, name: j.name, status: "completed" as const, durationMs: j.lastRunDurationMs - 500, recordsProcessed: j.affectedRecords - 10, errors: 0 })),
+    jobs: EOD_JOBS_SEED.map((j) => ({ jobId: j.id, name: j.name, status: "completed" as const, durationMs: j.lastRunDurationMs - 500, recordsProcessed: j.affectedRecords - 10, errors: 0 })),
   },
 ];
 
 export function registerBatchEodEngine(app: Express) {
-  app.get("/api/eod/v1/jobs", (_req: Request, res: Response) => {
-    res.json({ items: EOD_JOBS, total: EOD_JOBS.length });
-  });
+  app.get("/api/eod/v1/jobs", asyncRoute(async (_req: Request, res: Response) => {
+    const jobs = await loadEodJobs();
+    res.json({ items: jobs, total: jobs.length });
+  }));
   app.get("/api/eod/v1/runs", (_req: Request, res: Response) => {
     res.json({ items: BATCH_RUNS, total: BATCH_RUNS.length });
   });
@@ -69,23 +88,25 @@ export function registerBatchEodEngine(app: Express) {
     const r = BATCH_RUNS.find((x) => x.id === req.params.id);
     r ? res.json(r) : res.status(404).json({ error: "Batch run not found" });
   });
-  app.post("/api/eod/v1/trigger", (req: Request, res: Response) => {
+  app.post("/api/eod/v1/trigger", asyncRoute(async (req: Request, res: Response) => {
+    const eodJobs = await loadEodJobs();
     const businessDate = req.body?.businessDate ?? new Date().toISOString().slice(0, 10);
     const run: EODBatchRun = {
       id: `BATCH-${businessDate.replace(/-/g, "")}`, businessDate,
       startedAt: new Date().toISOString(), status: "running",
       totalRecordsProcessed: 0, triggeredBy: "manual-api",
-      jobs: EOD_JOBS.map((j) => ({ jobId: j.id, name: j.name, status: "pending" as const, durationMs: 0, recordsProcessed: 0, errors: 0 })),
+      jobs: eodJobs.map((j) => ({ jobId: j.id, name: j.name, status: "pending" as const, durationMs: 0, recordsProcessed: 0, errors: 0 })),
     };
     res.status(201).json(run);
-  });
-  app.get("/api/eod/v1/stats", (_req: Request, res: Response) => {
+  }));
+  app.get("/api/eod/v1/stats", asyncRoute(async (_req: Request, res: Response) => {
+    const eodJobs = await loadEodJobs();
     res.json({
-      totalJobs: EOD_JOBS.length, lastBatchDate: "2026-05-09", lastBatchStatus: "completed",
+      totalJobs: eodJobs.length, lastBatchDate: "2026-05-09", lastBatchStatus: "completed",
       avgBatchDurationMin: 195, totalRecordsLastBatch: 126995,
       interestAccrued: { savings: 4250000, loans: 2800000, fixedDeposits: 1200000 },
       standingOrdersExecuted: 3200, dormantAccountsFlagged: 145,
       reconciliationStatus: "balanced", nextScheduledRun: "2026-05-10T00:00:00Z",
     });
-  });
+  }));
 }

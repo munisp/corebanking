@@ -316,8 +316,79 @@ async fn ready_handler() -> Json<HealthOutput> {
     })
 }
 
-async fn evaluate_handler(Json(payload): Json<RiskInput>) -> Json<RiskOutput> {
-    Json(evaluate_risk(payload))
+
+// --- Permify authorization (W12-B5-P0-D3) ---
+// The single mutating handler (POST /evaluate) performs a REAL Permify
+// permission check AFTER jwt_auth_middleware has authenticated the caller.
+// Subject = verified JWT sub (VerifiedClaims in request extensions), tenant =
+// X-Tenant-Id header or PERMIFY_DEFAULT_TENANT, resource = domain entity id.
+// FAIL-CLOSED: Permify unreachable/non-200 => 503; denied => 403.
+fn permify_base_url() -> String {
+    match std::env::var("PERMIFY_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => "http://permify:3476".to_string(),
+    }
+}
+
+async fn permify_check_axum(claims: &VerifiedClaims, headers: &axum::http::HeaderMap, entity_type: &str, entity_id: &str, permission: &str) -> Result<(), axum::response::Response> {
+    let subject = claims.0.get("sub").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let subject = match subject {
+        Some(s) if !s.is_empty() => s,
+        _ => return Err((axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "authorization context incomplete"}))).into_response()),
+    };
+    if entity_id.is_empty() {
+        return Err((axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "authorization context incomplete"}))).into_response());
+    }
+    let tenant_id = headers.get("X-Tenant-Id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string());
+    let payload = serde_json::json!({
+        "metadata": {"schema_version": "", "snap_token": "", "depth": 20},
+        "entity": {"type": entity_type, "id": entity_id},
+        "permission": permission,
+        "subject": {"type": "user", "id": subject},
+    });
+    let url = format!("{}/v1/tenants/{}/permissions/check", permify_base_url(), tenant_id);
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(_) => return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify client init failed (fail-closed)"}))).into_response()),
+    };
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[permify] FAIL-CLOSED check {} on {}:{} unreachable: {}", permission, entity_type, entity_id, e);
+            return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify unreachable (fail-closed)"}))).into_response());
+        }
+    };
+    if !resp.status().is_success() {
+        return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "authorization_unavailable", "detail": "permify check failed (fail-closed)"}))).into_response());
+    }
+    let body = resp.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({}));
+    let allowed = body.get("can").and_then(|v| v.as_str()) == Some("CHECK_RESULT_ALLOWED")
+        || body.get("can").and_then(|v| v.as_bool()) == Some(true);
+    if !allowed {
+        return Err((axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "forbidden", "detail": format!("permify: {} denied on {}:{}", permission, entity_type, entity_id)}))).into_response());
+    }
+    Ok(())
+}
+
+async fn evaluate_handler(
+    axum::Extension(claims): axum::Extension<VerifiedClaims>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<RiskInput>,
+) -> Result<Json<RiskOutput>, axum::response::Response> {
+    let permify_entity = if payload.transaction_id.trim().is_empty() {
+        payload.customer_id.trim()
+    } else {
+        payload.transaction_id.trim()
+    };
+    if let Err(resp) = permify_check_axum(&claims, &headers, "fraud_case", permify_entity, "score").await {
+        return Err(resp);
+    }
+    Ok(Json(evaluate_risk(payload)))
 }
 
 fn evaluate_risk(input: RiskInput) -> RiskOutput {

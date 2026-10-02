@@ -8,11 +8,13 @@ export default function ENairaWorkspace() {
   const [stats, setStats] = useState<any>(null);
 
   useEffect(() => {
-    fetch("/account/accounts")
+    // W12-A4-P0-D: was /account/accounts (unserved); account-service serves
+    // GET /statements/accounts (gateway /account/* -> /*).
+    fetch("/account/statements/accounts")
       .then(r => r.json())
       .then(d => setItems(d.items || []))
       .catch(() => {});
-    fetch("/api/db/virtual-accounts/count")
+    fetch("/api/db/virtual-accounts/stats/count")
       .then(r => r.json())
       .then(d => setStats(d))
       .catch(() => {});

@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
@@ -319,9 +321,96 @@ func init() {
 	}
 }
 
-// evalStaticDeny returns (true, policyName) if any active deny policy matches.
-func evalStaticDeny(entity, action string, ctx map[string]string) (bool, string) {
+// ─── Static policy store (c3-0696) ──────────────────────────────────────────
+// Static deny policies are seeded into redis — `policy:static:{id}` JSON and
+// a `policy:static:index` SET of IDs, no TTL (policies are static) — and read
+// through from redis on every evaluation so policy state is shared across
+// replicas and survives restarts. The in-code slice remains as the seed
+// source. Failure policy: FAIL-CLOSED — a policy-store outage DENIES the
+// authorization check rather than silently skipping static deny rules.
+
+const staticPolicyIndexKey = "policy:static:index"
+
+func staticPolicyKey(id string) string { return "policy:static:" + id }
+
+// Pooled go-redis client (canonical fleet pattern).
+var (
+	redisAddr       string
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
+)
+
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+}
+
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
+}
+
+// seedStaticPolicies writes the compiled-in policies to redis (NX: existing
+// entries win, so restarts never clobber operator-updated policies).
+func seedStaticPolicies() {
+	r := getRedisClient()
 	for _, pol := range staticPolicies {
+		data, err := json.Marshal(pol)
+		if err != nil {
+			log.Printf("permify-authz-go: cannot marshal static policy %s: %v", pol.ID, err)
+			continue
+		}
+		if err := r.SetNX(redisCtx, staticPolicyKey(pol.ID), data, 0).Err(); err != nil {
+			log.Printf("permify-authz-go: static policy seed failed for %s (reads fail closed): %v", pol.ID, err)
+		}
+		if err := r.SAdd(redisCtx, staticPolicyIndexKey, pol.ID).Err(); err != nil {
+			log.Printf("permify-authz-go: static policy index seed failed for %s: %v", pol.ID, err)
+		}
+	}
+}
+
+// loadStaticPolicies reads all static policies back from redis (read-through).
+func loadStaticPolicies() ([]Policy, error) {
+	r := getRedisClient()
+	ids, err := r.SMembers(redisCtx, staticPolicyIndexKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("static policy index unreadable: %w", err)
+	}
+	policies := make([]Policy, 0, len(ids))
+	for _, id := range ids {
+		data, err := r.Get(redisCtx, staticPolicyKey(id)).Result()
+		if err != nil {
+			return nil, fmt.Errorf("static policy %s unreadable: %w", id, err)
+		}
+		var pol Policy
+		if err := json.Unmarshal([]byte(data), &pol); err != nil {
+			return nil, fmt.Errorf("static policy %s undecodable: %w", id, err)
+		}
+		policies = append(policies, pol)
+	}
+	return policies, nil
+}
+
+// evalStaticDeny returns (true, policyName) if any active deny policy matches.
+// FAIL-CLOSED: if the policy store is unavailable the check is denied.
+func evalStaticDeny(entity, action string, ctx map[string]string) (bool, string) {
+	policies, err := loadStaticPolicies()
+	if err != nil {
+		log.Printf("permify-authz-go: static policy store unavailable, FAIL-CLOSED deny: %v", err)
+		return true, "policy-store-unavailable"
+	}
+	for _, pol := range policies {
 		if pol.Status != "active" {
 			continue
 		}
@@ -779,6 +868,7 @@ func main() {
 	if port == "" {
 		port = "8129"
 	}
+	seedStaticPolicies() // c3-0696: seed static deny policies into redis (NX)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
 	// M-48: authorization-decision routes require a verified JWT.
@@ -961,7 +1051,14 @@ func handleCheckBatch(w http.ResponseWriter, r *http.Request) {
 
 func handlePolicies(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"items": staticPolicies, "total": len(staticPolicies)})
+	policies, err := loadStaticPolicies()
+	if err != nil {
+		// fail-closed: never serve a stale/empty policy catalog as authoritative
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{"error": "static policy store unavailable"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"items": policies, "total": len(policies)})
 }
 
 func handleStats(w http.ResponseWriter, _ *http.Request) {
@@ -973,11 +1070,16 @@ func handleStats(w http.ResponseWriter, _ *http.Request) {
 	if checks > 0 {
 		denyRate = float64(denials) / float64(checks) * 100
 	}
+	// SCARD of the policy index; -1 signals the policy store is unavailable.
+	staticCount, err := getRedisClient().SCard(redisCtx, staticPolicyIndexKey).Result()
+	if err != nil {
+		staticCount = -1
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"checksPerformed": checks,
 		"denials":         denials,
 		"denyRate":        fmt.Sprintf("%.1f%%", denyRate),
-		"staticPolicies":  len(staticPolicies),
+		"staticPolicies":  staticCount,
 		"permifyURL":      permifyURL,
 	})
 }

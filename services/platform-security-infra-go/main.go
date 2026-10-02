@@ -1271,15 +1271,15 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
-	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "view", http.HandlerFunc(alertsHandler))))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "view", http.HandlerFunc(degradationStatusHandler))))
 	mux.HandleFunc("/healthz", healthz)
-	mux.Handle("/v1/gap-f/multi-tenancy", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(multiTenancyIsolation)))
-	mux.Handle("/v1/gap-g/webhooks", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(webhookDelivery)))
-	mux.Handle("/v1/gap-h/api-documentation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(apiDocumentation)))
-	mux.Handle("/v1/gap-i/input-validation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(inputValidation)))
-	mux.Handle("/v1/platform-security-infra/fx-convert", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(platform_security_infraFXHandler)))
-	mux.Handle("/v1/platform-security-infra/risk-calc", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(platform_security_infraRiskHandler)))
+	mux.Handle("/v1/gap-f/multi-tenancy", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "multi_tenancy", http.HandlerFunc(multiTenancyIsolation))))
+	mux.Handle("/v1/gap-g/webhooks", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "webhooks", http.HandlerFunc(webhookDelivery))))
+	mux.Handle("/v1/gap-h/api-documentation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "api_documentation", http.HandlerFunc(apiDocumentation))))
+	mux.Handle("/v1/gap-i/input-validation", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "input_validation", http.HandlerFunc(inputValidation))))
+	mux.Handle("/v1/platform-security-infra/fx-convert", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "fx_convert", http.HandlerFunc(platform_security_infraFXHandler))))
+	mux.Handle("/v1/platform-security-infra/risk-calc", jwtMiddleware(jwtRealmURL(), permifyAuthzGuard("platform_security_infra", "risk_calc", http.HandlerFunc(platform_security_infraRiskHandler))))
 	log.Printf("Platform Security & Infra (Go) on :%s — Gaps F-I, 14 middleware", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

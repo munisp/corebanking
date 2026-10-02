@@ -11,7 +11,7 @@ import (
 // IncidentService handles incident operations
 type IncidentService struct {
 	tenantID  string
-	incidents map[string]*BranchIncident
+	incidents *repo[BranchIncident]
 	mu        sync.RWMutex
 }
 
@@ -19,17 +19,19 @@ type IncidentService struct {
 func NewIncidentService(tenantID string) *IncidentService {
 	return &IncidentService{
 		tenantID:  tenantID,
-		incidents: make(map[string]*BranchIncident),
+		incidents: newRepo[BranchIncident](serviceDB, "branch_incidents"),
 	}
 }
 
 // ListIncidents returns incidents based on filters
-func (s *IncidentService) ListIncidents(tenantID, branchID, status, severity string) []*BranchIncident {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *IncidentService) ListIncidents(tenantID, branchID, status, severity string) ([]*BranchIncident, error) {
 
 	var result []*BranchIncident
-	for _, incident := range s.incidents {
+	__ALL__, __ERR__ := s.incidents.list(tenantID)
+	if __ERR__ != nil {
+		return nil, __ERR__
+	}
+	for _, incident := range __ALL__ {
 		if incident.TenantID != tenantID {
 			continue
 		}
@@ -44,16 +46,14 @@ func (s *IncidentService) ListIncidents(tenantID, branchID, status, severity str
 		}
 		result = append(result, incident)
 	}
-	return result
+	return result, nil
 }
 
 // GetIncident retrieves an incident by ID
 func (s *IncidentService) GetIncident(tenantID, incidentID string) (*BranchIncident, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	incident, exists := s.incidents[incidentID]
-	if !exists || incident.TenantID != tenantID {
+	incident, err := s.incidents.get(tenantID, incidentID)
+	if err != nil {
 		return nil, errors.New("incident not found")
 	}
 	return incident, nil
@@ -61,8 +61,6 @@ func (s *IncidentService) GetIncident(tenantID, incidentID string) (*BranchIncid
 
 // CreateIncident creates a new incident
 func (s *IncidentService) CreateIncident(tenantID, branchID, userID string, req *CreateIncidentRequest) (*BranchIncident, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	incident := &BranchIncident{
 		IncidentID:   uuid.New().String(),
@@ -80,17 +78,17 @@ func (s *IncidentService) CreateIncident(tenantID, branchID, userID string, req 
 		UpdatedAt:    time.Now(),
 	}
 
-	s.incidents[incident.IncidentID] = incident
+	if err := s.incidents.put(tenantID, incident.IncidentID, incident); err != nil {
+		return nil, err
+	}
 	return incident, nil
 }
 
 // UpdateIncident updates an incident
 func (s *IncidentService) UpdateIncident(incident *BranchIncident) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	existing, exists := s.incidents[incident.IncidentID]
-	if !exists || existing.TenantID != incident.TenantID {
+	existing, err := s.incidents.get(incident.TenantID, incident.IncidentID)
+	if err != nil {
 		return errors.New("incident not found")
 	}
 
@@ -98,82 +96,72 @@ func (s *IncidentService) UpdateIncident(incident *BranchIncident) error {
 	incident.ReportedBy = existing.ReportedBy
 	incident.ReportedAt = existing.ReportedAt
 	incident.UpdatedAt = time.Now()
-	s.incidents[incident.IncidentID] = incident
-	return nil
+	return s.incidents.put(incident.TenantID, incident.IncidentID, incident)
 }
 
 // AssignIncident assigns an incident to a staff member
 func (s *IncidentService) AssignIncident(tenantID, incidentID, assignTo string) (*BranchIncident, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.incidents.update(tenantID, incidentID, func(incident *BranchIncident) error {
+		incident.AssignedTo = assignTo
+		incident.Status = "investigating"
+		incident.UpdatedAt = time.Now()
 
-	incident, exists := s.incidents[incidentID]
-	if !exists || incident.TenantID != tenantID {
-		return nil, errors.New("incident not found")
-	}
-
-	incident.AssignedTo = assignTo
-	incident.Status = "investigating"
-	incident.UpdatedAt = time.Now()
-
-	return incident, nil
+		return nil
+	})
 }
 
 // ResolveIncident resolves an incident
 func (s *IncidentService) ResolveIncident(tenantID, incidentID, userID, resolution string) (*BranchIncident, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.incidents.update(tenantID, incidentID, func(incident *BranchIncident) error {
+		now := time.Now()
+		incident.Status = "resolved"
+		incident.Resolution = resolution
+		incident.ResolvedBy = userID
+		incident.ResolvedAt = &now
+		incident.UpdatedAt = time.Now()
 
-	incident, exists := s.incidents[incidentID]
-	if !exists || incident.TenantID != tenantID {
-		return nil, errors.New("incident not found")
-	}
-
-	now := time.Now()
-	incident.Status = "resolved"
-	incident.Resolution = resolution
-	incident.ResolvedBy = userID
-	incident.ResolvedAt = &now
-	incident.UpdatedAt = time.Now()
-
-	return incident, nil
+		return nil
+	})
 }
 
 // CloseIncident closes an incident
 func (s *IncidentService) CloseIncident(tenantID, incidentID, userID string) (*BranchIncident, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.incidents.update(tenantID, incidentID, func(incident *BranchIncident) error {
+		if incident.Status != "resolved" {
+			return errors.New("can only close resolved incidents")
+		}
 
-	incident, exists := s.incidents[incidentID]
-	if !exists || incident.TenantID != tenantID {
-		return nil, errors.New("incident not found")
-	}
+		incident.Status = "closed"
+		incident.UpdatedAt = time.Now()
 
-	if incident.Status != "resolved" {
-		return nil, errors.New("can only close resolved incidents")
-	}
-
-	incident.Status = "closed"
-	incident.UpdatedAt = time.Now()
-
-	return incident, nil
+		return nil
+	})
 }
 
 // GetOpenIncidentsCount returns count of open incidents
-func (s *IncidentService) GetOpenIncidentsCount(tenantID, branchID string) int {
-	incidents := s.ListIncidents(tenantID, branchID, "open", "")
-	investigating := s.ListIncidents(tenantID, branchID, "investigating", "")
-	return len(incidents) + len(investigating)
+func (s *IncidentService) GetOpenIncidentsCount(tenantID, branchID string) (int, error) {
+	incidents, err := s.ListIncidents(tenantID, branchID, "open", "")
+	if err != nil {
+		return 0, err
+	}
+	investigating, err := s.ListIncidents(tenantID, branchID, "investigating", "")
+	if err != nil {
+		return 0, err
+	}
+	return len(incidents) + len(investigating), nil
 }
 
 // GetCriticalIncidentsCount returns count of critical incidents
-func (s *IncidentService) GetCriticalIncidentsCount(tenantID, branchID string) int {
-	incidents := s.ListIncidents(tenantID, branchID, "", "critical")
+func (s *IncidentService) GetCriticalIncidentsCount(tenantID, branchID string) (int, error) {
+	incidents, err := s.ListIncidents(tenantID, branchID, "", "critical")
+	if err != nil {
+		return 0, err
+	}
 	count := 0
 	for _, inc := range incidents {
 		if inc.Status == "open" || inc.Status == "investigating" {
 			count++
 		}
 	}
-	return count
+	return count, nil
 }

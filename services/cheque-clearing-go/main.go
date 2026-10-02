@@ -1003,7 +1003,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	http.HandleFunc("/", route)
+	http.HandleFunc("/", permifyAuthzGuardCheque(route))
 	log.Printf("cheque-clearing-go listening on :%s", port)
 	// GCM-067: TB calls can legitimately take 15s; configure timeouts and
 	// graceful shutdown instead of bare ListenAndServe (Slowloris exposure).

@@ -21,9 +21,30 @@ const COMMON_PASSWORDS = new Set([
   "iloveyou", "batman", "access", "hello", "charlie", "password123",
 ]);
 
-const PASSWORD_HISTORY: Map<string, string[]> = new Map();
+// Password history — redis-backed (W12 C3-P1-B2, c3-1033; register had no
+// key_pattern for this item — chosen pattern documented here):
+//   pwd_history:{tenant}:{userId}  redis LIST of sha256 password hashes,
+//                                  capped at the 5 most recent (preserves the
+//                                  previous in-memory history length), no TTL
+//                                  (password reuse windows are policy-driven,
+//                                  not time-driven, matching prior behavior).
+// History now survives restarts and is consistent across replicas; previously
+// a restart silently let users reuse recent passwords.
+import { getRedis } from "./redisKv";
 
-export function validatePassword(password: string, userId?: string): PasswordValidation {
+const PASSWORD_HISTORY_DEPTH = 5;
+
+function passwordHash(password: string): string {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const crypto = require("crypto");
+  return crypto.createHash("sha256").update(password).digest("hex");
+}
+
+async function getPasswordHistory(userId: string, tenant = "platform"): Promise<string[]> {
+  return getRedis().lrange(`pwd_history:${tenant}:${userId}`, 0, -1);
+}
+
+export async function validatePassword(password: string, userId?: string): Promise<PasswordValidation> {
   const errors: string[] = [];
   let score = 0;
 
@@ -52,13 +73,17 @@ export function validatePassword(password: string, userId?: string): PasswordVal
     score = Math.min(score, 10);
   }
 
-  // Check password history
+  // Check password history (redis-backed; on redis outage the history check
+  // cannot run — fail closed by flagging the password as unverifiable rather
+  // than silently skipping the reuse check).
   if (userId) {
-    const history = PASSWORD_HISTORY.get(userId) || [];
-    const crypto = require("crypto");
-    const currentHash = crypto.createHash("sha256").update(password).digest("hex");
-    if (history.includes(currentHash)) {
-      errors.push("Password was used recently — choose a different one");
+    try {
+      const history = await getPasswordHistory(userId);
+      if (history.includes(passwordHash(password))) {
+        errors.push("Password was used recently — choose a different one");
+      }
+    } catch {
+      errors.push("Password history unavailable — try again shortly");
     }
   }
 
@@ -67,11 +92,9 @@ export function validatePassword(password: string, userId?: string): PasswordVal
   return { valid: errors.length === 0, errors, strength, score };
 }
 
-export function recordPasswordChange(userId: string, password: string) {
-  const crypto = require("crypto");
-  const hash = crypto.createHash("sha256").update(password).digest("hex");
-  const history = PASSWORD_HISTORY.get(userId) || [];
-  history.push(hash);
-  if (history.length > 5) history.shift();
-  PASSWORD_HISTORY.set(userId, history);
+export async function recordPasswordChange(userId: string, password: string, tenant = "platform"): Promise<void> {
+  const key = `pwd_history:${tenant}:${userId}`;
+  await getRedis().rpush(key, passwordHash(password));
+  // Keep only the most recent PASSWORD_HISTORY_DEPTH hashes.
+  await getRedis().ltrim(key, -PASSWORD_HISTORY_DEPTH, -1);
 }

@@ -174,6 +174,98 @@ def mark_dormant(
     return {"message": "success", "status": "dormant"}
 
 
+@lifecycle_router.post("/{account_id}/freeze")
+def freeze_account(
+    account_id: str,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_id: str = Header(..., alias="x-keycloak-id"),
+):
+    """W12-A4-P0-D: customer-initiated freeze (web2/mobile
+    POST /account/account/{id}/freeze). ACTIVE -> FROZEN; debits are blocked
+    for any non-ACTIVE status, and the transition is reversible via unfreeze.
+    Terminal statuses (CLOSED/DECEASED/DELETED) are rejected."""
+    repo = AccountRepository(db)
+    account = repo.get_by_account_id(account_id, tenant_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status == AccountStatus.FROZEN:
+        return {"success": True, "message": "Account already frozen", "status": "frozen"}
+    if account.status != AccountStatus.ACTIVE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only ACTIVE accounts can be frozen (current: {account.status.value})",
+        )
+    account.status = AccountStatus.FROZEN
+    db.commit()
+    logger.info("Account %s frozen by %s", account_id, keycloak_id)
+    return {"success": True, "message": "Account frozen successfully", "status": "frozen"}
+
+
+@lifecycle_router.post("/{account_id}/unfreeze")
+def unfreeze_account(
+    account_id: str,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_id: str = Header(..., alias="x-keycloak-id"),
+):
+    """W12-A4-P0-D: reverse of freeze. FROZEN -> ACTIVE only."""
+    repo = AccountRepository(db)
+    account = repo.get_by_account_id(account_id, tenant_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status == AccountStatus.ACTIVE:
+        return {"success": True, "message": "Account already active", "status": "active"}
+    if account.status != AccountStatus.FROZEN:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only FROZEN accounts can be unfrozen (current: {account.status.value})",
+        )
+    account.status = AccountStatus.ACTIVE
+    db.commit()
+    logger.info("Account %s unfrozen by %s", account_id, keycloak_id)
+    return {"success": True, "message": "Account unfrozen successfully", "status": "active"}
+
+
+@lifecycle_router.post("/{account_id}/set-primary")
+def set_primary_account(
+    account_id: str,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_id: str = Header(..., alias="x-keycloak-id"),
+):
+    """W12-A4-P0-D: mark this account as the user's primary account
+    (mirrors business-service set_primary_account: clear previous, set new).
+    At most one primary per keycloak user within the tenant."""
+    repo = AccountRepository(db)
+    account = repo.get_by_account_id(account_id, tenant_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status in (AccountStatus.CLOSED, AccountStatus.DECEASED, AccountStatus.DELETED):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot set a {account.status.value} account as primary",
+        )
+    from models import Account as AccountModel
+
+    previous = (
+        db.query(AccountModel)
+        .filter(
+            AccountModel.keycloak_id == account.keycloak_id,
+            AccountModel.tenant_id == tenant_id,
+            AccountModel.is_primary.is_(True),
+            AccountModel.id != account.id,
+        )
+        .all()
+    )
+    for prev in previous:
+        prev.is_primary = False
+    account.is_primary = True
+    db.commit()
+    logger.info("Account %s set as primary for user %s", account_id, account.keycloak_id)
+    return {"success": True, "message": "Primary account updated", "account_id": str(account.id)}
+
+
 class DeathNotificationPayload(BaseModel):
     deceasedOn: Optional[str] = None
     certificateReference: Optional[str] = None

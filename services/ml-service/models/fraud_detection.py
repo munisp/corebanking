@@ -18,6 +18,112 @@ from enum import Enum
 import hashlib
 import math
 import logging
+import os
+import json
+
+# --- W12-C3P2B5: PostgreSQL persistence (replaces in-memory singleton stores) ---
+# Pattern: pooled psycopg2 (fleet ref: services/inventory-py/main.py:63-116).
+# PG is authoritative: create/update/delete hit Postgres transactionally
+# (autocommit => each statement is its own transaction); on PG failure the
+# handler returns 503. There is NO in-memory shadow that could silently
+# diverge from PG (cf. failed_login_tracker anti-pattern).
+import threading as _w12_threading
+import psycopg2 as _w12_pg
+import psycopg2.pool as _w12_pgpool
+import psycopg2.extras as _w12_pgextras
+
+_w12_pool = None
+_w12_pool_lock = _w12_threading.Lock()
+
+
+def _w12_get_pool():
+    global _w12_pool
+    if _w12_pool is None or _w12_pool.closed:
+        with _w12_pool_lock:
+            if _w12_pool is None or _w12_pool.closed:
+                _w12_pool = _w12_pgpool.ThreadedConnectionPool(1, 10, os.environ["DATABASE_URL"])
+    return _w12_pool
+
+
+def _w12_run(sql, params=(), fetch="all"):
+    """Run one statement on a pooled connection (autocommit = per-statement transaction)."""
+    conn = _w12_get_pool().getconn()
+    try:
+        conn.autocommit = True
+        with conn.cursor(cursor_factory=_w12_pgextras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            return cur.rowcount
+    finally:
+        _w12_get_pool().putconn(conn)
+
+
+class _W12Store:
+    """Per-domain PG table (jsonb payload pattern):
+    id uuid pk default gen_random_uuid(), record_id text UNIQUE (natural key;
+    upsert makes retry-able creates idempotent), tenant_id text, payload jsonb,
+    created_at/updated_at timestamptz default now()."""
+    _ensured = set()
+    _ensured_lock = _w12_threading.Lock()
+
+    def __init__(self, table, key="id", seed=(), tenant_key="tenant_id"):
+        self.table = table
+        self.key = key
+        self.seed = list(seed)
+        self.tenant_key = tenant_key
+
+    def ensure(self):
+        with _W12Store._ensured_lock:
+            if self.table in _W12Store._ensured:
+                return
+            _w12_run(f"""CREATE TABLE IF NOT EXISTS {self.table} (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""", fetch=None)
+            for row in self.seed:
+                _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb) ON CONFLICT (record_id) DO NOTHING""",
+                         (str(row.get(self.key, "")), row.get(self.tenant_key),
+                          json.dumps(row, default=str)), fetch=None)
+            _W12Store._ensured.add(self.table)
+
+    def all(self, limit=100000):
+        self.ensure()
+        return [r["payload"] for r in _w12_run(
+            f"SELECT payload FROM {self.table} ORDER BY created_at, record_id LIMIT %s", (limit,))]
+
+    def get(self, record_id):
+        self.ensure()
+        row = _w12_run(f"SELECT payload FROM {self.table} WHERE record_id = %s",
+                       (str(record_id),), fetch="one")
+        return row["payload"] if row else None
+
+    def put(self, record_id, payload, tenant_id=None):
+        self.ensure()
+        _w12_run(f"""INSERT INTO {self.table} (record_id, tenant_id, payload)
+VALUES (%s, %s, %s::jsonb)
+ON CONFLICT (record_id) DO UPDATE
+SET payload = EXCLUDED.payload, tenant_id = EXCLUDED.tenant_id, updated_at = NOW()""",
+                 (str(record_id),
+                  tenant_id if tenant_id is not None else payload.get(self.tenant_key),
+                  json.dumps(payload, default=str)), fetch=None)
+
+    def delete(self, record_id):
+        self.ensure()
+        return _w12_run(f"DELETE FROM {self.table} WHERE record_id = %s",
+                        (str(record_id),), fetch=None)
+
+
+# W12-C3P2B5 stores: per-user behavioral state + fraud blacklists.
+_W12_STATE_STORE = _W12Store("fraud_user_state")
+_W12_BL_STORE = _W12Store("fraud_blacklists")
 
 logger = logging.getLogger(__name__)
 
@@ -73,14 +179,12 @@ class FraudDetectionModel:
         self.max_single_transaction = 1000000  # NGN
         self.suspicious_hours = [0, 1, 2, 3, 4, 5]  # 12am - 6am
         
-        # User behavior cache (in production, use Redis)
-        self.user_history: Dict[str, List[Transaction]] = {}
-        self.user_profiles: Dict[str, Dict] = {}
-        
-        # Known fraud patterns
-        self.blacklisted_ips: set = set()
-        self.blacklisted_devices: set = set()
-        self.suspicious_merchants: set = set()
+        # W12-C3P2B5: user behavior (fraud_user_state) and blacklists
+        # (fraud_blacklists) are PG-backed. The structures below are short-TTL
+        # read-through caches ONLY; Postgres is authoritative.
+        self._state_cache: Dict[str, Tuple[float, list, dict]] = {}
+        self._state_cache_lock = _w12_threading.Lock()
+        self._blacklist_cache: Dict[str, object] = {"ts": 0.0, "data": {"ip": set(), "device": set(), "merchant": set()}}
         
         # Model weights for ensemble
         self.weights = {
@@ -91,6 +195,77 @@ class FraudDetectionModel:
             'behavior': 0.20,
             'network': 0.10,
         }
+
+    # --- W12-C3P2B5: PG-backed fraud state (fraud_user_state, fraud_blacklists) ---
+    _STATE_TTL = 10.0   # read-through cache seconds; PG is authoritative
+    _BL_TTL = 60.0
+
+    def _user_state_row(self, user_id: str) -> Tuple[list, dict]:
+        """Load (history, profile) from PG fraud_user_state.
+
+        W12-DEGRADED fallback: on PG read failure scoring continues with empty
+        state (logged) — fraud checks degrade to rule-only rather than 5xx."""
+        now = datetime.utcnow().timestamp()
+        with self._state_cache_lock:
+            hit = self._state_cache.get(user_id)
+            if hit and now - hit[0] < self._STATE_TTL:
+                return hit[1], hit[2]
+        try:
+            _W12_STATE_STORE.ensure()
+            row = _w12_run("SELECT payload FROM fraud_user_state WHERE record_id = %s",
+                           (user_id,), fetch="one")
+        except Exception as e:
+            logger.warning("W12-DEGRADED fraud_user_state read failed for %s: %s", user_id, e)
+            return [], {}
+        hist, prof = [], {}
+        if row:
+            p = row["payload"]
+            for d in p.get("history", []):
+                try:
+                    dd = dict(d)
+                    dd["timestamp"] = datetime.fromisoformat(dd["timestamp"])
+                    hist.append(Transaction(**dd))
+                except Exception:
+                    continue
+            prof = p.get("profile", {})
+            for k in ("known_devices", "common_merchant_categories", "common_channels"):
+                prof[k] = set(prof.get(k, []))
+        with self._state_cache_lock:
+            self._state_cache[user_id] = (now, hist, prof)
+        return hist, prof
+
+    def _user_history(self, user_id: str) -> list:
+        return self._user_state_row(user_id)[0]
+
+    def _user_profile(self, user_id: str) -> dict:
+        return self._user_state_row(user_id)[1]
+
+    def _blacklist(self, kind: str) -> set:
+        """Read-through set from PG fraud_blacklists (60s TTL cache; PG authoritative)."""
+        now = datetime.utcnow().timestamp()
+        if now - float(self._blacklist_cache["ts"]) < self._BL_TTL:
+            return self._blacklist_cache["data"][kind]
+        try:
+            _W12_BL_STORE.ensure()
+            rows = _w12_run("SELECT record_id FROM fraud_blacklists")
+            data = {"ip": set(), "device": set(), "merchant": set()}
+            for r in rows:
+                k, _, v = r["record_id"].partition(":")
+                if k in data:
+                    data[k].add(v)
+            self._blacklist_cache = {"ts": now, "data": data}
+        except Exception as e:
+            logger.warning("W12-DEGRADED fraud_blacklists read failed: %s", e)
+        return self._blacklist_cache["data"][kind]
+
+    def _blacklist_add(self, kind: str, value: str):
+        """Idempotent add (ON CONFLICT DO UPDATE) + cache invalidation."""
+        try:
+            _W12_BL_STORE.put(f"{kind}:{value}", {"kind": kind, "value": value})
+        except Exception as e:
+            logger.warning("W12-DEGRADED fraud_blacklists write failed: %s", e)
+        self._blacklist_cache["ts"] = 0.0
+        self._blacklist_cache["data"].setdefault(kind, set()).add(value)
 
     def predict(self, transaction: Transaction) -> FraudScore:
         """
@@ -160,7 +335,7 @@ class FraudDetectionModel:
         score = 0.0
         reasons = []
         
-        user_txns = self.user_history.get(txn.user_id, [])
+        user_txns = self._user_history(txn.user_id)
         recent_txns = [
             t for t in user_txns
             if (txn.timestamp - t.timestamp) < timedelta(minutes=self.velocity_window_minutes)
@@ -196,7 +371,7 @@ class FraudDetectionModel:
             reasons.append(f"Large transaction amount: {txn.amount:,.2f} NGN")
         
         # Check against user's typical amounts
-        user_profile = self.user_profiles.get(txn.user_id, {})
+        user_profile = self._user_profile(txn.user_id)
         avg_amount = user_profile.get('avg_transaction_amount', txn.amount)
         std_amount = user_profile.get('std_transaction_amount', txn.amount * 0.5)
         
@@ -224,7 +399,7 @@ class FraudDetectionModel:
         if txn.latitude is None or txn.longitude is None:
             return 20, ["Location data unavailable"]
         
-        user_txns = self.user_history.get(txn.user_id, [])
+        user_txns = self._user_history(txn.user_id)
         if not user_txns:
             return 0, []
         
@@ -258,7 +433,7 @@ class FraudDetectionModel:
         
         # Check if international
         if txn.is_international:
-            user_profile = self.user_profiles.get(txn.user_id, {})
+            user_profile = self._user_profile(txn.user_id)
             if not user_profile.get('has_international_history', False):
                 score += 30
                 reasons.append("First international transaction")
@@ -271,16 +446,16 @@ class FraudDetectionModel:
         reasons = []
         
         # Check blacklists
-        if txn.device_id in self.blacklisted_devices:
+        if txn.device_id in self._blacklist("device"):
             score += 90
             reasons.append("Device on blacklist")
         
-        if txn.ip_address in self.blacklisted_ips:
+        if txn.ip_address in self._blacklist("ip"):
             score += 90
             reasons.append("IP address on blacklist")
         
         # Check for new device
-        user_profile = self.user_profiles.get(txn.user_id, {})
+        user_profile = self._user_profile(txn.user_id)
         known_devices = user_profile.get('known_devices', set())
         
         if txn.device_id not in known_devices:
@@ -306,7 +481,7 @@ class FraudDetectionModel:
             reasons.append(f"Unusual transaction time: {hour}:00")
         
         # Check merchant category
-        user_profile = self.user_profiles.get(txn.user_id, {})
+        user_profile = self._user_profile(txn.user_id)
         common_categories = user_profile.get('common_merchant_categories', set())
         
         if common_categories and txn.merchant_category not in common_categories:
@@ -320,7 +495,7 @@ class FraudDetectionModel:
             reasons.append(f"Unusual channel: {txn.channel}")
         
         # Check for suspicious merchant
-        if txn.merchant_id in self.suspicious_merchants:
+        if txn.merchant_id in self._blacklist("merchant"):
             score += 50
             reasons.append("Merchant flagged as suspicious")
         
@@ -335,7 +510,7 @@ class FraudDetectionModel:
             return 0, []
         
         # Check for circular transactions (simplified)
-        user_txns = self.user_history.get(txn.user_id, [])
+        user_txns = self._user_history(txn.user_id)
         
         # Check if recipient has sent money back recently
         for t in user_txns:
@@ -385,7 +560,7 @@ class FraudDetectionModel:
         confidence = 0.5  # Base confidence
         
         # More history = higher confidence
-        user_txns = self.user_history.get(txn.user_id, [])
+        user_txns = self._user_history(txn.user_id)
         if len(user_txns) >= 100:
             confidence += 0.3
         elif len(user_txns) >= 50:
@@ -398,30 +573,44 @@ class FraudDetectionModel:
             confidence += 0.1
         
         # Device known
-        user_profile = self.user_profiles.get(txn.user_id, {})
+        user_profile = self._user_profile(txn.user_id)
         if txn.device_id in user_profile.get('known_devices', set()):
             confidence += 0.1
         
         return min(confidence, 1.0)
 
     def _update_user_history(self, txn: Transaction):
-        """Update user transaction history"""
-        if txn.user_id not in self.user_history:
-            self.user_history[txn.user_id] = []
-        
-        self.user_history[txn.user_id].append(txn)
-        
-        # Keep only last 1000 transactions per user
-        if len(self.user_history[txn.user_id]) > 1000:
-            self.user_history[txn.user_id] = self.user_history[txn.user_id][-1000:]
-        
-        # Update user profile
-        self._update_user_profile(txn)
+        """Update user transaction history + profile in PG (fraud_user_state).
 
-    def _update_user_profile(self, txn: Transaction):
-        """Update user profile with new transaction data"""
-        if txn.user_id not in self.user_profiles:
-            self.user_profiles[txn.user_id] = {
+        Read-modify-write of the user's row then a single upsert (one
+        transaction). W12-DEGRADED: if the read failed (empty state from the
+        degraded fallback AND PG still down) the write is skipped rather than
+        clobbering stored history with a truncated list."""
+        hist, profile = self._user_state_row(txn.user_id)
+        hist.append(txn)
+        # Keep only last 1000 transactions per user
+        if len(hist) > 1000:
+            hist = hist[-1000:]
+        profile = self._update_user_profile(txn, profile)
+        payload = {
+            "history": [
+                {**{f: getattr(t, f) for f in Transaction.__dataclass_fields__ if f != "timestamp"},
+                 "timestamp": t.timestamp.isoformat()}
+                for t in hist
+            ],
+            "profile": {k: (sorted(v) if isinstance(v, set) else v) for k, v in profile.items()},
+        }
+        try:
+            _W12_STATE_STORE.put(txn.user_id, payload)
+        except Exception as e:
+            logger.warning("W12-DEGRADED fraud_user_state write failed for %s: %s", txn.user_id, e)
+        with self._state_cache_lock:
+            self._state_cache[txn.user_id] = (datetime.utcnow().timestamp(), hist, profile)
+
+    def _update_user_profile(self, txn: Transaction, profile: dict = None) -> dict:
+        """Update user profile with new transaction data (pure; caller persists)."""
+        if not profile:
+            profile = {
                 'known_devices': set(),
                 'common_merchant_categories': set(),
                 'common_channels': set(),
@@ -430,28 +619,28 @@ class FraudDetectionModel:
                 'transaction_count': 0,
                 'has_international_history': False,
             }
-        
-        profile = self.user_profiles[txn.user_id]
+
         profile['known_devices'].add(txn.device_id)
         profile['common_merchant_categories'].add(txn.merchant_category)
         profile['common_channels'].add(txn.channel)
-        
+
         if txn.is_international:
             profile['has_international_history'] = True
-        
+
         # Update running average and std
         n = profile['transaction_count']
         old_avg = profile['avg_transaction_amount']
-        
+
         profile['transaction_count'] = n + 1
         profile['avg_transaction_amount'] = old_avg + (txn.amount - old_avg) / (n + 1)
-        
+
         if n > 0:
             # Welford's algorithm for running std
             profile['std_transaction_amount'] = math.sqrt(
-                ((n - 1) * profile['std_transaction_amount'] ** 2 + 
+                ((n - 1) * profile['std_transaction_amount'] ** 2 +
                  (txn.amount - old_avg) * (txn.amount - profile['avg_transaction_amount'])) / n
             )
+        return profile
 
     def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate distance between two points in km"""
@@ -479,13 +668,9 @@ class FraudDetectionModel:
         return any(ip.startswith(r) for r in suspicious_ranges)
 
     def add_to_blacklist(self, item_type: str, value: str):
-        """Add item to blacklist"""
-        if item_type == 'ip':
-            self.blacklisted_ips.add(value)
-        elif item_type == 'device':
-            self.blacklisted_devices.add(value)
-        elif item_type == 'merchant':
-            self.suspicious_merchants.add(value)
+        """Add item to blacklist (PG fraud_blacklists; idempotent)."""
+        if item_type in ("ip", "device", "merchant"):
+            self._blacklist_add(item_type, value)
 
     def train_on_historical_data(self, transactions: List[Transaction], labels: List[bool]):
         """
@@ -506,7 +691,7 @@ class FraudDetectionModel:
         
         for merchant_id, count in merchant_fraud_counts.items():
             if count >= 5:  # Threshold for suspicious
-                self.suspicious_merchants.add(merchant_id)
+                self._blacklist_add("merchant", merchant_id)
         
         logger.info(f"Trained on {len(transactions)} transactions, {len(fraud_txns)} fraud cases")
 

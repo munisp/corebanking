@@ -139,6 +139,37 @@ class UserService {
       // Fail gracefully.
     }
   }
+
+  // Update a user profile by user-service's internal user id (PUT /user/{id}).
+  public async updateUserById(
+    tenant_id: string,
+    keycloak_id: string,
+    user_id: string,
+    payload: Record<string, unknown>,
+  ): Promise<IUser> {
+    try {
+      const response = await this._axiosInstance.put<{ user: IUser }>(
+        `/user/${encodeURIComponent(user_id)}`,
+        payload,
+        {
+          headers: {
+            "x-tenant-id": tenant_id,
+            "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
+          },
+        },
+      );
+      return response.data.user;
+    } catch (error: any) {
+      if (error.response) {
+        throw new Error(
+          error.response.data?.message ?? error.response.data?.detail ?? "Update user failed",
+        );
+      }
+      throw new Error("Network error — user service unreachable");
+    }
+  }
 }
 
 export const userService = new UserService();

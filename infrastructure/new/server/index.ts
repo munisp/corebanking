@@ -124,12 +124,38 @@ import { registerHighAvailability } from "./lib/highAvailability";
 import { WebSocketServer, WebSocket } from "ws";
 
 import {
+  createAuditEntry,
+  createCustomerRecord,
+  createExportJobRecord,
+  addCustomerCardEvent,
+  createBillPayment,
+  createSavedBiller,
+  createStatementExportRecord,
+  createTransfer,
+  deleteSavedBiller,
+  getCustomerTransfer,
+  resolveApproval,
+  updateTransfer,
   ensurePlatformSeed,
   getCustomerSessionPreference,
+  listAuditEntries,
+  listCustomerApprovals,
+  listCustomerBillPayments,
+  listCustomerCardEvents,
+  listCustomerSavedBillers,
+  listCustomerStatementExports,
+  listCustomerTransfers,
+  listCustomers,
+  listExportJobs,
   listTenantConfigurations,
+  listWorkflowCases,
   loadRuntimeStateFromDb,
   provisionPartnerTenant,
   syncRuntimeStateToDb,
+  updateBillPayment,
+  updateCustomerRecord,
+  updateExportJobRecord,
+  updateWorkflowCase,
   upsertCustomerSessionPreference,
 } from "./platformPersistence";
 import { closeDbPool, getDb } from "./db";
@@ -244,7 +270,10 @@ const rateLimitWindowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS || "6
 const rateLimitMaxWrites = Number.parseInt(process.env.RATE_LIMIT_MAX_WRITES || "120", 10);
 const healthCacheSeconds = Number.parseInt(process.env.HEALTH_CACHE_SECONDS || "5", 10);
 const staticAssetCacheSeconds = Number.parseInt(process.env.STATIC_ASSET_CACHE_SECONDS || "86400", 10);
-const writeRequestBuckets = new Map<string, { count: number; resetAt: number }>();
+// W12 C3-P1-B2 (c3-1025): write-rate-limit buckets are redis-backed
+// (ratelimit:write:{subject}, fixed window TTL = rateLimitWindowMs) so limits
+// hold across restarts/replicas. See the write-throttle middleware below.
+import { kvIncrWindow } from "./lib/redisKv";
 
 const serviceEndpoints = {
   teller: readRuntimeValue(["TELLER_SERVICE_URL"], "https://teller.middleware.54bank.app", { label: "teller service URL" }),
@@ -370,7 +399,7 @@ const middlewareConfig = {
 type JsonRecord = Record<string, unknown>;
 type HealthStatus = "healthy" | "degraded" | "down" | "unknown";
 type Trend = "up" | "down" | "flat";
-type CustomerStatus = "Active" | "Pending" | "Review" | "Dormant";
+type CustomerStatus = "Active" | "Pending" | "Review" | "Dormant" | "Deleted";
 type CustomerSegment = "Agriculture" | "Trade" | "Retail" | "Public sector";
 type CustomerTier = "Tier 1" | "Tier 2" | "Tier 3";
 type CustomerRisk = "Low" | "Medium" | "High";
@@ -793,7 +822,7 @@ const customers: CustomerRecord[] = [
     relationshipManager: "M. Danjuma",
     risk: "Medium",
     status: "Active",
-    bvn: "22188439014",
+    bvn: "Pending capture" /* W12-C3-P0: BVN seed fixture removed from source */,
     phone: "08030000001",
     balance: 12450000,
     lastTouchpoint: "10 minutes ago",
@@ -807,7 +836,7 @@ const customers: CustomerRecord[] = [
     relationshipManager: "K. Ibrahim",
     risk: "High",
     status: "Review",
-    bvn: "22188439015",
+    bvn: "Pending capture" /* W12-C3-P0: BVN seed fixture removed from source */,
     phone: "08030000002",
     balance: 28650000,
     lastTouchpoint: "35 minutes ago",
@@ -821,7 +850,7 @@ const customers: CustomerRecord[] = [
     relationshipManager: "A. Effiong",
     risk: "Low",
     status: "Pending",
-    bvn: "22188439016",
+    bvn: "Pending capture" /* W12-C3-P0: BVN seed fixture removed from source */,
     phone: "08030000003",
     balance: 3750000,
     lastTouchpoint: "1 hour ago",
@@ -835,7 +864,7 @@ const customers: CustomerRecord[] = [
     relationshipManager: "L. Hassan",
     risk: "Medium",
     status: "Active",
-    bvn: "22188439017",
+    bvn: "Pending capture" /* W12-C3-P0: BVN seed fixture removed from source */,
     phone: "08030000004",
     balance: 9450000,
     lastTouchpoint: "22 minutes ago",
@@ -849,7 +878,7 @@ const customers: CustomerRecord[] = [
     relationshipManager: "B. Okorie",
     risk: "Medium",
     status: "Review",
-    bvn: "22188439018",
+    bvn: "Pending capture" /* W12-C3-P0: BVN seed fixture removed from source */,
     phone: "08030000005",
     balance: 41200000,
     lastTouchpoint: "12 minutes ago",
@@ -863,7 +892,7 @@ const customers: CustomerRecord[] = [
     relationshipManager: "T. Bello",
     risk: "Low",
     status: "Active",
-    bvn: "22188439019",
+    bvn: "Pending capture" /* W12-C3-P0: BVN seed fixture removed from source */,
     phone: "08030000006",
     balance: 22850000,
     lastTouchpoint: "6 minutes ago",
@@ -2135,6 +2164,11 @@ function resolveApprovalRequest(approvalId: string, state: "approved" | "rejecte
   request.state = state;
   request.resolvedAt = new Date().toISOString();
   request.resolutionNote = resolutionNote;
+  // W12-C3-P0: the approval decision is persisted to the customerApprovals
+  // table (was memory + snapshot-sync only).
+  void resolveApproval(approvalId, state, resolutionNote).catch((error: unknown) => {
+    logger.error("Unable to persist approval decision to Postgres", { error: String(error), approvalId });
+  });
   persistRuntimeState();
   return request;
 }
@@ -2145,6 +2179,13 @@ function recordAudit(entry: Omit<AuditEntry, "id" | "timestamp">) {
     timestamp: new Date().toISOString(),
     ...entry,
   };
+  // W12-C3-P0: the auditEntries table is the authoritative audit store.
+  // Write-through synchronously (fire-and-forget with error logging — the
+  // handler contract stays sync); the in-memory slice is now only a bounded
+  // hot cache for the snapshot-sync path.
+  void createAuditEntry(record).catch((error: unknown) => {
+    logger.error("Unable to persist audit entry to Postgres", { error: String(error), auditId: record.id });
+  });
   auditTrail.unshift(record);
   trimAuditTrail();
   persistRuntimeState();
@@ -3061,33 +3102,36 @@ async function startServer() {
     res.locals.abortSignal = controller.signal;
     next();
   });
-  app.use((req, res, next) => {
+  app.use(async (req, res, next) => {
     if (!req.path.startsWith("/api/") || !["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) {
       next();
       return;
     }
 
-    const now = Date.now();
     // M-33: Never key rate-limit buckets on the raw x-forwarded-for header — it is
     // client-spoofable and trivially defeats limiting. req.ip is only derived from
     // X-Forwarded-For for hops trusted via `trust proxy` (TRUST_PROXY_HOPS);
     // otherwise it is the unspoofable socket peer address.
     const bucketKey = req.ip || req.socket.remoteAddress || "unknown";
-    const current = writeRequestBuckets.get(bucketKey);
-
-    if (!current || current.resetAt <= now) {
-      writeRequestBuckets.set(bucketKey, { count: 1, resetAt: now + rateLimitWindowMs });
+    const windowSeconds = Math.max(1, Math.ceil(rateLimitWindowMs / 1000));
+    let count: number;
+    try {
+      count = await kvIncrWindow(`ratelimit:write:${bucketKey}`, windowSeconds);
+    } catch (err) {
+      // Rate limiting is not a revocation control: on redis outage we fail
+      // OPEN (request proceeds) with a loud log, rather than taking all API
+      // writes down with the cache layer.
+      console.error("[rate-limit] redis unavailable — failing open", err);
       next();
       return;
     }
 
-    if (current.count >= rateLimitMaxWrites) {
-      res.setHeader("Retry-After", String(Math.ceil((current.resetAt - now) / 1000)));
+    if (count > rateLimitMaxWrites) {
+      res.setHeader("Retry-After", String(windowSeconds));
       res.status(429).json({ error: "Rate limit exceeded", windowMs: rateLimitWindowMs, maxWrites: rateLimitMaxWrites });
       return;
     }
 
-    current.count += 1;
     next();
   });
 
@@ -3346,12 +3390,22 @@ async function startServer() {
   app.use("/api/platform/customer-servicing", inMemoryServicingGuard);
   app.use("/api/platform/customers", inMemoryServicingGuard);
 
-  app.get("/api/platform/customers", (req, res) => {
+  app.get("/api/platform/customers", async (req, res) => {
     const role = readRole(req);
     const q = String(req.query.q || "").toLowerCase();
     const segment = String(req.query.segment || "All");
     const status = String(req.query.status || "All");
-    const results = customers.filter((customer) => {
+    // W12-C3-P0: customers are served from the drizzle `customers` table
+    // (previously the in-memory seed array). Fail-closed, no memory fallback.
+    let customerSource: CustomerRecord[];
+    try {
+      customerSource = (await listCustomers()) as CustomerRecord[];
+    } catch (error) {
+      logger.error("Customer list DB read failed", { error: String(error) });
+      res.status(503).json({ error: "customer_store_unavailable", message: "Customer store (Postgres) unavailable" });
+      return;
+    }
+    const results = customerSource.filter((customer) => {
       const matchesQuery = !q || [customer.id, customer.name, customer.location, customer.relationshipManager, customer.bvn, customer.phone].join(" ").toLowerCase().includes(q);
       const matchesSegment = segment === "All" || customer.segment === segment;
       const matchesStatus = status === "All" || customer.status === status;
@@ -3360,7 +3414,7 @@ async function startServer() {
     res.json({ asOf: new Date().toISOString(), role, items: results, total: results.length });
   });
 
-  app.post("/api/platform/customers", validateBody(customerCreateSchema), (req, res) => {
+  app.post("/api/platform/customers", validateBody(customerCreateSchema), async (req, res) => {
     const role = readRole(req);
     const payload = req.body as Record<string, unknown>;
     const customer: CustomerRecord = {
@@ -3377,6 +3431,15 @@ async function startServer() {
       balance: Number(payload.balance || 0),
       lastTouchpoint: "Just now",
     };
+    // W12-C3-P0: persist to the drizzle `customers` table first (the in-memory
+    // array is no longer the system of record). Fail-closed on DB error.
+    try {
+      await createCustomerRecord(tenantId, customer.id, customer);
+    } catch (error) {
+      logger.error("Customer create DB write failed", { error: String(error), customerId: customer.id });
+      res.status(503).json({ error: "customer_store_unavailable", message: "Customer store (Postgres) unavailable; record NOT created" });
+      return;
+    }
     customers.unshift(customer);
     recordAudit({
       actorRole: role,
@@ -3393,7 +3456,7 @@ async function startServer() {
     res.status(201).json(customer);
   });
 
-  app.put("/api/platform/customers/:customerId", (req, res) => {
+  app.put("/api/platform/customers/:customerId", async (req, res) => {
     const role = readRole(req);
     const target = customers.find((item) => item.id === req.params.customerId);
     if (!target) {
@@ -3401,6 +3464,14 @@ async function startServer() {
       return;
     }
     Object.assign(target, req.body, { lastTouchpoint: "Just now" });
+    // W12-C3-P0: updates hit Postgres (previously memory-only).
+    try {
+      await updateCustomerRecord(target.id, req.body);
+    } catch (error) {
+      logger.error("Customer update DB write failed", { error: String(error), customerId: target.id });
+      res.status(503).json({ error: "customer_store_unavailable", message: "Customer store (Postgres) unavailable; update NOT persisted" });
+      return;
+    }
     recordAudit({
       actorRole: role,
       actorId: readActorId(req, role),
@@ -3416,7 +3487,7 @@ async function startServer() {
     res.json(target);
   });
 
-  app.delete("/api/platform/customers/:customerId", (req, res) => {
+  app.delete("/api/platform/customers/:customerId", async (req, res) => {
     const role = readRole(req);
     const customerIndex = customers.findIndex((item) => item.id === req.params.customerId);
     if (customerIndex < 0) {
@@ -3424,7 +3495,19 @@ async function startServer() {
       return;
     }
 
-    const [removedCustomer] = customers.splice(customerIndex, 1);
+    // W12-C3-P0: soft-delete (plan P0-B3: DELETE-splice → soft-delete). The
+    // row is retained in Postgres with status "Deleted" for audit/NDPR
+    // retention; the in-memory cache mirrors the soft-delete.
+    try {
+      await updateCustomerRecord(req.params.customerId, { status: "Deleted" });
+    } catch (error) {
+      logger.error("Customer soft-delete DB write failed", { error: String(error), customerId: req.params.customerId });
+      res.status(503).json({ error: "customer_store_unavailable", message: "Customer store (Postgres) unavailable; delete NOT persisted" });
+      return;
+    }
+    const removedCustomer = customers[customerIndex];
+    removedCustomer.status = "Deleted" as CustomerStatus;
+    customers.splice(customerIndex, 1);
     recordAudit({
       actorRole: role,
       actorId: readActorId(req, role),
@@ -3467,7 +3550,7 @@ async function startServer() {
           approvalRole: "branch",
         })
       : undefined;
-    customerCardEvents.unshift({
+    const cardEvent: CustomerCardEvent = {
       id: nextCardEventId(),
       cardId: card.id,
       customerId: card.customerId,
@@ -3475,7 +3558,12 @@ async function startServer() {
       detail: "A servicing operator updated card controls or spending posture through the active platform endpoint.",
       severity: card.isLocked ? "warning" : "success",
       createdAt: new Date().toISOString(),
+    };
+    // W12-C3-P0: persist to the customerCardEvents table (write-through).
+    void addCustomerCardEvent(cardEvent).catch((error: unknown) => {
+      logger.error("Unable to persist card event to Postgres", { error: String(error), eventId: cardEvent.id });
     });
+    customerCardEvents.unshift(cardEvent);
     recordAudit({
       actorRole: role,
       actorId: readActorId(req, role),
@@ -3491,10 +3579,18 @@ async function startServer() {
     res.json({ card, approvalRequest });
   });
 
-  app.get("/api/platform/customer-servicing/card-events", (req, res) => {
+  app.get("/api/platform/customer-servicing/card-events", async (req, res) => {
     const customerId = resolveCustomerId(req);
-    const items = customerCardEvents.filter((item) => item.customerId === customerId);
-    res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    // W12-C3-P0-B3R: card events are served from Postgres (customerCardEvents
+    // table via listCustomerCardEvents). Fail-closed 503 on DB error — the
+    // boot-hydrated in-memory cache is NOT served as a silent stale fallback.
+    try {
+      const items = await listCustomerCardEvents(customerId);
+      res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    } catch (error) {
+      logger.error("Card events DB read failed", { error: String(error), customerId });
+      res.status(503).json({ error: "card_event_store_unavailable", message: "Card-event store (Postgres) unavailable" });
+    }
   });
 
   app.get("/api/platform/customer-servicing/session-preference", asyncHandler(async (req, res) => {
@@ -3690,10 +3786,18 @@ async function startServer() {
     });
   });
 
-  app.get("/api/platform/customer-servicing/billers", (req, res) => {
+  app.get("/api/platform/customer-servicing/billers", async (req, res) => {
     const customerId = resolveCustomerId(req);
-    const items = customerSavedBillers.filter((item) => item.customerId === customerId);
-    res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    // W12-C3-P0-B3R: saved billers are served from Postgres (customerSavedBillers
+    // table via listCustomerSavedBillers). Fail-closed 503 on DB error — the
+    // boot-hydrated in-memory cache is NOT served as a silent stale fallback.
+    try {
+      const items = await listCustomerSavedBillers(customerId);
+      res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    } catch (error) {
+      logger.error("Saved billers DB read failed", { error: String(error), customerId });
+      res.status(503).json({ error: "saved_biller_store_unavailable", message: "Saved-biller store (Postgres) unavailable" });
+    }
   });
 
   app.post("/api/platform/customer-servicing/billers", (req, res) => {
@@ -3717,6 +3821,10 @@ async function startServer() {
       lastPaidAt: payload.lastPaidAt,
       createdAt: new Date().toISOString(),
     };
+    // W12-C3-P0: persist to the customerSavedBillers table (write-through).
+    void createSavedBiller(item).catch((error: unknown) => {
+      logger.error("Unable to persist saved biller to Postgres", { error: String(error), billerId: item.id });
+    });
     customerSavedBillers.unshift(item);
     recordAudit({
       actorRole: role,
@@ -3741,6 +3849,10 @@ async function startServer() {
       return;
     }
     const [removed] = customerSavedBillers.splice(index, 1);
+    // W12-C3-P0: deletes hit Postgres (previously memory-only splice).
+    void deleteSavedBiller(removed.id).catch((error: unknown) => {
+      logger.error("Unable to delete saved biller in Postgres", { error: String(error), billerId: removed.id });
+    });
     recordAudit({
       actorRole: role,
       actorId: readActorId(req, role),
@@ -3756,10 +3868,18 @@ async function startServer() {
     res.json({ id: removed.id, removed: true });
   });
 
-  app.get("/api/platform/customer-servicing/bills", (req, res) => {
+  app.get("/api/platform/customer-servicing/bills", async (req, res) => {
     const customerId = resolveCustomerId(req);
-    const items = customerBillPayments.filter((item) => item.customerId === customerId).sort((left, right) => new Date(right.paidAt).getTime() - new Date(left.paidAt).getTime());
-    res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    // W12-C3-P0-B3R: bill payments are served from Postgres (customerBillPayments
+    // table via listCustomerBillPayments, paidAt DESC — same ordering as the old
+    // in-memory sort). Fail-closed 503 on DB error — no silent stale cache.
+    try {
+      const items = await listCustomerBillPayments(customerId);
+      res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    } catch (error) {
+      logger.error("Bill payments DB read failed", { error: String(error), customerId });
+      res.status(503).json({ error: "bill_payment_store_unavailable", message: "Bill-payment store (Postgres) unavailable" });
+    }
   });
 
   app.post("/api/platform/customer-servicing/bills", (req, res) => {
@@ -3786,6 +3906,10 @@ async function startServer() {
       evidenceStatus: payload.evidenceStatus || (payload.scheduledFor ? "scheduled" : "ready"),
       channel: payload.channel || (payload.billerId ? "saved-biller" : "self-service"),
     };
+    // W12-C3-P0: persist to the customerBillPayments table (write-through).
+    void createBillPayment(payment).catch((error: unknown) => {
+      logger.error("Unable to persist bill payment to Postgres", { error: String(error), paymentId: payment.id });
+    });
     customerBillPayments.unshift(payment);
     const approvalRequest = payment.status === "scheduled"
       ? ensureApprovalRequest({
@@ -3815,12 +3939,18 @@ async function startServer() {
     res.status(201).json({ payment, approvalRequest });
   });
 
-  app.get("/api/platform/customer-servicing/transfers", (req, res) => {
+  app.get("/api/platform/customer-servicing/transfers", async (req, res) => {
     const customerId = resolveCustomerId(req);
-    const items = customerTransfers
-      .filter((item) => item.customerId === customerId)
-      .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
-    res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    // W12-C3-P0-B3R: transfers are served from Postgres (customerTransfers table
+    // via listCustomerTransfers, createdAt DESC — same ordering as the old
+    // in-memory sort). Fail-closed 503 on DB error — no silent stale cache.
+    try {
+      const items = await listCustomerTransfers(customerId);
+      res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    } catch (error) {
+      logger.error("Customer transfers DB read failed", { error: String(error), customerId });
+      res.status(503).json({ error: "transfer_store_unavailable", message: "Transfer store (Postgres) unavailable" });
+    }
   });
 
   app.post("/api/platform/customer-servicing/transfers", validateBody(transferCreateSchema), (req, res) => {
@@ -3846,6 +3976,11 @@ async function startServer() {
       workflowId: payload.workflowId ? String(payload.workflowId) : undefined,
       approvalState: amount >= 500000 ? "pending_review" : "not_required",
     };
+    // W12-C3-P0: persist the transfer draft to the customerTransfers table
+    // (write-through — money path, previously memory-only).
+    void createTransfer(transfer).catch((error: unknown) => {
+      logger.error("Unable to persist transfer to Postgres", { error: String(error), transferId: transfer.id });
+    });
     customerTransfers.unshift(transfer);
     recordAudit({
       actorRole: role,
@@ -3871,7 +4006,7 @@ async function startServer() {
     );
   });
 
-  app.post("/api/platform/customer-servicing/transfers/:transferId/otp", (req, res) => {
+  app.post("/api/platform/customer-servicing/transfers/:transferId/otp", async (req, res) => {
     const role = readRole(req);
     const transfer = customerTransfers.find((item) => item.id === req.params.transferId);
     if (!transfer) {
@@ -3885,13 +4020,17 @@ async function startServer() {
     const otpActorId = readActorId(req, role);
     let otpChallenge: { otpId: string; expiresInSeconds: number };
     try {
-      otpChallenge = generateOTP(otpActorId);
+      otpChallenge = await generateOTP(otpActorId);
     } catch (otpErr) {
       res.status(429).json({ message: otpErr instanceof Error ? otpErr.message : "OTP issuance rate-limited" });
       return;
     }
     transfer.otpReference = otpChallenge.otpId;
     transfer.otpIssuedAt = new Date().toISOString();
+    // W12-C3-P0: lifecycle mutation hits Postgres (previously memory-only).
+    void updateTransfer(transfer.id, { status: transfer.status, otpReference: transfer.otpReference, otpIssuedAt: transfer.otpIssuedAt }).catch((error: unknown) => {
+      logger.error("Unable to persist transfer OTP state to Postgres", { error: String(error), transferId: transfer.id });
+    });
     const otp: CustomerTransferOtpRequest = {
       transferId: transfer.id,
       otpReference: transfer.otpReference,
@@ -3922,7 +4061,7 @@ async function startServer() {
     );
   });
 
-  app.post("/api/platform/customer-servicing/transfers/:transferId/confirm", (req, res) => {
+  app.post("/api/platform/customer-servicing/transfers/:transferId/confirm", async (req, res) => {
     const role = readRole(req);
     const payload = req.body as { otpReference?: string; otpCode?: string };
     const transfer = customerTransfers.find((item) => item.id === req.params.transferId);
@@ -3942,12 +4081,29 @@ async function startServer() {
       res.status(409).json({ message: `Transfer ${transfer.id} is not awaiting OTP confirmation (status: ${transfer.status})` });
       return;
     }
-    if (!payload.otpReference || payload.otpReference !== transfer.otpReference || !payload.otpCode || !verifyOTP(payload.otpReference, payload.otpCode)) {
+    let otpConfirmed = false;
+    if (payload.otpReference && payload.otpReference === transfer.otpReference && payload.otpCode) {
+      try {
+        otpConfirmed = await verifyOTP(payload.otpReference, payload.otpCode);
+      } catch (otpErr) {
+        // FAIL CLOSED: OTP state unreachable => the money-moving confirmation
+        // must not proceed on an unverifiable OTP.
+        res.status(503).json({ message: "OTP verification unavailable", code: "OTP_STATE_UNAVAILABLE" });
+        return;
+      }
+    }
+    if (!otpConfirmed) {
       res.status(400).json({ message: "OTP confirmation failed" });
       return;
     }
     transfer.status = transfer.approvalState === "pending_review" ? "submitted" : "completed";
     transfer.confirmedAt = new Date().toISOString();
+    // W12-C3-P0: the money-moving confirmation persists to Postgres
+    // (previously memory-only — a restart could resurrect a confirmed debit
+    // into otp_pending and enable double payout).
+    void updateTransfer(transfer.id, { status: transfer.status, confirmedAt: transfer.confirmedAt }).catch((error: unknown) => {
+      logger.error("Unable to persist transfer confirmation to Postgres", { error: String(error), transferId: transfer.id });
+    });
     const statement: CustomerStatementRecord = {
       id: `stmt-${transfer.id}`,
       customerId: transfer.customerId,
@@ -3985,13 +4141,19 @@ async function startServer() {
     );
   });
 
-  app.get("/api/platform/customer-servicing/approvals", (req, res) => {
+  app.get("/api/platform/customer-servicing/approvals", async (req, res) => {
     const customerId = resolveCustomerId(req);
-    const source = customerApprovals.length > 0 ? customerApprovals : defaultCustomerApprovals;
-    const items = source
-      .filter((item) => item.customerId === customerId)
-      .sort((left, right) => new Date(right.requestedAt).getTime() - new Date(left.requestedAt).getTime());
-    res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    // W12-C3-P0-B3R: approval requests are served from Postgres (customerApprovals
+    // table via listCustomerApprovals, requestedAt DESC — same ordering as the old
+    // in-memory sort). Fail-closed 503 on DB error — no silent stale cache; the
+    // defaultCustomerApprovals seed fallback is no longer served.
+    try {
+      const items = await listCustomerApprovals(customerId);
+      res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    } catch (error) {
+      logger.error("Approval requests DB read failed", { error: String(error), customerId });
+      res.status(503).json({ error: "approval_store_unavailable", message: "Approval store (Postgres) unavailable" });
+    }
   });
 
   app.post("/api/platform/customer-servicing/approvals/:approvalId/approve", (req, res) => {
@@ -4028,6 +4190,13 @@ async function startServer() {
         payment.status = "paid";
         payment.paidAt = new Date().toISOString();
         payment.evidenceStatus = "verified";
+        // W12-C3-P0-B3R: the bill list is now PG-served, so the approval-driven
+        // money-moving status transition must be durable too (write-through,
+        // fire-and-forget with error logging — handler contract stays sync,
+        // same pattern as C3P0's resolveApproval wiring).
+        void updateBillPayment(payment.id, { status: payment.status, paidAt: payment.paidAt, evidenceStatus: payment.evidenceStatus }).catch((error: unknown) => {
+          logger.error("Unable to persist approved bill payment to Postgres", { error: String(error), paymentId: payment.id });
+        });
       }
     }
     if (approvalRequest.entityType === "statement_export") {
@@ -4035,6 +4204,12 @@ async function startServer() {
       if (job) {
         job.approvalState = "Signed";
         job.status = "Ready";
+        // W12-C3-P0-B3R: statement-export reads are now PG-served, so the
+        // approval-driven Ready/Signed transition must be durable too
+        // (write-through, fire-and-forget with error logging).
+        void updateExportJobRecord(job.id, { approvalState: job.approvalState, status: job.status }).catch((error: unknown) => {
+          logger.error("Unable to persist approved export job to Postgres", { error: String(error), exportId: job.id });
+        });
       }
     }
     recordAudit({
@@ -4106,13 +4281,27 @@ async function startServer() {
     );
   });
 
-  app.get("/api/platform/customer-servicing/statement-exports", (req, res) => {
+  app.get("/api/platform/customer-servicing/statement-exports", async (req, res) => {
     const customerId = resolveCustomerId(req);
-    const items = exportJobs.filter((item) => item.domainKey === "customer-statements" && item.approvalSignature.includes(customerId));
-    res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    // W12-C3-P0-B3R: statement exports are served from Postgres. Primary source
+    // is the customerStatementExports link table (listCustomerStatementExports);
+    // exportJobs rows persisted before the link table existed are still matched
+    // via the CUSTOMER-<id> approvalSignature convention. Fail-closed 503 on DB
+    // error — the boot-hydrated in-memory cache is NOT served as a stale fallback.
+    try {
+      const linked = await listCustomerStatementExports(customerId);
+      const legacy = (await listExportJobs("customer-statements")).filter(
+        (job) => job.approvalSignature.includes(customerId) && !linked.some((row) => row.id === job.id),
+      );
+      const items = [...linked, ...legacy].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+      res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
+    } catch (error) {
+      logger.error("Statement exports DB read failed", { error: String(error), customerId });
+      res.status(503).json({ error: "statement_export_store_unavailable", message: "Statement-export store (Postgres) unavailable" });
+    }
   });
 
-  app.post("/api/platform/customer-servicing/statement-exports", (req, res) => {
+  app.post("/api/platform/customer-servicing/statement-exports", async (req, res) => {
     const role = readRole(req);
     const customerId = resolveCustomerId(req);
     const payload = req.body as { format?: ExportJob["format"]; rowCount?: number; title?: string };
@@ -4135,6 +4324,25 @@ async function startServer() {
       approvalChain: ["Customer servicing", "Branch operations"],
       signedBy: [],
     };
+    // W12-C3-P0-B3R: persist the export job AND the customer link row to
+    // Postgres first (fail-closed 503 on DB error) — previously this handler
+    // was unshift-only, so statement exports were lost on restart.
+    try {
+      await createExportJobRecord(exportJob);
+      await createStatementExportRecord({
+        exportRequestId: `STMTEXP-${exportId}`,
+        customerId,
+        exportJobId: exportJob.id,
+        format: exportJob.format,
+        rowCount: exportJob.rowCount,
+        title: exportJob.title,
+        createdAt: exportJob.createdAt,
+      });
+    } catch (error) {
+      logger.error("Statement export DB write failed", { error: String(error), exportId: exportJob.id });
+      res.status(503).json({ error: "statement_export_store_unavailable", message: "Statement-export store (Postgres) unavailable; job NOT created" });
+      return;
+    }
     exportJobs.unshift(exportJob);
     const approvalRequest = ensureApprovalRequest({
       customerId,
@@ -4215,12 +4423,18 @@ async function startServer() {
       recentAudit,
     });
   });
-  app.get("/api/platform/workflows", (_req, res) => {
-
-    res.json({ asOf: new Date().toISOString(), items: workflowCases, total: workflowCases.length });
+  app.get("/api/platform/workflows", async (_req, res) => {
+    // W12-C3-P0: workflow cases served from Postgres (workflowCases table).
+    try {
+      const items = await listWorkflowCases();
+      res.json({ asOf: new Date().toISOString(), items, total: items.length });
+    } catch (error) {
+      logger.error("Workflow list DB read failed", { error: String(error) });
+      res.status(503).json({ error: "workflow_store_unavailable", message: "Workflow store (Postgres) unavailable" });
+    }
   });
 
-  app.post("/api/platform/workflows/:workflowId/advance", (req, res) => {
+  app.post("/api/platform/workflows/:workflowId/advance", async (req, res) => {
     const role = readRole(req);
     const item = workflowCases.find((entry) => entry.id === req.params.workflowId);
     if (!item) {
@@ -4229,10 +4443,26 @@ async function startServer() {
     }
     const stages: WorkflowStage[] = ["Origination", "KYC", "Approval", "Fulfilment", "Monitoring"];
     const stageIndex = stages.indexOf(item.stage);
-    item.stage = stages[Math.min(stageIndex + 1, stages.length - 1)];
-    item.status = item.stage === "Monitoring" ? "Ready" : "In Progress";
-    item.slaHours = Math.max(item.slaHours - 2, 1);
-    item.nextAction = item.stage === "Monitoring" ? "Monitor performance, repayment health, and control exceptions." : `Continue ${item.stage.toLowerCase()} tasks and capture evidence.`;
+    const nextStage = stages[Math.min(stageIndex + 1, stages.length - 1)];
+    const nextStatus = nextStage === "Monitoring" ? "Ready" : "In Progress";
+    const nextSlaHours = Math.max(item.slaHours - 2, 1);
+    const nextAction = nextStage === "Monitoring" ? "Monitor performance, repayment health, and control exceptions." : `Continue ${nextStage.toLowerCase()} tasks and capture evidence.`;
+    // W12-C3-P0-B3R: wire the case-mutation write-through C3P0 left unwired —
+    // the stage transition is persisted to the workflowCases table
+    // (updateWorkflowCase) BEFORE the in-memory mirror is mutated, because the
+    // workflow list is PG-served (a memory-only advance would be invisible and
+    // restart-lost). Fail-closed 503 on DB error; memory mirror left untouched.
+    try {
+      await updateWorkflowCase(item.id, { stage: nextStage, status: nextStatus, slaHours: nextSlaHours, nextAction });
+    } catch (error) {
+      logger.error("Workflow advance DB write failed", { error: String(error), workflowId: item.id });
+      res.status(503).json({ error: "workflow_store_unavailable", message: "Workflow store (Postgres) unavailable; case NOT advanced" });
+      return;
+    }
+    item.stage = nextStage;
+    item.status = nextStatus;
+    item.slaHours = nextSlaHours;
+    item.nextAction = nextAction;
     recordAudit({
       actorRole: role,
       actorId: readActorId(req, role),
@@ -4504,11 +4734,21 @@ async function startServer() {
     );
   });
 
-  app.get("/api/platform/audit", (req, res) => {
+  app.get("/api/platform/audit", async (req, res) => {
     const role = readRole(req);
     const rawDomain = String(req.query.domainKey || req.query.domain || "").trim().toLowerCase();
     const treatAsWorkspaceDomain = rawDomain === "operations" || rawDomain === "operator";
-    const auditSource = auditTrail.length ? auditTrail : defaultAuditTrail;
+    // W12-C3-P0: audit reads are served from Postgres (auditEntries). No
+    // in-memory fallback — a compliance trail must not silently go stale.
+    let auditSource: AuditEntry[];
+    try {
+      const rows = await listAuditEntries();
+      auditSource = rows.length ? (rows as AuditEntry[]) : (auditTrail.length ? auditTrail : defaultAuditTrail);
+    } catch (error) {
+      logger.error("Audit trail DB read failed", { error: String(error) });
+      res.status(503).json({ error: "audit_store_unavailable", message: "Audit store (Postgres) unavailable" });
+      return;
+    }
     const items = auditSource.filter((entry) => {
       if (!rawDomain || treatAsWorkspaceDomain) {
         return true;
@@ -4518,15 +4758,24 @@ async function startServer() {
     res.json({ asOf: new Date().toISOString(), role, items, total: items.length, domain: rawDomain || undefined });
   });
 
-  app.get("/api/platform/exports", (req, res) => {
+  app.get("/api/platform/exports", async (req, res) => {
     const role = readRole(req);
     const profile = getRoleProfile(role);
-    const exportSource = exportJobs.length ? exportJobs : defaultExportJobs;
+    // W12-C3-P0: export jobs served from Postgres (exportJobs table).
+    let exportSource: ExportJob[];
+    try {
+      const rows = await listExportJobs();
+      exportSource = rows.length ? (rows as ExportJob[]) : (exportJobs.length ? exportJobs : defaultExportJobs);
+    } catch (error) {
+      logger.error("Export jobs DB read failed", { error: String(error) });
+      res.status(503).json({ error: "export_store_unavailable", message: "Export-job store (Postgres) unavailable" });
+      return;
+    }
     const items = exportSource.filter((job) => profile.exportScopes.some((scope) => job.domainKey.includes(scope) || job.title.toLowerCase().includes(scope)) || job.requestedByRole === role);
     res.json({ asOf: new Date().toISOString(), role, items, total: items.length });
   });
 
-  app.post("/api/platform/exports", (req, res) => {
+  app.post("/api/platform/exports", async (req, res) => {
     const role = readRole(req);
     const payload = req.body as Partial<ExportJob> & { domainKey?: string; title?: string };
     if (!payload.domainKey || !payload.title) {
@@ -4552,6 +4801,14 @@ async function startServer() {
       approvalChain: payload.approvalChain || [roleProfiles.find((profile) => profile.role === role)?.title || role],
       signedBy: payload.signedBy || [`${role.toUpperCase()}-AUTO-SIGNOFF`],
     };
+    // W12-C3-P0: persist to the exportJobs table first (fail-closed).
+    try {
+      await createExportJobRecord(job);
+    } catch (error) {
+      logger.error("Export job DB write failed", { error: String(error), exportId: job.id });
+      res.status(503).json({ error: "export_store_unavailable", message: "Export-job store (Postgres) unavailable; job NOT created" });
+      return;
+    }
     exportJobs.unshift(job);
     recordAudit({
       actorRole: role,
@@ -5214,7 +5471,7 @@ async function startServer() {
   }));
 
   // --- Audit trail endpoints (#16) ---
-  app.get("/api/platform/audit", (_req, res) => {
+  app.get("/api/platform/audit", asyncHandler(async (_req, res) => {
     const auditLimit = parseBoundedInt(_req.query.limit, { defaultValue: 50, min: 1, max: 200 });
     if (auditLimit === null) {
       res.status(400).json({ error: "Invalid 'limit' query parameter: must be an integer between 1 and 200" });
@@ -5228,11 +5485,11 @@ async function startServer() {
       to: _req.query.to as string | undefined,
       limit: auditLimit,
     };
-    res.json(auditLog.query(filters));
-  });
-  app.get("/api/platform/audit/stats", (_req, res) => {
-    res.json(auditLog.getStats());
-  });
+    res.json(await auditLog.query(filters));
+  }));
+  app.get("/api/platform/audit/stats", asyncHandler(async (_req, res) => {
+    res.json(await auditLog.getStats());
+  }));
 
   // --- Full-text search across domains (#20) ---
   app.get("/api/platform/search", asyncHandler(async (req, res) => {
@@ -5565,18 +5822,31 @@ async function startServer() {
   });
 
   // Session management endpoints
-  app.get("/api/platform/sessions/stats", (_req, res) => {
-    res.json(getSessionStats());
+  app.get("/api/platform/sessions/stats", async (_req, res) => {
+    try {
+      res.json(await getSessionStats());
+    } catch (err) {
+      res.status(503).json({ error: "Session state unavailable", code: "SESSION_STATE_UNAVAILABLE" });
+    }
   });
 
-  app.get("/api/platform/sessions/:userId", (req, res) => {
-    const sessions = listUserSessions(req.params.userId);
-    res.json({ sessions, count: sessions.length });
+  app.get("/api/platform/sessions/:userId", async (req, res) => {
+    try {
+      const sessions = await listUserSessions(req.params.userId);
+      res.json({ sessions, count: sessions.length });
+    } catch (err) {
+      res.status(503).json({ error: "Session state unavailable", code: "SESSION_STATE_UNAVAILABLE" });
+    }
   });
 
-  app.delete("/api/platform/sessions/:userId", (req, res) => {
-    const count = revokeAllSessions(req.params.userId);
-    res.json({ revoked: count });
+  app.delete("/api/platform/sessions/:userId", async (req, res) => {
+    try {
+      // FAIL CLOSED: a revocation that cannot reach redis must not pretend success.
+      const count = await revokeAllSessions(req.params.userId);
+      res.json({ revoked: count });
+    } catch (err) {
+      res.status(503).json({ error: "Session revocation unavailable", code: "REVOCATION_UNAVAILABLE" });
+    }
   });
 
   // Redis status endpoint
@@ -7456,96 +7726,96 @@ async function startServer() {
   app.all("/api/platform/standing-charges/healthz", (req, res) => { void proxyToService(STANDING_CHARGES_URL, "/healthz", req, res); });
 
   // GL Account Management endpoints
-  app.get("/api/platform/gl/accounts", (_req, res) => {
+  app.get("/api/platform/gl/accounts", asyncHandler(async (_req, res) => {
     const { getGLAccounts } = require("./lib/glAccountManagement");
-    const accounts = getGLAccounts();
+    const accounts = await getGLAccounts();
     res.json({ items: accounts, total: accounts.length });
-  });
-  app.get("/api/platform/gl/trial-balance", (_req, res) => {
+  }));
+  app.get("/api/platform/gl/trial-balance", asyncHandler(async (_req, res) => {
     const { getTrialBalance } = require("./lib/glAccountManagement");
-    res.json(getTrialBalance());
-  });
-  app.get("/api/platform/gl/balance-sheet", (_req, res) => {
+    res.json(await getTrialBalance());
+  }));
+  app.get("/api/platform/gl/balance-sheet", asyncHandler(async (_req, res) => {
     const { getBalanceSheet } = require("./lib/glAccountManagement");
-    res.json(getBalanceSheet());
-  });
+    res.json(await getBalanceSheet());
+  }));
 
   // Collateral management endpoints
-  app.get("/api/platform/collateral/items", (_req, res) => {
+  app.get("/api/platform/collateral/items", asyncHandler(async (_req, res) => {
     const { getCollaterals } = require("./lib/collateralManagement");
-    const items = getCollaterals();
+    const items = await getCollaterals();
     res.json({ items, total: items.length });
-  });
-  app.get("/api/platform/collateral/summary", (_req, res) => {
+  }));
+  app.get("/api/platform/collateral/summary", asyncHandler(async (_req, res) => {
     const { getCollateralSummary } = require("./lib/collateralManagement");
-    res.json(getCollateralSummary());
-  });
+    res.json(await getCollateralSummary());
+  }));
 
   // Complaint management endpoints
-  app.get("/api/platform/complaints", (_req, res) => {
+  app.get("/api/platform/complaints", asyncHandler(async (_req, res) => {
     const { getComplaints } = require("./lib/complaintManagement");
-    const complaints = getComplaints();
+    const complaints = await getComplaints();
     res.json({ items: complaints, total: complaints.length });
-  });
-  app.get("/api/platform/complaints/stats", (_req, res) => {
+  }));
+  app.get("/api/platform/complaints/stats", asyncHandler(async (_req, res) => {
     const { getComplaintStats } = require("./lib/complaintManagement");
-    res.json(getComplaintStats());
-  });
+    res.json(await getComplaintStats());
+  }));
 
   // Interbank settlement endpoints
-  app.get("/api/platform/settlement/batches", (_req, res) => {
+  app.get("/api/platform/settlement/batches", async (_req, res) => {
     const { getSettlementBatches } = require("./lib/interbankSettlement");
-    const batches = getSettlementBatches();
+    const batches = await getSettlementBatches();
     res.json({ items: batches, total: batches.length });
   });
-  app.get("/api/platform/settlement/summary", (_req, res) => {
+  app.get("/api/platform/settlement/summary", async (_req, res) => {
     const { getSettlementSummary } = require("./lib/interbankSettlement");
-    res.json(getSettlementSummary());
+    res.json(await getSettlementSummary());
   });
 
   // Staff management endpoints
-  app.get("/api/platform/staff", (_req, res) => {
+  app.get("/api/platform/staff", asyncHandler(async (_req, res) => {
     const { getStaff } = require("./lib/staffManagement");
-    const members = getStaff();
+    const members = await getStaff();
     res.json({ items: members, total: members.length });
-  });
-  app.get("/api/platform/staff/stats", (_req, res) => {
+  }));
+  app.get("/api/platform/staff/stats", asyncHandler(async (_req, res) => {
     const { getStaffStats } = require("./lib/staffManagement");
-    res.json(getStaffStats());
-  });
+    res.json(await getStaffStats());
+  }));
 
   // Channel management endpoints
-  app.get("/api/platform/channels", (_req, res) => {
+  app.get("/api/platform/channels", asyncHandler(async (_req, res) => {
     const { getChannels } = require("./lib/channelManagement");
-    const channels = getChannels();
+    const channels = await getChannels();
     res.json({ items: channels, total: channels.length });
-  });
-  app.get("/api/platform/channels/summary", (_req, res) => {
+  }));
+  app.get("/api/platform/channels/summary", asyncHandler(async (_req, res) => {
     const { getChannelSummary } = require("./lib/channelManagement");
-    res.json(getChannelSummary());
-  });
+    res.json(await getChannelSummary());
+  }));
 
   // Fixed deposit management endpoints
-  app.get("/api/platform/fixed-deposits", (_req, res) => {
+  app.get("/api/platform/fixed-deposits", asyncHandler(async (_req, res) => {
     const { getFixedDeposits } = require("./lib/fixedDepositManagement");
-    const deposits = getFixedDeposits();
+    const deposits = await getFixedDeposits();
     res.json({ items: deposits, total: deposits.length });
-  });
-  app.get("/api/platform/fixed-deposits/summary", (_req, res) => {
+  }));
+  app.get("/api/platform/fixed-deposits/summary", asyncHandler(async (_req, res) => {
     const { getFixedDepositSummary } = require("./lib/fixedDepositManagement");
-    res.json(getFixedDepositSummary());
-  });
+    res.json(await getFixedDepositSummary());
+  }));
 
   // Standing instruction endpoints
-  app.get("/api/platform/standing-instructions", (_req, res) => {
+  app.get("/api/platform/standing-instructions", asyncHandler(async (_req, res) => {
     const { getStandingInstructions } = require("./lib/standingInstructionEngine");
-    const instructions = getStandingInstructions();
+    const instructions = await getStandingInstructions();
     res.json({ items: instructions, total: instructions.length });
-  });
-  app.get("/api/platform/standing-instructions/stats", (_req, res) => {
+  }));
+  app.get("/api/platform/standing-instructions/stats", asyncHandler(async (_req, res) => {
     const { getStandingInstructionStats } = require("./lib/standingInstructionEngine");
-    res.json(getStandingInstructionStats());
-  });
+    res.json(await getStandingInstructionStats());
+  }));
 
   // Cash management endpoints
   app.get("/api/platform/cash/positions", (_req, res) => {
@@ -7564,48 +7834,48 @@ async function startServer() {
   });
 
   // Correspondent banking endpoints
-  app.get("/api/platform/correspondent-banks", (_req, res) => {
+  app.get("/api/platform/correspondent-banks", asyncHandler(async (_req, res) => {
     const { getCorrespondentBanks } = require("./lib/correspondentBanking");
-    const banks = getCorrespondentBanks();
+    const banks = await getCorrespondentBanks();
     res.json({ items: banks, total: banks.length });
-  });
-  app.get("/api/platform/correspondent-banks/summary", (_req, res) => {
+  }));
+  app.get("/api/platform/correspondent-banks/summary", asyncHandler(async (_req, res) => {
     const { getCorrespondentSummary } = require("./lib/correspondentBanking");
-    res.json(getCorrespondentSummary());
-  });
+    res.json(await getCorrespondentSummary());
+  }));
 
   // Product catalog endpoints
-  app.get("/api/platform/products", (_req, res) => {
+  app.get("/api/platform/products", asyncHandler(async (_req, res) => {
     const { getProducts } = require("./lib/productCatalog");
-    const products = getProducts();
+    const products = await getProducts();
     res.json({ items: products, total: products.length });
-  });
-  app.get("/api/platform/products/stats", (_req, res) => {
+  }));
+  app.get("/api/platform/products/stats", asyncHandler(async (_req, res) => {
     const { getProductStats } = require("./lib/productCatalog");
-    res.json(getProductStats());
-  });
+    res.json(await getProductStats());
+  }));
 
   // Customer segmentation endpoints
-  app.get("/api/platform/segments", (_req, res) => {
+  app.get("/api/platform/segments", asyncHandler(async (_req, res) => {
     const { getCustomerSegments } = require("./lib/customerSegmentation");
-    const segments = getCustomerSegments();
+    const segments = await getCustomerSegments();
     res.json({ items: segments, total: segments.length });
-  });
-  app.get("/api/platform/segments/stats", (_req, res) => {
+  }));
+  app.get("/api/platform/segments/stats", asyncHandler(async (_req, res) => {
     const { getSegmentStats } = require("./lib/customerSegmentation");
-    res.json(getSegmentStats());
-  });
+    res.json(await getSegmentStats());
+  }));
 
   // Dormancy engine endpoints
-  app.get("/api/platform/dormancy/accounts", (_req, res) => {
+  app.get("/api/platform/dormancy/accounts", asyncHandler(async (_req, res) => {
     const { getDormantAccounts } = require("./lib/dormancyEngine");
-    const accounts = getDormantAccounts();
+    const accounts = await getDormantAccounts();
     res.json({ items: accounts, total: accounts.length });
-  });
-  app.get("/api/platform/dormancy/stats", (_req, res) => {
+  }));
+  app.get("/api/platform/dormancy/stats", asyncHandler(async (_req, res) => {
     const { getDormancyStats } = require("./lib/dormancyEngine");
-    res.json(getDormancyStats());
-  });
+    res.json(await getDormancyStats());
+  }));
 
   // Interest accrual engine endpoints
   app.get("/api/platform/interest-accrual/records", (_req, res) => {
@@ -7621,36 +7891,37 @@ async function startServer() {
   });
 
   // Limit management endpoints
-  app.get("/api/platform/limits/config", (_req, res) => {
+  app.get("/api/platform/limits/config", asyncHandler(async (_req, res) => {
     const { getTransactionLimits } = require("./lib/limitManagement");
-    const limits = getTransactionLimits();
+    const limits = await getTransactionLimits();
     res.json({ items: limits, total: limits.length });
-  });
+  }));
   app.get("/api/platform/limits/utilization", (_req, res) => {
     const { getLimitUtilizations } = require("./lib/limitManagement");
     const util = getLimitUtilizations();
     res.json({ items: util, total: util.length });
   });
-  app.post("/api/platform/limits/check", (req, res) => {
+  app.post("/api/platform/limits/check", asyncHandler(async (req, res) => {
     const { checkLimit } = require("./lib/limitManagement");
     const { tier, channel, amount } = req.body;
     if (!tier || !channel || !amount) { res.status(400).json({ error: "tier, channel, and amount required", code: "VALIDATION_ERROR" }); return; }
-    res.json(checkLimit(tier, channel, amount));
-  });
+    res.json(await checkLimit(tier, channel, amount));
+  }));
 
   // B6: Treasury portfolio endpoints
-  app.get("/api/platform/treasury/investments", (_req, res) => {
+  app.get("/api/platform/treasury/investments", async (_req, res) => {
     const { getInvestments } = require("./lib/treasuryPortfolio");
-    const inv = getInvestments();
+    const inv = await getInvestments();
     res.json({ items: inv, total: inv.length });
   });
-  app.get("/api/platform/treasury/maturity-ladder", (_req, res) => {
+  app.get("/api/platform/treasury/maturity-ladder", async (_req, res) => {
     const { getMaturityLadder } = require("./lib/treasuryPortfolio");
-    res.json({ items: getMaturityLadder(), total: getMaturityLadder().length });
+    const ladder = await getMaturityLadder();
+    res.json({ items: ladder, total: ladder.length });
   });
-  app.get("/api/platform/treasury/portfolio-summary", (_req, res) => {
+  app.get("/api/platform/treasury/portfolio-summary", async (_req, res) => {
     const { getPortfolioSummary } = require("./lib/treasuryPortfolio");
-    res.json(getPortfolioSummary());
+    res.json(await getPortfolioSummary());
   });
 
   // B7: SWIFT message center endpoints
@@ -7665,15 +7936,15 @@ async function startServer() {
   });
 
   // B8: Credit risk engine endpoints
-  app.get("/api/platform/credit-risk/assessments", (_req, res) => {
+  app.get("/api/platform/credit-risk/assessments", asyncHandler(async (_req, res) => {
     const { getCreditAssessments } = require("./lib/creditRiskEngine");
-    const assessments = getCreditAssessments();
+    const assessments = await getCreditAssessments();
     res.json({ items: assessments, total: assessments.length });
-  });
-  app.get("/api/platform/credit-risk/portfolio", (_req, res) => {
+  }));
+  app.get("/api/platform/credit-risk/portfolio", asyncHandler(async (_req, res) => {
     const { getPortfolioRiskSummary } = require("./lib/creditRiskEngine");
-    res.json(getPortfolioRiskSummary());
-  });
+    res.json(await getPortfolioRiskSummary());
+  }));
   app.post("/api/platform/credit-risk/compute-ecl", (req, res) => {
     const { computeECL } = require("./lib/creditRiskEngine");
     const { pd, lgd, ead } = req.body;
@@ -7737,15 +8008,15 @@ async function startServer() {
   });
 
   // D4: Audit trail endpoints
-  app.get("/api/platform/audit/entries", (_req, res) => {
+  app.get("/api/platform/audit/entries", asyncHandler(async (_req, res) => {
     const { getAuditEntries } = require("./lib/auditTrail");
-    const entries = getAuditEntries();
+    const entries = await getAuditEntries();
     res.json({ items: entries, total: entries.length });
-  });
-  app.get("/api/platform/audit/stats", (_req, res) => {
+  }));
+  app.get("/api/platform/audit/stats", asyncHandler(async (_req, res) => {
     const { getAuditStats } = require("./lib/auditTrail");
-    res.json(getAuditStats());
-  });
+    res.json(await getAuditStats());
+  }));
 
   // C10: Compliance scoring endpoints
   app.get("/api/platform/compliance/checks", (_req, res) => {
@@ -7764,27 +8035,27 @@ async function startServer() {
   });
 
   // E5: Customer onboarding endpoints (KYC-gated workflow)
-  app.get("/api/platform/onboarding/applications", (_req, res) => {
+  app.get("/api/platform/onboarding/applications", async (_req, res) => {
     const { getOnboardingApplications } = require("./lib/customerOnboarding");
-    const apps = getOnboardingApplications();
+    const apps = await getOnboardingApplications();
     res.json({ items: apps, total: apps.length });
   });
-  app.get("/api/platform/onboarding/applications/:id", (req, res) => {
+  app.get("/api/platform/onboarding/applications/:id", async (req, res) => {
     const { getOnboardingById } = require("./lib/customerOnboarding");
-    const app = getOnboardingById(req.params.id);
+    const app = await getOnboardingById(req.params.id);
     if (!app) { res.status(404).json({ error: "Application not found" }); return; }
     res.json(app);
   });
-  app.post("/api/platform/onboarding/applications", (req, res) => {
+  app.post("/api/platform/onboarding/applications", async (req, res) => {
     const { createOnboardingApplication } = require("./lib/customerOnboarding");
-    const result = createOnboardingApplication(req.body);
+    const result = await createOnboardingApplication(req.body);
     res.status(201).json(result);
   });
-  app.post("/api/platform/onboarding/applications/:id/advance", (req, res) => {
+  app.post("/api/platform/onboarding/applications/:id/advance", async (req, res) => {
     const { advanceOnboarding } = require("./lib/customerOnboarding");
     const { step, passed, details } = req.body;
     if (!step) { res.status(400).json({ error: "step is required (bvn_verification, nin_verification, liveness_check, document_verification, sanctions_screening, pep_check, risk_scoring)" }); return; }
-    const result = advanceOnboarding(req.params.id, step, { passed: passed !== false, details });
+    const result = await advanceOnboarding(req.params.id, step, { passed: passed !== false, details });
     if (result.error) { res.status(404).json(result); return; }
     if (result.kycBlocked) { res.status(403).json(result); return; }
     res.json(result);
@@ -7793,9 +8064,9 @@ async function startServer() {
     const { getKYCRequirements } = require("./lib/customerOnboarding");
     res.json(getKYCRequirements(req.params.tier));
   });
-  app.get("/api/platform/onboarding/stats", (_req, res) => {
+  app.get("/api/platform/onboarding/stats", async (_req, res) => {
     const { getOnboardingStats } = require("./lib/customerOnboarding");
-    res.json(getOnboardingStats());
+    res.json(await getOnboardingStats());
   });
   app.post("/api/platform/onboarding/validate-bvn", (req, res) => {
     const { validateBVN } = require("./lib/customerOnboarding");
@@ -7887,21 +8158,21 @@ async function startServer() {
   });
 
   // B1: Double-entry ledger endpoints
-  app.get("/api/platform/ledger/chart-of-accounts", (_req, res) => {
+  app.get("/api/platform/ledger/chart-of-accounts", async (_req, res) => {
     const { getChartOfAccounts } = require("./lib/doubleEntryLedger");
-    const accounts = getChartOfAccounts();
+    const accounts = await getChartOfAccounts();
     res.json({ items: accounts, total: accounts.length });
   });
-  app.get("/api/platform/ledger/journal-entries", (_req, res) => {
+  app.get("/api/platform/ledger/journal-entries", async (_req, res) => {
     const { getJournalEntries } = require("./lib/doubleEntryLedger");
-    const entries = getJournalEntries();
+    const entries = await getJournalEntries();
     res.json({ items: entries, total: entries.length });
   });
-  app.get("/api/platform/ledger/trial-balance", (_req, res) => {
+  app.get("/api/platform/ledger/trial-balance", async (_req, res) => {
     const { computeTrialBalance } = require("./lib/doubleEntryLedger");
-    res.json(computeTrialBalance());
+    res.json(await computeTrialBalance());
   });
-  app.post("/api/platform/ledger/journal-entries", (req, res) => {
+  app.post("/api/platform/ledger/journal-entries", async (req, res) => {
     const { addJournalEntry, validateJournalBalance } = require("./lib/doubleEntryLedger");
     const entry = req.body;
     if (!entry.entries || entry.entries.length === 0) {
@@ -7929,9 +8200,12 @@ async function startServer() {
     entry.id = `JE-${randomUUID()}`;
     entry.postedAt = new Date().toISOString();
     try {
-      // Save durably first; only mark the entry posted after the save succeeds.
+      // Save durably first (single PG transaction: header + lines + deferred
+      // balance trigger); only mark the entry posted after the save succeeds.
       entry.status = "pending";
-      addJournalEntry(entry);
+      await addJournalEntry(entry);
+      const { updateJournalEntryStatus } = require("./lib/doubleEntryLedger");
+      await updateJournalEntryStatus(entry.id, "posted");
       entry.status = "posted";
     } catch (err) {
       // Failure marking: never leave a silent half-posted state.
@@ -7988,15 +8262,24 @@ async function startServer() {
   });
 
   // OTP endpoint for transaction signing (C8)
-  app.post("/api/platform/otp/generate", (req, res) => {
+  app.post("/api/platform/otp/generate", async (req, res) => {
     const userId = (req as any).user?.sub ?? req.body?.userId ?? "anonymous";
-    const result = generateOTP(userId);
-    res.json(result);
+    try {
+      const result = await generateOTP(userId);
+      res.json(result);
+    } catch (err) {
+      res.status(503).json({ error: "OTP issuance unavailable", code: "OTP_STATE_UNAVAILABLE" });
+    }
   });
-  app.post("/api/platform/otp/verify", (req, res) => {
+  app.post("/api/platform/otp/verify", async (req, res) => {
     const { otpId, code } = req.body;
-    const valid = verifyOTP(otpId, code);
-    res.json({ valid });
+    try {
+      const valid = await verifyOTP(otpId, code);
+      res.json({ valid });
+    } catch (err) {
+      // FAIL CLOSED: an unverifiable OTP is reported as unavailable, never as valid.
+      res.status(503).json({ error: "OTP verification unavailable", code: "OTP_STATE_UNAVAILABLE" });
+    }
   });
 
   // C6: Secrets management endpoints — restricted to admin role (fail closed).

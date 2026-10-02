@@ -29,11 +29,49 @@ from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Header, Depends
+from permify_guard import require_permify
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import structlog
+import uuid
+import asyncpg
 
 logger = structlog.get_logger()
+
+
+# --- W12-C3P2B5: PostgreSQL persistence via the service's DECLARED asyncpg
+# driver (requirements.txt: asyncpg==0.29.0). PG is authoritative for the
+# verification audit trail; no in-memory shadow.
+#
+# PII NOTICE (NDPR): verification_audit payloads contain BVN/NIN inside
+# request/response. At rest they rely on Postgres storage encryption
+# (volume/TDE); field-level KMS envelope encryption is a TRACKED FOLLOW-UP —
+# no envelope helper exists in this service (see fix dispositions).
+# RETENTION: newest 1000 audit rows are kept (rolling window); CBN/NDPR
+# audit-retention review (>= 5 years for identity verification records) is a
+# tracked follow-up (see dispositions). Reads mask BVN/NIN (last 3 chars).
+_w12_pg_pool = None
+
+
+async def _w12_pool():
+    """Lazily create the asyncpg pool (async service pattern)."""
+    global _w12_pg_pool
+    if _w12_pg_pool is None:
+        _w12_pg_pool = await asyncpg.create_pool(
+            os.environ["DATABASE_URL"], min_size=1, max_size=10)
+    return _w12_pg_pool
+
+
+async def _w12_ensure_audit(conn):
+    await conn.execute("""CREATE TABLE IF NOT EXISTS verification_audit (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""")
+
 
 
 def validate_jwt(authorization: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -99,6 +137,34 @@ async def get_current_tenant(authorization: str = Header(None)) -> str:
     return tenant_id
 
 
+async def get_verified_tenant(authorization: str = Header(None), x_tenant_id: str = Header(None)) -> str:
+    """W12-B5-P0-A: require a verified Bearer JWT on the mutating verify
+    endpoints (previously only an attacker-controlled x-tenant-id header was
+    required, and GET /audit was the sole JWT-enforced route).
+
+    Tenant identity is derived from the VERIFIED token claims. The
+    caller-supplied x-tenant-id header is used only as a fallback when the
+    token carries no tenant claim; a header/claim discrepancy is always
+    logged and the token claim wins.
+    """
+    claims, err = validate_jwt(authorization or "")
+    if err is not None:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: {err}")
+    token_tenant = claims.get("tenant_id") or claims.get("tenant")
+    if token_tenant:
+        if x_tenant_id and x_tenant_id != token_tenant:
+            logger.warning(
+                "tenant_header_token_mismatch",
+                token_tenant=token_tenant,
+                header_tenant=x_tenant_id,
+            )
+        return token_tenant
+    if x_tenant_id:
+        logger.warning("tenant_from_header_fallback", header_tenant=x_tenant_id)
+        return x_tenant_id
+    raise HTTPException(status_code=401, detail="Token missing tenant claim")
+
+
 def _mask_identifier(value: Any) -> str:
     """M-52/M-53: mask government identifiers (BVN/NIN) — last 3 chars only."""
     if not isinstance(value, str) or not value:
@@ -120,7 +186,8 @@ def _mask_audit_record(record: Dict[str, Any]) -> Dict[str, Any]:
     return masked
 
 
-audit_log = []
+# W12-C3P2B5: in-memory audit_log removed — verification_audit (PG) is the
+# authoritative audit trail (see persist_verification_audit).
 
 app = FastAPI(
     title="54link-dev Identity Verification Service",
@@ -207,9 +274,30 @@ class DriversLicenseVerificationRequest(BaseModel):
     date_of_birth: Optional[str] = None
 
 async def persist_verification_audit(record: Dict[str, Any]):
-    audit_log.append(record)
-    if len(audit_log) > 1000:
-        del audit_log[0 : len(audit_log) - 1000]
+    """Persist a verification audit record to PG (table verification_audit).
+
+    Idempotency: record_id = type:tenant:timestamp => a retried persist of the
+    same verification event is an ON CONFLICT DO NOTHING no-op. Retention:
+    rolling newest-1000 window (see PII/retention notice above).
+    W12-DEGRADED: a persist failure is logged and does NOT fail the
+    verification response (the provider verdict was already obtained) — but
+    unlike the old in-memory list, every written row is durable."""
+    try:
+        pool = await _w12_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await _w12_ensure_audit(conn)
+                rid = f"{record.get('type')}:{record.get('tenant_id')}:{record.get('timestamp')}"
+                await conn.execute(
+                    "INSERT INTO verification_audit (record_id, tenant_id, payload) "
+                    "VALUES ($1, $2, $3::jsonb) ON CONFLICT (record_id) DO NOTHING",
+                    rid, record.get("tenant_id"), json.dumps(record, default=str))
+                await conn.execute(
+                    "DELETE FROM verification_audit WHERE record_id NOT IN "
+                    "(SELECT record_id FROM verification_audit "
+                    "ORDER BY created_at DESC, record_id LIMIT 1000)")
+    except Exception as e:
+        logger.error("W12-DEGRADED verification_audit persist failed", error=str(e))
 
 
 async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source: str) -> Dict[str, Any]:
@@ -294,11 +382,21 @@ async def get_verification_audit(limit: int = 50, tenant_id: str = Depends(get_c
     token claims (not caller-supplied headers) and results are scoped to that
     tenant only. BVN/NIN values are masked (last 3 chars) in the response."""
     bounded = max(1, min(limit, 200))
-    scoped = [r for r in audit_log if r.get("tenant_id") == tenant_id][-bounded:]
+    try:
+        pool = await _w12_pool()
+        async with pool.acquire() as conn:
+            await _w12_ensure_audit(conn)
+            rows = await conn.fetch(
+                "SELECT payload FROM verification_audit WHERE tenant_id = $1 "
+                "ORDER BY created_at DESC, record_id DESC LIMIT $2",
+                tenant_id, bounded)
+        scoped = [json.loads(r["payload"]) for r in reversed(rows)]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"persistence_unavailable: {e}")
     return {"records": [_mask_audit_record(r) for r in scoped], "total": len(scoped)}
 
-@app.post("/api/v1/verify/nin")
-async def verify_nin(request: NINVerificationRequest, x_tenant_id: str = Header(...)):
+@app.post("/api/v1/verify/nin", dependencies=[Depends(require_permify("identity_verification", "verify"))])
+async def verify_nin(request: NINVerificationRequest, tenant_id: str = Depends(get_verified_tenant)):
     payload = {
         "nin": request.nin,
         "first_name": request.first_name,
@@ -323,11 +421,11 @@ async def verify_nin(request: NINVerificationRequest, x_tenant_id: str = Header(
         "confidence_score": provider.get("confidence_score"),
         "fallback": provider.get("fallback", False),
     }
-    await persist_verification_audit({"tenant_id": x_tenant_id, "type": "nin", "request": payload, "response": response, "timestamp": response["verification_date"]})
+    await persist_verification_audit({"tenant_id": tenant_id, "type": "nin", "request": payload, "response": response, "timestamp": response["verification_date"]})
     return response
 
-@app.post("/api/v1/verify/bvn")
-async def verify_bvn(request: BVNVerificationRequest, x_tenant_id: str = Header(...)):
+@app.post("/api/v1/verify/bvn", dependencies=[Depends(require_permify("identity_verification", "verify"))])
+async def verify_bvn(request: BVNVerificationRequest, tenant_id: str = Depends(get_verified_tenant)):
     payload = {
         "bvn": request.bvn,
         "first_name": request.first_name,
@@ -351,11 +449,11 @@ async def verify_bvn(request: BVNVerificationRequest, x_tenant_id: str = Header(
         "confidence_score": provider.get("confidence_score"),
         "fallback": provider.get("fallback", False),
     }
-    await persist_verification_audit({"tenant_id": x_tenant_id, "type": "bvn", "request": payload, "response": response, "timestamp": response["verification_date"]})
+    await persist_verification_audit({"tenant_id": tenant_id, "type": "bvn", "request": payload, "response": response, "timestamp": response["verification_date"]})
     return response
 
-@app.post("/api/v1/verify/passport")
-async def verify_passport(request: PassportVerificationRequest, x_tenant_id: str = Header(...)):
+@app.post("/api/v1/verify/passport", dependencies=[Depends(require_permify("identity_verification", "verify"))])
+async def verify_passport(request: PassportVerificationRequest, tenant_id: str = Depends(get_verified_tenant)):
     payload = {
         "passport_number": request.passport_number,
         "surname": request.surname,
@@ -380,11 +478,11 @@ async def verify_passport(request: PassportVerificationRequest, x_tenant_id: str
         "confidence_score": provider.get("confidence_score"),
         "fallback": provider.get("fallback", False),
     }
-    await persist_verification_audit({"tenant_id": x_tenant_id, "type": "passport", "request": payload, "response": response, "timestamp": response["verification_date"]})
+    await persist_verification_audit({"tenant_id": tenant_id, "type": "passport", "request": payload, "response": response, "timestamp": response["verification_date"]})
     return response
 
-@app.post("/api/v1/verify/drivers-license")
-async def verify_drivers_license(request: DriversLicenseVerificationRequest, x_tenant_id: str = Header(...)):
+@app.post("/api/v1/verify/drivers-license", dependencies=[Depends(require_permify("identity_verification", "verify"))])
+async def verify_drivers_license(request: DriversLicenseVerificationRequest, tenant_id: str = Depends(get_verified_tenant)):
     payload = {
         "license_number": request.license_number,
         "date_of_birth": request.date_of_birth,
@@ -407,7 +505,7 @@ async def verify_drivers_license(request: DriversLicenseVerificationRequest, x_t
         "confidence_score": provider.get("confidence_score"),
         "fallback": provider.get("fallback", False),
     }
-    await persist_verification_audit({"tenant_id": x_tenant_id, "type": "drivers_license", "request": payload, "response": response, "timestamp": response["verification_date"]})
+    await persist_verification_audit({"tenant_id": tenant_id, "type": "drivers_license", "request": payload, "response": response, "timestamp": response["verification_date"]})
     return response
 
 if __name__ == "__main__":

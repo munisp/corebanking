@@ -78,22 +78,22 @@ export interface AgriPartner {
 
 export const agricultureApi = {
   listFarmers: (params?: { page?: number; limit?: number; state?: string; status?: string; q?: string }) =>
-    apiClient.get<{ items: Farmer[]; total: number }>(`${APISIX.AGRICULTURE}/v1/farmers`, { params }).then((r) => r.data),
+    apiClient.get<{ items: Farmer[]; total: number }>(`/agricultural/api/v1/agriculture/farmers`, { params }).then((r) => r.data),
 
   getFarmerById: (id: string) =>
-    apiClient.get<Farmer>(`${APISIX.AGRICULTURE}/v1/farmers/${id}`).then((r) => r.data),
+    apiClient.get<Farmer>(`/agricultural/api/v1/agriculture/farmers/${id}`).then((r) => r.data),
 
   onboardFarmer: (body: Partial<Farmer>) =>
-    apiClient.post<Farmer>(`${APISIX.AGRICULTURE}/v1/farmers`, body).then((r) => r.data),
+    apiClient.post<Farmer>(`/agricultural/api/v1/agriculture/farmers`, body).then((r) => r.data),
 
   listFarms: (params?: { page?: number; limit?: number; farmerId?: string; state?: string; cropType?: string }) =>
-    apiClient.get<{ items: Farm[]; total: number }>(`${APISIX.AGRICULTURE}/v1/farms`, { params }).then((r) => r.data),
+    apiClient.get<{ items: Farm[]; total: number }>(`/agricultural/api/v1/agriculture/farms`, { params }).then((r) => r.data),
 
   getFarmById: (id: string) =>
-    apiClient.get<Farm>(`${APISIX.AGRICULTURE}/v1/farms/${id}`).then((r) => r.data),
+    apiClient.get<Farm>(`/agricultural/api/v1/agriculture/farms/${id}`).then((r) => r.data),
 
   registerFarm: (body: Partial<Farm>) =>
-    apiClient.post<Farm>(`${APISIX.AGRICULTURE}/v1/farms`, body).then((r) => r.data),
+    apiClient.post<Farm>(`/agricultural/api/v1/agriculture/farms`, body).then((r) => r.data),
 
   listAgTechDevices: (params?: { page?: number; limit?: number; farmId?: string; status?: string }) =>
     apiClient.get(`${APISIX.AGRICULTURE}/v1/agtech/devices`, { params }).then((r) => r.data),
@@ -102,7 +102,7 @@ export const agricultureApi = {
     apiClient.get(`${APISIX.AGRICULTURE}/v1/analytics`, { params }).then((r) => r.data),
 
   listPartners: (params?: { page?: number; limit?: number; partnerType?: string; status?: string }) =>
-    apiClient.get<{ items: AgriPartner[]; total: number }>(`${APISIX.AGRICULTURE}/v1/partners`, { params }).then((r) => r.data),
+    apiClient.get<{ items: AgriPartner[]; total: number }>(`/agricultural/api/v1/agriculture/partners`, { params }).then((r) => r.data),
 
 };
 
@@ -190,16 +190,16 @@ export interface LivestockLoan {
 
 export const livestockFinanceApi = {
   listLoans: (params?: { page?: number; limit?: number; livestockType?: string; status?: string }) =>
-    apiClient.get<{ items: LivestockLoan[]; total: number }>(`${APISIX.LIVESTOCK_FINANCE}/v1/loans`, { params }).then((r) => r.data),
+    apiClient.get<{ items: LivestockLoan[]; total: number }>(`/agricultural/api/v1/agriculture/loans`, { params }).then((r) => r.data),
 
   getLoanById: (id: string) =>
-    apiClient.get<LivestockLoan>(`${APISIX.LIVESTOCK_FINANCE}/v1/loans/${id}`).then((r) => r.data),
+    apiClient.get<LivestockLoan>(`/agricultural/api/v1/agriculture/loans/${id}`).then((r) => r.data),
 
   create: (body: Partial<LivestockLoan>) =>
-    apiClient.post<LivestockLoan>(`${APISIX.LIVESTOCK_FINANCE}/v1/loans`, body).then((r) => r.data),
+    apiClient.post<LivestockLoan>(`/agricultural/api/v1/agriculture/loans`, body).then((r) => r.data),
 
   approveLoan: (id: string) =>
-    apiClient.post(`${APISIX.LIVESTOCK_FINANCE}/v1/loans/${id}/approve`, {}).then((r) => r.data),
+    apiClient.post(`/agricultural/api/v1/agriculture/loans/${id}/approve`, {}).then((r) => r.data),
 
   getValuations: (params?: { livestockType?: string }) =>
     apiClient.get(`${APISIX.LIVESTOCK_FINANCE}/v1/valuations`, { params }).then((r) => r.data),
@@ -223,13 +223,13 @@ export interface LivestockRecord {
 
 export const livestockMgmtApi = {
   list: (params?: { page?: number; limit?: number; farmerId?: string; livestockType?: string; healthStatus?: string }) =>
-    apiClient.get<{ items: LivestockRecord[]; total: number }>(`${APISIX.LIVESTOCK_MGMT}/v1/livestock`, { params }).then((r) => r.data),
+    apiClient.get<{ items: LivestockRecord[]; total: number }>(`/agricultural/api/v1/agriculture/livestock`, { params }).then((r) => r.data),
 
   getById: (id: string) =>
-    apiClient.get<LivestockRecord>(`${APISIX.LIVESTOCK_MGMT}/v1/livestock/${id}`).then((r) => r.data),
+    apiClient.get<LivestockRecord>(`/agricultural/api/v1/agriculture/livestock/${id}`).then((r) => r.data),
 
   register: (body: Partial<LivestockRecord>) =>
-    apiClient.post<LivestockRecord>(`${APISIX.LIVESTOCK_MGMT}/v1/livestock`, body).then((r) => r.data),
+    apiClient.post<LivestockRecord>(`/agricultural/api/v1/agriculture/livestock`, body).then((r) => r.data),
 
   updateHealthStatus: (id: string, status: string, notes?: string) =>
     apiClient.patch(`${APISIX.LIVESTOCK_MGMT}/v1/livestock/${id}/health`, { status, notes }).then((r) => r.data),
@@ -268,7 +268,7 @@ export const commodityExchangeApi = {
     apiClient.post(`${APISIX.COMMODITY_EXCHANGE}/v1/listings/${listingId}/bids`, body).then((r) => r.data),
 
   getMarketPrices: (params?: { commodity?: string }) =>
-    apiClient.get(`${APISIX.COMMODITY_EXCHANGE}/v1/prices`, { params }).then((r) => r.data),
+    apiClient.get(`/agricultural/api/v1/integrations/commodity/prices`, { params }).then((r) => r.data),
 };
 
 // ─── Warehouse Management ─────────────────────────────────────────────────────
@@ -355,7 +355,7 @@ export const nirsalAgroGeocoopApi = {
     apiClient.get(`${APISIX.NIRSAL_AGRO_GEOCOOP}/v1/geospatial`, { params }).then((r) => r.data),
 
   getDashboard: () =>
-    apiClient.get(`${APISIX.NIRSAL_AGRO_GEOCOOP}/v1/dashboard`).then((r) => r.data),
+    apiClient.get(`/agricultural/api/v1/analytics/portfolio/dashboard`).then((r) => r.data),
 };
 
 // ─── Fisheries & Aquaculture ──────────────────────────────────────────────────
@@ -403,7 +403,7 @@ export const crossborderAgriTradeApi = {
 // ─── Commodity Price Intelligence ─────────────────────────────────────────────
 export const commodityPriceIntelApi = {
   listPrices: (params?: { commodity?: string; page?: number; limit?: number }) =>
-    apiClient.get(`${APISIX.COMMODITY_PRICE_INTEL}/v1/prices`, { params }).then((r) => r.data),
+    apiClient.get(`/agricultural/api/v1/integrations/commodity/prices`, { params }).then((r) => r.data),
 
   getPriceTrend: (commodity: string, params?: { from?: string; to?: string }) =>
     apiClient.get(`${APISIX.COMMODITY_PRICE_INTEL}/v1/prices/${commodity}/trend`, { params }).then((r) => r.data),
@@ -418,7 +418,7 @@ export const commodityPriceIntelApi = {
 // ─── CBN Agri Returns ─────────────────────────────────────────────────────────
 export const cbnAgriReturnsApi = {
   listReturns: (params?: { page?: number; limit?: number; status?: string; period?: string }) =>
-    apiClient.get(`${APISIX.CBN_AGRI_RETURNS}/v1/returns`, { params }).then((r) => r.data),
+    apiClient.get(`/efass-generator/v1/efass/returns`, { params }).then((r) => r.data),
 
   createReturn: (body: Record<string, unknown>) =>
     apiClient.post(`${APISIX.CBN_AGRI_RETURNS}/v1/create`, body).then((r) => r.data),

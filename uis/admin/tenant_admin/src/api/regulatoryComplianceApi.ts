@@ -342,7 +342,7 @@ export const ndprComplianceApi = {
     apiClient.get(`${APISIX.NDPR_COMPLIANCE}/api/v1/data-inventory`).then((r) => r.data),
 
   getConsentRecords: (params?: { page?: number; limit?: number; customerId?: string }) =>
-    apiClient.get(`${APISIX.NDPR_COMPLIANCE}/api/v1/consents`, { params }).then((r) => r.data),
+    apiClient.get(`/open-banking/v1/open-banking/consents`, { params }).then((r) => r.data),
 
   getDashboard: () =>
     apiClient.get(`${APISIX.NDPR_COMPLIANCE}/api/v1/dashboard`).then((r) => r.data),

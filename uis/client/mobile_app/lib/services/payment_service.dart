@@ -137,30 +137,23 @@ Future<Map<String, dynamic>> initiateTransfer({
   String destination = "pup",
 }) async {
   try {
+    // W12-A4B: map to InitiatePaymentSchema (payment-processing
+    // schemas/payment.py:50): payer/payee/amount_kobo/note/pin. The service
+    // replies {message, reference} (no {data} envelope).
     final response = await _apiService.post(
       '${AppConfig.paymentEndpoint}/payment/transfer',
       data: {
-        "amount": amount.toStringAsFixed(2),
-        "currency": currency,
-        "destination": destination,
+        "payer": senderAccount,
+        "payee": recipientAccount,
+        "amount_kobo": (amount * 100).round(),
         "note": note,
         "pin": pin,
-        "switch_name": switchName,
-        "from": {
-          "idType": "ACCOUNT_ID",
-          "idValue": senderAccount,
-          "displayName": senderName,
-        },
-        "to": {
-          "idType": "ACCOUNT_ID",
-          "idValue": recipientAccount,
-          "displayName": recipientName,
-        },
       },
     );
 
     if (response.statusCode == 200 || response.statusCode == 201) {
-      return response.data['data'] as Map<String, dynamic>;
+      return (response.data['data'] as Map<String, dynamic>?) ??
+          Map<String, dynamic>.from(response.data as Map);
     } else {
       throw Exception(
         ErrorHandlerService.handleError(response.data),
@@ -180,11 +173,15 @@ Future<Map<String, dynamic>> initiateTransfer({
     required String pin,
   }) async {
     try {
+      // W12-A4B: /payment-processing/payment/deposit now rewrites to
+      // payment-processing-service POST /payment/deposit
+      // (InitiateDepositSchema: recipient:int, amount|amount_kobo, note).
       final response = await _apiService.post(
-        '${AppConfig.paymentEndpoint}/deposit',
+        '${AppConfig.paymentEndpoint}/payment/deposit',
         data: {
-          'account_id': accountId,
+          'recipient': int.tryParse(accountId) ?? accountId,
           'amount': amount,
+          'note': 'Deposit',
           'pin': pin,
         },
       );
@@ -329,12 +326,14 @@ Future<Map<String, dynamic>> loanPayment({
     print('Loan ID: $loanId');
     print('Customer Account Number: $customerAccountNumber'); // ✅ CHANGED
     print('Amount: $amount');
+    // W12-A4B: InitiateLoanPaymentSchema (schemas/payment.py:122) requires
+    // payer:int and integer amount_kobo.
     final response = await _apiService.post(
       '${AppConfig.paymentEndpoint}/payment/loan',
       data: {
         'loan_id': loanId,
-        'payer': customerAccountNumber, // ✅ USE ACCOUNT NUMBER
-        'amount': amount,
+        'payer': int.tryParse(customerAccountNumber) ?? customerAccountNumber,
+        'amount_kobo': (amount * 100).round(),
         'pin': pin,
       },
     );
@@ -368,12 +367,13 @@ Future<Map<String, dynamic>> lpoPayment({
   required String pin,
 }) async {
   try {
+    // W12-A4B: InitiateLPOPaymentSchema (schemas/payment.py:133) requires
+    // payer:int (amount is not part of the schema and is dropped).
     final response = await _apiService.post(
       '${AppConfig.paymentEndpoint}/payment/lpo',
       data: {
         'lpo_id': lpoId,
-        'payer': customerAccountNumber,
-        'amount': amount,
+        'payer': int.tryParse(customerAccountNumber) ?? customerAccountNumber,
         'pin': pin,
       },
     );
@@ -405,11 +405,12 @@ Future<Map<String, dynamic>> lpoPayment({
     required String pin,
   }) async {
     try {
+      // W12-A4B: InitiateInsurancePremiumPaymentSchema requires payer:int.
       final response = await _apiService.post(
         '${AppConfig.paymentEndpoint}/payment/insurance-premium',
         data: {
           'insurance_policy_id': insurancePolicyId,
-          'payer': payer,
+          'payer': int.tryParse(payer) ?? payer,
           'pin': pin,
         },
       );
@@ -448,11 +449,14 @@ Future<Map<String, dynamic>> lpoPayment({
     required String pin,
   }) async {
     try {
+      // W12-A4B: service route is /payment/supply-chain-financing
+      // (api/payment.py:387); the /payment-processing/payment/* gateway
+      // rewrite added in this batch makes it reachable.
       final response = await _apiService.post(
-        '${AppConfig.paymentEndpoint}/supply-chain-financing',
+        '${AppConfig.paymentEndpoint}/payment/supply-chain-financing',
         data: {
           'financing_id': financingId,
-          'payer': payer,
+          'payer': int.tryParse(payer) ?? payer,
           'pin': pin,
         },
       );
@@ -490,16 +494,20 @@ Future<Map<String, dynamic>> lpoPayment({
     String? bankCode,
   }) async {
     try {
+      // W12-A4B: account verification = name enquiry, served by
+      // beneficiary-management-go POST /v1/beneficiaries/verify
+      // (camelCase body; returns the enquiry object directly, no envelope).
       final response = await _apiService.post(
-        '${AppConfig.paymentEndpoint}/verify-account',
+        '/beneficiaries/v1/beneficiaries/verify',
         data: {
-          'account_number': accountNumber,
-          'bank_code': bankCode,
+          'accountNumber': accountNumber,
+          'bankCode': bankCode,
         },
       );
 
       if (response.statusCode == 200) {
-        return response.data['data'] as Map<String, dynamic>;
+        return (response.data['data'] as Map<String, dynamic>?) ??
+            Map<String, dynamic>.from(response.data as Map);
       } else {
         throw Exception(ErrorHandlerService.handleError(response.data));
       }
@@ -562,11 +570,25 @@ Future<Map<String, dynamic>> lpoPayment({
   // =================== GET BILLER CATEGORIES ===================
   Future<List<Map<String, dynamic>>> getBillerCategories() async {
     try {
-      final response = await _apiService.get('${AppConfig.paymentEndpoint}/billers/categories');
+      // W12-A4B: no categories endpoint exists; mobile-bff
+      // GET /api/v1/billers returns billers tagged with `category`, so the
+      // category list is derived client-side from the real biller list.
+      final response = await _apiService.get('/mobile-bff/api/v1/billers');
 
       if (response.statusCode == 200) {
-        final List<dynamic> data = response.data['data'];
-        return data.map((category) => Map<String, dynamic>.from(category)).toList();
+        final payload = response.data;
+        final List<dynamic> billers = payload is List
+            ? payload
+            : (payload['billers'] ?? payload['data'] ?? []) as List<dynamic>;
+        final seen = <String>{};
+        final categories = <Map<String, dynamic>>[];
+        for (final b in billers) {
+          final c = (b is Map ? b['category'] : null)?.toString().trim() ?? '';
+          if (c.isNotEmpty && seen.add(c)) {
+            categories.add({'id': c, 'name': c});
+          }
+        }
+        return categories;
       } else {
         throw Exception(ErrorHandlerService.handleError(response.data));
       }
@@ -582,14 +604,18 @@ Future<Map<String, dynamic>> lpoPayment({
   // =================== GET BILLERS BY CATEGORY ===================
   Future<List<Map<String, dynamic>>> getBillers(String categoryId) async {
     try {
+      // W12-A4B: mobile-bff GET /api/v1/billers/:category ->
+      // { category, billers: [...] }.
       final response = await _apiService.get(
-        '${AppConfig.paymentEndpoint}/billers',
-        queryParameters: {'category_id': categoryId},
+        '/mobile-bff/api/v1/billers/${Uri.encodeComponent(categoryId)}',
       );
 
       if (response.statusCode == 200) {
-        final List<dynamic> data = response.data['data'];
-        return data.map((biller) => Map<String, dynamic>.from(biller)).toList();
+        final payload = response.data;
+        final List<dynamic> data = payload is List
+            ? payload
+            : (payload['billers'] ?? payload['data'] ?? []) as List<dynamic>;
+        return data.map((biller) => Map<String, dynamic>.from(biller as Map)).toList();
       } else {
         throw Exception(ErrorHandlerService.handleError(response.data));
       }
@@ -610,8 +636,10 @@ Future<Map<String, dynamic>> lpoPayment({
     Map<String, dynamic>? additionalData,
   }) async {
     try {
+      // W12-A4B: mobile-bff POST /api/v1/bills/pay (payload forwarded to the
+      // bill-pay upstream; bff answers 202 Accepted with the receipt).
       final response = await _apiService.post(
-        '${AppConfig.paymentEndpoint}/bills',
+        '${AppConfig.billEndpoint}/pay',
         data: {
           'biller_id': billerId,
           'customer_id': customerId,
@@ -620,8 +648,10 @@ Future<Map<String, dynamic>> lpoPayment({
         },
       );
 
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        return response.data['data'];
+      if (response.statusCode == 200 || response.statusCode == 201 || response.statusCode == 202) {
+        return response.data is Map && response.data['data'] != null
+            ? response.data['data']
+            : response.data;
       } else {
         throw Exception(ErrorHandlerService.handleError(response.data));
       }
@@ -640,8 +670,10 @@ Future<Map<String, dynamic>> lpoPayment({
     required String customerId,
   }) async {
     try {
+      // W12-A4B: mobile-bff POST /api/v1/bills/validate -> validation result
+      // object (status/customer_name/amount_due), no {data} envelope.
       final response = await _apiService.post(
-        '${AppConfig.paymentEndpoint}/bills/validate',
+        '${AppConfig.billEndpoint}/validate',
         data: {
           'biller_id': billerId,
           'customer_id': customerId,
@@ -649,7 +681,9 @@ Future<Map<String, dynamic>> lpoPayment({
       );
 
       if (response.statusCode == 200) {
-        return response.data['data'];
+        return response.data is Map && response.data['data'] != null
+            ? response.data['data']
+            : response.data;
       } else {
         throw Exception(ErrorHandlerService.handleError(response.data));
       }
@@ -665,11 +699,16 @@ Future<Map<String, dynamic>> lpoPayment({
   // =================== GET BENEFICIARIES ===================
   Future<List<Map<String, dynamic>>> getBeneficiaries() async {
     try {
-      final response = await _apiService.get('${AppConfig.paymentEndpoint}/beneficiaries');
+      // W12-A4B: beneficiary-management-go GET /v1/beneficiaries ->
+      // { items: [...], total } (gateway prefix /beneficiaries/*).
+      final response = await _apiService.get('/beneficiaries/v1/beneficiaries');
 
       if (response.statusCode == 200) {
-        final List<dynamic> data = response.data['data'];
-        return data.map((beneficiary) => Map<String, dynamic>.from(beneficiary)).toList();
+        final payload = response.data;
+        final List<dynamic> data = payload is List
+            ? payload
+            : (payload['items'] ?? payload['data'] ?? []) as List<dynamic>;
+        return data.map((beneficiary) => Map<String, dynamic>.from(beneficiary as Map)).toList();
       } else {
         throw Exception(ErrorHandlerService.handleError(response.data));
       }
@@ -690,18 +729,26 @@ Future<Map<String, dynamic>> lpoPayment({
     String? bankName,
   }) async {
     try {
+      // W12-A4B: beneficiary-management-go POST /v1/beneficiaries requires
+      // camelCase { customerId, accountNumber, bankCode } and returns the
+      // created Beneficiary object directly (201, no envelope).
+      final prefs = await SharedPreferences.getInstance();
+      final customerId = prefs.getString('keycloak_id') ?? '';
       final response = await _apiService.post(
-      '${AppConfig.paymentEndpoint}/beneficiaries',
+      '/beneficiaries/v1/beneficiaries',
       data: {
-        'account_number': accountNumber,
-        'account_name': accountName,
-        'bank_code': bankCode,
-        'bank_name': bankName,
+        'customerId': customerId,
+        'accountNumber': accountNumber,
+        'name': accountName,
+        'bankCode': bankCode,
+        'bankName': bankName,
       },
       );
 
       if (response.statusCode == 200 || response.statusCode == 201) {
-        return response.data['data'];
+        return response.data is Map && response.data['data'] != null
+            ? response.data['data']
+            : response.data;
       } else {
         throw Exception(ErrorHandlerService.handleError(response.data));
       }
@@ -717,8 +764,11 @@ Future<Map<String, dynamic>> lpoPayment({
   // =================== DELETE BENEFICIARY ===================
   Future<void> deleteBeneficiary(String beneficiaryId) async {
     try {
+      // W12-A4B: beneficiary-management-go DELETE /v1/beneficiaries takes the
+      // id in the request body ({beneficiaryId}), not as a path segment.
       final response = await _apiService.delete(
-        '${AppConfig.paymentEndpoint}/beneficiaries/$beneficiaryId',
+        '/beneficiaries/v1/beneficiaries',
+        data: {'beneficiaryId': beneficiaryId},
       );
 
       if (response.statusCode != 200 && response.statusCode != 204) {

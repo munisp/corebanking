@@ -12,7 +12,9 @@ from contextlib import asynccontextmanager
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException, Header, Body
+from fastapi import Depends, FastAPI, HTTPException, Header, Body
+from permify_guard import require_permify  # W12-B5-P1-D-C
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -347,7 +349,7 @@ def metrics():
         return {"service": "credit-scoring-py", "total_records": 0}
 
 
-@app.get("/api/v1/loans")
+@app.get("/api/v1/loans", dependencies=[Depends(require_permify("credit_application", "view"))])
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     # Validate inputs: fail fast with 400 on invalid parameters.
     if page < 1:
@@ -472,7 +474,7 @@ def _require_numeric(payload: Dict[str, Any], fields) -> Dict[str, float]:
     return values
 
 
-@app.post("/api/v1/score/advisory")
+@app.post("/api/v1/score/advisory", dependencies=[Depends(require_permify("credit_application", "create"))])
 def score_advisory(payload: Dict[str, Any] = Body(...)):
     v = _require_numeric(payload, ["income", "debt", "employment_years", "loan_history_count", "defaults", "age"])
     result = compute_credit_score(
@@ -483,7 +485,7 @@ def score_advisory(payload: Dict[str, Any] = Body(...)):
     return result
 
 
-@app.post("/api/v1/affordability/advisory")
+@app.post("/api/v1/affordability/advisory", dependencies=[Depends(require_permify("credit_application", "create"))])
 def affordability_advisory(payload: Dict[str, Any] = Body(...)):
     v = _require_numeric(payload, ["monthly_income", "monthly_expenses", "proposed_emi"])
     result = affordability_check(v["monthly_income"], v["monthly_expenses"], v["proposed_emi"])

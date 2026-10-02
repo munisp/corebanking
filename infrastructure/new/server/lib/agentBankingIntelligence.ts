@@ -1,5 +1,28 @@
 // B7: Agent Banking Intelligence — Float optimization, scoring, geo-mapping, commission reconciliation
+//
+// W12-C3-P2-MLIB (c3-1012): the agent registry was module process memory
+// (lost on restart, divergent across replicas). Now Postgres-authoritative
+// (table `agent_registry`, natural key agentId) via lib/pgJsonStore.ts;
+// fail-closed 503 on PG outage, no degraded-memory fallback.
 import type { Express, Request, Response } from "express";
+import { ensureTables, storeDDL, storeList, storeSeed } from "./pgJsonStore";
+import { asyncRoute, pgGuard } from "./pgSupport";
+
+const TABLE = "agent_registry";
+
+// Rows persist the served payload plus id = agentId (natural key); the id is
+// stripped on read so the API shape is unchanged.
+type AgentRow = AgentPerformance & { id: string };
+const toRow = (a: AgentPerformance): AgentRow => ({ ...a, id: a.agentId });
+const fromRow = (r: AgentRow): AgentPerformance => { const { id: _id, ...rest } = r; return rest; };
+
+async function loadAgents(): Promise<AgentPerformance[]> {
+  return pgGuard((async () => {
+    await ensureTables("agentBankingIntelligence", storeDDL(TABLE));
+    await storeSeed(TABLE, AGENTS_SEED.map(toRow), () => "");
+    return (await storeList<AgentRow>(TABLE)).map(fromRow);
+  })());
+}
 
 interface AgentPerformance {
   agentId: string; name: string; tier: string; location: { state: string; lga: string; lat: number; lng: number };
@@ -8,7 +31,8 @@ interface AgentPerformance {
   score: number; nextTierThreshold: number;
 }
 
-const agents: AgentPerformance[] = [
+// Seed rows (same data the in-memory build shipped; Postgres owns it after first seed).
+const AGENTS_SEED: AgentPerformance[] = [
   { agentId: "AGT-001", name: "Mama Nkechi POS Center", tier: "super_agent", location: { state: "Lagos", lga: "Ikeja", lat: 6.6018, lng: 3.3515 }, monthlyTxnVolume: 15000, monthlyTxnValue: 250000000, avgDailyFloat: 5000000, commissionEarned: 1250000, customerCount: 3200, uptimePercent: 98.5, score: 92, nextTierThreshold: 95 },
   { agentId: "AGT-002", name: "Alhaji Garba Mobile Money", tier: "master_agent", location: { state: "Kano", lga: "Nassarawa", lat: 12.0022, lng: 8.5920 }, monthlyTxnVolume: 25000, monthlyTxnValue: 500000000, avgDailyFloat: 10000000, commissionEarned: 2500000, customerCount: 8500, uptimePercent: 99.2, score: 97, nextTierThreshold: 100 },
   { agentId: "AGT-003", name: "Chioma Digital Hub", tier: "agent", location: { state: "Enugu", lga: "Nsukka", lat: 6.8568, lng: 7.3951 }, monthlyTxnVolume: 5000, monthlyTxnValue: 50000000, avgDailyFloat: 1000000, commissionEarned: 250000, customerCount: 800, uptimePercent: 95.0, score: 75, nextTierThreshold: 80 },
@@ -18,11 +42,13 @@ const agents: AgentPerformance[] = [
 ];
 
 export function registerAgentBankingIntelligence(app: Express) {
-  app.get("/api/platform/agents/performance", (_: Request, res: Response) => {
+  app.get("/api/platform/agents/performance", asyncRoute(async (_: Request, res: Response) => {
+    const agents = await loadAgents();
     res.json({ items: agents, total: agents.length });
-  });
+  }));
 
-  app.get("/api/platform/agents/float-optimization", (_: Request, res: Response) => {
+  app.get("/api/platform/agents/float-optimization", asyncRoute(async (_: Request, res: Response) => {
+    const agents = await loadAgents();
     const recommendations = agents.map(a => ({
       agentId: a.agentId, name: a.name,
       currentFloat: a.avgDailyFloat,
@@ -31,9 +57,10 @@ export function registerAgentBankingIntelligence(app: Express) {
       replenishmentFrequency: a.avgDailyFloat < 2000000 ? "daily" : "weekly",
     }));
     res.json({ items: recommendations, total: recommendations.length });
-  });
+  }));
 
-  app.get("/api/platform/agents/geo-coverage", (_: Request, res: Response) => {
+  app.get("/api/platform/agents/geo-coverage", asyncRoute(async (_: Request, res: Response) => {
+    const agents = await loadAgents();
     const stateMap: Record<string, number> = {};
     agents.forEach(a => { stateMap[a.location.state] = (stateMap[a.location.state] || 0) + 1; });
     const coveredStates = Object.keys(stateMap).length;
@@ -48,12 +75,13 @@ export function registerAgentBankingIntelligence(app: Express) {
       gap_states: gaps.slice(0, 10),
       heatmap: agents.map(a => ({ lat: a.location.lat, lng: a.location.lng, weight: a.monthlyTxnVolume })),
     });
-  });
+  }));
 
-  app.get("/api/platform/agents/commission-summary", (_: Request, res: Response) => {
+  app.get("/api/platform/agents/commission-summary", asyncRoute(async (_: Request, res: Response) => {
+    const agents = await loadAgents();
     const total = agents.reduce((s, a) => s + a.commissionEarned, 0);
     const byTier: Record<string, number> = {};
     agents.forEach(a => { byTier[a.tier] = (byTier[a.tier] || 0) + a.commissionEarned; });
     res.json({ total_commission: total, by_tier: byTier, agent_count: agents.length, avg_per_agent: Math.round(total / agents.length) });
-  });
+  }));
 }

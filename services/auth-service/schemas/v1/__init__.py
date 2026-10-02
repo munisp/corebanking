@@ -7,6 +7,11 @@ from .auth import (
 	ResetPassword,
 	ChangePassword,
 	VerifyOTP,
+	VerifyEmail,
+	ResendOTP,
+	ResendVerification,
+	CreatePin,
+	UpdateUser,
 )
 from .context import Context
 from .audit import AuditEventSchema
