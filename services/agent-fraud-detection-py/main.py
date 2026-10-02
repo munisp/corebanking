@@ -200,13 +200,13 @@ def grpc_call(target, method, payload, retries=3):
     if not _grpc_cb.allow():
         logger.warning(f"Circuit breaker open for {target}/{method}")
         return None
+    data = json.dumps({"method": method, "payload": payload}).encode()
     for attempt in range(retries):
         try:
             host, port = target.rsplit(":", 1)
             sock = _grpc_socket.socket(_grpc_socket.AF_INET, _grpc_socket.SOCK_STREAM)
             sock.settimeout(5.0)
             sock.connect((host, int(port)))
-            data = json.dumps({"method": method, "payload": payload}).encode()
             sock.sendall(_grpc_struct.pack(">I", len(data)) + data)
             length_bytes = sock.recv(4)
             if len(length_bytes) == 4:
@@ -230,9 +230,9 @@ def call_service(method, url, body=None, retries=3, timeout=15):
     if not _grpc_cb.allow():
         return None
     import urllib.request, urllib.error
+    data = json.dumps(body).encode() if body else None
     for attempt in range(retries):
         try:
-            data = json.dumps(body).encode() if body else None
             req = urllib.request.Request(url, data=data, method=method,
                                          headers={"Content-Type": "application/json"})
             resp = urllib.request.urlopen(req, timeout=timeout)

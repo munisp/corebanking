@@ -1,0 +1,17 @@
+# OR-09: kafka-backed Dapr pubsub component created to satisfy code reference.
+# Mirrors components/pubsub.yaml (pubsub.kafka, ns 54bank). Referenced by: eod-processor-go/main.go:240 (DAPR_PUBSUB default)
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: eod-pubsub
+  namespace: 54bank
+spec:
+  type: pubsub.kafka
+  version: v1
+  metadata:
+    - name: brokers
+      value: "localhost:9092"
+    - name: consumerGroup
+      value: "54bank-eod"
+    - name: authType
+      value: "none"

@@ -13,6 +13,31 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# W11 client-per-request fix: one lazily-initialized module-level AsyncClient
+# (keep-alive connection reuse) shared by all CoAClient instances, instead of
+# a new client (TCP+TLS handshake) per request.
+from contextlib import asynccontextmanager as _asynccontextmanager
+
+_shared_client: "Optional[httpx.AsyncClient]" = None
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    """Return the shared AsyncClient, creating it lazily on first use."""
+    global _shared_client
+    if _shared_client is None or _shared_client.is_closed:
+        _shared_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0),
+            limits=httpx.Limits(max_connections=50),
+        )
+    return _shared_client
+
+
+@_asynccontextmanager
+async def _shared_client_context():
+    """Async context manager yielding the shared client (never closes it)."""
+    yield _get_shared_client()
+
+
 
 class CoAClient:
     """Client for Chart of Accounts service"""
@@ -73,7 +98,7 @@ class CoAClient:
         if description:
             account_data["description"] = description
         
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with _shared_client_context() as client:
             try:
                 response = await client.post(
                     f"{self.base_url}/api/v1/accounts",
@@ -123,7 +148,7 @@ class CoAClient:
         if metadata:
             entry_data["metadata"] = metadata
         
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with _shared_client_context() as client:
             try:
                 response = await client.post(
                     f"{self.base_url}/api/v1/journal-entries",
@@ -143,7 +168,7 @@ class CoAClient:
         user_role: str,
     ) -> List[Dict[str, Any]]:
         """Get all accounts for a tenant"""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with _shared_client_context() as client:
             try:
                 response = await client.get(
                     f"{self.base_url}/api/v1/accounts",

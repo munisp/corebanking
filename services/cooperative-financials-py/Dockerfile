@@ -8,4 +8,4 @@ USER appuser
 ENV PORT=8621
 EXPOSE 8621
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8621/healthz')" || exit 1
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8621} --workers ${UVICORN_WORKERS:-4}"]

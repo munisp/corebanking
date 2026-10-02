@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from "axios";
 import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
 import { IUser, IUserProfilePayload, IUserProfileResponse } from "../types/user";
+import { serviceAuthClient } from "../lib/serviceAuthClient";
 
 class UserService {
   private _axiosInstance: AxiosInstance;
@@ -9,6 +10,7 @@ class UserService {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: readEnv("USER_SVC_URL"),
+      timeout: 10000,
       headers: {
         "content-type": "application/json",
       },
@@ -22,6 +24,8 @@ class UserService {
         headers: {
           "x-tenant-id": payload.tenant_id,
           "x-keycloak-id": payload.keycloak_id,
+          // OB-03: service-to-service bearer (role="service")
+          "Authorization": serviceAuthClient.getAuthHeader(payload.tenant_id),
         },
       });
       return response.data;
@@ -39,6 +43,8 @@ class UserService {
         headers: {
           "x-tenant-id": tenant_id,
           "x-keycloak-id": keycloak_id,
+          // OB-03: service-to-service bearer (role="service")
+          "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
         },
       });
       return response.data.user;
@@ -61,6 +67,8 @@ class UserService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         }
       );
@@ -81,6 +89,8 @@ class UserService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         }
       );
@@ -101,6 +111,8 @@ class UserService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         }
       );
@@ -118,6 +130,8 @@ class UserService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         }
       );

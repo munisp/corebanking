@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/segmentio/kafka-go"
 )
 
 // Kafka metrics
@@ -54,22 +55,11 @@ type MortgageEvent struct {
 
 // KafkaClient handles Kafka operations for mortgage events
 type KafkaClient struct {
-	brokers       []string
-	producerID    string
-	mutex         sync.Mutex
-	connected     bool
-	eventBuffer   []bufferedEvent
-	bufferSize    int
-	flushInterval time.Duration
-	stopCh        chan struct{}
-	stopped       chan struct{}
-	closeOnce     sync.Once
-}
-
-type bufferedEvent struct {
-	topic   string
-	event   MortgageEvent
-	created time.Time
+	brokers    []string
+	producerID string
+	mutex      sync.Mutex
+	writer     *kafka.Writer // nil until a broker is reachable
+	connected  bool
 }
 
 // Kafka topics for mortgage events
@@ -105,6 +95,7 @@ func NewKafkaClient() *KafkaClient {
 	// Probe broker reachability: when Kafka is down the client reports
 	// connected=false and every publish fails fast (callers persist to the
 	// outbox for retry) instead of pretending success.
+	var writer *kafka.Writer
 	connected := false
 	for _, broker := range brokers {
 		addr := strings.TrimPrefix(broker, "tcp://")
@@ -118,31 +109,36 @@ func NewKafkaClient() *KafkaClient {
 		}
 		log.Printf("Kafka broker %s unreachable: %v", broker, err)
 	}
-	if !connected {
+	if connected {
+		// F1-09 (Wave-10): a REAL producer. The previous implementation only
+		// buffered events in memory and the flusher discarded them with a log
+		// line whenever the broker was reachable — every mortgage lifecycle
+		// event evaporated while metrics claimed success.
+		writer = kafka.NewWriter(kafka.WriterConfig{
+			Brokers:      brokers,
+			Balancer:     &kafka.Hash{}, // key by mortgage id: per-mortgage ordering
+			BatchTimeout: 200 * time.Millisecond,
+			RequiredAcks: 1,
+			Async:        false,
+		})
+	} else {
 		log.Printf("ERROR: no Kafka broker reachable (%v) — publishes will fail fast and events go to the outbox", brokers)
 	}
 
 	client := &KafkaClient{
-		brokers:       brokers,
-		producerID:    fmt.Sprintf("mortgage-service-%d", time.Now().UnixNano()%10000),
-		connected:     connected,
-		eventBuffer:   make([]bufferedEvent, 0),
-		bufferSize:    100,
-		flushInterval: time.Second * 5,
-		stopCh:        make(chan struct{}),
-		stopped:       make(chan struct{}),
+		brokers:    brokers,
+		producerID: fmt.Sprintf("mortgage-service-%d", time.Now().UnixNano()%10000),
+		writer:     writer,
+		connected:  connected,
 	}
-
-	// Start background flusher
-	go client.backgroundFlusher()
 
 	log.Printf("Kafka client initialized: %v (connected=%v)", brokers, connected)
 	return client
 }
 
-// PublishEvent publishes a mortgage event to Kafka. It returns an error when
-// the producer is unavailable — callers must handle it (PublishEventReliably
-// does, via the outbox).
+// PublishEvent publishes a mortgage event to Kafka with a real producer. It
+// returns an error when the produce fails or the producer is unavailable —
+// callers must handle it (PublishEventReliably does, via the outbox).
 func (c *KafkaClient) PublishEvent(topic string, event MortgageEvent) error {
 	start := time.Now()
 	defer func() {
@@ -162,25 +158,27 @@ func (c *KafkaClient) PublishEvent(topic string, event MortgageEvent) error {
 	}
 
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
+	writer := c.writer
+	connected := c.connected
+	c.mutex.Unlock()
 
-	if !c.connected {
+	if !connected || writer == nil {
 		kafkaMessagesPublished.WithLabelValues(topic, "error").Inc()
 		return fmt.Errorf("kafka producer unavailable (brokers %v): event type %s not published", c.brokers, event.Type)
 	}
 
-	// In production, this would use actual Kafka producer
-	// For now, log and buffer
-	log.Printf("Publishing to %s: %s", topic, string(payload))
-
-	c.eventBuffer = append(c.eventBuffer, bufferedEvent{
-		topic:   topic,
-		event:   event,
-		created: time.Now(),
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := writer.WriteMessages(ctx, kafka.Message{
+		Topic: topic,
+		Key:   []byte(event.MortgageID),
+		Value: payload,
+	}); err != nil {
+		kafkaMessagesPublished.WithLabelValues(topic, "error").Inc()
+		return fmt.Errorf("kafka produce to %s failed for event %s (mortgage %s): %w", topic, event.Type, event.MortgageID, err)
+	}
 
 	kafkaMessagesPublished.WithLabelValues(topic, "success").Inc()
-
 	return nil
 }
 
@@ -224,99 +222,33 @@ func (c *KafkaClient) PublishBatch(topic string, events []MortgageEvent) error {
 	return nil
 }
 
-// backgroundFlusher periodically flushes the event buffer until Close
-// signals stopCh. It always closes stopped on exit so Close can wait for it.
-func (c *KafkaClient) backgroundFlusher() {
-	ticker := time.NewTicker(c.flushInterval)
-	defer func() {
-		ticker.Stop()
-		close(c.stopped)
-	}()
-
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		case <-ticker.C:
-			c.flushBuffer()
-		}
-	}
-}
-
-// flushBuffer flushes buffered events. On a produce failure the affected
-// events are persisted to the outbox for retry — never silently dropped.
-func (c *KafkaClient) flushBuffer() {
+// Close marks the producer disconnected and closes the underlying writer,
+// flushing any in-flight batches. PublishEvent is synchronous (Async=false),
+// so a completed PublishEvent is durably acknowledged; there is no hidden
+// buffer to drain (F1-09).
+func (c *KafkaClient) Close() error {
 	c.mutex.Lock()
-	if len(c.eventBuffer) == 0 {
-		c.mutex.Unlock()
-		return
-	}
-	batch := c.eventBuffer
-	c.eventBuffer = make([]bufferedEvent, 0)
-	connected := c.connected
-	c.mutex.Unlock()
-
-	if !connected {
-		// Producer is down: move buffered events to the outbox for retry.
-		for _, be := range batch {
-			if err := saveEventToOutbox(be.topic, be.event); err != nil {
-				log.Printf("ALERT: flush could not outbox event %s (mortgage %s): %v — EVENT AT RISK OF LOSS",
-					be.event.Type, be.event.MortgageID, err)
-				kafkaMessagesPublished.WithLabelValues(be.topic, "outbox_error").Inc()
-				continue
-			}
-			kafkaMessagesPublished.WithLabelValues(be.topic, "outboxed").Inc()
+	defer c.mutex.Unlock()
+	c.connected = false
+	if c.writer != nil {
+		if err := c.writer.Close(); err != nil {
+			return fmt.Errorf("close kafka writer: %w", err)
 		}
-		log.Printf("Producer unavailable: persisted %d buffered events to outbox", len(batch))
-		return
+		c.writer = nil
 	}
-
-	// In production, batch send to Kafka
-	log.Printf("Flushing %d buffered events", len(batch))
-}
-
-// Subscribe subscribes to a topic (for consuming events)
-func (c *KafkaClient) Subscribe(ctx context.Context, topic string, handler func(MortgageEvent) error) error {
-	log.Printf("Subscribed to topic: %s", topic)
-
-	// In production, this would use actual Kafka consumer
-	// For now, just log
-	go func() {
-		<-ctx.Done()
-		log.Printf("Unsubscribed from topic: %s", topic)
-	}()
-
+	log.Println("Kafka client closed")
 	return nil
 }
 
-// Close stops the background flusher, waits for it (bounded), marks the
-// producer disconnected, then performs a final flush (buffered events are
-// persisted to the outbox so nothing is dropped on shutdown). Shutdown
-// ordering: callers stop consumers first (context cancellation), then call
-// Close, then exit. Close never deadlocks: the flusher lock is never held
-// across channel operations, and Close does not re-enter a locked section.
-func (c *KafkaClient) Close() error {
-	var closeErr error
-	c.closeOnce.Do(func() {
-		// 1. Stop the background flusher and wait for it, with a timeout.
-		close(c.stopCh)
-		select {
-		case <-c.stopped:
-		case <-time.After(10 * time.Second):
-			log.Printf("ERROR: timed out waiting for Kafka background flusher to stop")
-			closeErr = fmt.Errorf("timeout waiting for kafka flusher shutdown")
-		}
-
-		// 2. Mark disconnected, then final flush — with the producer down,
-		//    flushBuffer persists any remaining events to the outbox.
-		c.mutex.Lock()
-		c.connected = false
-		c.mutex.Unlock()
-		c.flushBuffer()
-
-		log.Println("Kafka client closed")
-	})
-	return closeErr
+// PublishEventOrAlert publishes through PublishEventReliably and surfaces a
+// terminal failure (neither published nor outboxed) with an ALERT log line.
+// OR-17/T13 (Wave-10): the 18 lifecycle call sites previously discarded the
+// returned error, so the last-resort failure mode was invisible.
+func PublishEventOrAlert(c *KafkaClient, topic string, event MortgageEvent) {
+	if err := c.PublishEventReliably(topic, event); err != nil {
+		log.Printf("ALERT: mortgage event lost — publish and outbox both failed (topic=%s type=%s mortgage=%s): %v",
+			topic, event.Type, event.MortgageID, err)
+	}
 }
 
 // IsConnected returns connection status

@@ -5,7 +5,6 @@ on:
     branches:
       - main
     paths:
-      - 'services/account-closure-go/**'
       - 'services/account-opening-go/**'
       - 'services/account-service/**'
       - 'services/account-statement-go/**'
@@ -48,7 +47,7 @@ jobs:
           file: ./docker/Dockerfile.consolidated
           push: true
           build-args: |
-            SERVICES=account-closure-go,account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go
+            SERVICES=account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go
             PRIMARY_LANG=go
             PORT_BASE=9278
           tags: registry.digitalocean.com/talentgraph-auth/54link-dev-core-accounts:${{ env.TAG }}

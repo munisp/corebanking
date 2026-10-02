@@ -89,7 +89,10 @@ export class TransactionRepository extends MainRepository<Transaction> {
       },
     });
 
-    transactions.forEach(async (transaction) => {
+    // TS-48: for..of + await — the async forEach was fire-and-forget: DB writes
+    // raced the response and errors were silently lost. Iterations are kept
+    // sequential because fund release/re-reserve operations mutate balances.
+    for (const transaction of transactions) {
       // If transaction is a reversal, update balance_after_transaction to the pre-transaction state
       if (payload.reason.toLowerCase() == "reversal" && transaction.balance_after_transaction) {
         const currentBalance = Number(transaction.balance_after_transaction ?? "0.0");
@@ -127,7 +130,11 @@ export class TransactionRepository extends MainRepository<Transaction> {
           const reserve_funds_response = await CoreBankingApiClient.getInstance().reserve_funds(
             transaction.payer.idValue,
             transaction.amount,
-            "Retryable Transaction"
+            "Retryable Transaction",
+            // MN-07: deterministic hold key; attempt-scoped because a voided
+            // TB pending transfer id can never be reused.
+            `${transaction.transaction_id}:${transaction.hold_id || "initial"}`,
+            transaction.tenant
           );
           transaction.hold_id = reserve_funds_response?.resourceId || transaction.hold_id;
         } else {
@@ -156,7 +163,9 @@ export class TransactionRepository extends MainRepository<Transaction> {
             const reserve_funds_response = await CoreBankingApiClient.getInstance().reserve_funds(
               parentTransaction.payer.idValue,
               parentTransaction.amount,
-              "Failed Retriable Transaction"
+              "Failed Retriable Transaction",
+              `${parentTransaction.transaction_id}:${parentTransaction.hold_id || "initial"}`,
+              parentTransaction.tenant
             );
             parentTransaction.hold_id = reserve_funds_response?.resourceId || parentTransaction.hold_id;
           } else {
@@ -176,7 +185,7 @@ export class TransactionRepository extends MainRepository<Transaction> {
         PhEventTypeEnum.TransactionFailed,
         transaction.transaction_id
       ).catch(console.error);
-    });
+    }
   }
 
   async reserve_transaction(transaction_id: string) {
@@ -223,6 +232,18 @@ export class TransactionRepository extends MainRepository<Transaction> {
     });
 
     if (!transaction) return;
+
+    // MN-14: terminal-state guard — duplicate fulfil callbacks (callback
+    // storms) must not re-complete an already-terminal transaction.
+    if (
+      transaction.status === TransactionStatusEnum.success ||
+      transaction.status === TransactionStatusEnum.failed
+    ) {
+      logger.warn(
+        `complete_txn: transaction ${data.transaction_id} already terminal (${transaction.status}); skipping duplicate completion`
+      );
+      return;
+    }
 
     // Safely fetch and store the user's account balance after transaction completion
     try {

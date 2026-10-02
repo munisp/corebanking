@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +26,23 @@ import (
 	_ "github.com/lib/pq"
 	"math/big"
 )
+
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(rand.Int63n(int64(d)/2))
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var serviceName = "qdrant-financial-search-go"
 var db *sql.DB
@@ -120,14 +138,14 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 	for i := 0; i < 3; i++ {
 		req, _ := http.NewRequest(method, url, reqBody)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
 			continue
 		}
-		defer resp.Body.Close()
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		return result, nil
 	}
 	return nil, fmt.Errorf("all retries failed")
@@ -451,11 +469,10 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 	if !_cb.allow() {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond))
 		}
 		var req *http.Request
 		if body != nil {
@@ -466,21 +483,22 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Source-Service", serviceName)
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -557,8 +575,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -657,7 +674,13 @@ func main() {
 
 	port := envOr("PORT", "8080")
 	handler := rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(mux)))
-	srv := &http.Server{Addr: ":" + port, Handler: handler}
+	srv := &http.Server{
+		Addr: ":" + port, Handler: handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() { log.Printf("[%s] listening on port %s", serviceName, port); srv.ListenAndServe() }()
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)

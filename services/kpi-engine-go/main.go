@@ -20,6 +20,17 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var startTime = time.Now()
 
 // db is the optional Postgres handle probed by middleware.go (nil = in-memory mode).
@@ -91,8 +102,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -362,7 +372,7 @@ func main() {
 	})
 
 	log.Printf("[kpi-engine-go] KPI engine on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 // healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).

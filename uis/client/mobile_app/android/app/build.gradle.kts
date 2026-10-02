@@ -34,6 +34,9 @@ android {
         release {
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // MOB-11: enable R8 code shrinking + resource shrinking for release.
+            isMinifyEnabled = true
+            isShrinkResources = true
         }
     }
 }

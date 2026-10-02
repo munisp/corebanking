@@ -11,8 +11,10 @@ from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header
+import psycopg2.pool
+from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import time
@@ -104,24 +106,80 @@ def inc_errors():
 # --- Database ---
 _db_pool = None
 
-db_conn = None
 
 
-def get_db():
-    global db_conn
-    if db_conn is None or db_conn.closed:
-        db_conn = psycopg2.connect(DATABASE_URL)
-        db_conn.autocommit = True
-    return db_conn
+# --- Database ---
+_db_pool = None
+_db_pool_lock = threading.Lock()
 
-def release_db(conn):
-    """Return a connection to the pool."""
+def _get_db_pool():
+    """Lazily create the process-wide connection pool (thread-safe)."""
     global _db_pool
-    if _db_pool and conn:
+    if _db_pool is None or _db_pool.closed:
+        with _db_pool_lock:
+            if _db_pool is None or _db_pool.closed:
+                _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+    return _db_pool
+
+class _PooledConn:
+    """Borrowed pooled connection.
+
+    Returned to the pool on close() or when the last reference is dropped
+    (CPython refcounting), so existing `conn = get_db()` call sites remain
+    safe without an explicit release_db() call."""
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        raw, self._raw = self._raw, None
+        if raw is not None:
+            try:
+                _get_db_pool().putconn(raw)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+
+    def __del__(self):
         try:
-            _db_pool.putconn(conn)
+            self.close()
         except Exception:
             pass
+
+def get_db():
+    """Borrow a connection from the pool (thread-safe)."""
+    raw = _get_db_pool().getconn()
+    raw.autocommit = True
+    return _PooledConn(raw)
+
+def release_db(conn):
+    """Return a borrowed connection to the pool."""
+    if conn:
+        conn.close()
+
+_schema_ready = threading.Event()
+
+def _init_schema_bg():
+    """Run blocking schema init off the event loop in a daemon thread;
+    sets _schema_ready when done (surfaced via /healthz)."""
+    try:
+        init_schema()
+    finally:
+        _schema_ready.set()
+
 
 def init_schema():
     """Create the tables this service actually uses. Never crash startup:
@@ -166,17 +224,19 @@ def init_schema():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_schema()
+    _schema_ready.clear()
+    threading.Thread(target=_init_schema_bg, daemon=True, name="init-schema").start()
     logger.info(f"[credit-scoring-py] ready on :%d", PORT)
     logger.info(f"[credit-scoring-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
     yield
-    if db_conn:
-        db_conn.close()
+    if _db_pool:
+        _db_pool.closeall()
 
 
 app = FastAPI(title="credit-scoring-py", version="1.0.0", lifespan=lifespan)
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
 import inspect as _jwt_inspect
 from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
@@ -256,7 +316,7 @@ class UpdateRequest(BaseModel):
 
 @app.get("/healthz")
 def health():
-    return {"status": "healthy", "service": "credit-scoring-py", "version": "1.0.0"}
+    return {"status": "healthy", "service": "credit-scoring-py", "version": "1.0.0", "schema_ready": _schema_ready.is_set()}
 
 
 @app.get("/readyz")
@@ -394,6 +454,43 @@ def affordability_check(monthly_income, monthly_expenses, proposed_emi):
     return {"disposable_income": round(disposable, 2), "proposed_emi": proposed_emi, "affordable": affordable, "max_emi": round(disposable * 0.5, 2)}
 
 
+# LN-16: advisory scoring routes. These expose the domain logic above over HTTP
+# for loan-origination (see services/loan-origination/main.go:51-55, R9-05).
+# Advisory only: results are NOT persisted and carry advisory=True so callers
+# cannot mistake them for binding credit decisions. The global JWTAuthMiddleware
+# (fail-closed; probes exempt) already guards these paths.
+def _require_numeric(payload: Dict[str, Any], fields) -> Dict[str, float]:
+    values = {}
+    for f in fields:
+        v = payload.get(f)
+        if v is None:
+            raise HTTPException(status_code=400, detail=f"missing required field: {f}")
+        try:
+            values[f] = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"field {f} must be numeric")
+    return values
+
+
+@app.post("/api/v1/score/advisory")
+def score_advisory(payload: Dict[str, Any] = Body(...)):
+    v = _require_numeric(payload, ["income", "debt", "employment_years", "loan_history_count", "defaults", "age"])
+    result = compute_credit_score(
+        v["income"], v["debt"], v["employment_years"],
+        v["loan_history_count"], v["defaults"], v["age"],
+    )
+    result["advisory"] = True
+    return result
+
+
+@app.post("/api/v1/affordability/advisory")
+def affordability_advisory(payload: Dict[str, Any] = Body(...)):
+    v = _require_numeric(payload, ["monthly_income", "monthly_expenses", "proposed_emi"])
+    result = affordability_check(v["monthly_income"], v["monthly_expenses"], v["proposed_emi"])
+    result["advisory"] = True
+    return result
+
+
 # --- HTTP Handler ---
 
 # --- Inter-Service HTTP Client with Retry & Circuit Breaker ---
@@ -449,12 +546,12 @@ def call_service(method, url, body=None, retries=3, timeout=15):
         raise Exception(f"Circuit breaker open for {url}")
     
     last_err = None
+    data = json.dumps(body).encode() if body else None
     for attempt in range(retries):
         try:
             if attempt > 0:
                 time.sleep(0.1 * (2 ** attempt))
             
-            data = json.dumps(body).encode() if body else None
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("Content-Type", "application/json")
             
@@ -702,4 +799,4 @@ signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=int(os.environ.get("UVICORN_WORKERS", "4")))

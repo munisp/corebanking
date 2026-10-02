@@ -93,7 +93,7 @@ export default function AgentBanking() {
         {/* Stats Cards */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
           {stats.map((stat, index) => (
-            <Card key={index} className="p-6">
+            <Card key={stat.label} className="p-6">
               <div className="flex items-center justify-between mb-2">
                 <stat.icon className="h-8 w-8" style={{ color: index === 0 ? primaryColor : undefined }} />
                 <Badge className="bg-green-100 text-green-800">{stat.change}</Badge>

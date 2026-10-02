@@ -6,20 +6,25 @@ const logger = createLogger(extract_name_form_path(__filename));
 
 const processInput = async (req: Request, contentType: string) => {
   return new Promise<void>((response) => {
-    let rawBody = "";
+    // TS-35: collect Buffer chunks and concat once — avoids O(n^2) string
+    // concatenation on chunked FSPIOP requests.
+    const chunks: Buffer[] = [];
 
     // Collect the raw body data
-    req.on("data", (chunk) => {
-      rawBody += chunk;
+    req.on("data", (chunk: Buffer) => {
+      chunks.push(chunk);
     });
 
     req.on("end", () => {
       try {
-        console.log("Body Collected, attempt to parse", rawBody);
+        const rawBody = Buffer.concat(chunks).toString("utf8");
+        // TS-34: full request bodies (incl. PII) only at debug level
+        // (LOG_LEVEL=debug), never on the default info path.
+        logger.debug("Body Collected, attempt to parse", { rawBody });
         // Parse the raw body into JSON (or any other format you need)
         const parsedBody = JSON.parse(rawBody);
 
-        console.log("parsed body", parsedBody);
+        logger.debug("parsed body", { parsedBody });
 
         // Optionally, handle versioning if needed
         const version = contentType.split("version=")[1];
@@ -45,7 +50,7 @@ export const customMojaloopJsonParser = async (
 ) => {
   const contentType = req.headers["content-type"];
 
-  console.log("customMojaloopJsonParser ", contentType);
+  logger.debug("customMojaloopJsonParser ", { contentType });
 
   if (
     contentType &&

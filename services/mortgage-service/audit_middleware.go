@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"net/http"
 	"os"
 	"regexp"
@@ -13,11 +15,33 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var (
-	ginAuditSvcURL  = os.Getenv("AUDIT_SVC_URL")
-	ginSkipPrefixes = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
-	ginAuditUUIDRE  = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	ginAuditIntRE   = regexp.MustCompile(`/[0-9]+`)
+	ginAuditSvcURL      = os.Getenv("AUDIT_SVC_URL")
+	ginAuditIngestToken = os.Getenv("AUDIT_INGEST_TOKEN") // AU-01
+	ginSkipPrefixes     = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
+	ginAuditUUIDRE      = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	ginAuditIntRE       = regexp.MustCompile(`/[0-9]+`)
+)
+
+// auditShipFailures implements the w9 alerting contract counter
+// audit_ship_failures_total{service,tenant_id} for audit shipping failures.
+var auditShipFailures = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "audit_ship_failures_total",
+		Help: "Audit event shipping failures (w9 alerting contract).",
+	},
+	[]string{"service", "tenant_id"},
 )
 
 func init() {
@@ -50,12 +74,19 @@ func ginSendAuditEvent(actorID, tenantID, eventType string, eventData map[string
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-tenant-id", tenantID)
 	req.Header.Set("x-keycloak-id", "system")
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
+	if ginAuditIngestToken != "" {
+		// AU-01 (F15-1): shared ingest credential; audit-service fails closed without it.
+		req.Header.Set("X-Audit-Ingest-Token", ginAuditIngestToken)
+	}
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
+		auditShipFailures.WithLabelValues("mortgage-service", tenantID).Inc()
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		auditShipFailures.WithLabelValues("mortgage-service", tenantID).Inc()
+	}
 }
 
 func auditMiddleware() gin.HandlerFunc {

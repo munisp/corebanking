@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "otelkit"
+version = "0.1.0"
+description = "corebanking shared OpenTelemetry kit (SPEC w9 section 2.5)"
+requires-python = ">=3.10"
+dependencies = [
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27",
+    "opentelemetry-propagator-b3>=1.27; python_version >= '3.10'",
+]
+
+[project.optional-dependencies]
+fastapi = [
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+]
+flask = [
+    "opentelemetry-instrumentation-flask>=0.48b0",
+]
+sqlalchemy = [
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+]
+psycopg2 = [
+    "opentelemetry-instrumentation-psycopg2>=0.48b0",
+]
+redis = [
+    "opentelemetry-instrumentation-redis>=0.48b0",
+]
+kafka = [
+    "opentelemetry-instrumentation-kafka-python>=0.48b0",
+]
+requests = [
+    "opentelemetry-instrumentation-requests>=0.48b0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
+]
+temporal = [
+    "temporalio>=1.7",
+    "temporalio[opentelemetry]>=1.7",
+]
+all = [
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+    "opentelemetry-instrumentation-flask>=0.48b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+    "opentelemetry-instrumentation-psycopg2>=0.48b0",
+    "opentelemetry-instrumentation-redis>=0.48b0",
+    "opentelemetry-instrumentation-kafka-python>=0.48b0",
+    "opentelemetry-instrumentation-requests>=0.48b0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
+    "temporalio>=1.7",
+    "temporalio[opentelemetry]>=1.7",
+]
+
+[tool.setuptools.packages.find]
+include = ["otelkit*"]

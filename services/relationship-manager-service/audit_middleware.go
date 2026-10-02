@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"net/http"
 	"os"
 	"regexp"
@@ -11,12 +13,34 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var (
-	auditSvcURL  = os.Getenv("AUDIT_SVC_URL")
-	skipPrefixes = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
-	skipMethods  = map[string]bool{"GET": true, "HEAD": true, "OPTIONS": true}
-	auditUUIDRE  = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	auditIntRE   = regexp.MustCompile(`/[0-9]+`)
+	auditSvcURL      = os.Getenv("AUDIT_SVC_URL")
+	auditIngestToken = os.Getenv("AUDIT_INGEST_TOKEN") // AU-01
+	skipPrefixes     = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
+	skipMethods      = map[string]bool{"GET": true, "HEAD": true, "OPTIONS": true}
+	auditUUIDRE      = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	auditIntRE       = regexp.MustCompile(`/[0-9]+`)
+)
+
+// auditShipFailures implements the w9 alerting contract counter
+// audit_ship_failures_total{service,tenant_id} for audit shipping failures.
+var auditShipFailures = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "audit_ship_failures_total",
+		Help: "Audit event shipping failures (w9 alerting contract).",
+	},
+	[]string{"service", "tenant_id"},
 )
 
 func init() {
@@ -59,12 +83,19 @@ func sendAuditEvent(actorID, tenantID, eventType string, eventData map[string]in
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-tenant-id", tenantID)
 	req.Header.Set("x-keycloak-id", "system")
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
+	if auditIngestToken != "" {
+		// AU-01 (F15-1): shared ingest credential; audit-service fails closed without it.
+		req.Header.Set("X-Audit-Ingest-Token", auditIngestToken)
+	}
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
+		auditShipFailures.WithLabelValues("relationship-manager-service", tenantID).Inc()
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		auditShipFailures.WithLabelValues("relationship-manager-service", tenantID).Inc()
+	}
 }
 
 func auditMiddleware(next http.Handler) http.Handler {

@@ -6,6 +6,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   ArrowUpDown,
   CheckSquare,
@@ -141,10 +142,7 @@ function ServiceUnavailable({ onRetry }: { onRetry: () => void }) {
 }
 
 export default function CrudWorkspace({ config }: CrudWorkspaceProps) {
-  const [records, setRecords] = useState<RecordData[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [serviceDown, setServiceDown] = useState(false);
+
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [showCreate, setShowCreate] = useState(false);
@@ -175,10 +173,18 @@ export default function CrudWorkspace({ config }: CrudWorkspaceProps) {
     }
   }, []);
 
-  const fetchRecords = useCallback(async () => {
-    setLoading(true);
-    setServiceDown(false);
-    try {
+  // Data fetching via react-query: cached, deduped across mounts, with a
+  // 30s staleTime so revisiting a workspace doesn't refetch immediately.
+  const {
+    data: queryData,
+    isLoading: loading,
+    error: queryError,
+    refetch,
+  } = useQuery({
+    queryKey: ["crud-records", config.apiBase],
+    staleTime: 30_000,
+    retry: 1,
+    queryFn: async () => {
       // Build URL with tenantId query parameter if available
       const tenantId = getTenantId();
       const url = new URL(config.apiBase, window.location.origin);
@@ -186,42 +192,34 @@ export default function CrudWorkspace({ config }: CrudWorkspaceProps) {
         url.searchParams.append("tenantId", tenantId);
       }
       const res = await fetch(url.toString());
+      const ct = res.headers.get("content-type") ?? "";
       if (!res.ok) {
-        const ct = res.headers.get("content-type") ?? "";
         if (!ct.includes("json")) {
-          setServiceDown(true);
-          setError(null);
-          setRecords([]);
-          return;
+          // Non-JSON response (e.g. HTML error page): treat as service down
+          return { items: [] as RecordData[], serviceDown: true };
         }
         throw new Error(`Failed to load: ${res.status}`);
       }
-      const ct = res.headers.get("content-type") ?? "";
       if (!ct.includes("json")) {
-        setServiceDown(true);
-        setError(null);
-        setRecords([]);
-        return;
+        return { items: [] as RecordData[], serviceDown: true };
       }
       const data = await res.json();
       const items = Array.isArray(data) ? data : data.items ?? data.records ?? data.data ?? [];
-      setRecords(items);
-      setError(null);
-    } catch (err) {
-      if (err instanceof TypeError && err.message.includes("JSON")) {
-        setServiceDown(true);
-        setError(null);
-      } else {
-        setError(err instanceof Error ? err.message : "Failed to load data");
-      }
-    } finally {
-      setLoading(false);
-    }
-  }, [config.apiBase, getTenantId]);
+      return { items: items as RecordData[], serviceDown: false };
+    },
+  });
 
-  useEffect(() => {
-    void fetchRecords();
-  }, [fetchRecords]);
+  const records = queryData?.items ?? [];
+  const serviceDown = queryData?.serviceDown ?? false;
+  const error = queryError
+    ? queryError instanceof Error
+      ? queryError.message
+      : "Failed to load data"
+    : null;
+
+  const fetchRecords = useCallback(async () => {
+    await refetch();
+  }, [refetch]);
 
   const filteredRecords = useMemo(() => {
     let result = records;

@@ -1,5 +1,7 @@
 import bcrypt from "bcryptjs";
 
-export const hashString = (str: string, rounds?: number) => {
-  return bcrypt.hashSync(str, rounds || 10);
+// TS-70: async hashing — hashSync blocked the event loop (~80ms+ per call).
+// No live callers existed at the time of the change; the export is now async.
+export const hashString = async (str: string, rounds?: number): Promise<string> => {
+  return bcrypt.hash(str, rounds || 10);
 };

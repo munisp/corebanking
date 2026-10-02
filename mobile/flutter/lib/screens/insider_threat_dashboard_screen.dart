@@ -403,13 +403,19 @@ class _InsiderThreatDashboardScreenState extends State<InsiderThreatDashboardScr
         content: SizedBox(
           width: double.maxFinite,
           height: 300,
-          child: ListView(
-            children: _uebaAlertList.map((a) => ListTile(
-              dense: true,
-              leading: Icon(Icons.warning, color: a['severity'] == 'critical' ? Colors.red : Colors.orange, size: 18),
-              title: Text('${a['type']} — ${a['employee']}', style: const TextStyle(fontSize: 13)),
-              subtitle: Text(a['details'] ?? '', style: const TextStyle(fontSize: 11)),
-            )).toList(),
+          // MOB-17: lazy builder so this stays cheap if wired to real
+          // (growing) alert data instead of the current mock rows.
+          child: ListView.builder(
+            itemCount: _uebaAlertList.length,
+            itemBuilder: (ctx, i) {
+              final a = _uebaAlertList[i];
+              return ListTile(
+                dense: true,
+                leading: Icon(Icons.warning, color: a['severity'] == 'critical' ? Colors.red : Colors.orange, size: 18),
+                title: Text('${a['type']} — ${a['employee']}', style: const TextStyle(fontSize: 13)),
+                subtitle: Text(a['details'] ?? '', style: const TextStyle(fontSize: 11)),
+              );
+            },
           ),
         ),
         actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close'))],

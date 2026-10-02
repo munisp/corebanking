@@ -100,7 +100,7 @@ const SEED = {
 async function proxyOrSeed(serviceKey: string, path: string, seedData: any, res: Response) {
   const svc = (SERVICES as any)[serviceKey];
   try {
-    const resp = await fetch(`http://${svc.host}:${svc.port}${path}`);
+    const resp = await fetch(`http://${svc.host}:${svc.port}${path}`, { signal: AbortSignal.timeout(3000) });
     const data = await resp.json();
     return res.json(data);
   } catch {

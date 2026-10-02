@@ -174,7 +174,9 @@ spec:
     spec:
       containers:
         - name: kafka
-          image: confluentinc/cp-kafka:7.6.0
+          # PL-16: unified to 7.6.5 (matches docker-compose; was 7.6.0 here —
+          # dev ran NEWER than prod). One Kafka version everywhere.
+          image: confluentinc/cp-kafka:7.6.5
           ports:
             - containerPort: 9092
           livenessProbe:
@@ -312,7 +314,14 @@ spec:
     spec:
       containers:
         - name: tigerbeetle
-          image: ghcr.io/tigerbeetle/tigerbeetle:0.16.11
+          # PL-16: bumped 0.16.11 → 0.17.0 to match the pinned Go clients
+          # (pkg/tbclient + consumers require tigerbeetle-go v0.17.0; TB wire
+          # protocol requires matched client/server versions). Downgrading the
+          # clients was evaluated and rejected — the v0.16.x client lacks API
+          # used by pkg/tbclient (tb.CreateTransferResult/ToUint128). Server and
+          # clients MUST move together on any future bump. Known stragglers to
+          # align: escrow-service (v0.16.67), communication-hub (v0.15.3).
+          image: ghcr.io/tigerbeetle/tigerbeetle:0.17.0
           command: ["start", "--addresses=0.0.0.0:3001", "--cluster-id=0"]
           ports:
             - containerPort: 3001

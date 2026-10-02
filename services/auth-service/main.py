@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from adapters.permify import load_schema
 
@@ -34,18 +35,51 @@ import urllib.request as _jwt_urlreq
 
 _JWT_JWKS_URL = _jwt_os.environ.get("KEYCLOAK_JWKS_URL", "")
 _JWT_SECRET = _jwt_os.environ.get("JWT_SECRET", "")
+import logging as _jwt_logging
+
+_jwt_logger = _jwt_logging.getLogger("jwt_auth")
+if not _JWT_SECRET or _JWT_SECRET.startswith("${"):
+    # OB-03 fail-closed posture: without JWT_SECRET, HS256 service-to-service
+    # tokens cannot be verified and are rejected (401 auth_not_configured).
+    # Log loudly at boot so a missing secret is never silent; RS256 user-token
+    # validation via KEYCLOAK_JWKS_URL is unaffected.
+    _jwt_logger.error(
+        "JWT_SECRET is not set: HS256 service-to-service tokens (OB-03) will be "
+        "rejected with 401 auth_not_configured"
+    )
 _JWT_ISSUER = _jwt_os.environ.get("JWT_ISSUER", "")
 _JWT_AUDIENCE = _jwt_os.environ.get("JWT_AUDIENCE", "")
 try:
-    _JWT_JWKS_TTL = int(_jwt_os.environ.get("JWKS_CACHE_TTL_SECONDS", "300"))
+    # W11 PY-706: 15min JWKS TTL (matches services/token.py).
+    _JWT_JWKS_TTL = int(_jwt_os.environ.get("JWKS_CACHE_TTL_SECONDS", "900"))
 except ValueError:
-    _JWT_JWKS_TTL = 300
+    _JWT_JWKS_TTL = 900
 _jwks_cache = {"fetched_at": 0.0, "keys": {}}
 
 
 def _jwt_b64url_decode(segment):
     segment += "=" * (-len(segment) % 4)
     return _jwt_b64.urlsafe_b64decode(segment.encode())
+
+
+def _jwt_token_alg(headers):
+    """Best-effort read of the JWT `alg` header field (OB-03).
+
+    Used only AFTER validate_jwt has cryptographically verified the token, to
+    confine the service-token bypass to HS256 tokens signed with the shared
+    JWT_SECRET (a Keycloak RS256 user token can never impersonate the service
+    account by carrying role claims).
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None
+    parts = auth[7:].split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        return _jwt_json.loads(_jwt_b64url_decode(parts[0])).get("alg")
+    except Exception:
+        return None
 
 
 def _jwt_fetch_jwks():
@@ -195,13 +229,31 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
             if _jwt_inspect.iscoroutinefunction(validate_jwt):
                 claims, err = await validate_jwt(request.headers)
             else:
-                claims, err = validate_jwt(request.headers)
+                # W11 PY-706: sync validate_jwt may perform a blocking JWKS
+                # fetch — never run it on the event loop.
+                claims, err = await asyncio.to_thread(validate_jwt, request.headers)
         except Exception as exc:
             return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
         if not claims:
             status = 503 if err == "jwks_unavailable" else 401
             return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
         request.state.jwt_claims = claims
+        # OB-03: accept orchestrator service-to-service tokens. A service token is
+        # an HS256 JWT signed with the shared JWT_SECRET carrying role='service'
+        # (sub='orchestrator-service'). Signature and exp have already been fully
+        # verified by validate_jwt above — an unverifiable token never reaches
+        # here. Service callers keep the caller-supplied tenant headers (the token
+        # carries no tenant), are flagged request.state.is_service_caller so
+        # downstream Permify/user checks can bypass user-level enforcement, and
+        # receive x-user-role=service.
+        if _jwt_token_alg(request.headers) == "HS256" and claims.get("role") == "service":
+            request.state.is_service_caller = True
+            _jwt_set_scope_header(request.scope, "x-user-role", "service")
+            _jwt_set_scope_header(
+                request.scope, "x-keycloak-id", claims.get("sub") or "orchestrator-service"
+            )
+            return await call_next(request)
+        request.state.is_service_caller = False
         tenant = claims.get("tenant_id") or claims.get("tenant")
         _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
         _jwt_set_scope_header(request.scope, "x-tenant", tenant)
@@ -232,5 +284,11 @@ app.include_router(permissions_router, prefix="/permissions", tags=["permissions
 
 @app.on_event("startup")
 async def startup_event():
-    load_schema()
+    # W11 PY-004: Permify schema load blocks (sync HTTP) — keep it off the
+    # event loop at boot.
+    await asyncio.to_thread(load_schema)
+    # W11 PY-706: start the background JWKS refresh task (15min TTL cache).
+    from services.token import ensure_jwks_background_refresh
+
+    ensure_jwks_background_refresh()
     logger.info("Auth Service is running..")

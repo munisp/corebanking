@@ -9,6 +9,7 @@ class VerificationService {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: readEnv("VERIFICATION_SVC_URL"),
+      timeout: 10000,
       headers: {
         "content-type": "application/json",
         "x-client-id": readEnv("VERIFICATION_SVC_CLIENT_ID"),

@@ -51,9 +51,11 @@ export function getTenantHeaders(tenant: Tenant | null): Record<string, string> 
 
     const keycloakId = cfg.id ?? cfg.keycloak_id ?? cfg.client_id ?? null;
     if (keycloakId) headers['x-keycloak-id'] = String(keycloakId);
-    if (keycloakId) headers['x-keycloak-id']     = String(keycloakId);
     if (keycloakId) headers['x-user-id']         = String(keycloakId);
-    if (keycloakId) headers['x-user-role']       = "super_admin"; // Assuming only admins can perform API actions; adjust as needed
+    // ST-02: the hardcoded x-user-role 'super_admin' was deleted. Tenant config
+    // says nothing about the logged-in user's role; the role header (when sent
+    // at all) is derived from the authenticated user's JWT realm_access.roles
+    // in services/api.ts. Server-side JWT claims remain the source of truth.
   }
 
   // ── x-ledger-id ───────────────────────────────────────────────────────────

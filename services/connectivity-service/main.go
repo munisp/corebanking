@@ -21,6 +21,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 type ConnectivityServer struct {
 	router            *mux.Router
 	imageOptimizer    *AdaptiveImageOptimizer
@@ -502,8 +513,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -591,11 +601,12 @@ func main() {
 	server := NewConnectivityServer()
 
 	httpServer := &http.Server{
-		Addr:         ":" + port,
-		Handler:      jwtAuthMiddleware(server.router),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           jwtAuthMiddleware(server.router),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

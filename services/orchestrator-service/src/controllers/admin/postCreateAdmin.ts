@@ -1,19 +1,17 @@
-import { uuid4 } from "@temporalio/workflow";
 import { asyncHandler } from "../../middlewares/async";
+import { resolveTenantId } from "../../middlewares/auth";
 import { workflowRunner } from "../../utils/workflowRunner";
 import { validateRequest } from "../../validations";
 import httpStatus from "http-status";
 import { tenantService } from "../../services/tenantService";
 import { CreateAdminSchema } from "../../validations/schemas";
-import { ApiError } from "../../middlewares/error";
 import { createAdminWorkflow } from "../../workflows/createAdminWorkflow";
 
 export const postCreateAdmin = asyncHandler(async (req, res) => {
   const payload = validateRequest(CreateAdminSchema, req.body);
-  console.log("[postCreateAdmin] parsed payload:", JSON.stringify(payload));
 
-  const tenantId = req.headers["x-tenant-id"] as string;
-  if (!tenantId) throw new ApiError(httpStatus.BAD_REQUEST, "Tenant ID is required.");
+  // OB-01: tenant derived from verified token claims (see resolveTenantId).
+  const tenantId = resolveTenantId(req, res);
 
   const keycloakRealm = "54link_" + tenantId;
   const [keycloakPublicKey, ledgerId] = await Promise.all([
@@ -23,7 +21,8 @@ export const postCreateAdmin = asyncHandler(async (req, res) => {
 
   const verification = await workflowRunner(createAdminWorkflow, {
     args: { ...payload, tenantId, keycloakRealm, keycloakPublicKey, ledgerId },
-    workflowId: `54link_create_tenant_admin_${tenantId}_${uuid4()}`,
+    // OB-08: deterministic workflow id for Temporal-side dedup.
+    workflowId: `54link_create_tenant_admin_${tenantId}_${payload.email}`,
     defaultErrorMessage: "Tenant admin creation failed.",
     withTimeOut: 40000,
     timeOutFn: () => {

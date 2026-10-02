@@ -4,7 +4,7 @@ import { ICreateCustomerWorkflow } from "../types/workflows";
 import { CustomerRole, NotificationCategory, NotificationType } from "../utils/enums";
 
 export async function createCustomerWorkflow(args: ICreateCustomerWorkflow): Promise<string> {
-  const { createAuthProfile, createUserProfile, sendEmail, initializeKyc, setupPassword, saveKycState, checkTenantBillingStatus, screenSanctions } =
+  const { createAuthProfile, deleteAuthProfile, createUserProfile, sendEmail, initializeKyc, setupPassword, saveKycState, checkTenantBillingStatus, screenSanctions } =
     proxyActivities<typeof activities>({
       retry: {
         initialInterval: "1s",
@@ -15,6 +15,9 @@ export async function createCustomerWorkflow(args: ICreateCustomerWorkflow): Pro
       },
       startToCloseTimeout: "1m",
     });
+
+  // OB-08: saga state — track side effects that need compensation on failure.
+  let createdAuthProfile: { keycloak_id: string } | null = null;
 
   try {
     // 00. Billing gate
@@ -36,6 +39,7 @@ export async function createCustomerWorkflow(args: ICreateCustomerWorkflow): Pro
       keycloak_realm: args.keycloakRealm,
       keycloak_pub_key: args.keycloakPublicKey,
     });
+    createdAuthProfile = { keycloak_id: auth.auth.keycloak_id };
 
     // 01b. Setup Password
     await setupPassword({
@@ -114,6 +118,16 @@ export async function createCustomerWorkflow(args: ICreateCustomerWorkflow): Pro
 
     return kyc.url;
   } catch (e: any) {
+    // OB-08: saga compensation — roll back the Keycloak/auth identity created
+    // above so a retry (same deterministic workflow id) is not deadlocked by
+    // auth-service's 409 email dedup. Best-effort: never masks the failure.
+    if (createdAuthProfile) {
+      await deleteAuthProfile({
+        tenant_id: args.tenantId,
+        keycloak_id: createdAuthProfile.keycloak_id,
+        keycloak_realm: args.keycloakRealm,
+      });
+    }
     throw new ApplicationFailure(e.message);
   }
 }

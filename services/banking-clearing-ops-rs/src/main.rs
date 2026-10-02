@@ -42,6 +42,7 @@ async fn cheque_clearing_gl(req: actix_web::HttpRequest, state: web::Data<AppSta
     if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let _span = otelkit::pg_span("SELECT cycle_id, direction, clearing, cheque_no, amount FROM cheques (cheque_clearing_gl)").entered();
     let rows = sqlx::query(
         r#"SELECT cycle_id, direction, clearing, cheque_no, drawer, payee, amount::float8, status, business_date::text
            FROM cheques ORDER BY business_date DESC, cycle_id, cheque_no LIMIT 1000"#,
@@ -645,9 +646,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }
@@ -670,6 +681,15 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[banking-clearing-ops-rs] starting");
+
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("banking-clearing-ops-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[banking-clearing-ops-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
 
     // Fail-fast policy: no DB => all data endpoints 503 (never fabricated).
     let db = match env::var("DATABASE_URL") {
@@ -708,6 +728,7 @@ async fn main() -> std::io::Result<()> {
                 .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
                 .add(("Content-Security-Policy", "default-src 'self'"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(healthz))
             .route("/v1/cheque/clearing-gl", web::get().to(cheque_clearing_gl))

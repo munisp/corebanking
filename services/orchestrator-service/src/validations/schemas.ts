@@ -43,6 +43,14 @@ export const EnvSchema = z.object({
   KEYCLOAK_ADMIN_USERNAME: z.string(),
   KEYCLOAK_ADMIN_PASSWORD: z.string(),
   TENANT_SERVICE_APP_ID: z.string(),
+  // OB-01: fail-fast at boot when authentication secrets are absent.
+  ORCHESTRATOR_SERVICE_TOKEN: z.string().min(32),
+  CALLBACK_HMAC_SECRET: z.string().min(32),
+  // OB-03: shared secret for minting service-to-service JWTs (HS256) that the
+  // Python identity services accept (role="service").
+  JWT_SECRET: z.string().min(32),
+  // PL-01: default ledger for new tenants until per-tenant ledger provisioning exists.
+  DEFAULT_LEDGER_ID: z.string().optional().default("1"),
 });
 
 export const CreateEmployeeSchema = z.object({

@@ -16,7 +16,20 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"shared/otel/go/otelkit"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 type POSTerminal struct {
 	ID              string  `json:"id"`
@@ -134,8 +147,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -287,6 +299,17 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), "pos-terminal-go")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startJWKSRefresh()
 
 	mux := http.NewServeMux()
@@ -420,7 +443,7 @@ func main() {
 	// Wrap mux with CORS middleware
 	handler := corsMiddleware(mux)
 
-	if err := http.ListenAndServe(addr, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(handler)))); err != nil {
+	if err := (&http.Server{Addr: addr, Handler: otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(handler)))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}

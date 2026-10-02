@@ -2,7 +2,7 @@ import uuid
 import datetime
 
 from database import Base
-from sqlalchemy import String, TIMESTAMP
+from sqlalchemy import BigInteger, Boolean, String, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 
 
@@ -20,6 +20,10 @@ class AccountOpeningApplication(Base):
     date_of_birth: Mapped[str | None] = mapped_column(String, nullable=True)
     address: Mapped[str | None] = mapped_column(String, nullable=True)
     tier: Mapped[str | None] = mapped_column(String, nullable=True)
+    # MN-04: minor-account controls.
+    guardian_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_minor: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    daily_limit_kobo: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     tenant_id: Mapped[str] = mapped_column(String, nullable=False)
     keycloak_id: Mapped[str] = mapped_column(String, nullable=False)

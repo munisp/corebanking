@@ -13,6 +13,10 @@ RUN apt-get update \
 WORKDIR /build
 # Prime the dependency cache with a stub main before copying real sources.
 COPY services/${SERVICE}/Cargo.toml services/${SERVICE}/Cargo.lock* ./
+# Wave-9: services may depend on the shared otelkit crate via
+# `otelkit = { path = "../../shared/otel/rust" }`, which resolves to
+# /shared/otel/rust from /build. Copy it in (build context is repo root).
+COPY shared/otel/rust /shared/otel/rust
 RUN mkdir src && echo 'fn main(){}' > src/main.rs \
  && (cargo build --release 2>/dev/null || true) && rm -rf src
 COPY services/${SERVICE}/ ./

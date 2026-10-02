@@ -1,4 +1,3 @@
-import { uuid4 } from "@temporalio/workflow";
 import httpStatus from "http-status";
 import * as z from "zod";
 import { asyncHandler } from "../../middlewares/async";
@@ -33,11 +32,14 @@ export const postKycCallback = asyncHandler(async (req, res) => {
 
   // ── Admin path ────────────────────────────────────────────────────────────
   // Admin KYC uses liveness/default workflow — no NIN/document gate.
-  // score=0 means the workflow threw (e.g. Invalid face); otherwise mark complete.
+  // OB-11: admins must meet the SAME minimum score as customers (previously
+  // any nonzero score passed). Score is normalized 0–1 → 0–100 first.
   if (isAdmin) {
-    logger.info(`[kycCallback] admin path — score=${score}`);
-    if (score === 0) {
-      logger.warn(`[kycCallback] admin KYC failed (score=0) — returning failure`);
+    const kycMinimumScore = parseInt(process.env.KYC_MINIMUM_SCORE || "80", 10);
+    const scorePercent    = score <= 1 ? score * 100 : score;
+    logger.info(`[kycCallback] admin path — raw=${score} percent=${scorePercent} minimum=${kycMinimumScore}`);
+    if (scorePercent < kycMinimumScore) {
+      logger.warn(`[kycCallback] admin KYC failed (score ${scorePercent} < ${kycMinimumScore}) — returning failure`);
       return res.status(httpStatus.OK).json({
         isSuccessful: false,
         message: "Admin KYC verification failed.",
@@ -87,7 +89,8 @@ export const postKycCallback = asyncHandler(async (req, res) => {
   if (isAgent) {
     await workflowRunner(completeAgentOnboardingWorkflow, {
       args: payload,
-      workflowId: `54link_complete_agent_onboarding_${metadata.keycloak_id}_${uuid4()}`,
+      // OB-08: deterministic id (keycloak_id + verification id) dedups repeat callback deliveries.
+      workflowId: `54link_complete_agent_onboarding_${metadata.keycloak_id}_${id}`,
       defaultErrorMessage: "Complete agent onboarding failed.",
       withTimeOut: 40000,
       timeOutFn: () => {
@@ -102,7 +105,8 @@ export const postKycCallback = asyncHandler(async (req, res) => {
   } else {
     await workflowRunner(completeCustomerOnboardingWorkflow, {
       args: payload,
-      workflowId: `54link_complete_customer_onboarding_${metadata.keycloak_id}_${uuid4()}`,
+      // OB-08: deterministic id (keycloak_id + verification id) dedups repeat callback deliveries.
+      workflowId: `54link_complete_customer_onboarding_${metadata.keycloak_id}_${id}`,
       defaultErrorMessage: "Complete customer onboarding failed.",
       withTimeOut: 40000,
       timeOutFn: () => {

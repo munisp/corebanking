@@ -45,6 +45,18 @@ class TenantService {
     const accountsFeature = tenant?.features?.find((f) => f.flag === "accounts");
     return accountsFeature?.config?.ledger_id ?? "1";
   }
+
+  // PL-02 / OB-08: suspend a tenant record in tenant-management
+  // (POST /tenant/{tenant_id}/suspend). Awaited — no fire-and-forget.
+  async suspendTenant(tenantId: string): Promise<void> {
+    await daprClient.invoke(
+      this.APP_ID,
+      `tenant/${tenantId}/suspend`,
+      HttpMethod.POST,
+      {},
+      { "x-tenant-id": tenantId }
+    );
+  }
 }
 
 export const tenantService = new TenantService();

@@ -50,10 +50,10 @@ export async function createAgentWorkflow(
       });
     }
 
-    // 01a. Create Auth Profile with USER role (agent-specific role tracked in agent service)
+    // 01a. Create Auth Profile — ST-03: persist the AGENT role (was USER).
     const auth = await createAuthProfile({
       email: args.email,
-      user_role: CustomerRole.USER,
+      user_role: CustomerRole.AGENT,
       tenant_id: args.tenantId,
       keycloak_realm: args.keycloakRealm,
       keycloak_pub_key: args.keycloakPublicKey,

@@ -476,16 +476,54 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
+// Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
+// or every 100 rows by a spawned task (was: one blocking INSERT per request).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
+        let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         let id = format!("{}_{}_{}", "typology_detector_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         let svc_name = String::from("typology-detector-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let client = client.clone();
+            let buf = buf.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+                loop {
+                    tick.tick().await;
+                    let rows: Vec<(String, String, String, String, String)> = {
+                        let mut b = buf.lock().unwrap();
+                        if b.is_empty() { continue; }
+                        std::mem::take(&mut *b)
+                    };
+                    for (id, svc, ep, st, d) in rows {
+                        let _ = client.execute(
+                            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                            &[&id, &svc, &ep, &st, &d],
+                        ).await;
+                    }
+                }
+            });
+        }
+        let mut b = buf.lock().unwrap();
+        b.push((id, svc_name, endpoint.to_string(), status, data_str));
+        if b.len() >= 100 {
+            let rows = std::mem::take(&mut *b);
+            drop(b);
+            let client = client.clone();
+            tokio::spawn(async move {
+                for (id, svc, ep, st, d) in rows {
+                    let _ = client.execute(
+                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                        &[&id, &svc, &ep, &st, &d],
+                    ).await;
+                }
+            });
+        }
     }
 }
 
@@ -558,6 +596,9 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
     match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
         Ok(mut stream) => {
+            // Wave-11: bound blocking I/O (was unbounded read_to_string).
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
             let host = host_port.split(':').next().unwrap_or("localhost");
             let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
             stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
@@ -728,12 +769,19 @@ HttpServer::new(move || {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("none")
                     .to_string();
-                eprintln!("[typology-detector-rs] {} {} trace={}", req.method(), req.path(), trace_id);
+                // Wave-11: log only errors, plus 1% sampled requests (was: every request).
+                let w11_method = req.method().clone();
+                let w11_path = req.path().to_string();
+                let w11_sample = _REQ_COUNT.load(AtomicOrdering::Relaxed) % 100 == 0;
                 let fut = srv.call(req);
                 async move {
                     let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
+                    let w11_err = res.status().is_server_error() || res.status().is_client_error();
+                    if w11_err {
                         _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if w11_err || w11_sample {
+                        eprintln!("[typology-detector-rs] {} {} trace={} status={}", w11_method, w11_path, trace_id, res.status().as_u16());
                     }
                     Ok(res)
                 }

@@ -124,8 +124,7 @@ func (m *MiddlewareIntegration) publishToKafka(topic string, event interface{}) 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -166,8 +165,7 @@ func (m *MiddlewareIntegration) postToTigerBeetle(endpoint string, data interfac
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -196,8 +194,7 @@ func (m *MiddlewareIntegration) CacheRMData(key string, data interface{}, ttlSec
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -243,8 +240,7 @@ func (m *MiddlewareIntegration) CheckPermission(userID, resource, action string)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("permify unreachable: %w", err)
 	}
@@ -284,8 +280,7 @@ func (m *MiddlewareIntegration) SendNotification(channel, recipient, subject, me
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -336,8 +331,7 @@ func (m *MiddlewareIntegration) PublishToLakehouse(table string, data interface{
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

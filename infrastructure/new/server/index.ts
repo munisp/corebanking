@@ -1792,10 +1792,49 @@ function currentRuntimeState(): PersistedRuntimeState {
   };
 }
 
+// TS-02: ring-buffer cap for the in-memory audit trail. Bounding the trail
+// also bounds the persisted payload (TS-01).
+const AUDIT_TRAIL_CAP = 1000;
+const RUNTIME_STATE_FLUSH_MS = 500;
+let runtimeStateDirty = false;
+let runtimeStateFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function trimAuditTrail() {
+  if (auditTrail.length > AUDIT_TRAIL_CAP) {
+    auditTrail.length = AUDIT_TRAIL_CAP;
+  }
+}
+
 function persistRuntimeState() {
+  // TS-01: never write synchronously on the request path. Mark the state dirty
+  // and schedule a coalesced async flush; mutations within the flush window
+  // collapse into a single file write + DB sync.
+  trimAuditTrail();
+  runtimeStateDirty = true;
+  if (runtimeStateFlushTimer) {
+    return;
+  }
+  runtimeStateFlushTimer = setTimeout(() => {
+    runtimeStateFlushTimer = null;
+    void flushRuntimeState();
+  }, RUNTIME_STATE_FLUSH_MS);
+  runtimeStateFlushTimer.unref();
+}
+
+async function flushRuntimeState() {
+  if (!runtimeStateDirty) {
+    return;
+  }
+  runtimeStateDirty = false;
+  trimAuditTrail();
   const payload = currentRuntimeState();
-  fs.mkdirSync(persistenceDirectory, { recursive: true });
-  fs.writeFileSync(persistenceFile, JSON.stringify(payload, null, 2));
+  try {
+    await fs.promises.mkdir(persistenceDirectory, { recursive: true });
+    // Compact JSON (no pretty-print) — smaller payload, cheaper write.
+    await fs.promises.writeFile(persistenceFile, JSON.stringify(payload));
+  } catch (error) {
+    logger.error("Unable to write platform runtime state file", { error: String(error) });
+  }
   persistenceChain = persistenceChain
     .then(async () => {
       await syncRuntimeStateToDb(
@@ -1809,6 +1848,16 @@ function persistRuntimeState() {
     .catch((error) => {
       logger.error("Unable to persist platform runtime state", { error: String(error) });
     });
+}
+
+// Flush any pending runtime-state write during graceful shutdown (SIGTERM/SIGINT).
+async function flushRuntimeStateForShutdown() {
+  if (runtimeStateFlushTimer) {
+    clearTimeout(runtimeStateFlushTimer);
+    runtimeStateFlushTimer = null;
+  }
+  await flushRuntimeState();
+  await persistenceChain;
 }
 
 async function refreshPartnerOnboardingRuntimeFromDb() {
@@ -2097,6 +2146,7 @@ function recordAudit(entry: Omit<AuditEntry, "id" | "timestamp">) {
     ...entry,
   };
   auditTrail.unshift(record);
+  trimAuditTrail();
   persistRuntimeState();
   return record;
 }
@@ -2929,8 +2979,9 @@ async function startServer() {
   app.use(jwtAuthMiddleware);
   app.use(multiTenancyMiddleware);
 
-  // Production auth middleware (validates JWT on all /api/* routes)
-  app.use(authMiddleware());
+  // TS-03: removed duplicate authMiddleware() registration here — the single
+  // registration above (before registerAuthRoutes) already covers every route
+  // registered after it, so a second app.use() double-verified JWTs per request.
 
   // MFA & API key routes (must be AFTER authMiddleware so req.user is populated)
   registerMfaRoutes(app);
@@ -3622,6 +3673,7 @@ async function startServer() {
       middleware: ["Postgres", "Notification rail"],
       detail: notification.message,
     });
+    trimAuditTrail();
     res.status(201).json(notification);
   });
 
@@ -5197,15 +5249,19 @@ async function startServer() {
     }
 
     const searchDomains: { name: string; url: string }[] = [];
-    if (!domain || domain === "disputes") searchDomains.push({ name: "disputes", url: `${DISPUTE_SERVICE_URL}/v1/disputes/cases` });
+    if (!domain || domain === "disputes") searchDomains.push({ name: "disputes", url: `${DISPUTE_SERVICE_URL}/api/v1/disputes` });
     if (!domain || domain === "customers") searchDomains.push({ name: "customers", url: "" });
 
     const results: Array<{ domain: string; id: string; match: string; score: number }> = [];
-    for (const d of searchDomains) {
+    // TS-04: hoist a single escaped RegExp out of the per-item loop (escaping
+    // also prevents ReDoS from a user-supplied pattern).
+    const queryRegex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    // TS-06: fan out to search domains concurrently — iterations are independent.
+    await Promise.allSettled(searchDomains.map(async (d) => {
       try {
-        if (!d.url) continue;
+        if (!d.url) return;
         const resp = await fetch(d.url, { signal: AbortSignal.timeout(5000) });
-        if (!resp.ok) continue;
+        if (!resp.ok) return;
         const data = await resp.json() as Record<string, unknown>[];
         const items = Array.isArray(data) ? data : [];
         for (const item of items) {
@@ -5215,12 +5271,12 @@ async function startServer() {
               domain: d.name,
               id: String((item as Record<string, unknown>).id ?? ""),
               match: text.slice(0, 200),
-              score: (text.match(new RegExp(query, "g")) ?? []).length,
+              score: (text.match(queryRegex) ?? []).length,
             });
           }
         }
       } catch { /* service not available */ }
-    }
+    }));
 
     results.sort((a, b) => b.score - a.score);
     res.json({ query, results: results.slice(0, limit), total: results.length });
@@ -5236,11 +5292,11 @@ async function startServer() {
   const VIRTUAL_ACCOUNTS_SERVICE_URL = process.env.VIRTUAL_ACCOUNTS_SERVICE_URL || "http://localhost:8096";
   const AGENT_BANKING_SERVICE_URL = process.env.AGENT_BANKING_SERVICE_URL || "http://localhost:8097";
   const GROUP_LENDING_SERVICE_URL = process.env.GROUP_LENDING_SERVICE_URL || "http://localhost:8098";
-  const EDUCATION_LOANS_SERVICE_URL = process.env.EDUCATION_LOANS_SERVICE_URL || "http://localhost:8099";
   const LEDGER_RECON_SERVICE_URL = process.env.LEDGER_RECON_SERVICE_URL || "http://localhost:8100";
   const IDENTITY_CHANNELS_SERVICE_URL = process.env.IDENTITY_CHANNELS_SERVICE_URL || "http://localhost:8101";
-  const DISPUTE_SERVICE_URL = process.env.DISPUTE_SERVICE_URL || "http://localhost:8102";
-  const ERPNEXT_SYNC_SERVICE_URL = process.env.ERPNEXT_SYNC_SERVICE_URL || "http://localhost:8103";
+  // OR-06 closure: repointed from deleted dispute-management-py (:8102) to the real
+  // dispute-service (uvicorn PORT default 8019, services/dispute-service/main.py:609).
+  const DISPUTE_SERVICE_URL = process.env.DISPUTE_SERVICE_URL || "http://localhost:8019";
   const REGULATORY_SERVICE_URL = process.env.REGULATORY_SERVICE_URL || "http://localhost:8104";
   const SECURITY_GATEWAY_URL = process.env.SECURITY_GATEWAY_URL || "http://localhost:8105";
   const RESILIENCE_SERVICE_URL = process.env.RESILIENCE_SERVICE_URL || "http://localhost:8106";
@@ -5280,11 +5336,9 @@ async function startServer() {
     "virtual-accounts": VIRTUAL_ACCOUNTS_SERVICE_URL,
     "agent-banking": AGENT_BANKING_SERVICE_URL,
     "group-lending": GROUP_LENDING_SERVICE_URL,
-    "education-loans": EDUCATION_LOANS_SERVICE_URL,
     "ledger-recon": LEDGER_RECON_SERVICE_URL,
     "identity-channels": IDENTITY_CHANNELS_SERVICE_URL,
     "disputes": DISPUTE_SERVICE_URL,
-    "erpnext-sync": ERPNEXT_SYNC_SERVICE_URL,
     "regulatory": REGULATORY_SERVICE_URL,
     "security-gateway": SECURITY_GATEWAY_URL,
     "resilience": RESILIENCE_SERVICE_URL,
@@ -5867,35 +5921,6 @@ async function startServer() {
     void proxyToService(GROUP_LENDING_SERVICE_URL, `/v1/group-lending/groups/${req.params.id}/repay`, req, res);
   });
 
-  // Education Loans proxy routes (Python :8099)
-  app.all("/api/platform/education-loans/loans", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education-loans/loans", req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/approve", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/approve`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/disburse", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/disburse`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/repay", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/repay`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/defer", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/defer`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/schedule", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/schedule`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/disbursements", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/disbursements`, req, res);
-  });
-  app.all("/api/platform/education-loans/repayments", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education-loans/repayments", req, res);
-  });
-
   // Ledger Reconciliation proxy routes (Rust :8100)
   app.all("/api/platform/reconciliation/runs", (req, res) => {
     void proxyToService(LEDGER_RECON_SERVICE_URL, "/v1/reconciliation/runs", req, res);
@@ -5943,55 +5968,6 @@ async function startServer() {
   });
   app.all("/api/platform/identity/sessions", (req, res) => {
     void proxyToService(IDENTITY_CHANNELS_SERVICE_URL, "/v1/identity/sessions", req, res);
-  });
-
-  // Dispute Management proxy routes (Python :8102)
-  app.all("/api/platform/disputes/cases", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/cases", req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/evidence", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/evidence`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/investigate", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/investigate`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/resolve", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/resolve`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/escalate", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/escalate`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/chargeback", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/chargeback`, req, res);
-  });
-  app.all("/api/platform/disputes/categories", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/categories", req, res);
-  });
-
-  // ERPNext Sync proxy routes (Python :8103)
-  app.all("/api/platform/erpnext/sync-jobs", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, "/v1/erpnext/sync-jobs", req, res);
-  });
-  app.all("/api/platform/erpnext/sync-jobs/:id", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/sync-jobs/${req.params.id}`, req, res);
-  });
-  app.all("/api/platform/erpnext/sync-jobs/:id/execute", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/sync-jobs/${req.params.id}/execute`, req, res);
-  });
-  app.all("/api/platform/erpnext/sync-jobs/:id/retry", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/sync-jobs/${req.params.id}/retry`, req, res);
-  });
-  app.all("/api/platform/erpnext/journal-entries", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, "/v1/erpnext/journal-entries", req, res);
-  });
-  app.all("/api/platform/erpnext/coa-mappings", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, "/v1/erpnext/coa-mappings", req, res);
-  });
-  app.all("/api/platform/erpnext/coa-mappings/:id", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/coa-mappings/${req.params.id}`, req, res);
   });
 
   // Regulatory Reporting proxy routes (Python :8104)
@@ -6274,34 +6250,6 @@ async function startServer() {
   });
   app.all("/api/platform/esusu/analytics", (req, res) => {
     void proxyToService(ESUSU_SERVICE_URL, "/v1/esusu/analytics", req, res);
-  });
-
-  // B8: Education Loans enhanced routes
-  app.all("/api/platform/education/institutions", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/institutions", req, res);
-  });
-  app.all("/api/platform/education/grace-periods", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/grace-periods", req, res);
-  });
-  app.all("/api/platform/education/scholarships", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/scholarships", req, res);
-  });
-  app.all("/api/platform/education/income-repayment", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/income-repayment", req, res);
-  });
-
-  // B9: Disputes enhanced routes
-  app.all("/api/platform/disputes/chargebacks", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/chargebacks", req, res);
-  });
-  app.all("/api/platform/disputes/arbitration", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/arbitration", req, res);
-  });
-  app.all("/api/platform/disputes/sla", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/sla", req, res);
-  });
-  app.all("/api/platform/disputes/evidence", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/evidence", req, res);
   });
 
   // B10: Regulatory enhanced routes
@@ -8544,6 +8492,8 @@ async function startServer() {
       server.close(() => resolve());
     });
 
+    // TS-01: flush any debounced runtime-state write before tearing down the DB pool.
+    await flushRuntimeStateForShutdown();
     await closeDbPool();
     process.exit(0);
   };

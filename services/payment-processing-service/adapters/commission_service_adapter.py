@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 import uuid
 
@@ -66,7 +67,13 @@ class CommissionServiceAdapter:
 
     @staticmethod
     def _to_minor_units(amount: float) -> int:
-        return int(round(float(amount)))
+        # MN-10 (F13-1): amounts here are MAJOR units (naira); minor units
+        # (kobo) = amount * 100 with explicit ROUND_HALF_UP (F13-8).
+        return int(
+            (Decimal(str(amount)) * 100).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
 
     def _zero_commission(self, amount: float, currency: str) -> dict[str, Any]:
         gross_minor = self._to_minor_units(amount)
@@ -101,9 +108,23 @@ class CommissionServiceAdapter:
                 metadata=metadata,
             )
         except Exception as err:
+            # F2-04: fail-closed. Zero commission on commission-service outage
+            # is only permitted when explicitly configured.
+            if not getattr(config, "ALLOW_ZERO_COMMISSION", False):
+                logger.error(
+                    "Commission service unavailable and ALLOW_ZERO_COMMISSION is not "
+                    "enabled; failing transaction closed transaction_type=%s ref=%s error=%s",
+                    transaction_type,
+                    transaction_ref,
+                    str(err),
+                )
+                raise Exception(
+                    "Commission service unavailable and zero-commission fallback "
+                    "is not enabled (set ALLOW_ZERO_COMMISSION=true to permit)"
+                ) from err
             logger.warning(
                 "Commission service unavailable, proceeding with zero commission "
-                "transaction_type=%s ref=%s error=%s",
+                "(ALLOW_ZERO_COMMISSION=true) transaction_type=%s ref=%s error=%s",
                 transaction_type,
                 transaction_ref,
                 str(err),

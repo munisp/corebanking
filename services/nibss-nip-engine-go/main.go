@@ -13,6 +13,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -26,7 +27,20 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"shared/otel/go/otelkit"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ISO 8583 MESSAGE STRUCTURES
@@ -262,8 +276,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[auth] JWKS fetch failed: %v", err)
 		return
@@ -700,6 +713,17 @@ func main() {
 	if port == "" {
 		port = "8111"
 	}
+	shutdown, oerr := otelkit.Init(context.Background(), "nibss-nip-engine-go")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startJWKSRefresh()
 	http.HandleFunc("/healthz", handleHealthz)
 	// Money-path endpoints require a verified RS256 Bearer token (fail-closed).
@@ -718,7 +742,7 @@ func main() {
 	// Slowloris hardening: explicit server timeouts (ReadHeader/Read/Write/Idle).
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           http.DefaultServeMux,
+		Handler:           otelkit.HTTPMiddleware(http.DefaultServeMux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

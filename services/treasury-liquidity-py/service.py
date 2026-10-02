@@ -7,6 +7,7 @@ Middleware: Kafka, Redis, TigerBeetle, Temporal, Postgres, OpenSearch, Lakehouse
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from typing import List
@@ -15,6 +16,7 @@ import os
 
 app = FastAPI(title="54link-dev Treasury & Liquidity", version="1.0.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
 # is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
@@ -461,4 +463,4 @@ def alm_report():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8110))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("service:app", host="0.0.0.0", port=port, workers=int(os.environ.get("UVICORN_WORKERS", "4")))

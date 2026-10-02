@@ -6,32 +6,13 @@ import json
 
 PORT = int(os.environ.get("PORT", "8255"))
 
-RETURNS = [
-    {"id": "RET-001", "type": "CBN_eFASS", "name": "Electronic Financial Analysis Surveillance System", "frequency": "monthly", "dueDate": "2026-06-15", "status": "auto_generated", "dataPoints": 450, "lastGenerated": "2026-05-11T00:00:00Z", "format": "XML"},
-    {"id": "RET-002", "type": "NDIC_Returns", "name": "NDIC Quarterly Returns", "frequency": "quarterly", "dueDate": "2026-07-15", "status": "auto_generated", "dataPoints": 280, "lastGenerated": "2026-05-11T00:00:00Z", "format": "Excel"},
-    {"id": "RET-003", "type": "Basel_III_LCR", "name": "Liquidity Coverage Ratio Report", "frequency": "daily", "dueDate": "2026-05-12", "status": "auto_generated", "dataPoints": 120, "lastGenerated": "2026-05-11T00:00:00Z", "format": "JSON"},
-    {"id": "RET-004", "type": "Basel_III_NSFR", "name": "Net Stable Funding Ratio", "frequency": "quarterly", "dueDate": "2026-07-15", "status": "auto_generated", "dataPoints": 95, "lastGenerated": "2026-05-11T00:00:00Z", "format": "JSON"},
-    {"id": "RET-005", "type": "CBN_CTR", "name": "Currency Transaction Report", "frequency": "daily", "dueDate": "2026-05-12", "status": "auto_generated", "dataPoints": 340, "lastGenerated": "2026-05-11T00:00:00Z", "format": "XML"},
-    {"id": "RET-006", "type": "CBN_STR", "name": "Suspicious Transaction Report", "frequency": "immediate", "dueDate": "2026-05-11", "status": "auto_generated", "dataPoints": 15, "lastGenerated": "2026-05-11T12:00:00Z", "format": "XML"},
-    {"id": "RET-007", "type": "FIRS_WHT", "name": "Withholding Tax Returns", "frequency": "monthly", "dueDate": "2026-06-21", "status": "auto_generated", "dataPoints": 180, "lastGenerated": "2026-05-11T00:00:00Z", "format": "Excel"},
-    {"id": "RET-008", "type": "CBN_BOFI", "name": "Bank Other Financial Institutions Returns", "frequency": "monthly", "dueDate": "2026-06-15", "status": "auto_generated", "dataPoints": 520, "lastGenerated": "2026-05-11T00:00:00Z", "format": "XML"},
-]
-
-SCHEDULES = [
-    {"id": "SCH-001", "returnType": "CBN_eFASS", "cronExpression": "0 0 1 * *", "nextRun": "2026-06-01T00:00:00Z", "lastRun": "2026-05-01T00:00:00Z", "status": "active"},
-    {"id": "SCH-002", "returnType": "Basel_III_LCR", "cronExpression": "0 23 * * *", "nextRun": "2026-05-11T23:00:00Z", "lastRun": "2026-05-10T23:00:00Z", "status": "active"},
-    {"id": "SCH-003", "returnType": "CBN_CTR", "cronExpression": "0 22 * * *", "nextRun": "2026-05-11T22:00:00Z", "lastRun": "2026-05-10T22:00:00Z", "status": "active"},
-    {"id": "SCH-004", "returnType": "CBN_STR", "cronExpression": "*/15 * * * *", "nextRun": "2026-05-11T15:15:00Z", "lastRun": "2026-05-11T15:00:00Z", "status": "active"},
-]
-
-DATA_SOURCES = [
-    {"id": "DS-001", "name": "Core Banking GL", "service": "gl-engine-rs", "dataType": "trial_balance", "refreshRate": "realtime"},
-    {"id": "DS-002", "name": "Transaction Ledger", "service": "tigerbeetle", "dataType": "transactions", "refreshRate": "realtime"},
-    {"id": "DS-003", "name": "Customer Registry", "service": "cif-management-go", "dataType": "customer_profiles", "refreshRate": "daily"},
-    {"id": "DS-004", "name": "Loan Portfolio", "service": "loan-origination-go", "dataType": "loan_balances", "refreshRate": "daily"},
-    {"id": "DS-005", "name": "Treasury Positions", "service": "treasury-liquidity-py", "dataType": "liquidity_positions", "refreshRate": "hourly"},
-    {"id": "DS-006", "name": "KYC/AML Data", "service": "kyc-engine-py", "dataType": "screening_results", "refreshRate": "realtime"},
-]
+# CP-11: the hardcoded RETURNS / SCHEDULES / DATA_SOURCES constants (fabricated
+# "auto_generated" CBN eFASS / NDIC / Basel / CTR / STR records with invented
+# dataPoints counts) were deleted. Fabricated regulatory returns presented as
+# real are worse than none. This service has no database and no generation
+# engine, so the routes below return an honest HTTP 501. For real GL-derived
+# returns use services/efass-generator-rs; for CTR/STR filing use
+# services/nfiu-ctr-str-filing-py.
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -188,40 +169,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(401, {"error": "unauthorized", "detail": _n1_err})
                 return
         if self.path == "/healthz":
+            # CP-11: the previous "middleware" block claimed 14 integrations
+            # (kafka/dapr/fluvio/temporal/postgres/...) as "connected" — none
+            # of them exist in this service. Removed; honest minimal health.
             self._respond(200, {
-                "service": "regulatory-automation-py", "status": "healthy", "version": "1.0.0",
-                "middleware": {
-                    "kafka": {"status": "connected", "topics": ["regulatory.returns", "regulatory.alerts", "regulatory.submissions"]},
-                    "dapr": {"status": "connected", "appId": "regulatory-automation-py"},
-                    "fluvio": {"status": "connected", "topic": "regulatory-realtime"},
-                    "temporal": {"status": "connected", "workflows": ["return-generation", "submission-workflow", "data-collection"]},
-                    "postgres": {"status": "connected", "tables": ["regulatory_returns", "schedules", "data_sources", "submissions"]},
-                    "keycloak": {"status": "connected", "realm": "54link-dev"},
-                    "permify": {"status": "connected", "schema": "regulatory_rbac"},
-                    "redis": {"status": "connected", "prefix": "regulatory:"},
-                    "mojaloop": {"status": "connected", "participant": "regulatory-automation"},
-                    "opensearch": {"status": "connected", "index": "regulatory-returns-*"},
-                    "openappsec": {"status": "connected", "policy": "regulatory-protection"},
-                    "apisix": {"status": "connected", "upstream": "regulatory-automation"},
-                    "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
-                    "lakehouse": {"status": "connected", "table": "regulatory_returns_iceberg"},
-                },
+                "service": "regulatory-automation-py", "status": "healthy", "version": "1.0.1",
+                "capabilities": "none — return generation not implemented (see /v1/regulatory/* 501s)",
             })
-        elif self.path.startswith("/v1/regulatory/returns"):
-            self._respond(200, {"items": RETURNS, "total": len(RETURNS)})
-        elif self.path.startswith("/v1/regulatory/schedules"):
-            self._respond(200, {"items": SCHEDULES, "total": len(SCHEDULES)})
-        elif self.path.startswith("/v1/regulatory/data-sources"):
-            self._respond(200, {"items": DATA_SOURCES, "total": len(DATA_SOURCES)})
-        elif self.path.startswith("/v1/regulatory/stats"):
-            total_data_points = sum(r["dataPoints"] for r in RETURNS)
-            active_schedules = sum(1 for s in SCHEDULES if s["status"] == "active")
-            self._respond(200, {
-                "totalReturns": len(RETURNS), "totalDataPoints": total_data_points,
-                "activeSchedules": active_schedules, "totalDataSources": len(DATA_SOURCES),
-                "automationRate": 100.0, "complianceScore": 100.0,
-                "frameworks": ["CBN", "NDIC", "Basel_III", "FIRS", "NFIU"],
-                "returnFormats": ["XML", "Excel", "JSON", "PDF"],
+        elif self.path.startswith("/v1/regulatory/"):
+            # CP-11: honest 501 — the seeded return/schedule/data-source
+            # records and 100% automation stats were fabrication and have been
+            # deleted. Real return generation lives in efass-generator-rs
+            # (GL-derived); CTR/STR filing in nfiu-ctr-str-filing-py.
+            self._respond(501, {
+                "error": "not_implemented",
+                "detail": "Automated regulatory return generation is not implemented in this "
+                          "service. Use efass-generator-rs for GL-derived CBN returns and "
+                          "nfiu-ctr-str-filing-py for CTR/STR filings.",
             })
         else:
             self._respond(404, {"error": "not found"})

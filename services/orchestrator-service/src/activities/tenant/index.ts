@@ -4,3 +4,7 @@ export * from "./provisionKeycloakRealm";
 export * from "./createTenant";
 export * from "./createMintAccount";
 export * from "./getTenant";
+export * from "./deleteTenantRealm";
+export * from "./revokeTenantSessions";
+export * from "./suspendTenantRecord";
+export * from "./publishTenantTombstone";

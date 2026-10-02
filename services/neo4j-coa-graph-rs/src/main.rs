@@ -557,9 +557,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }

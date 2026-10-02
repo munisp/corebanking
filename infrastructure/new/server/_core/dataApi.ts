@@ -48,6 +48,7 @@ export async function callDataApi(
   if (apiKey) headers["x-api-key"] = apiKey;
 
   const response = await fetch(url, {
+    signal: AbortSignal.timeout(10_000),
     method: options.body ? "POST" : "GET",
     headers,
     ...(options.body ? { body: JSON.stringify(options.body) } : {}),

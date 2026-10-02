@@ -1,3 +1,4 @@
+import asyncio
 import os
 import threading
 import time
@@ -19,7 +20,10 @@ config = get_config()
 logger = create_logger(__name__)
 
 # ── JWKS cache (H-34): module-level, TTL-bound, single-flight, with timeouts ──
-_JWKS_CACHE_TTL_SECONDS = int(os.getenv("JWKS_CACHE_TTL_SECONDS", "300"))
+# W11 PY-706: TTL raised to 15min and a background refresh task re-fetches
+# cached documents before expiry so the request path almost never performs a
+# blocking network fetch; any remaining fetch runs via asyncio.to_thread.
+_JWKS_CACHE_TTL_SECONDS = int(os.getenv("JWKS_CACHE_TTL_SECONDS", "900"))
 _JWKS_FETCH_TIMEOUT_SECONDS = float(os.getenv("JWKS_FETCH_TIMEOUT_SECONDS", "5"))
 
 # {jwks_url: {"fetched_at": float, "keys": {kid: jwk}}}
@@ -179,8 +183,10 @@ class TokenService:
             )
         pem_key = self.jwk_to_pem(key_data)
 
-        decode_options = {"verify_exp": True, "verify_signature": True}
-        decode_kwargs = {}
+        decode_options = {"verify_exp": True, "verify_signature": True, "verify_nbf": True}
+        # PL-06: clock-skew tolerance for exp/nbf (previously zero — any
+        # pod/IdP clock drift caused spurious 401s fleet-wide).
+        decode_kwargs = {"leeway": float(os.getenv("JWT_LEEWAY_SECONDS", "30"))}
         # iss is always validated against the configured/derived realm issuer.
         decode_kwargs["issuer"] = self._expected_issuer(context)
         decode_options["verify_iss"] = True
@@ -202,10 +208,58 @@ class TokenService:
         )
         return decoded_token
 
+    async def avalidate_token(self, token: str, context: Context):
+        """Async variant of validate_token for async middleware/handlers.
+
+        The blocking JWKS fetch (and RSA crypto) run in a worker thread via
+        asyncio.to_thread; failure semantics (401/503 ApiError, stale-cache
+        fallback) are identical to validate_token.
+        """
+        ensure_jwks_background_refresh()
+        return await asyncio.to_thread(self.validate_token, token, context)
+
     def refresh_token(self, token: str, context: Context) -> dict:
         return KeycloakAdapter(realm=context.keycloak_realm).refresh_user_token(
             refresh_token=token
         )
+
+
+# ── Background JWKS refresh (W11 PY-706) ────────────────────────────────────
+_jwks_bg_task = None
+
+
+async def _jwks_refresh_loop():
+    """Periodically re-fetch cached JWKS documents before their TTL expires
+    so request-path validations are served warm from cache."""
+    while True:
+        await asyncio.sleep(max(_JWKS_CACHE_TTL_SECONDS // 2, 60))
+        with _jwks_cache_lock:
+            due = [
+                url
+                for url, entry in _jwks_cache.items()
+                if time.time() - entry["fetched_at"] >= _JWKS_CACHE_TTL_SECONDS // 2
+            ]
+        for url in due:
+            try:
+                # Runs the (blocking, single-flight, stale-on-error) refresh
+                # off the event loop.
+                await asyncio.to_thread(token_service._get_jwks_keys, url)
+            except Exception as exc:
+                # _get_jwks_keys already serves stale / logs; this guard only
+                # covers a cold-cache failure — keep the loop alive either way.
+                logger.warning(f"Background JWKS refresh failed for {url}: {exc}")
+
+
+def ensure_jwks_background_refresh():
+    """Idempotently start the background JWKS refresh task on the running
+    event loop (no-op outside an async context or if already running)."""
+    global _jwks_bg_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _jwks_bg_task is None or _jwks_bg_task.done():
+        _jwks_bg_task = loop.create_task(_jwks_refresh_loop())
 
 
 token_service = TokenService()

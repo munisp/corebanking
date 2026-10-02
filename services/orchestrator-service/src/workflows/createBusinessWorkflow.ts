@@ -49,10 +49,10 @@ export async function createBusinessWorkflow(
       screenType: "onboarding",
     });
 
-    // 01a. Create Auth Profile
+    // 01a. Create Auth Profile — ST-03: persist the BUSINESS role (was USER).
     const auth = await createAuthProfile({
       email: args.email,
-      user_role: CustomerRole.USER,
+      user_role: CustomerRole.BUSINESS,
       tenant_id: args.tenantId,
       keycloak_realm: args.keycloakRealm,
       keycloak_pub_key: args.keycloakPublicKey,

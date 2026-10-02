@@ -1,0 +1,249 @@
+apiVersion: 1
+groups:
+- orgId: 1
+  name: corebanking-availability
+  folder: Corebanking Alerts
+  interval: 1m
+  rules:
+  - uid: cb-servicedown
+    title: ServiceDown
+    condition: B
+    data:
+    - refId: A
+      queryType: ''
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: up{service_namespace="corebanking"} == 0
+        instant: true
+        intervalMs: 1000
+        legendFormat: __auto
+        maxDataPoints: 43200
+        range: false
+        refId: A
+    - refId: B
+      queryType: ''
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 1
+            type: lt
+          operator:
+            type: and
+          query:
+            params:
+            - B
+          reducer:
+            params: []
+            type: last
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: B
+        type: classic_conditions
+    noDataState: Alerting
+    execErrState: Error
+    for: 5m
+    annotations:
+      summary: Service {{ $labels.service_name }} (instance {{ $labels.instance }}) has been down for 5 minutes.
+      runbook_hint: "Check pod/deploy state (kubectl get pods -l app={{ $labels.service_name }}), recent rollouts, and the\
+        \ collector scrape config. NOTE: 41 services report fabricated healthz (audit F15-9) \u2014 trust `up`, not /healthz\
+        \ payloads."
+    labels:
+      severity: critical
+      team: platform-ops
+    isPaused: false
+  - uid: cb-tigerbeetle-unavailable
+    title: TigerBeetleUnavailable
+    condition: B
+    data:
+    - refId: A
+      queryType: ''
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: up{job=~"tigerbeetle.*"} == 0
+        instant: true
+        intervalMs: 1000
+        legendFormat: __auto
+        maxDataPoints: 43200
+        range: false
+        refId: A
+    - refId: B
+      queryType: ''
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 1
+            type: lt
+          operator:
+            type: and
+          query:
+            params:
+            - B
+          reducer:
+            params: []
+            type: last
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: B
+        type: classic_conditions
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: TigerBeetle ledger target {{ $labels.instance }} is unreachable.
+      runbook_hint: 'TigerBeetle backs all money-path transfers (money map TOP 20 #1-4,11-12,17,19). Halt payment-processing-service
+        traffic; check tigerbeetle cluster pods and the tigerbeetle-adapter-rs sidecar (note: its image cannot be built from
+        source per audit F16-1).'
+    labels:
+      severity: critical
+      team: money-ops
+      money_path: 'true'
+      finding: F16-1
+    isPaused: false
+  - uid: cb-idempotency-store-down
+    title: IdempotencyStoreUnavailable
+    condition: B
+    data:
+    - refId: A
+      queryType: ''
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: '(redis_up{job=~".*(idempotency|redis).*"} == 0) or (redis_up{service_name=~".*redis.*"} == 0)'
+        instant: true
+        intervalMs: 1000
+        legendFormat: __auto
+        maxDataPoints: 43200
+        range: false
+        refId: A
+    - refId: B
+      queryType: ''
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 1
+            type: lt
+          operator:
+            type: and
+          query:
+            params:
+            - B
+          reducer:
+            params: []
+            type: last
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: B
+        type: classic_conditions
+    noDataState: Alerting
+    execErrState: Error
+    for: 2m
+    annotations:
+      summary: "Idempotency store (Redis/Dapr state) is down \u2014 money paths fail OPEN."
+      runbook_hint: 'Audit F12-04: the idempotency store fails open, so retries can double-post. Freeze payment-processing-service
+        and nibss-nip-engine-go writes, restore Redis/Dapr state component, then reconcile in-flight transfer ids before resuming.'
+    labels:
+      severity: critical
+      team: money-ops
+      money_path: 'true'
+      finding: F12-04
+    isPaused: false
+  - uid: cb-collector-queue-backpressure
+    title: CollectorQueueBackpressure
+    condition: B
+    data:
+    - refId: A
+      queryType: ''
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: otelcol_queue_size / otelcol_queue_capacity > 0.8
+        instant: true
+        intervalMs: 1000
+        legendFormat: __auto
+        maxDataPoints: 43200
+        range: false
+        refId: A
+    - refId: B
+      queryType: ''
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 0.8
+            type: gt
+          operator:
+            type: and
+          query:
+            params:
+            - B
+          reducer:
+            params: []
+            type: last
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: B
+        type: classic_conditions
+    noDataState: NoData
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: "OTel collector send queue is at {{ $value | humanizePercentage }} of capacity \u2014 telemetry loss imminent."
+      runbook_hint: Scale collector replicas or raise queue/batch settings in infrastructure/observability/otel-collector/config.yaml;
+        check exporter (Tempo/Prometheus/Loki) latency. Persistent backpressure silently drops spans/metrics.
+    labels:
+      severity: warning
+      team: platform-ops
+    isPaused: false

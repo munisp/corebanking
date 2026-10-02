@@ -1,0 +1,72 @@
+# =============================================================================
+# Keycloak — OpenTelemetry tracing + Prometheus metrics (env patch)
+#
+# Target (verified-static): infrastructure/new/k8s/infrastructure.yaml deploys
+# `Deployment/keycloak` ns `54bank`, container `keycloak`,
+# image quay.io/keycloak/keycloak:24.0 — see README: **v24 ignores
+# KC_TRACING_* and serves metrics on :8080, not :9000.** This patch is written
+# for the v25+ upgrade path; apply together with the image bump.
+#
+# Requirements (README): Keycloak v25+ (Quarkus distribution). The `KC_TRACING_*`
+# options exist from v25 (preview) and are stable from v26.
+#
+# Contracts (SPEC §3 / §2.1):
+#   - metrics endpoint :9000 (management port) -> job `keycloak`
+#   - OTLP gRPC to the collector on :4317
+#   - full sampling (money path), service.namespace=corebanking
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak              # matches infrastructure/new/k8s/infrastructure.yaml
+  namespace: 54bank
+spec:
+  template:
+    spec:
+      containers:
+        - name: keycloak      # matches existing container name
+          # image: quay.io/keycloak/keycloak:26.0   # REQUIRED: bump from 24.0 (uncomment at apply time)
+          env:
+            # --- Tracing (Keycloak >= 25) -----------------------------------
+            - name: KC_TRACING_ENABLED
+              value: "true"
+            - name: KC_TRACING_ENDPOINT
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: KC_TRACING_PROTOCOL
+              value: "grpc"
+            - name: KC_TRACING_SERVICE_NAME
+              value: "keycloak"
+            - name: KC_TRACING_SAMPLER_RATIO
+              value: "1.0"    # SPEC §2.1: money services always 1.0
+            - name: KC_TRACING_RESOURCE_ATTRIBUTES
+              value: "service.namespace=corebanking,deployment.environment=$(DEPLOY_ENV)"
+            - name: DEPLOY_ENV
+              value: "dev"    # SPEC §2.2 default
+            # --- Metrics (Prometheus) ---------------------------------------
+            - name: KC_METRICS_ENABLED
+              value: "true"
+            # Management interface (health+metrics) — default 9000 since v25,
+            # pinned here to make the :9000 scrape contract explicit.
+            - name: KC_HTTP_MANAGEMENT_PORT
+              value: "9000"
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 9000
+              name: mgmt-metrics
+---
+# Scrape Service so the collector job `keycloak` (:9000) has a stable target.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-metrics
+  namespace: 54bank           # matches the Keycloak Deployment namespace
+  labels:
+    observability.corebanking/scrape: "true"
+spec:
+  selector:
+    app: keycloak             # matches existing pod labels
+  ports:
+    - name: metrics
+      port: 9000
+      targetPort: 9000

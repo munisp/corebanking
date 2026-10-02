@@ -1,5 +1,6 @@
 #![allow(unused)]
 use tokio_postgres;
+use std::sync::Mutex;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,8 @@ struct CreateRequest {
 
 struct AppState {
     db: PgPool,
+    records: Mutex<Vec<serde_json::Value>>,
+    db_url: Option<String>,
 }
 
 fn composite_risk(credit: f64, market: f64, operational: f64, liquidity: f64) -> f64 {
@@ -87,10 +90,21 @@ async fn score_entity(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     db_persist(&state, "score_entity", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("RISK_ASSESSMENT_URL").unwrap_or_else(|_| "http://localhost:8125".to_string());
-    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/assess", _upstream_url), "{}")).await {
-        Ok(Ok(_resp)) => eprintln!("risk-scoring-rs: upstream call ok"),
-        Ok(Err(e)) => eprintln!("risk-scoring-rs: upstream call failed: {}", e),
-        Err(e) => eprintln!("risk-scoring-rs: upstream call join failed: {}", e),
+    {
+        // Wave-11: upstream AML/notify result is discarded on this path; run
+        // fire-and-forget with a 3s timeout instead of blocking the request.
+        let (w11_url, w11_body) = ((format!("{}/v1/assess", _upstream_url)).to_string(), ("{}").to_string());
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::task::spawn_blocking(move || call_service_sync(&w11_url, &w11_body)),
+            ).await {
+                Ok(Ok(Ok(_resp))) => {}
+                Ok(Ok(Err(e))) => eprintln!("risk-scoring-rs: upstream call failed: {}", e),
+                Ok(Err(e)) => eprintln!("risk-scoring-rs: upstream call join failed: {}", e),
+                Err(_) => eprintln!("risk-scoring-rs: upstream call timed out after 3s"),
+            }
+        });
     }
 
     HttpResponse::Ok().json(json!({
@@ -142,22 +156,27 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
     let offset = (page - 1) * limit;
-    if let Some(ref client) = state.db_client {
-        match client.query(
+    { // Wave-11: read via shared sqlx pool (was single tokio_postgres client)
+        match sqlx::query(
             "SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-            &[&"risk_scoring_rs", &(limit as i64), &(offset as i64)]
-        ).await {
+        )
+        .bind("risk_scoring_rs")
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&state.db)
+        .await {
             Ok(rows) => {
                 let items: Vec<serde_json::Value> = rows.iter().map(|r| {
                     json!({
-                        "id": r.get::<_, String>(0),
-                        "service": r.get::<_, String>(1),
-                        "type": r.get::<_, String>(2),
-                        "status": r.get::<_, String>(3),
-                        "data": r.get::<_, String>(4),
+                        "id": r.get::<String, _>(0),
+                        "service": r.get::<String, _>(1),
+                        "type": r.get::<String, _>(2),
+                        "status": r.get::<String, _>(3),
+                        "data": r.get::<serde_json::Value, _>(4),
                     })
                 }).collect();
-                let total: i64 = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = $1", &[&"risk_scoring_rs"]).await.map(|r| r.get(0)).unwrap_or(0);
+                let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_records WHERE service = $1")
+                    .bind("risk_scoring_rs").fetch_one(&state.db).await.unwrap_or(0);
                 return HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "database"}));
             }
             Err(e) => { eprintln!("DB query failed: {} — fallback to in-memory", e); }
@@ -170,9 +189,9 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
 }
 
 async fn stats(state: web::Data<AppState>) -> HttpResponse {
-    if let Some(ref client) = state.db_client {
-        if let Ok(row) = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = $1", &[&"risk_scoring_rs"]).await {
-            let total: i64 = row.get(0);
+    { // Wave-11: read via shared sqlx pool
+        if let Ok(total) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM service_records WHERE service = $1")
+            .bind("risk_scoring_rs").fetch_one(&state.db).await {
             return HttpResponse::Ok().json(json!({"total": total, "service": env!("CARGO_PKG_NAME"), "source": "database"}));
         }
     }
@@ -221,24 +240,16 @@ async fn prom_metrics() -> HttpResponse {
 }
 
 
-// --- Database Connection ---
-use tokio_postgres::NoTls;
-
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS service_records (
-                    id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-                    status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
-    }
+// --- Database Connection (Wave-11: sqlx pool, max 25 connections) ---
+async fn init_db_pool(pool: &sqlx::PgPool) {
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS service_records (
+            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+        )",
+    ).execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)").execute(pool).await;
 }
 
 
@@ -471,16 +482,51 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
+// Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
+// or every 100 rows by a spawned task on the shared sqlx pool
+// (was: one blocking INSERT per request on a single tokio_postgres::Client).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "risk_scoring_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let svc_name = String::from("risk-scoring-rs");
-        let status = String::from("active");
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+    let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let id = format!("{}_{}_{}", "risk_scoring_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let svc_name = String::from("risk-scoring-rs");
+    let status = String::from("active");
+    let data_str = serde_json::to_string(data).unwrap_or_default();
+    if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let pool = state.db.clone();
+        let buf = buf.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                let rows: Vec<(String, String, String, String, String)> = {
+                    let mut b = buf.lock().unwrap();
+                    if b.is_empty() { continue; }
+                    std::mem::take(&mut *b)
+                };
+                for (id, svc, ep, st, d) in rows {
+                    let _ = sqlx::query(
+                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                    ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+                }
+            }
+        });
+    }
+    let mut b = buf.lock().unwrap();
+    b.push((id, svc_name, endpoint.to_string(), status, data_str));
+    if b.len() >= 100 {
+        let rows = std::mem::take(&mut *b);
+        drop(b);
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            for (id, svc, ep, st, d) in rows {
+                let _ = sqlx::query(
+                    "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+            }
+        });
     }
 }
 
@@ -553,6 +599,9 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
     match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
         Ok(mut stream) => {
+            // Wave-11: bound blocking I/O (was unbounded read_to_string).
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
             let host = host_port.split(':').next().unwrap_or("localhost");
             let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
             stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
@@ -595,9 +644,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }
@@ -660,16 +719,34 @@ fn mtls_config() -> (bool, String, String, String) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8124);
-    let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
-        match init_db(&url).await {
-            Some(c) => { println!("risk-scoring-rs: connected to Postgres"); Some(std::sync::Arc::new(c)) }
-            None => None,
+    // Wave-11: shared sqlx pool (max 25) replaces the single tokio_postgres::Client.
+    let db: sqlx::PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("risk-scoring-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[risk-scoring-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[risk-scoring-rs] DATABASE_URL not set — DB endpoints will fail");
+            sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
         }
-    } else { None };
+    };
+    {
+        let schema_pool = db.clone();
+        tokio::spawn(async move { init_db_pool(&schema_pool).await; });
+    }
     let state = web::Data::new(AppState {
+        db: db.clone(),
         records: Mutex::new(Vec::new()),
         db_url: std::env::var("DATABASE_URL").ok(),
-        db_client,
     });
     println!("risk-scoring-rs listening on port {}", port);
     start_grpc_server("risk-scoring-rs", 10359);
@@ -690,12 +767,19 @@ async fn main() -> std::io::Result<()> {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("none")
                     .to_string();
-                eprintln!("[risk-scoring-rs] {} {} trace={}", req.method(), req.path(), trace_id);
+                // Wave-11: log only errors, plus 1% sampled requests (was: every request).
+                let w11_method = req.method().clone();
+                let w11_path = req.path().to_string();
+                let w11_sample = _REQ_COUNT.load(AtomicOrdering::Relaxed) % 100 == 0;
                 let fut = srv.call(req);
                 async move {
                     let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
+                    let w11_err = res.status().is_server_error() || res.status().is_client_error();
+                    if w11_err {
                         _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if w11_err || w11_sample {
+                        eprintln!("[risk-scoring-rs] {} {} trace={} status={}", w11_method, w11_path, trace_id, res.status().as_u16());
                     }
                     Ok(res)
                 }

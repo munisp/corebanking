@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
@@ -12,9 +12,9 @@ import (
 	"fmt"
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
-	"io"
 	"math"
 	"math/big"
+	"math/rand"
 	"os/signal"
 	"strconv"
 	"sync"
@@ -28,8 +28,44 @@ import (
 	"os"
 	"strings"
 
-	"net"
+	"github.com/redis/go-redis/v9"
 )
+
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(rand.Int63n(int64(d)/2))
+}
+
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var serviceName = "agent-banking-go"
 
@@ -162,6 +198,162 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "in-memory"})
 }
 
+// --- OB-04: agent profile endpoints (orchestrator agentService client contract) ---
+// The orchestrator client (services/orchestrator-service/src/services/agentService.ts)
+// calls, against base AGENT_SVC_URL:
+//   POST /agent                 body: IAgentProfilePayload   headers: x-tenant-id, x-keycloak-id
+//   POST /agent/kyc/save        body: {kyc_url}              headers: x-tenant-id, x-keycloak-id
+//   POST /agent/kyc/complete    body: {}                     headers: x-tenant-id, x-keycloak-id
+//   POST /agent/kyc/fail        body: {}                     headers: x-tenant-id, x-keycloak-id
+// Both the client's literal paths and the canonical /v1/agent-banking/agents
+// prefix are mounted (see route registration below). All require a verified
+// JWT (jwtMiddleware): RS256 Keycloak user tokens or HS256 service tokens.
+
+type agentProfilePayload struct {
+	FirstName       string `json:"first_name"`
+	LastName        string `json:"last_name"`
+	Email           string `json:"email"`
+	Phone           string `json:"phone"`
+	UIN             string `json:"uin"`
+	KeycloakID      string `json:"keycloak_id"`
+	TenantID        string `json:"tenant_id"`
+	AgentRole       string `json:"agent_role"`
+	BusinessName    string `json:"business_name"`
+	BusinessAddress string `json:"business_address"`
+	City            string `json:"city"`
+	State           string `json:"state"`
+	PostalCode      string `json:"postal_code"`
+	LGA             string `json:"lga"`
+}
+
+// agentIdentity resolves (tenantID, keycloakID) for agent profile calls:
+// headers first (claim-derived for user tokens; caller-supplied for verified
+// service tokens), body values as fallback. A body/header tenant mismatch is
+// rejected with 403.
+func agentIdentity(w http.ResponseWriter, r *http.Request, bodyTenant, bodyKeycloakID string) (string, string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		tenantID = bodyTenant
+	} else if bodyTenant != "" && bodyTenant != tenantID {
+		jsonResp(w, 403, map[string]interface{}{"error": "tenant_mismatch", "message": "tenant_id in body does not match the request tenant"})
+		return "", "", false
+	}
+	keycloakID := r.Header.Get("X-Keycloak-ID")
+	if keycloakID == "" {
+		keycloakID = bodyKeycloakID
+	}
+	if tenantID == "" || keycloakID == "" {
+		jsonResp(w, 400, map[string]interface{}{"error": "missing_identity", "message": "x-tenant-id and x-keycloak-id (or body equivalents) are required"})
+		return "", "", false
+	}
+	return tenantID, keycloakID, true
+}
+
+func createAgentProfileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonResp(w, 405, map[string]interface{}{"error": "method_not_allowed", "message": "POST required"})
+		return
+	}
+	if db == nil {
+		// OB-04: durable persistence is mandatory — fail closed rather than
+		// acknowledge a profile that was never stored.
+		jsonResp(w, 503, map[string]interface{}{"error": "storage_unavailable", "message": "agent profile store unavailable (DATABASE_URL not configured)"})
+		return
+	}
+	var body agentProfilePayload
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_body", "message": err.Error()})
+		return
+	}
+	tenantID, keycloakID, ok := agentIdentity(w, r, body.TenantID, body.KeycloakID)
+	if !ok {
+		return
+	}
+	var id int64
+	err := db.QueryRow(`INSERT INTO agent_profiles
+		(tenant_id, keycloak_id, first_name, last_name, email, phone, uin, agent_role,
+		 business_name, business_address, city, state, postal_code, lga)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		ON CONFLICT (tenant_id, keycloak_id) DO NOTHING
+		RETURNING id`,
+		tenantID, keycloakID, body.FirstName, body.LastName, body.Email, body.Phone,
+		body.UIN, body.AgentRole, body.BusinessName, body.BusinessAddress,
+		body.City, body.State, body.PostalCode, body.LGA).Scan(&id)
+	if err == sql.ErrNoRows {
+		// Idempotent replay: profile already exists — return it with 200.
+		var existingID int64
+		var kycStatus string
+		if qerr := db.QueryRow(`SELECT id, kyc_status FROM agent_profiles WHERE tenant_id=$1 AND keycloak_id=$2`,
+			tenantID, keycloakID).Scan(&existingID, &kycStatus); qerr != nil {
+			jsonResp(w, 500, map[string]interface{}{"error": "db_query_failed", "message": qerr.Error()})
+			return
+		}
+		jsonResp(w, 200, map[string]interface{}{"created": false, "id": existingID, "tenant_id": tenantID, "keycloak_id": keycloakID, "kyc_status": kycStatus, "idempotent": true})
+		return
+	}
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": "db_insert_failed", "message": err.Error()})
+		return
+	}
+	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "tenant_id": tenantID, "keycloak_id": keycloakID, "kyc_status": "pending"})
+}
+
+// agentKycTransitionHandler handles kyc/save, kyc/complete and kyc/fail.
+func agentKycTransitionHandler(transition string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonResp(w, 405, map[string]interface{}{"error": "method_not_allowed", "message": "POST required"})
+			return
+		}
+		if db == nil {
+			jsonResp(w, 503, map[string]interface{}{"error": "storage_unavailable", "message": "agent profile store unavailable (DATABASE_URL not configured)"})
+			return
+		}
+		var body struct {
+			KycURL     string `json:"kyc_url"`
+			TenantID   string `json:"tenant_id"`
+			KeycloakID string `json:"keycloak_id"`
+		}
+		// body may be empty for complete/fail
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		tenantID, keycloakID, ok := agentIdentity(w, r, body.TenantID, body.KeycloakID)
+		if !ok {
+			return
+		}
+		var query string
+		var args []interface{}
+		switch transition {
+		case "save":
+			if body.KycURL == "" {
+				jsonResp(w, 400, map[string]interface{}{"error": "missing_kyc_url", "message": "kyc_url is required"})
+				return
+			}
+			query = `UPDATE agent_profiles SET kyc_url=$1, kyc_status='in_progress', updated_at=now() WHERE tenant_id=$2 AND keycloak_id=$3`
+			args = []interface{}{body.KycURL, tenantID, keycloakID}
+		case "complete":
+			query = `UPDATE agent_profiles SET kyc_status='verified', updated_at=now() WHERE tenant_id=$1 AND keycloak_id=$2`
+			args = []interface{}{tenantID, keycloakID}
+		case "fail":
+			query = `UPDATE agent_profiles SET kyc_status='failed', updated_at=now() WHERE tenant_id=$1 AND keycloak_id=$2`
+			args = []interface{}{tenantID, keycloakID}
+		default:
+			jsonResp(w, 500, map[string]interface{}{"error": "unknown_transition", "message": transition})
+			return
+		}
+		res, err := db.Exec(query, args...)
+		if err != nil {
+			jsonResp(w, 500, map[string]interface{}{"error": "db_update_failed", "message": err.Error()})
+			return
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			jsonResp(w, 404, map[string]interface{}{"error": "agent_not_found", "message": "no agent profile for tenant_id+keycloak_id"})
+			return
+		}
+		jsonResp(w, 200, map[string]interface{}{"updated": true, "tenant_id": tenantID, "keycloak_id": keycloakID, "transition": transition})
+	}
+}
+
 func computeCommission(amount float64, rate float64) float64 {
 	return math.Round(amount*rate/100.0*100) / 100
 }
@@ -288,12 +480,11 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond))
 		}
 
 		var req *http.Request
@@ -305,16 +496,16 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[inter-service] %s %s attempt %d failed: %v", method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
@@ -322,6 +513,7 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -334,11 +526,8 @@ func callAgentKYC(agentID string) (map[string]interface{}, error) {
 	})
 }
 
-func callAgentFloatTopup(agentID string, amount float64) (map[string]interface{}, error) {
-	return callService("POST", walletURL+"/v1/transfers", map[string]interface{}{
-		"to_account": agentID, "amount": amount, "type": "float_topup",
-	})
-}
+// MN-23: callAgentFloatTopup deleted — it had zero call sites and targeted a
+// wallet /v1/transfers domain that does not exist in the fleet (ROADMAP).
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
@@ -387,6 +576,32 @@ func initDB() {
 		return
 	}
 	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+
+	// OB-04: durable agent profile store (expand-only; CREATE IF NOT EXISTS).
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS agent_profiles (
+		id BIGSERIAL PRIMARY KEY,
+		tenant_id TEXT NOT NULL,
+		keycloak_id TEXT NOT NULL,
+		first_name TEXT NOT NULL DEFAULT '',
+		last_name TEXT NOT NULL DEFAULT '',
+		email TEXT NOT NULL DEFAULT '',
+		phone TEXT NOT NULL DEFAULT '',
+		uin TEXT NOT NULL DEFAULT '',
+		agent_role TEXT NOT NULL DEFAULT '',
+		business_name TEXT NOT NULL DEFAULT '',
+		business_address TEXT NOT NULL DEFAULT '',
+		city TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL DEFAULT '',
+		postal_code TEXT NOT NULL DEFAULT '',
+		lga TEXT NOT NULL DEFAULT '',
+		kyc_status TEXT NOT NULL DEFAULT 'pending',
+		kyc_url TEXT,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		UNIQUE (tenant_id, keycloak_id)
+	)`); err != nil {
+		log.Printf("[%s] agent_profiles table init failed: %v", serviceName, err)
+	}
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -487,16 +702,8 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
-		}
-	}()
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -522,8 +729,57 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		}
 		var header struct {
 			Kid string `json:"kid"`
+			Alg string `json:"alg"`
 		}
 		json.Unmarshal(headerBytes, &header)
+
+		// OB-03/OB-04: accept orchestrator service-to-service tokens — HS256
+		// signed with the shared JWT_SECRET and carrying role='service'
+		// (sub='orchestrator-service'). Signature and exp are fully verified;
+		// fail-closed when JWT_SECRET is unset. Service tokens carry no tenant
+		// claim, so the caller-supplied X-Tenant-ID header is kept (for user
+		// tokens it is overwritten from claims below).
+		if header.Alg == "HS256" {
+			secret := os.Getenv("JWT_SECRET")
+			if secret == "" || strings.HasPrefix(secret, "${") {
+				http.Error(w, `{"error":"auth_not_configured"}`, http.StatusUnauthorized)
+				return
+			}
+			sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+			if err != nil {
+				http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+				return
+			}
+			mac := hmac.New(sha256.New, []byte(secret))
+			mac.Write([]byte(parts[0] + "." + parts[1]))
+			if !hmac.Equal(mac.Sum(nil), sigBytes) {
+				http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+				return
+			}
+			claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+			var claims map[string]interface{}
+			if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+				http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
+				return
+			}
+			exp, ok := claims["exp"].(float64)
+			if !ok {
+				http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+				return
+			}
+			if time.Now().Unix() >= int64(exp) {
+				http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+				return
+			}
+			if claims["role"] != "service" {
+				http.Error(w, `{"error":"forbidden: service role required"}`, http.StatusForbidden)
+				return
+			}
+			r.Header.Set("X-User-Role", "service")
+			ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
 
 		jwtCache.mu.RLock()
 		pub, ok := jwtCache.keys[header.Kid]
@@ -715,108 +971,36 @@ func init() {
 	}
 }
 
-// redisConn dials Redis and returns the connection plus a buffered reader with
-// a hard deadline (M-23: no partial reads against the raw socket).
-func redisConn() (net.Conn, *bufio.Reader, error) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil {
-		return nil, nil, err
-	}
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	return conn, bufio.NewReader(conn), nil
-}
+// W11 GPT-01: pooled go-redis client shared per service (replaces per-op TCP dial).
+// Lazy init so REDIS_URL env override in init() is honored; DialTimeout kept as dial fallback.
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
+)
 
-// writeRESPCommand serializes args as a RESP multi-bulk request.
-func writeRESPCommand(w *bufio.Writer, args ...string) {
-	fmt.Fprintf(w, "*%d\r\n", len(args))
-	for _, a := range args {
-		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(a), a)
-	}
-	w.Flush()
-}
-
-// readRESPReply parses one RESP reply: simple string, error, integer, bulk
-// string (length-prefixed read), or multi-bulk (recursive). Redis error
-// replies are returned as Go errors.
-func readRESPReply(r *bufio.Reader) (interface{}, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return nil, err
-	}
-	if len(line) < 3 || !strings.HasSuffix(line, "\r\n") {
-		return nil, fmt.Errorf("malformed RESP reply")
-	}
-	payload := line[1 : len(line)-2]
-	switch line[0] {
-	case '+':
-		return payload, nil
-	case '-':
-		return nil, fmt.Errorf("redis error: %s", payload)
-	case ':':
-		n, err := strconv.ParseInt(payload, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("malformed integer reply: %v", err)
-		}
-		return n, nil
-	case '$':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil // nil bulk string
-		}
-		buf := make([]byte, n+2) // payload + trailing CRLF
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
-		return string(buf[:n]), nil
-	case '*':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed multi-bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil
-		}
-		items := make([]interface{}, 0, n)
-		for i := 0; i < n; i++ {
-			it, err := readRESPReply(r)
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, it)
-		}
-		return items, nil
-	}
-	return nil, fmt.Errorf("unknown RESP type byte %q", line[0])
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
 }
 
 func cacheGet(key string) (string, bool) {
-	conn, rd, err := redisConn()
+	s, err := getRedisClient().Get(redisCtx, key).Result()
 	if err != nil {
 		return "", false
 	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "GET", key)
-	rep, err := readRESPReply(rd)
-	if err != nil || rep == nil {
-		return "", false
-	}
-	s, ok := rep.(string)
-	return s, ok
+	return s, true
 }
-
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, rd, err := redisConn()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "SET", key, value, "EX", strconv.Itoa(ttlSeconds))
-	if _, err := readRESPReply(rd); err != nil { // detects -ERR replies
+	if err := getRedisClient().Set(redisCtx, key, value, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
 		log.Printf("[%s] cacheSet(%s) failed: %v", serviceName, key, err)
 	}
 }
@@ -1367,17 +1551,30 @@ func main() {
 	mux.Handle("/v1/agent/float-check", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(floatCheckHandler)))
 	mux.Handle("/v1/agent/tier-assess", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(tierAssessHandler)))
 
+	// OB-04: real agent profile endpoints. Canonical prefixed paths AND the
+	// orchestrator agentService client's literal paths (client base is
+	// AGENT_SVC_URL, so it hits /agent, /agent/kyc/save, ...).
+	mux.Handle("/v1/agent-banking/agents", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(createAgentProfileHandler)))
+	mux.Handle("/v1/agent-banking/agents/kyc/save", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("save")))
+	mux.Handle("/v1/agent-banking/agents/kyc/complete", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("complete")))
+	mux.Handle("/v1/agent-banking/agents/kyc/fail", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("fail")))
+	mux.Handle("/agent", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(createAgentProfileHandler)))
+	mux.Handle("/agent/kyc/save", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("save")))
+	mux.Handle("/agent/kyc/complete", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("complete")))
+	mux.Handle("/agent/kyc/fail", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("fail")))
+
 	log.Printf("agent-banking-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(jwtAuthMiddleware(countingMiddleware(mux))))),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(jwtAuthMiddleware(countingMiddleware(mux))))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

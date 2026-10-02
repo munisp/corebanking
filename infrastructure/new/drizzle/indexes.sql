@@ -3,6 +3,35 @@
 -- Run with: psql $DATABASE_URL -f drizzle/indexes.sql
 -- All indexes created CONCURRENTLY to avoid table locks
 -- ─────────────────────────────────────────────────────────────
+--
+-- ⚠ W11 SCHEMA-DRIFT WARNING (annotation only — file intentionally NOT
+-- rewritten; see work/w11/fix-dispositions/data-indexes.md):
+-- This file targets snake_case tables/columns, but the drizzle schema is
+-- camelCase and double-quoted. Against the platform DB these statements
+-- will fail or silently miss:
+--   * accounts/transfers/loans/settlements/"transactions" EXIST as quoted
+--     lowercase tables (0007_core_banking_tables.sql:4,144,96,172,30) but
+--     their columns are camelCase ("customerId","createdAt",...), so e.g.
+--     `ON accounts (customer_id, status)` below errors: column customer_id
+--     does not exist.
+--   * These snake_case tables DO NOT EXIST at all (camelCase counterparts
+--     shown): agri_loans→"agriLoans" (0008), aml_alerts→"amlAlerts" (0007),
+--     audit_entries→"auditEntries" (0008),
+--     billing_invoices→"billingInvoices" (0008),
+--     billing_usage_events→"billingUsageEvents" (0008),
+--     card_transactions→"cardTransactions" (0007),
+--     customer_cards→"customerCards" (0008), gl_accounts→"glAccounts" (0007),
+--     journal_entries→"journalEntries" (0007), kyc_verifications→"kycVerifications"
+--     (0007), loan_repayments→"loanRepayments" (0007),
+--     nip_transactions→"nipTransactions" (0007),
+--     tenant_feature_flags→"tenantFeatureFlags" (0008),
+--     trial_balances→"trialBalances" (0007).
+--   * Still-valid snake targets (tables exist with snake columns):
+--     audit_trail (migrations/001:119, 002:6), aml_cases, kyc_tiers,
+--     sanctions_screenings, security_events, session_records (003),
+--     customers/farmers/tenants (0008).
+-- New W11 indexes that ARE verified against the real (camelCase) DDL live in
+-- drizzle/migrations/005_w11_performance_indexes.sql.
 
 -- ── Core Banking (high-frequency OLTP) ────────────────────
 

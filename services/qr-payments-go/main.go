@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"github.com/IBM/sarama"
-	_ "github.com/lib/pq"
+	pq "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"math/big"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -22,8 +24,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"net"
 )
 
 // cryptoRandUint32 returns a cryptographically secure random uint32 for
@@ -583,44 +583,35 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 // --- Redis Caching Layer ---
 var redisAddr string
 
+// GCM (AP-03): pooled go-redis client.
+var redisRdb *redis.Client
+
 func init() {
 	redisAddr = os.Getenv("REDIS_URL")
 	if redisAddr == "" {
 		redisAddr = "localhost:6379"
 	}
+	redisRdb = redis.NewClient(&redis.Options{Addr: redisAddr, PoolSize: 20})
 }
 
+// GCM (AP-03): pooled go-redis cache ops (3s deadline per op) — replaces the
+// per-operation TCP dial. Key names and TTLs are unchanged.
 func cacheGet(key string) (string, bool) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	s, err := redisRdb.Get(ctx, key).Result()
 	if err != nil {
-		return "", false
+		return "", false // miss or redis.Nil
 	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n < 3 {
-		return "", false
-	}
-	resp := string(buf[:n])
-	if resp[0] == '$' && resp[1] != '-' {
-		// Parse bulk string response
-		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 {
-			return parts[1], true
-		}
-	}
-	return "", false
+	return s, true
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil {
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := redisRdb.Set(ctx, key, value, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
+		log.Printf("[%s] cacheSet(%s) failed: %v", serviceName, key, err)
 	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
-		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
 }
 
 // --- mTLS Configuration ---
@@ -750,10 +741,9 @@ func relayOutbox(brokers string, topic string) {
 	if len(ids) == 0 {
 		return
 	}
-	for _, id := range ids {
-		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
-			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
-		}
+	// GCM (AP-01): single batch UPDATE instead of one RTT per event.
+	if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = ANY($1::uuid[])`, pq.Array(ids)); err != nil {
+		log.Printf("[outbox-relay] failed to batch-mark %d events published: %v — events remain unpublished and will be retried", len(ids), err)
 	}
 	if len(ids) > 0 {
 		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)

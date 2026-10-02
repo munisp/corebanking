@@ -1,4 +1,6 @@
 import axios, { AxiosError, AxiosInstance } from "axios";
+import http from "http";
+import https from "https";
 import { readEnv } from "../config/readEnv.config";
 import logger from "../config/logger.config";
 import {
@@ -21,6 +23,10 @@ class BallerineApiClient {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: this._baseUrl,
+      // TS-68: bound hung provider calls; reuse TCP/TLS connections.
+      timeout: 15000,
+      httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+      httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Api-Key ${this._apiKey}`,

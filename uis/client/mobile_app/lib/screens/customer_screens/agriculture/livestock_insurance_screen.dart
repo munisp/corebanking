@@ -17,6 +17,15 @@ class _LivestockInsuranceScreenState extends State<LivestockInsuranceScreen> {
   Map<String, dynamic> _stats = {};
   bool _loading = true;
 
+  // MOB-03: pagination state — records are fetched page-by-page (page size
+  // 50) and rendered lazily via ListView.builder instead of an eager
+  // ListView(children: [..._records.map(...)]) that built every row at once.
+  static const int _pageSize = 50;
+  int _page = 1;
+  bool _hasMore = false;
+  bool _loadingMore = false;
+  final ScrollController _scrollCtrl = ScrollController();
+
   final _farmerCtrl = TextEditingController();
   final _animalCtrl = TextEditingController();
   final _countCtrl = TextEditingController();
@@ -31,13 +40,16 @@ class _LivestockInsuranceScreenState extends State<LivestockInsuranceScreen> {
   @override
   void initState() {
     super.initState();
+    _scrollCtrl.addListener(_onScroll);
     _load();
   }
 
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final res = await service.listLivestockInsurance();
+      final res = await service.listLivestockInsurance(page: 1, limit: _pageSize);
+      _page = 1;
+      _hasMore = res is List && res.length >= _pageSize;
       final statsRes = await service.getLivestockInsuranceStats();
       setState(() {
         _records = (res is List && res.isNotEmpty) ? res : _fallbackRecords;
@@ -50,6 +62,35 @@ class _LivestockInsuranceScreenState extends State<LivestockInsuranceScreen> {
       });
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  void _onScroll() {
+    if (_loading || _loadingMore || !_hasMore) return;
+    if (!_scrollCtrl.hasClients) return;
+    if (_scrollCtrl.position.pixels >=
+        _scrollCtrl.position.maxScrollExtent - 200) {
+      _loadMore();
+    }
+  }
+
+  Future<void> _loadMore() async {
+    setState(() => _loadingMore = true);
+    try {
+      final res = await service.listLivestockInsurance(page: _page + 1, limit: _pageSize);
+      if (res is List && res.isNotEmpty) {
+        setState(() {
+          _page += 1;
+          _records = [..._records, ...res];
+          _hasMore = res.length >= _pageSize;
+        });
+      } else {
+        setState(() => _hasMore = false);
+      }
+    } catch (_) {
+      setState(() => _hasMore = false);
+    } finally {
+      setState(() => _loadingMore = false);
     }
   }
 
@@ -138,6 +179,7 @@ class _LivestockInsuranceScreenState extends State<LivestockInsuranceScreen> {
     _animalCtrl.dispose();
     _countCtrl.dispose();
     _sumInsuredCtrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
@@ -163,53 +205,68 @@ class _LivestockInsuranceScreenState extends State<LivestockInsuranceScreen> {
           ? Center(child: CircularProgressIndicator(color: primary))
           : RefreshIndicator(
               onRefresh: _load,
-              child: ListView(
+              child: ListView.builder(
+                controller: _scrollCtrl,
                 padding: const EdgeInsets.all(16),
-                children: [
-                  const Text('Livestock Insurance', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 4),
-                  Text('Protect farmers from livestock loss due to disease or disaster', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
-                  const SizedBox(height: 16),
-                  Row(children: [
-                    _statCard('Policies', _stats['active_policies']?.toString() ?? '236', Icons.policy, primary),
-                    _statCard('Coverage', _stats['total_coverage']?.toString() ?? '₦580M', Icons.shield_outlined, Colors.blue),
-                    _statCard('Claims Paid', _stats['claims_paid']?.toString() ?? '₦12M', Icons.payment, Colors.orange),
-                  ]),
-                  const SizedBox(height: 20),
-                  ..._records.map((item) {
-                    final m = item is Map ? item : {};
-                    final status = m['status']?.toString() ?? '-';
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
-                      child: ExpansionTile(
-                        tilePadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
-                        childrenPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
-                        title: Text(m['farmer'] ?? m['id'] ?? 'Farmer', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                        subtitle: Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Row(children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                              decoration: BoxDecoration(color: _statusColor(status).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
-                              child: Text(status, style: TextStyle(color: _statusColor(status), fontSize: 11, fontWeight: FontWeight.w600)),
-                            ),
-                            const SizedBox(width: 8),
-                            Text(m['animal']?.toString() ?? '', style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+                itemCount: 1 + _records.length + ((_hasMore || _loadingMore) ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (index == 0) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                          const Text('Livestock Insurance', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 4),
+                          Text('Protect farmers from livestock loss due to disease or disaster', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+                          const SizedBox(height: 16),
+                          Row(children: [
+                            _statCard('Policies', _stats['active_policies']?.toString() ?? '236', Icons.policy, primary),
+                            _statCard('Coverage', _stats['total_coverage']?.toString() ?? '₦580M', Icons.shield_outlined, Colors.blue),
+                            _statCard('Claims Paid', _stats['claims_paid']?.toString() ?? '₦12M', Icons.payment, Colors.orange),
                           ]),
-                        ),
-                        children: [
-                          _row('Animal Type', m['animal']),
-                          _row('Count', m['count']),
-                          _row('Sum Insured', m['insured']),
-                          _row('Premium', m['premium']),
-                          _row('Status', m['status']),
-                        ],
-                      ),
+                          const SizedBox(height: 20),
+                      ],
                     );
-                  }),
-                ],
-              ),
+                  }
+                  final recIndex = index - 1;
+                  if (recIndex >= _records.length) {
+                    return const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  }
+                  final item = _records[recIndex];
+                      final m = item is Map ? item : {};
+                      final status = m['status']?.toString() ?? '-';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
+                        child: ExpansionTile(
+                          tilePadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+                          childrenPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
+                          title: Text(m['farmer'] ?? m['id'] ?? 'Farmer', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                          subtitle: Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Row(children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(color: _statusColor(status).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
+                                child: Text(status, style: TextStyle(color: _statusColor(status), fontSize: 11, fontWeight: FontWeight.w600)),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(m['animal']?.toString() ?? '', style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+                            ]),
+                          ),
+                          children: [
+                            _row('Animal Type', m['animal']),
+                            _row('Count', m['count']),
+                            _row('Sum Insured', m['insured']),
+                            _row('Premium', m['premium']),
+                            _row('Status', m['status']),
+                          ],
+                        ),
+                      );
+                },
+                ),
             ),
     );
   }

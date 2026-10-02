@@ -142,8 +142,7 @@ func (m *MiddlewareIntegration) publishToKafka(topic string, message interface{}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Kafka publish error (non-fatal): %v\n", err)
 		return nil
@@ -235,8 +234,7 @@ func (m *MiddlewareIntegration) postToTigerBeetle(entries []map[string]interface
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("TigerBeetle post error (non-fatal): %v\n", err)
 		return nil
@@ -264,8 +262,7 @@ func (m *MiddlewareIntegration) CacheTreasuryData(key string, data interface{}, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Redis cache error (non-fatal): %v\n", err)
 		return nil
@@ -299,8 +296,7 @@ func (m *MiddlewareIntegration) CheckPermission(userID, permission, resource, re
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("permify unreachable: %w", err)
 	}
@@ -340,8 +336,7 @@ func (m *MiddlewareIntegration) SendNotification(notificationType, recipientID, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Dapr notification error (non-fatal): %v\n", err)
 		return nil
@@ -386,8 +381,7 @@ func (m *MiddlewareIntegration) PublishToLakehouse(dataType string, data interfa
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Lakehouse publish error (non-fatal): %v\n", err)
 		return nil

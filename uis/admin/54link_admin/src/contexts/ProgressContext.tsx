@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState, useEffect } from 'react';
 import type { ReactNode } from 'react';
 import type { ProgressState } from '@/../../shared/types';
 
@@ -34,65 +34,77 @@ export function ProgressProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(progress));
   }, [progress]);
 
-  const markModuleComplete = (moduleId: string) => {
+  const markModuleComplete = useCallback((moduleId: string) => {
     setProgress(prev => ({
       ...prev,
       completedModules: prev.completedModules.includes(moduleId)
         ? prev.completedModules
         : [...prev.completedModules, moduleId],
     }));
-  };
+  }, []);
 
-  const markLabComplete = (labId: string) => {
+  const markLabComplete = useCallback((labId: string) => {
     setProgress(prev => ({
       ...prev,
       completedLabs: prev.completedLabs.includes(labId)
         ? prev.completedLabs
         : [...prev.completedLabs, labId],
     }));
-  };
+  }, []);
 
-  const addBookmark = (path: string) => {
+  const addBookmark = useCallback((path: string) => {
     setProgress(prev => ({
       ...prev,
       bookmarks: prev.bookmarks.includes(path)
         ? prev.bookmarks
         : [...prev.bookmarks, path],
     }));
-  };
+  }, []);
 
-  const removeBookmark = (path: string) => {
+  const removeBookmark = useCallback((path: string) => {
     setProgress(prev => ({
       ...prev,
       bookmarks: prev.bookmarks.filter(b => b !== path),
     }));
-  };
+  }, []);
 
-  const isModuleComplete = (moduleId: string) => {
+  const isModuleComplete = useCallback((moduleId: string) => {
     return progress.completedModules.includes(moduleId);
-  };
+  }, [progress]);
 
-  const isLabComplete = (labId: string) => {
+  const isLabComplete = useCallback((labId: string) => {
     return progress.completedLabs.includes(labId);
-  };
+  }, [progress]);
 
-  const isBookmarked = (path: string) => {
+  const isBookmarked = useCallback((path: string) => {
     return progress.bookmarks.includes(path);
-  };
+  }, [progress]);
+
+  const value = useMemo(
+    () => ({
+      progress,
+      markModuleComplete,
+      markLabComplete,
+      addBookmark,
+      removeBookmark,
+      isModuleComplete,
+      isLabComplete,
+      isBookmarked,
+    }),
+    [
+      progress,
+      markModuleComplete,
+      markLabComplete,
+      addBookmark,
+      removeBookmark,
+      isModuleComplete,
+      isLabComplete,
+      isBookmarked,
+    ]
+  );
 
   return (
-    <ProgressContext.Provider
-      value={{
-        progress,
-        markModuleComplete,
-        markLabComplete,
-        addBookmark,
-        removeBookmark,
-        isModuleComplete,
-        isLabComplete,
-        isBookmarked,
-      }}
-    >
+    <ProgressContext.Provider value={value}>
       {children}
     </ProgressContext.Provider>
   );

@@ -108,5 +108,5 @@ func main() {
 	})
 
 	log.Printf("[fraudfusion] Fraud fusion engine on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }

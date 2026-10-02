@@ -21,6 +21,14 @@ class Config:
     KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
     KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
 
+    # MN-12: transaction-ledger is the statement system of record.
+    TRANSACTION_LEDGER_URL = os.getenv("TRANSACTION_LEDGER_URL", "")
+    # MN-02/MN-05: lien checks + journal posting for closure/payout sweeps.
+    LIEN_SVC_URL = os.getenv("LIEN_SVC_URL", "http://account-lien-go:9046")
+    JOURNAL_POSTING_URL = os.getenv("JOURNAL_POSTING_URL", "http://journal-posting-go:8080")
+    DISPUTE_SVC_URL = os.getenv("DISPUTE_SVC_URL", "")
+    INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
 
 class DevelopmentConfig(Config):
     """Development specific config"""

@@ -18,6 +18,17 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // Beneficiary Management Service — saved payees, verification, transfer limits
 // Port: 8116
 // Middleware: Kafka, Redis, Postgres
@@ -87,8 +98,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -259,7 +269,7 @@ func main() {
 
 	handler := corsMiddleware(mux)
 	log.Printf("Beneficiary Management Service starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(handler)))))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(handler))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 func handleBeneficiaries(w http.ResponseWriter, r *http.Request) {

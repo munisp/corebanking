@@ -47,7 +47,11 @@ class AppConfig {
   // App Configuration
   static const String appName = 'pup'; // Deprecated: Use tenant.displayName instead
   static const String appVersion = '1.0.0';
-  static const int apiTimeout = 60; // seconds - reduced for better mobile experience
+  static const int apiTimeout = 15; // seconds - legacy shared timeout (kept for callers that use it directly)
+  // Split timeouts (MOB-10): a hung endpoint previously blocked a screen for
+  // 60s+; connect is cheap, receive bounds total wait.
+  static const int apiConnectTimeout = 10; // seconds
+  static const int apiReceiveTimeout = 15; // seconds
   
   // Storage Keys
   static const String accessTokenKey = 'access_token';

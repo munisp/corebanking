@@ -6,9 +6,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -19,11 +21,15 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/lib/pq"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"shared/otel/go/otelkit"
 )
 
 // Prometheus metrics
@@ -131,6 +137,42 @@ type VirtualAccountService struct {
 	nibssClient    *NIBSSClient
 	webhookClient  *http.Client
 	lakehouse      *LakehousePublisher
+	db             *sql.DB // MN-14: durable webhook dedup store
+}
+
+// ErrDuplicateInboundPayment marks a replayed webhook (MN-14).
+var ErrDuplicateInboundPayment = errors.New("duplicate inbound payment")
+
+// initDedupStore opens Postgres for durable inbound-payment dedup
+// (MN-14/S14). Returns nil (with a warning) when DATABASE_URL is unset —
+// the webhook route fails closed in that case.
+func initDedupStore() *sql.DB {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[virtual-account-service] DATABASE_URL unset — inbound webhook dedup will be UNAVAILABLE (fail-closed on /payments/inbound)")
+		return nil
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[virtual-account-service] DATABASE_URL invalid: %v", err)
+		return nil
+	}
+	if err := db.Ping(); err != nil {
+		log.Printf("[virtual-account-service] Postgres unreachable: %v", err)
+		return nil
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS processed_inbound_payments (
+		id BIGSERIAL PRIMARY KEY,
+		provider TEXT NOT NULL,
+		external_id TEXT NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		CONSTRAINT uq_processed_inbound UNIQUE (provider, external_id)
+	)`)
+	if err != nil {
+		log.Printf("[virtual-account-service] dedup table init failed: %v", err)
+		return nil
+	}
+	return db
 }
 
 // NewVirtualAccountService creates a new service instance
@@ -155,6 +197,7 @@ func NewVirtualAccountService() *VirtualAccountService {
 			Timeout: 30 * time.Second,
 		},
 		lakehouse: NewLakehousePublisher(),
+		db:        initDedupStore(),
 	}
 }
 
@@ -228,12 +271,14 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 		return nil, err
 	}
 
+	// GCM-102: hold s.mu ONLY for in-memory map updates — all RPC/HTTP
+	// (TigerBeetle, NIBSS, lakehouse) run after the lock is released.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Generate unique VAN
 	van, err := s.generateVAN(req.BankID)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("failed to generate VAN: %w", err)
 	}
 
@@ -270,6 +315,7 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 	// Store account
 	s.accounts[van] = account
 	s.accountsByID[account.ID] = account
+	s.mu.Unlock()
 
 	// Escrow VANs need a dedicated holding account in TigerBeetle.
 	// All other purposes credit the parent account directly on payment, so no sub-account is needed.
@@ -279,7 +325,7 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 		}
 	}
 
-	// Register with NIBSS for inbound routing
+	// Register with NIBSS for inbound routing (outside s.mu — slow HTTP call)
 	if err := s.registerWithNIBSS(ctx, account); err != nil {
 		log.Printf("Warning: Failed to register with NIBSS: %v", err)
 		// Continue anyway - can be registered later
@@ -363,42 +409,84 @@ func (s *VirtualAccountService) registerWithNIBSS(ctx context.Context, account *
 }
 
 // ProcessInboundPayment processes an inbound payment to a VAN
+// GCM-101: s.mu is held ONLY for in-memory map/field mutations. The Postgres
+// dedup claim, TigerBeetle RPCs and lakehouse publishes all run outside the
+// lock. Idempotency semantics unchanged: the dedup INSERT ... ON CONFLICT
+// remains the atomic gate and runs before any side effect.
 func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payment *VANPayment) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	for _, existing := range s.payments {
-		if payment.SessionID != "" && existing.SessionID == payment.SessionID {
-			return fmt.Errorf("duplicate inbound payment session: %s", payment.SessionID)
+	// MN-14 (S14): durable dedup in Postgres — in-memory dedup was lost on
+	// restart and duplicates returned 400, amplifying upstream retry storms.
+	// Claim (provider, external_id) atomically; a replay is reported via
+	// ErrDuplicateInboundPayment and the route returns 200 (prior outcome).
+	if s.db != nil {
+		externalID := payment.SessionID
+		if externalID == "" {
+			externalID = payment.TransactionRef
 		}
-		if payment.TransactionRef != "" && existing.TransactionRef == payment.TransactionRef {
-			return fmt.Errorf("duplicate inbound payment reference: %s", payment.TransactionRef)
+		if externalID != "" {
+			var claimID int64
+			err := s.db.QueryRowContext(ctx,
+				`INSERT INTO processed_inbound_payments (provider, external_id)
+				 VALUES ('nibss', $1)
+				 ON CONFLICT (provider, external_id) DO NOTHING
+				 RETURNING id`, externalID).Scan(&claimID)
+			if err == sql.ErrNoRows {
+				return ErrDuplicateInboundPayment
+			}
+			if err != nil {
+				// Fail-closed: cannot prove this payment was not processed.
+				return fmt.Errorf("dedup store unavailable: %w", err)
+			}
 		}
+	} else {
+		log.Printf("[virtual-account-service] WARNING: in-memory dedup fallback (DATABASE_URL unset)")
+		s.mu.RLock()
+		for _, existing := range s.payments {
+			if payment.SessionID != "" && existing.SessionID == payment.SessionID {
+				s.mu.RUnlock()
+				return ErrDuplicateInboundPayment
+			}
+			if payment.TransactionRef != "" && existing.TransactionRef == payment.TransactionRef {
+				s.mu.RUnlock()
+				return ErrDuplicateInboundPayment
+			}
+		}
+		s.mu.RUnlock()
 	}
 
-	// Find the VAN
+	// Find and validate the VAN under a read lock. The account fields used
+	// below and by the TigerBeetle client (ID, VAN, BankID, ParentAccountID,
+	// Purpose, ReferenceID, Currency) are immutable after creation.
+	s.mu.RLock()
 	account, ok := s.accounts[payment.VAN]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("VAN not found: %s", payment.VAN)
 	}
 
 	// Validate account status
 	if account.Status != "active" {
+		s.mu.RUnlock()
 		return fmt.Errorf("VAN is not active: %s", account.Status)
 	}
 
 	// Check expiry
 	if account.ExpiresAt != nil && time.Now().After(*account.ExpiresAt) {
+		s.mu.RUnlock()
 		return fmt.Errorf("VAN has expired")
 	}
 
 	// Validate amount constraints
 	if account.MinAmount != nil && payment.Amount < *account.MinAmount {
+		s.mu.RUnlock()
 		return fmt.Errorf("payment amount %.2f below minimum %.2f", payment.Amount, *account.MinAmount)
 	}
 	if account.MaxAmount != nil && payment.Amount > *account.MaxAmount {
+		s.mu.RUnlock()
 		return fmt.Errorf("payment amount %.2f exceeds maximum %.2f", payment.Amount, *account.MaxAmount)
 	}
+	s.mu.RUnlock()
 
 	// Generate payment ID
 	payment.ID = uuid.New().String()
@@ -408,16 +496,21 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	payment.Status = "pending"
 	payment.CreatedAt = time.Now()
 
-	// Create ledger entry in TigerBeetle
+	// Create ledger entry in TigerBeetle (RPC — outside s.mu). The transfer
+	// ID is payment.ID, so a retried call with the same payment ID is
+	// idempotent at the ledger.
 	ledgerEntryID, err := s.createLedgerEntry(ctx, account, payment)
 	if err != nil {
 		payment.Status = "failed"
+		s.mu.Lock()
 		s.payments[payment.ID] = payment
+		s.mu.Unlock()
 		return fmt.Errorf("failed to create ledger entry: %w", err)
 	}
 	payment.LedgerEntryID = ledgerEntryID
 
-	// Update account stats
+	// Update account stats + record the payment (in-memory mutations only).
+	s.mu.Lock()
 	account.TotalReceived += payment.Amount
 	account.PaymentCount++
 	now := time.Now()
@@ -433,6 +526,7 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	payment.Status = "processed"
 	payment.ProcessedAt = &now
 	s.payments[payment.ID] = payment
+	s.mu.Unlock()
 
 	// Send webhook notification
 	go s.sendWebhookNotification(account, payment)
@@ -442,18 +536,29 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	vanPaymentAmount.WithLabelValues(account.BankID).Observe(payment.Amount)
 
 	if s.lakehouse != nil {
-		if err := s.lakehouse.PublishVANCollection(ctx, account.ID, payment.TransactionRef, payment.Amount, payment.Currency, payment.SenderName, payment.SenderBank, account.BankID); err != nil {
-			log.Printf("Warning: failed to publish VAN collection to lakehouse: %v", err)
-		}
-		if s.shouldRouteSettlementViaMojaloop(account, payment) {
-			settlementRef := payment.TransactionRef
-			if settlementRef == "" {
-				settlementRef = payment.ID
+		// Publish asynchronously with its own deadline — the request ctx may
+		// be cancelled as soon as the handler returns, and these publishes
+		// must neither hold s.mu nor block the webhook response.
+		accountID, bankID, parentID := account.ID, account.BankID, account.ParentAccountID
+		txRef, senderName, senderBank := payment.TransactionRef, payment.SenderName, payment.SenderBank
+		amount, currency, paymentID := payment.Amount, payment.Currency, payment.ID
+		viaMojaloop := s.shouldRouteSettlementViaMojaloop(account, payment)
+		go func() {
+			pubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := s.lakehouse.PublishVANCollection(pubCtx, accountID, txRef, amount, currency, senderName, senderBank, bankID); err != nil {
+				log.Printf("Warning: failed to publish VAN collection to lakehouse: %v", err)
 			}
-			if err := s.lakehouse.PublishVANSettlement(ctx, account.ID, settlementRef, payment.Amount, account.ParentAccountID, account.BankID); err != nil {
-				log.Printf("Warning: failed to publish VAN settlement to lakehouse: %v", err)
+			if viaMojaloop {
+				settlementRef := txRef
+				if settlementRef == "" {
+					settlementRef = paymentID
+				}
+				if err := s.lakehouse.PublishVANSettlement(pubCtx, accountID, settlementRef, amount, parentID, bankID); err != nil {
+					log.Printf("Warning: failed to publish VAN settlement to lakehouse: %v", err)
+				}
 			}
-		}
+		}()
 	}
 
 	log.Printf("Processed payment %s of %.2f to VAN %s", payment.ID, payment.Amount, payment.VAN)
@@ -825,8 +930,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -906,9 +1010,21 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), "virtual-account-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	service := NewVirtualAccountService()
 
 	router := gin.Default()
+	router.Use(otelkit.GinMiddleware())
 	router.Use(jwtAuthMiddleware())
 	router.Use(auditMiddleware())
 
@@ -1027,19 +1143,47 @@ func main() {
 		})
 
 		// Receive inbound payment (NIBSS webhook)
+		// MN-14 (S14): routed THROUGH the HMAC signature check in
+		// NIBSSWebhookHandler.HandleInboundPayment (previously bypassed), with
+		// durable Postgres dedup (fail-closed when the dedup store is absent).
+		webhookHandler := NewNIBSSWebhookHandler(service.nibssClient, service)
 		api.POST("/payments/inbound", func(c *gin.Context) {
-			var payment VANPayment
-			if err := c.ShouldBindJSON(&payment); err != nil {
+			if service.db == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "webhook dedup store unavailable (DATABASE_URL not configured)"})
+				return
+			}
+
+			var nibssPayment NIBSSInboundPayment
+			if err := c.ShouldBindJSON(&nibssPayment); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
 
-			if err := service.ProcessInboundPayment(c.Request.Context(), &payment); err != nil {
+			signature := c.GetHeader("x-nibss-signature")
+			if signature == "" {
+				signature = c.GetHeader("x-signature")
+			}
+			if signature == "" {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "missing webhook signature"})
+				return
+			}
+
+			err := webhookHandler.HandleInboundPayment(c.Request.Context(), &nibssPayment, signature)
+			if err != nil {
+				if errors.Is(err, ErrDuplicateInboundPayment) {
+					// MN-14: replays get 200 (prior outcome), not a 400 storm.
+					c.JSON(http.StatusOK, gin.H{"message": "payment already processed", "idempotent_replay": true})
+					return
+				}
+				if err.Error() == "invalid signature" {
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid signature"})
+					return
+				}
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
 
-			c.JSON(http.StatusOK, gin.H{"message": "payment processed", "payment_id": payment.ID})
+			c.JSON(http.StatusOK, gin.H{"message": "payment processed"})
 		})
 	}
 
@@ -1201,5 +1345,17 @@ func main() {
 
 	port := getEnv("PORT", "8080")
 	log.Printf("Virtual Account Service starting on port %s", port)
-	router.Run(":" + port)
+	// GCM-105: router.Run() = bare http.ListenAndServe (no timeouts, Slowloris
+	// exposure). Use a configured http.Server instead.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("server error: %v", err)
+	}
 }

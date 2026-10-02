@@ -28,12 +28,16 @@ class ShieldApiClient {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: this._baseUrl,
+      // TS-67: bound hung provider calls; reuse TLS connections.
+      timeout: 15000,
       headers: {
         "Content-Type": "application/json",
         "x-api-key": this._apiKey,
       },
       httpsAgent: new https.Agent({
         rejectUnauthorized: !ALLOW_INSECURE_TLS,
+        keepAlive: true,
+        maxSockets: 50,
       }),
     });
   }

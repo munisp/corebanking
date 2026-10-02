@@ -68,7 +68,11 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
+  # PL-12: Dapr pubsub component name for the Python Dapr services in this
+  # group (config.py default is "", which makes publish/subscribe calls fail).
+  # Matches the platform component infrastructure/manifests/dapr/pubsub.yaml.
+  DAPR_PUBSUB_NAME: "pubsub"
   APP_PORT: "9244"
   PORT_BASE: "9244"
   SERVICE_GROUP: compliance-regulatory
-  SERVICES: "agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,ctr-auto-filer-go,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"
+  SERVICES: "agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"

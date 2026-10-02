@@ -67,7 +67,12 @@ class KeycloakAdapter(ExternalAPIClient):
                 {"type": "password", "value": payload.password, "temporary": False}
             ]
 
-        logger.info(f"create_user_payload: {create_user_payload}")
+        # PL-15/F10-1: never log the payload — it may contain plaintext
+        # credentials. Log only non-secret identifiers.
+        logger.info(
+            f"create_user: username={payload.user_name} email={payload.email} "
+            f"with_credentials={bool(payload.password)}"
+        )
 
         response = self._post(
             endpoint=f"/admin/realms/{self.__realm}/users",
@@ -144,7 +149,9 @@ class KeycloakAdapter(ExternalAPIClient):
             "temporary": False,
         }
 
-        logger.info(f"set_user_password_payload: {set_user_password_payload}")
+        # PL-15/F10-1: deleted the plaintext password payload log — only the
+        # keycloak user id is logged.
+        logger.info(f"set_user_password for keycloak user id: {id}")
 
         response = self._put(
             endpoint=f"/admin/realms/{self.__realm}/users/{id}/reset-password",
@@ -163,6 +170,31 @@ class KeycloakAdapter(ExternalAPIClient):
                 status_code=500,
                 code="AUTH-KEYCLOAK-INT-5003",
             )
+
+    def delete_user(self, user_id: str) -> bool:
+        """Delete a Keycloak user by id (R1A saga-compensation contract).
+
+        Best-effort semantics: True on 204, False on 404 (already absent).
+        Other non-2xx responses raise ApiError so the caller can log the
+        compensation failure. Only the keycloak user id is logged (PL-15).
+        """
+        import requests as _requests
+
+        self.__initialize()
+
+        url = f"{self.base_url.rstrip('/')}/admin/realms/{self.__realm}/users/{user_id}"
+        response = _requests.delete(url, headers=self.headers, timeout=30)
+        logger.info(f"delete_user_status_code: {response.status_code} for keycloak user id: {user_id}")
+
+        if response.status_code == 404:
+            return False
+        if response.status_code != 204:
+            raise ApiError(
+                message=f"Failed to delete Keycloak user (status {response.status_code}).",
+                status_code=500,
+                code="AUTH-KEYCLOAK-INT-5003",
+            )
+        return True
 
     def get_user(self, email: str):
         """Get a keycloak user."""

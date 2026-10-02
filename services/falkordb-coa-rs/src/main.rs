@@ -380,7 +380,13 @@ async fn graph_query(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     let input = body.into_inner();
     db_persist(&state, "graph_query", &input).await;
     let upstream = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
-    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), &format!(r#"{"source": "falkordb-coa-rs", "action": "graph_query"}"#))).await;
+    { // Wave-11: fire-and-forget upstream call (was awaited-and-discarded)
+        let (w11_url, w11_body) = ((format!("{}/v1/notify", upstream)).to_string(), (format!(r#"{"source": "falkordb-coa-rs", "action": "graph_query"}"#)).to_string());
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3),
+                tokio::task::spawn_blocking(move || call_service_sync(&w11_url, &w11_body))).await;
+        });
+    }
     HttpResponse::Ok().json(json!({"service": "falkordb-coa-rs", "endpoint": "graph_query", "result": input}))
 }
 
@@ -427,9 +433,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }

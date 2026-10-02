@@ -40,15 +40,11 @@ interface ReactivateDialogProps {
   onConfirm: (data: ReactivateDeveloperRequest) => void;
 }
 
-// Mock developer data
-const mockDevelopers = [
-  {
-    name: "Jane Doe",
-  },
-];
-
+// ST-06: mock developer roster removed — "Jane Doe" was hardcoded fiction.
+// No live developer-directory API exists yet; the list starts empty and the
+// page says so instead of showing fabricated people.
 export function DeveloperManagement() {
-  const [developers, setDevelopers] = useState(mockDevelopers);
+  const [developers, setDevelopers] = useState<Developer[]>([]);
   // ...existing code...
   const [suspendDialog, setSuspendDialog] = useState(false);
   const [reactivateDialog, setReactivateDialog] = useState(false);
@@ -56,18 +52,22 @@ export function DeveloperManagement() {
     null,
   );
 
-  // No real API, so just use mock data
+  // ST-06: no real developer-directory API exists; nothing is loaded.
   useEffect(() => {
-    // Avoid direct setState in effect body
-    setTimeout(() => {
-      setDevelopers(mockDevelopers);
-    }, 0);
+    setDevelopers([]);
   }, []);
 
   return (
     <div className="p-6 space-y-6">
       <h1 className="text-3xl font-bold">Developer Management</h1>
       {/* Removed error display as error is not declared */}
+      {developers.length === 0 && (
+        <p className="text-muted-foreground">
+          No developers to display — the live developer directory is not yet
+          available. Previously shown entries were hardcoded sample data and
+          have been removed (ST-06).
+        </p>
+      )}
       <div>
         <ul>
           {developers.map((dev) => (

@@ -75,7 +75,7 @@ spec:
               memory: 32Mi
       containers:
         - name: nqr-payments-go
-          image: ghcr.io/54bank/nqr-payments-go:latest
+          image: ghcr.io/54bank/nqr-payments-go:v1.0.0  # PL-16: :latest banned — pinned release tag; replace with the signed image digest at deploy time. (~460 remaining manifests still on :latest — fleet-wide pin is follow-up)
           ports:
             - containerPort: 8080
               name: http

@@ -367,96 +367,104 @@ class _RewardsScreenState extends State<RewardsScreen> with SingleTickerProvider
     }
 
     final userPoints = _summary?.totalPoints ?? 0;
-    return ListView(
+    return ListView.builder( // MOB-03: lazy builder for API-driven redeem options
       padding: const EdgeInsets.all(16),
-      children: [
-        const Text('Redeem Your Points', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 12),
-        ..._redeemOptions.map((option) {
-          final canRedeem = userPoints >= option.pointsRequired && option.isAvailable;
-          return Card(
-            margin: const EdgeInsets.only(bottom: 12),
-            child: Opacity(
-              opacity: canRedeem ? 1.0 : 0.6,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        if (option.imageUrl != null)
-                          Text(option.imageUrl!, style: const TextStyle(fontSize: 40))
-                        else
-                          const Icon(Icons.card_giftcard, size: 40, color: Colors.purple),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+      itemCount: 1 + _redeemOptions.length,
+      itemBuilder: (context, index) {
+        if (index == 0) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+                const Text('Redeem Your Points', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 12),
+            ],
+          );
+        }
+        final option = _redeemOptions[index - 1];
+            final canRedeem = userPoints >= option.pointsRequired && option.isAvailable;
+            return Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              child: Opacity(
+                opacity: canRedeem ? 1.0 : 0.6,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          if (option.imageUrl != null)
+                            Text(option.imageUrl!, style: const TextStyle(fontSize: 40))
+                          else
+                            const Icon(Icons.card_giftcard, size: 40, color: Colors.purple),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        option.title,
+                                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                                      ),
+                                    ),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: Colors.purple.shade50,
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: Text(
+                                        option.category,
+                                        style: TextStyle(color: Colors.purple.shade700, fontSize: 11),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  option.description,
+                                  style: const TextStyle(color: Colors.grey, fontSize: 13),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
                             children: [
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      option.title,
-                                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                                    ),
-                                  ),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                    decoration: BoxDecoration(
-                                      color: Colors.purple.shade50,
-                                      borderRadius: BorderRadius.circular(12),
-                                    ),
-                                    child: Text(
-                                      option.category,
-                                      style: TextStyle(color: Colors.purple.shade700, fontSize: 11),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 4),
+                              const Icon(Icons.star, color: Colors.amber, size: 18),
+                              const SizedBox(width: 4),
                               Text(
-                                option.description,
-                                style: const TextStyle(color: Colors.grey, fontSize: 13),
+                                '${option.pointsRequired} points',
+                                style: const TextStyle(fontWeight: FontWeight.bold),
                               ),
                             ],
                           ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Row(
-                          children: [
-                            const Icon(Icons.star, color: Colors.amber, size: 18),
-                            const SizedBox(width: 4),
-                            Text(
-                              '${option.pointsRequired} points',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
+                          ElevatedButton(
+                            onPressed: canRedeem ? () => _handleRedeem(option) : null,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.purple,
+                              disabledBackgroundColor: Colors.grey,
                             ),
-                          ],
-                        ),
-                        ElevatedButton(
-                          onPressed: canRedeem ? () => _handleRedeem(option) : null,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.purple,
-                            disabledBackgroundColor: Colors.grey,
+                            child: const Text('Redeem'),
                           ),
-                          child: const Text('Redeem'),
-                        ),
-                      ],
-                    ),
-                  ],
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            ),
-          );
-        }),
-      ],
+            );
+        
+      },
     );
   }
 

@@ -29,6 +29,7 @@ from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import structlog
 
@@ -126,6 +127,7 @@ app = FastAPI(
     description="NIMC, BVN, Passport, FRSC verification",
     version="1.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # API Configuration
 NIMC_API_URL = os.getenv("NIMC_API_URL", "https://api.nimc.gov.ng/v1")

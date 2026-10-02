@@ -10,13 +10,36 @@ from utils.config import get_config
 config = get_config()
 
 engine = create_engine(
-    config.DATABASE_URI, 
+    config.DATABASE_URI,
     pool_pre_ping=True,  # Checks if connections are alive before using them
     pool_size=10,  # Number of connections to keep in the pool
     max_overflow=20,  # Number of connections to allow in overflow
     pool_timeout=30,  # Time to wait before giving up on getting a connection from the pool
     pool_recycle=1800,  # Recycle connections after this many seconds
 )
+
+# --- OpenTelemetry (SPEC w9 §2.5): SQLAlchemy client spans on this engine.
+# This module is imported before main.py installs the otelkit path, so the
+# path bootstrap is repeated here (setup.py is one package level deeper).
+# No-op when otelkit is unavailable or OTEL_SDK_DISABLED=true; never raises.
+try:
+    import os as _otel_os
+    import sys as _otel_sys
+
+    _otel_sys.path.insert(
+        0,
+        _otel_os.path.normpath(
+            _otel_os.path.join(
+                _otel_os.path.dirname(__file__),
+                "..", "..", "..", "shared", "otel", "python",
+            )
+        ),
+    )
+    from otelkit import instrument_sqlalchemy
+
+    instrument_sqlalchemy(engine)
+except Exception:
+    pass
 
 SessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

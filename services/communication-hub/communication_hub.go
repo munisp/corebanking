@@ -2430,7 +2430,7 @@ func main() {
 
 	port := getEnv("PORT", "8124")
 	fmt.Printf("Communication Hub starting on port %s\n", port)
-	http.ListenAndServe(":"+port, nil)
+	(&http.Server{Addr: ":" + port, Handler: nil, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }
 
 func getEnv(key, defaultValue string) string {

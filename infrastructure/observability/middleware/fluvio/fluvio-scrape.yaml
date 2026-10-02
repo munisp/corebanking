@@ -1,0 +1,48 @@
+# =============================================================================
+# Fluvio — Prometheus scrape wiring
+#
+# Target (verified-static): StatefulSet/fluvio ns `54bank`,
+# image infinyon/fluvio:0.11.9, single container exposing ONLY :9003 (the SC
+# public port). No metrics port is configured in-tree.
+#
+# Contract (SPEC §3): collector scrape job `fluvio` -> :9110.
+#
+# requires-deployment: whether this single-image deployment actually serves
+# Prometheus metrics on :9110 must be verified against the running pod
+# (`kubectl port-forward ... 9110` + `curl localhost:9110/metrics`). Full
+# operator-based Fluvio deployments (SC + SPU pods) expose metrics separately
+# per component; the in-tree deployment is a simplified all-in-one.
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fluvio
+  namespace: 54bank
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9110"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: fluvio
+          ports:
+            - containerPort: 9110
+              name: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluvio-metrics
+  namespace: 54bank
+  labels:
+    observability.corebanking/scrape: "true"
+spec:
+  selector:
+    app: fluvio
+  ports:
+    - name: metrics
+      port: 9110                  # SPEC §3 contract
+      targetPort: 9110

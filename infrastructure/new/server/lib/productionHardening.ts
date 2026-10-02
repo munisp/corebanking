@@ -81,7 +81,6 @@ const i18nConfig = { languages: ["en", "ha", "yo", "ig", "pcm"], defaultLocale: 
 const missingDomains = [
   { service: "credit-scoring-py", port: 8332 },
   { service: "debt-collection-go", port: 8333 },
-  { service: "account-closure-go", port: 8334 },
   { service: "dormancy-management-rs", port: 8335 },
   { service: "interest-computation-rs", port: 8336 },
   { service: "fee-management-go", port: 8337 },

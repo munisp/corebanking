@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:provider/provider.dart';
 import '../../../providers/auth_provider.dart';
 import '../../../providers/tenant_provider.dart';
@@ -61,12 +62,14 @@ class OnboardingStartScreen extends StatelessWidget {
                       ),
                       child: Center(
                         child: tenant.logo.isNotEmpty
-                            ? Image.network(
-                                tenant.logo,
+                            ? CachedNetworkImage(
+                                  imageUrl: tenant.logo,
                                 width: 80,
+                                memCacheWidth: 160, // MOB-08
                                 height: 80,
+                                memCacheHeight: 160, // MOB-08: decode at ~2x display size, not full-res
                                 fit: BoxFit.contain,
-                                errorBuilder: (context, error, stackTrace) {
+                                errorWidget: (context, url, error) {
                                   return Text(
                                     tenant.name.substring(0, 2).toUpperCase(),
                                     style: const TextStyle(

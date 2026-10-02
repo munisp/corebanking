@@ -5,7 +5,13 @@ from utils.enums import CurrencyLedgerId
 from schemas.context import Context
 from schemas.payment import ExternalDebitSchema, ExternalTransferSchema, ExternalParty, ExternalAmount
 from services.payment import PaymentService
+from decimal import Decimal, ROUND_HALF_UP
+import base64
+import hashlib
+import hmac
 import json
+import os
+import time
 import uuid
 
 transfers_router = APIRouter()
@@ -15,6 +21,51 @@ logger = create_logger(__name__)
 config = get_config()
 
 _SYSTEM_AGENT_NS = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # uuid.NAMESPACE_URL
+
+
+def _to_kobo_half_up(amount) -> int:
+    """MN-16 (F13-8): single conversion point shared with the quote side
+    (mojaloop-connector create_quote.ts uses Decimal ROUND_HALF_UP)."""
+    return int(
+        (Decimal(str(amount)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+
+def _validate_rate_lock_token(body: dict, amount_minor: int) -> None:
+    """MN-16: when a quote rate-lock token is supplied with execution, verify
+    the HMAC signature, expiry, and amount so the executed amount always
+    matches the accepted quote. Fail-closed when a token is supplied but the
+    verifier secret is not configured."""
+    token = str(
+        (body.get("metadata") or {}).get("rate_lock_token")
+        or body.get("rate_lock_token")
+        or ""
+    ).strip()
+    if not token:
+        return
+    secret = os.getenv("FX_RATE_LOCK_SECRET", "")
+    if not secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Rate-lock token supplied but FX_RATE_LOCK_SECRET is not configured",
+        )
+    try:
+        payload_b64, sig = token.split(".", 1)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "==").decode())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed rate-lock token")
+    expected = hmac.new(
+        secret.encode(), payload_b64.encode(), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=400, detail="Invalid rate-lock token signature")
+    if int(payload.get("exp", 0)) < int(time.time()):
+        raise HTTPException(status_code=400, detail="Rate-lock token expired")
+    if int(payload.get("amount_minor", -1)) != int(amount_minor):
+        raise HTTPException(
+            status_code=400,
+            detail="Execution amount does not match the quoted rate-locked amount",
+        )
 
 
 def _system_agent_id(tenant: str) -> str:
@@ -45,12 +96,16 @@ def withdraw(
         currency = amount_info.get("currency", "NGN")
         logger.info(f"Parsed withdrawal details: payer_info={payer_info}, amount_info={amount_info}, currency={currency}")
 
+        amount_kobo = _to_kobo_half_up(amount_info.get("amount", 0))
+        # MN-16: validate rate-lock token (if supplied) against the executed amount.
+        _validate_rate_lock_token(body, amount_kobo)
+
         payload = ExternalDebitSchema(
             transactionId=body["transferId"],
             payer=payer_info.get("partyIdentifier", ""),
             amount=ExternalAmount(
                 currency=currency,
-                amount_kobo=int(round(float(amount_info.get("amount", 0)) * 100)),
+                amount_kobo=amount_kobo,
             ),
         )
 
@@ -96,6 +151,10 @@ def deposit(
 
         payee_id_value = payee_info.get("partyIdentifier", "").lstrip("+")
 
+        amount_kobo = _to_kobo_half_up(amount_info.get("amount", 0))
+        # MN-16: validate rate-lock token (if supplied) against the executed amount.
+        _validate_rate_lock_token(body, amount_kobo)
+
         payload = ExternalTransferSchema(
             transactionId=body["transaction_id"],
             party=ExternalParty(
@@ -104,7 +163,7 @@ def deposit(
             ),
             amount=ExternalAmount(
                 currency=currency,
-                amount_kobo=int(round(float(amount_info.get("amount", 0)) * 100)),
+                amount_kobo=amount_kobo,
             ),
         )
 

@@ -18,6 +18,25 @@ import (
 	"time"
 )
 
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
 // Permify Authorization Service — fine-grained RBAC/ABAC/ReBAC policy engine
 // Port: 8129
 // Delegates permission checks to real Permify engine.
@@ -97,17 +116,65 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
+// JWKS kid-miss singleflight + negative cache (GPT-22): an unknown kid no
+// longer triggers a synchronous Keycloak fetch per request; concurrent misses
+// collapse onto one refresh and repeated bogus kids are negatively cached.
+const (
+	kidNegCacheTTL       = 60 * time.Second
+	kidMissCacheMaxItems = 10000
+)
+
+var (
+	kidMissCache   = make(map[string]time.Time)
+	kidMissCacheMu sync.Mutex
+	jwksFetchMu    sync.Mutex
+)
+
+func refreshJWKSForKid(realmURL, kid string) {
+	now := time.Now()
+	kidMissCacheMu.Lock()
+	if exp, bad := kidMissCache[kid]; bad && now.Before(exp) {
+		kidMissCacheMu.Unlock()
+		return
+	}
+	kidMissCacheMu.Unlock()
+
+	jwksFetchMu.Lock()
+	defer jwksFetchMu.Unlock()
+	// Re-check after acquiring the flight lock: another goroutine may have
+	// just fetched the key or recorded the miss.
+	kidMissCacheMu.Lock()
+	if exp, bad := kidMissCache[kid]; bad && time.Now().Before(exp) {
+		kidMissCacheMu.Unlock()
+		return
+	}
+	kidMissCacheMu.Unlock()
+	jwtCache.mu.RLock()
+	_, ok := jwtCache.keys[kid]
+	jwtCache.mu.RUnlock()
+	if ok {
+		return
+	}
+	fetchJWKS(realmURL)
+	jwtCache.mu.RLock()
+	_, ok = jwtCache.keys[kid]
+	jwtCache.mu.RUnlock()
+	if !ok {
+		kidMissCacheMu.Lock()
+		if len(kidMissCache) >= kidMissCacheMaxItems {
+			for k := range kidMissCache { // drop one arbitrary entry
+				delete(kidMissCache, k)
+				break
+			}
 		}
-	}()
+		kidMissCache[kid] = time.Now().Add(kidNegCacheTTL)
+		kidMissCacheMu.Unlock()
+	}
+}
+
+func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -140,8 +207,8 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		pub, ok := jwtCache.keys[header.Kid]
 		jwtCache.mu.RUnlock()
 		if !ok {
-			// Try refresh
-			fetchJWKS(realmURL)
+			// Try refresh (singleflighted + negative-cached against kid fuzzing)
+			refreshJWKSForKid(realmURL, header.Kid)
 			jwtCache.mu.RLock()
 			pub, ok = jwtCache.keys[header.Kid]
 			jwtCache.mu.RUnlock()
@@ -389,6 +456,59 @@ func callPermify(tenantID, userID, entityType, entityID, permission string) (boo
 }
 
 // ---------------------------------------------------------------------------
+// Decision cache (GPT-20): short-TTL cache of successful Permify decisions so
+// the /check hot path does not hit Permify on every request. Errors are never
+// cached — callers keep their fail-closed behavior (502 / deny).
+// ---------------------------------------------------------------------------
+
+type decisionEntry struct {
+	allowed   bool
+	expiresAt time.Time
+}
+
+const (
+	decisionCacheTTL        = 30 * time.Second
+	decisionCacheMaxEntries = 10000
+)
+
+var (
+	decisionCache   = make(map[string]decisionEntry)
+	decisionCacheMu sync.RWMutex
+)
+
+func cachedPermifyCheck(tenantID, userID, entityType, entityID, permission string) (bool, error) {
+	key := tenantID + "|" + userID + "|" + entityType + "|" + entityID + "|" + permission
+	now := time.Now()
+	decisionCacheMu.RLock()
+	e, ok := decisionCache[key]
+	decisionCacheMu.RUnlock()
+	if ok && now.Before(e.expiresAt) {
+		return e.allowed, nil
+	}
+	allowed, err := callPermify(tenantID, userID, entityType, entityID, permission)
+	if err != nil {
+		return false, err // fail-closed: errors are never cached
+	}
+	decisionCacheMu.Lock()
+	if len(decisionCache) >= decisionCacheMaxEntries {
+		for k, v := range decisionCache { // evict expired first
+			if now.After(v.expiresAt) {
+				delete(decisionCache, k)
+			}
+		}
+		if len(decisionCache) >= decisionCacheMaxEntries { // still full: drop one
+			for k := range decisionCache {
+				delete(decisionCache, k)
+				break
+			}
+		}
+	}
+	decisionCache[key] = decisionEntry{allowed: allowed, expiresAt: now.Add(decisionCacheTTL)}
+	decisionCacheMu.Unlock()
+	return allowed, nil
+}
+
+// ---------------------------------------------------------------------------
 // API types
 // ---------------------------------------------------------------------------
 
@@ -434,6 +554,9 @@ var (
 	checkCount int64
 	denyCount  int64
 )
+
+// maxBatchChecks caps /check/batch fan-out (GPT-21).
+const maxBatchChecks = 100
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -666,7 +789,7 @@ func main() {
 	mux.Handle("/v1/authz/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 
 	log.Printf("permify-authz-go starting on :%s (permify upstream: %s)", port, permifyURL)
-	if err := http.ListenAndServe(":"+port, withCORS(mux)); err != nil {
+	if err := (&http.Server{Addr: ":" + port, Handler: withCORS(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
 }
@@ -726,8 +849,8 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Real Permify check
-	allowed, err := callPermify(tenantID, userID, req.Entity, entityID, req.Action)
+	// Real Permify check (TTL decision cache; errors stay fail-closed)
+	allowed, err := cachedPermifyCheck(tenantID, userID, req.Entity, entityID, req.Action)
 	if err != nil {
 		log.Printf("permify error: %v", err)
 		http.Error(w, fmt.Sprintf(`{"error":"permify unavailable: %s"}`, err.Error()), http.StatusBadGateway)
@@ -766,6 +889,12 @@ func handleCheckBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"user_id is required"}`, http.StatusBadRequest)
 		return
 	}
+	// Bound batch size: one goroutine per check without a cap is a spike
+	// amplifier (GPT-21).
+	if len(req.Checks) > maxBatchChecks {
+		http.Error(w, fmt.Sprintf(`{"error":"too many checks (max %d)"}`, maxBatchChecks), http.StatusBadRequest)
+		return
+	}
 
 	tenantID := resolveTenant(r, req.TenantID)
 	results := make([]BatchCheckResult, len(req.Checks))
@@ -800,7 +929,7 @@ func handleCheckBatch(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			allowed, err := callPermify(tenantID, req.UserID, item.Entity, entityID, item.Action)
+			allowed, err := cachedPermifyCheck(tenantID, req.UserID, item.Entity, entityID, item.Action)
 			if err != nil {
 				log.Printf("permify batch error [%s#%s]: %v", item.Entity, item.Action, err)
 				res.Allowed = false

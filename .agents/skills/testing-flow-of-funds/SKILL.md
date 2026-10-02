@@ -15,17 +15,19 @@ description: Test 54Bank flow-of-funds infrastructure (saga orchestration, Tiger
 
 | Package | Location | Tests | What It Tests |
 |---------|----------|-------|---------------|
-| `pkg/fundsaga` | Saga orchestration | 32+ | Forward execution, reverse-order compensation, double-entry validation |
-| `pkg/tb2pc` | TigerBeetle 2PC | 10+ | Pending→post/void lifecycle, expiry, double-post prevention |
-| `pkg/distlock` | Distributed locking | 10+ | Mutual exclusion, multi-key rollback, fencing tokens, TTL |
-| `pkg/outbox` | Transactional outbox | 6+ | Append/relay, retry/DLQ, auto-relay, SQL helpers |
+| ~~`pkg/fundsaga`~~ DELETED (OR-05, 0 importers) | Saga orchestration | 32+ | Forward execution, reverse-order compensation, double-entry validation |
+| ~~`pkg/tb2pc`~~ DELETED (OR-05, 0 importers) | TigerBeetle 2PC | 10+ | Pending→post/void lifecycle, expiry, double-post prevention |
+| ~~`pkg/distlock`~~ DELETED (OR-05, 0 importers) | Distributed locking | 10+ | Mutual exclusion, multi-key rollback, fencing tokens, TTL |
+| ~~`pkg/outbox`~~ DELETED (OR-05, 0 importers) | Transactional outbox | 6+ | Append/relay, retry/DLQ, auto-relay, SQL helpers |
 | `pkg/tbclient` | TigerBeetle SDK client | 7 | Real SDK wiring, Uint128 types, graceful skip without cluster |
 
 ## Step 1: Run All Package Tests with Race Detector
 
 ```bash
 cd /home/ubuntu/repos/corebanking
-for pkg in pkg/fundsaga pkg/tb2pc pkg/distlock pkg/outbox pkg/tbclient; do
+# NOTE (OR-05/Wave-10): pkg/fundsaga, pkg/tb2pc, pkg/distlock, pkg/outbox were
+# deleted — zero importers fleet-wide. Only pkg/tbclient remains.
+for pkg in pkg/tbclient; do
   echo "=== $pkg ==="
   (cd $pkg && go test -v -race ./...)
 done
@@ -142,7 +144,7 @@ _, err := mgr.Acquire("account:001", "txn-2", 30*time.Second) // MUST fail
 
 ```bash
 cd /home/ubuntu/repos/corebanking
-for svc in payments-hub-go gl-engine-go temporal-worker-go tigerbeetle-sync-go middleware-go; do
+for svc in payments-hub-go gl-engine-go temporal-worker-go tigerbeetle-sync-go ; do
   (cd services/$svc && CGO_ENABLED=0 go build -o /dev/null . && echo "PASS $svc")
 done
 ```

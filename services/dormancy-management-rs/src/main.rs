@@ -97,19 +97,13 @@ fn cbn_unclaimed_threshold_years() -> u32 { 10 }
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn health() -> HttpResponse {
+    // MN-01: fictional middleware descriptor block removed (no Kafka/Postgres/
+    // Redis/Temporal/Permify/OpenSearch connections exist in this service).
     HttpResponse::Ok().json(json!({
         "status": "healthy",
         "service": "dormancy-management-rs",
         "version": "2.0.0",
-        "domain": "Account Dormancy — CBN Compliance",
-        "middleware": {
-            "kafka": "dormancy.events, dormancy.audit",
-            "postgres": "dormant_accounts",
-            "redis": "dormancy_cache",
-            "temporal": "DormancyWorkflow",
-            "permify": "dormancy:manage, dormancy:view",
-            "opensearch": "dormancy-2026"
-        }
+        "domain": "Account Dormancy — CBN Compliance"
     }))
 }
 
@@ -118,54 +112,23 @@ async fn list_accounts(
     state: web::Data<AppState>,
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(25);
-    let search = query.get("search").map(|s| s.to_lowercase()).unwrap_or_default();
-    let stage_filter = query.get("stage").cloned().unwrap_or_default();
-
-    let accounts = state.accounts.lock().unwrap_or_else(|e| e.into_inner());
-    let filtered: Vec<&DormantAccount> = accounts.iter().filter(|a| {
-        let match_search = search.is_empty()
-            || a.account_name.to_lowercase().contains(&search)
-            || a.account_number.contains(&search)
-            || a.branch.to_lowercase().contains(&search)
-            || a.customer_id.to_lowercase().contains(&search);
-        let match_stage = stage_filter.is_empty() || a.dormancy_stage == stage_filter;
-        match_search && match_stage
-    }).collect();
-
-    let total = filtered.len();
-    let offset = (page - 1) * limit;
-    let items: Vec<&DormantAccount> = filtered.into_iter().skip(offset).take(limit).collect();
-
-    HttpResponse::Ok().json(json!({
-        "items": items,
-        "total": total,
-        "page": page,
-        "limit": limit,
+    // MN-01: the accounts store is initialized empty (`Mutex::new(vec![])`) and
+    // nothing in the fleet ever populates it, so any listing served from it is
+    // fiction. Fail closed until a real account source is wired.
+    let _ = (req, state, query);
+    HttpResponse::NotImplemented().json(json!({
+        "error": "not_implemented",
+        "detail": "dormant-account listing is not backed by a real account store (MN-01); the in-memory store is empty by construction. Previously this route served analysis over an empty dataset."
     }))
 }
 
 async fn stats(state: web::Data<AppState>, req: HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let accounts = state.accounts.lock().unwrap_or_else(|e| e.into_inner());
-    let mut s = DormancyStats {
-        total: accounts.len(),
-        active: 0, inactive: 0, dormant: 0, unclaimed: 0,
-        total_dormant_balance: 0.0, flagged_for_cbn_sweep: 0,
-    };
-    for a in accounts.iter() {
-        match a.dormancy_stage.as_str() {
-            "active"    => s.active += 1,
-            "inactive"  => s.inactive += 1,
-            "dormant"   => { s.dormant += 1; s.total_dormant_balance += a.balance; }
-            "unclaimed" => { s.unclaimed += 1; s.total_dormant_balance += a.balance; }
-            _ => {}
-        }
-        if a.flagged_for_cbn_sweep { s.flagged_for_cbn_sweep += 1; }
-    }
-    HttpResponse::Ok().json(s)
+    // MN-01: stats were computed over an always-empty in-memory Vec — fiction.
+    let _ = (state, req);
+    HttpResponse::NotImplemented().json(json!({
+        "error": "not_implemented",
+        "detail": "dormancy statistics are not backed by a real account store (MN-01); the in-memory store is empty by construction."
+    }))
 }
 
 async fn check_dormancy(
@@ -173,40 +136,15 @@ async fn check_dormancy(
     state: web::Data<AppState>,
     body: web::Json<CheckDormancyRequest>,
 ) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-
-    let accounts = state.accounts.lock().unwrap_or_else(|e| e.into_inner());
-
-    if let Some(ref account_id) = body.account_id {
-        if let Some(account) = accounts.iter().find(|a| a.id == *account_id || a.account_number == *account_id) {
-            let stage = account.dormancy_stage.clone();
-            let reqs = reactivation_requirements(&stage);
-            return HttpResponse::Ok().json(json!({
-                "account_id": account.id,
-                "account_number": account.account_number,
-                "dormancy_stage": stage,
-                "restriction_level": account.restriction_level,
-                "days_inactive": account.days_inactive,
-                "reactivation_requirements": reqs,
-                "reactivation_eligible": account.reactivation_eligible,
-                "flagged_for_cbn_sweep": account.flagged_for_cbn_sweep,
-            }));
-        }
-    }
-
-    if let Some(days) = body.last_txn_days {
-        let stage = dormancy_stage(days);
-        let reqs = reactivation_requirements(stage);
-        return HttpResponse::Ok().json(json!({
-            "days_inactive": days,
-            "dormancy_stage": stage,
-            "restriction_level": restriction_level(stage),
-            "reactivation_requirements": reqs,
-            "cbn_unclaimed_threshold_years": cbn_unclaimed_threshold_years(),
-        }));
-    }
-
-    HttpResponse::BadRequest().json(json!({"error": "account_id or last_txn_days is required"}))
+    // MN-01: this endpoint evaluated dormancy against an always-empty in-memory
+    // Vec (initialized `Mutex::new(vec![])`, never populated) — the "analysis"
+    // was fiction. The pure stage-classification helper remains available to a
+    // future real implementation, but this route now fails closed.
+    let _ = (req, state, body);
+    HttpResponse::NotImplemented().json(json!({
+        "error": "not_implemented",
+        "detail": "dormancy check is not backed by a real account activity source (MN-01). Previously this route served analysis over an empty dataset."
+    }))
 }
 
 async fn reactivate(

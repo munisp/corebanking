@@ -165,9 +165,9 @@ class EsusuService {
     return EsusuContribution.fromJson(response.data as Map<String, dynamic>);
   }
 
-  Future<List<EsusuContribution>> getContributions(String groupId, {int? round}) async {
+  Future<List<EsusuContribution>> getContributions(String groupId, {int? round, int page = 1, int limit = 50}) async {
     try {
-      final queryParams = <String, dynamic>{};
+      final queryParams = <String, dynamic>{'page': page, 'limit': limit};
       if (round != null) queryParams['round'] = round;
 
       final response = await _apiClient.get(
@@ -198,10 +198,11 @@ class EsusuService {
     }
   }
 
-  Future<List<EsusuPayout>> getPayouts(String groupId) async {
+  Future<List<EsusuPayout>> getPayouts(String groupId, {int page = 1, int limit = 50}) async {
     try {
       final response = await _apiClient.get(
         '/esusu/api/v1/esusu/groups/$groupId/payouts',
+        queryParameters: {'page': page, 'limit': limit},
       );
 
       List<dynamic> itemsRaw;

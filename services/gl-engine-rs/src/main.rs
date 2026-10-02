@@ -290,6 +290,7 @@ async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppSt
             return db_unavailable();
         }
     };
+    let _span = otelkit::pg_span("INSERT INTO gl_journals; INSERT INTO gl_journal_lines (post_journal transaction)").entered();
     let narration = entries.first().map(|e| e.narration.clone()).unwrap_or_default();
     let posted_by = entries.first().and_then(|e| e.posted_by.clone());
     if let Err(e) = sqlx::query(
@@ -700,6 +701,7 @@ fn sanitize_input(s: &str) -> String {
 // Best-effort audit persistence via the GL pool. Never fails a request.
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     let id = format!("{}_{}_{}", "gl_engine_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5::jsonb)").entered();
     let svc_name = String::from("gl-engine-rs");
     let status = String::from("active");
     let data_str = serde_json::to_string(data).unwrap_or_default();
@@ -780,6 +782,9 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
     match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
         Ok(mut stream) => {
+            // Wave-11: bound blocking I/O (was unbounded read_to_string).
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
             let host = host_port.split(':').next().unwrap_or("localhost");
             let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
             stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
@@ -826,9 +831,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }
@@ -980,6 +995,14 @@ async fn init_schema(pool: &PgPool) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("gl-engine-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[gl-engine-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8101);
     // FAIL FAST: the GL must never run on in-memory state or default credentials.
     let db_url = env::var("DATABASE_URL")
@@ -1010,17 +1033,25 @@ async fn main() -> std::io::Result<()> {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("none")
                     .to_string();
-                eprintln!("[gl-engine-rs] {} {} trace={}", req.method(), req.path(), trace_id);
+                // Wave-11: log only errors, plus 1% sampled requests (was: every request).
+                let w11_method = req.method().clone();
+                let w11_path = req.path().to_string();
+                let w11_sample = _REQ_COUNT.load(AtomicOrdering::Relaxed) % 100 == 0;
                 let fut = srv.call(req);
                 async move {
                     let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
+                    let w11_err = res.status().is_server_error() || res.status().is_client_error();
+                    if w11_err {
                         _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if w11_err || w11_sample {
+                        eprintln!("[gl-engine-rs] {} {} trace={} status={}", w11_method, w11_path, trace_id, res.status().as_u16());
                     }
                     Ok(res)
                 }
             })
             .app_data(state.clone())
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))

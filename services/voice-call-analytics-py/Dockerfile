@@ -12,4 +12,4 @@ COPY main.py .
 EXPOSE 8635
 USER nobody
 HEALTHCHECK --interval=30s --timeout=3s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8635/healthz')"
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8635"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port 8635 --workers ${UVICORN_WORKERS:-4}"]

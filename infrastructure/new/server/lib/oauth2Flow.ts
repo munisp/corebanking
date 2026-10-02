@@ -1,6 +1,8 @@
 /**
  * OAuth2 Authorization Code Flow — End-to-End SSO Implementation
- * Supports Keycloak as IdP with fallback to local JWT auth.
+ * Keycloak is the only identity provider. PL-03/PL-07 (F10-2): the local-JWT
+ * "sso-fallback" minting branch and the hardcoded fallback secret were deleted —
+ * a Keycloak outage now yields 503, never an unauthenticated session.
  * Implements: authorize → callback → token exchange → userinfo → logout
  */
 import type { Express, Request, Response } from "express";
@@ -12,7 +14,6 @@ const KEYCLOAK_REALM = process.env.KEYCLOAK_REALM || "54bank";
 const CLIENT_ID = process.env.KEYCLOAK_CLIENT_ID || "54bank-platform";
 const CLIENT_SECRET = process.env.KEYCLOAK_CLIENT_SECRET || "";
 const REDIRECT_URI = process.env.OAUTH2_REDIRECT_URI || "http://localhost:3000/api/auth/oauth2/callback";
-const JWT_SECRET = process.env.JWT_SECRET || "54bank-dev-secret-key-change-in-production";
 
 const oidcBase = `${KEYCLOAK_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect`;
 
@@ -23,19 +24,6 @@ function generatePKCE() {
   const verifier = crypto.randomBytes(32).toString("base64url");
   const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
   return { verifier, challenge };
-}
-
-function signLocalJWT(payload: Record<string, unknown>, expiresIn = "8h"): string {
-  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
-  const now = Math.floor(Date.now() / 1000);
-  const expSeconds = expiresIn.endsWith("h")
-    ? parseInt(expiresIn) * 3600
-    : parseInt(expiresIn) * 60;
-  const body = Buffer.from(
-    JSON.stringify({ ...payload, iat: now, exp: now + expSeconds })
-  ).toString("base64url");
-  const sig = crypto.createHmac("sha256", JWT_SECRET).update(`${header}.${body}`).digest("base64url");
-  return `${header}.${body}.${sig}`;
 }
 
 // Cleanup expired PKCE flows
@@ -107,6 +95,7 @@ export function registerOAuth2Endpoints(app: Express) {
       // Exchange authorization code for tokens
       const tokenResp = await fetch(`${oidcBase}/token`, {
         method: "POST",
+        signal: AbortSignal.timeout(5000),
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           grant_type: "authorization_code",
@@ -135,6 +124,7 @@ export function registerOAuth2Endpoints(app: Express) {
       // Fetch userinfo
       const userinfoResp = await fetch(`${oidcBase}/userinfo`, {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
+        signal: AbortSignal.timeout(5000),
       });
       const userinfo = userinfoResp.ok ? await userinfoResp.json() : {};
 
@@ -152,20 +142,13 @@ export function registerOAuth2Endpoints(app: Express) {
     } catch (err: any) {
       logger.error(`[OAuth2] Callback error: ${err.message}`);
 
-      // Fallback: generate local JWT if Keycloak is down
-      const fallbackToken = signLocalJWT({
-        sub: "sso-fallback",
-        role: "user",
-        ssoFallback: true,
-      });
-
-      res.json({
-        accessToken: fallbackToken,
-        refreshToken: null,
-        user: { email: "sso-user@54bank.ng", role: "user" },
-        ssoProvider: "local-fallback",
-        redirectTo: flow.redirectTo,
-        warning: "Keycloak unreachable, using local authentication",
+      // PL-07 (F10-2): fail closed. Keycloak unreachable => 503. The previous
+      // "sso-fallback" branch minted a platform-valid local JWT with role "user"
+      // for ANY caller during an IdP outage — that branch was deleted outright.
+      return res.status(503).json({
+        error: "identity_provider_unavailable",
+        message: "Keycloak is unreachable; SSO login cannot complete. No fallback authentication is performed.",
+        retryAfterSeconds: 30,
       });
     }
   });
@@ -180,6 +163,7 @@ export function registerOAuth2Endpoints(app: Express) {
     try {
       const resp = await fetch(`${oidcBase}/token`, {
         method: "POST",
+        signal: AbortSignal.timeout(5000),
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           grant_type: "refresh_token",
@@ -210,6 +194,7 @@ export function registerOAuth2Endpoints(app: Express) {
     try {
       const resp = await fetch(`${oidcBase}/userinfo`, {
         headers: { Authorization: auth },
+        signal: AbortSignal.timeout(5000),
       });
       if (resp.ok) {
         res.json(await resp.json());
@@ -243,6 +228,7 @@ export function registerOAuth2Endpoints(app: Express) {
       if (rt) {
         await fetch(`${oidcBase}/logout`, {
           method: "POST",
+          signal: AbortSignal.timeout(5000),
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({
             client_id: CLIENT_ID,

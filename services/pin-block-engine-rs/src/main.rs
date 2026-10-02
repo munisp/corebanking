@@ -59,7 +59,7 @@ struct VerifyRequest {
 struct AppState {
     start_time: Instant,
     pin_blocks: Arc<RwLock<Vec<PinBlock>>>,
-    pin_hashes: Arc<RwLock<Vec<PinHashRecord>>>,
+    pin_hashes: Arc<RwLock<std::collections::HashMap<String, PinHashRecord>>>,
 }
 
 impl AppState {
@@ -68,7 +68,7 @@ impl AppState {
         AppState {
             start_time: Instant::now(),
             pin_blocks: Arc::new(RwLock::new(Vec::new())),
-            pin_hashes: Arc::new(RwLock::new(Vec::new())),
+            pin_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -151,8 +151,11 @@ async fn encode_pin_block(req: actix_web::HttpRequest, _state: web::Data<AppStat
 
 async fn list_hashes(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let hashes = state.pin_hashes.read().unwrap();
-    HttpResponse::Ok().json(json!({"items": *hashes, "total": hashes.len()}))
+    // Wave-11 (RS-31): pin_hashes is now id-keyed (O(1) lookup); listing is capped.
+    let hashes = state.pin_hashes.read().unwrap_or_else(|e| e.into_inner());
+    let items: Vec<&PinHashRecord> = hashes.values().take(1000).collect();
+    let total = hashes.len();
+    HttpResponse::Ok().json(json!({"items": items, "total": total}))
 }
 
 async fn hash_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<HashRequest>) -> HttpResponse {
@@ -166,7 +169,12 @@ async fn hash_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, body:
     }
     let mut salt = [0u8; SALT_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    let hash = pbkdf2_hash_pin(&body.pin, &salt, PBKDF2_ITERATIONS);
+    // Wave-11 (RS-29): PBKDF2-310k off the actix worker thread.
+    let pin = body.pin.clone();
+    let hash = match tokio::task::spawn_blocking(move || pbkdf2_hash_pin(&pin, &salt, PBKDF2_ITERATIONS)).await {
+        Ok(h) => h,
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"error": "hashing_failed", "detail": e.to_string()})),
+    };
     let rec = PinHashRecord {
         id: format!("PH-{}", uuid::Uuid::new_v4()),
         account_number: body.account_number.clone(),
@@ -176,7 +184,14 @@ async fn hash_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, body:
         iterations: PBKDF2_ITERATIONS,
         created_at: now_utc(),
     };
-    state.pin_hashes.write().unwrap().push(rec.clone());
+    {
+        // Wave-11 (RS-31): bound table growth (100k records) instead of unbounded push.
+        let mut hashes = state.pin_hashes.write().unwrap_or_else(|e| e.into_inner());
+        if hashes.len() >= 100_000 {
+            return HttpResponse::InsufficientStorage().json(json!({"error": "pin_hash_store_full", "detail": "capacity 100000 reached"}));
+        }
+        hashes.insert(rec.id.clone(), rec.clone());
+    }
     HttpResponse::Created().json(json!({"id": rec.id, "algorithm": algo, "hashStored": true}))
 }
 
@@ -187,8 +202,9 @@ async fn verify_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
         return HttpResponse::Ok().json(json!({"hashId": body.hash_id, "verified": false, "reason": "invalid_pin_format"}));
     }
     let rec = {
-        let hashes = state.pin_hashes.read().unwrap();
-        hashes.iter().find(|h| h.id == body.hash_id).cloned()
+        // Wave-11 (RS-31): O(1) HashMap lookup (was O(n) scan).
+        let hashes = state.pin_hashes.read().unwrap_or_else(|e| e.into_inner());
+        hashes.get(&body.hash_id).cloned()
     };
     let rec = match rec {
         Some(r) => r,
@@ -202,7 +218,13 @@ async fn verify_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
         Some(h) => h,
         None => return HttpResponse::InternalServerError().json(json!({"error": "corrupt_hash_record"})),
     };
-    let actual = pbkdf2_hash_pin(&body.pin, &salt, rec.iterations);
+    // Wave-11 (RS-30): PBKDF2 off the actix worker thread.
+    let pin = body.pin.clone();
+    let iterations = rec.iterations;
+    let actual = match tokio::task::spawn_blocking(move || pbkdf2_hash_pin(&pin, &salt, iterations)).await {
+        Ok(h) => h,
+        Err(e) => return HttpResponse::InternalServerError().json(json!({"error": "hashing_failed", "detail": e.to_string()})),
+    };
     let verified = ct_eq(&actual, &expected);
     HttpResponse::Ok().json(json!({
         "hashId": body.hash_id,
@@ -214,8 +236,8 @@ async fn verify_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let blocks = state.pin_blocks.read().unwrap();
-    let hashes = state.pin_hashes.read().unwrap();
-    let algo_counts = hashes.iter().fold(std::collections::HashMap::<String,u32>::new(), |mut m, h| {
+    let hashes = state.pin_hashes.read().unwrap_or_else(|e| e.into_inner());
+    let algo_counts = hashes.values().fold(std::collections::HashMap::<String,u32>::new(), |mut m, h| {
         *m.entry(h.algorithm.clone()).or_insert(0) += 1;
         m
     });

@@ -135,7 +135,78 @@ class AuthService:
         )
         logger.info(f"✓ Permify permissions assigned for {payload.email}")
 
+        # ST-04: also assign Keycloak realm roles on the user. Previously
+        # adapters/keycloak.py assign_role_to_user had zero callers, so
+        # realm_access.roles was never populated and the Go fleet's
+        # X-User-Role (derived from realm_access.roles) stayed empty.
+        self._assign_keycloak_realm_roles(
+            keycloak_adapter=keycloak_adapter,
+            keycloak_user_id=keycloak_user.id,
+            user_role=payload.user_role,
+            platform_role=payload.platform_role,
+            tenant_role=payload.tenant_role,
+        )
+
         return auth
+
+    def _assign_keycloak_realm_roles(
+        self,
+        keycloak_adapter: KeycloakAdapter,
+        keycloak_user_id: str,
+        user_role: UserRole,
+        platform_role: str = None,
+        tenant_role: str = None,
+    ) -> None:
+        """ST-04: populate Keycloak realm_access.roles from the roles assigned
+        at profile creation (platform_role / tenant_role / auth-level user_role).
+
+        Fail-soft: any realm-role assignment failure is logged, never raised —
+        Permify remains the canonical authorization store and a missing realm
+        role must not abort onboarding.
+        """
+        role_names = [r for r in (platform_role, tenant_role) if r]
+        if user_role:
+            role_names.append(user_role.value if hasattr(user_role, "value") else str(user_role))
+        for role_name in dict.fromkeys(role_names):
+            try:
+                keycloak_adapter.assign_role_to_user(keycloak_user_id, role_name)
+            except Exception as e:
+                logger.warning(
+                    f"Keycloak realm-role assignment failed (fail-soft): "
+                    f"role={role_name} user={keycloak_user_id}: {e}"
+                )
+
+    def delete_auth(self, keycloak_id: str, tenant_id: str, keycloak_realm: str) -> bool:
+        """Remove an auth profile (DB) and its Keycloak identities (admin API).
+
+        R1A saga-compensation contract behind DELETE /auth/{keycloak_id}
+        (service-token callers only). Best-effort: returns False when the
+        profile is absent (route surfaces 404); a missing Keycloak user is
+        tolerated; Keycloak admin-API failures are logged and do NOT block the
+        DB delete, but the orphaned identity is called out in the log.
+        """
+        auth = self._auth_repository.get_auth_by_keycloak_id(keycloak_id, tenant_id)
+        if auth is None:
+            return False
+
+        try:
+            adapter = KeycloakAdapter(realm=keycloak_realm)
+            adapter.delete_user(keycloak_id)
+            # Best-effort: also remove the companion service-account user
+            # (created as "<api_key>_<email>") so it is not orphaned.
+            service_account = adapter.get_user(f"{auth.api_key}_{auth.email}")
+            if service_account is not None:
+                adapter.delete_user(service_account.id)
+        except Exception as e:
+            logger.error(
+                f"Keycloak deletion failed for keycloak_id={keycloak_id} — "
+                f"proceeding with DB delete; identity may be orphaned: {e}"
+            )
+
+        self._auth_repository.delete_auth_by_keycloak_id(keycloak_id, tenant_id)
+        self._db.commit()
+        logger.info(f"Auth profile deleted for keycloak_id={keycloak_id} tenant={tenant_id}")
+        return True
 
     def login(self, payload: Login, context: Context, device_info: dict = None) -> dict:
         """Auth Service - Login."""

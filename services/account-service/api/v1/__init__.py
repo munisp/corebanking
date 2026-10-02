@@ -7,3 +7,4 @@ from .account_opening import opening_router
 from .account_closure import closure_router
 from .safe_deposit import safe_deposit_router
 from .billing import billing_router
+from .account_lifecycle import lifecycle_router  # MN-03/MN-05

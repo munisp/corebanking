@@ -395,14 +395,54 @@ fn add_security_headers(resp: &mut HttpResponse) {
 
 // ─── DB PERSISTENCE ─────────────────────────────────────────────────────────
 
+// Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
+// or every 100 rows by a spawned task (was: one blocking INSERT per request).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "falkordb_graph_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let id = format!("{}_{}_{}", "falkordb_graph_engine_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         let svc_name = String::from("falkordb-graph-engine-rs");
-        let _ = client.execute(
-            "INSERT INTO records (id, service, tenant, status, data, created_at) VALUES ($1, $2, 'default', 'active', $3, NOW()) ON CONFLICT (id) DO UPDATE SET data=$3",
-            &[&id, &svc_name, &data.to_string()],
-        ).await;
+        let status = String::from("active");
+        let data_str = serde_json::to_string(data).unwrap_or_default();
+        if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let client = client.clone();
+            let buf = buf.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+                loop {
+                    tick.tick().await;
+                    let rows: Vec<(String, String, String, String, String)> = {
+                        let mut b = buf.lock().unwrap();
+                        if b.is_empty() { continue; }
+                        std::mem::take(&mut *b)
+                    };
+                    for (id, svc, ep, st, d) in rows {
+                        let _ = client.execute(
+                            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                            &[&id, &svc, &ep, &st, &d],
+                        ).await;
+                    }
+                }
+            });
+        }
+        let mut b = buf.lock().unwrap();
+        b.push((id, svc_name, endpoint.to_string(), status, data_str));
+        if b.len() >= 100 {
+            let rows = std::mem::take(&mut *b);
+            drop(b);
+            let client = client.clone();
+            tokio::spawn(async move {
+                for (id, svc, ep, st, d) in rows {
+                    let _ = client.execute(
+                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                        &[&id, &svc, &ep, &st, &d],
+                    ).await;
+                }
+            });
+        }
     }
 }
 
@@ -619,7 +659,13 @@ async fn detect_circular(req: actix_web::HttpRequest, state: web::Data<AppState>
     // Inter-service: notify AML engine
     let upstream = env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://aml-engine-rs:8080".to_string());
     let _notify_body = format!("{{\"source\": \"falkordb-graph-engine-rs\", \"circular_txns\": {}}}", cycles.len());
-    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), &_notify_body)).await;
+    { // Wave-11: fire-and-forget upstream call (was awaited-and-discarded)
+        let (w11_url, w11_body) = ((format!("{}/v1/notify", upstream)).to_string(), (_notify_body).to_string());
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3),
+                tokio::task::spawn_blocking(move || call_service_sync(&w11_url, &w11_body))).await;
+        });
+    }
 
     db_persist(&state, "detect_circular", &json!({"cycles_found": cycles.len()})).await;
     HttpResponse::Ok().json(json!({"circularTransactions": cycles, "count": cycles.len()}))
@@ -715,9 +761,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }

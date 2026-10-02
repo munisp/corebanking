@@ -9,6 +9,17 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 type TradePaymentStruct struct {
 	Payer  string `json:"payer"`
 	Payee  string `json:"payee"`
@@ -25,10 +36,6 @@ func TradePayment(payload *TradePaymentStruct) ([]byte, error) {
 		panic(err)
 	}
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		panic(err)
@@ -37,7 +44,7 @@ func TradePayment(payload *TradePaymentStruct) ([]byte, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 
 	if err != nil {
 		return nil, err

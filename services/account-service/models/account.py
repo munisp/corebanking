@@ -1,10 +1,11 @@
+import datetime
 from typing import Optional
 
 from database import Base
 from .mixins import TimestampMixin, SoftDeleteMixin
 from utils import AccountStatus, AccountType, AccountCurrency
 
-from sqlalchemy import BigInteger, Integer, String, Enum
+from sqlalchemy import BigInteger, Boolean, Integer, String, Enum, TIMESTAMP
 from sqlalchemy_serializer import SerializerMixin
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -55,6 +56,18 @@ class Account(Base, SerializerMixin, TimestampMixin, SoftDeleteMixin):
         default=AccountCurrency.NGN,
     )
     tier: Mapped[Optional[str]] = mapped_column(String, nullable=True, default="tier1")
+
+    # MN-01: last observed debit/credit activity; drives dormancy sweeps.
+    last_activity_at: Mapped[Optional[datetime.datetime]] = mapped_column(
+        TIMESTAMP, nullable=True
+    )
+    # MN-04: minor-account controls (expand-only).
+    is_minor: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    guardian_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    daily_limit_kobo: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # MN-03: signing mandate — 'single' (default) or 'all' (every signatory
+    # must approve; debits route through maker-checker).
+    mandate: Mapped[str] = mapped_column(String, nullable=False, default="single")
 
     def __repr__(self):
         return (

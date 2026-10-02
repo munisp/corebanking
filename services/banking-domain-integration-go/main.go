@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto"
@@ -13,11 +12,9 @@ import (
 	"encoding/binary"
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
-	"io"
 	"math/big"
-	"net"
+	"math/rand"
 	"os/signal"
-	"strconv"
 	"sync/atomic"
 	"syscall"
 
@@ -29,7 +26,45 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
+
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(rand.Int63n(int64(d)/2))
+}
+
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // secureUint32 returns a CSPRNG-derived uint32 for internal record IDs (L-16).
 // Fails fast if the system CSPRNG is unavailable.
@@ -166,16 +201,25 @@ func loanLifecycleToGL(w http.ResponseWriter, r *http.Request) {
 			}},
 	}
 
+	// MN-22: derive summary counters from the event list instead of hardcoding
+	// them, so the response can never contradict its own payload.
+	countByType := map[string]int{}
+	totalGLEntries := 0
+	for _, ev := range events {
+		countByType[ev.EventType]++
+		totalGLEntries += len(ev.GLPostings)
+	}
+
 	result := map[string]interface{}{
 		"batchId":      fmt.Sprintf("LOAN-GL-%s", businessDate),
 		"businessDate": businessDate,
 		"events":       events,
 		"summary": map[string]interface{}{
-			"disbursements":   1,
-			"repayments":      1,
-			"writeOffs":       1,
-			"restructures":    1,
-			"totalGLEntries":  8,
+			"disbursements":   countByType["disbursement"],
+			"repayments":      countByType["repayment"],
+			"writeOffs":       countByType["write_off"],
+			"restructures":    countByType["restructure"],
+			"totalGLEntries":  totalGLEntries,
 			"glCodesImpacted": []string{"1301 (Loans & Advances)", "1309 (Restructured)", "1357 (ECL Provision)", "2101 (Deposits)", "4101 (Interest Income)", "4203 (Processing Fee)", "9101 (Off-BS Memo)"},
 		},
 		"pipeline": map[string]string{
@@ -240,94 +284,34 @@ func fxDealingToGL(w http.ResponseWriter, r *http.Request) {
 // GAP 11: FIXED DEPOSIT → GL (placement, maturity, early liquidation)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// MN-22: The previous implementation served hardcoded fixed-deposit GL events
+// (FD-PLACE-001 etc.) stamped as posted via the middlewareActions fiction.
+// There is no FD table and no FD event source in the fleet
+// (computeFixedDepositMaturity has 0 callers). Fail honestly until the FD
+// module is built (ROADMAP).
 func fixedDepositToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("FD-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"events": []map[string]interface{}{
-			{"eventId": "FD-PLACE-001", "type": "placement", "customerId": "CUST-015", "customer": "Hassan Premium", "principal": 50_000_000, "tenor": 180, "rate": 14.0,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-PLACE-001", DebitGL: "2101", DebitName: "Savings Account (debit)", CreditGL: "2103", CreditName: "Fixed Deposit Liability", Amount: 50_000_000, Narration: "FD placement - 180 days @ 14% p.a."},
-				}},
-			{"eventId": "FD-MATURE-001", "type": "maturity", "customerId": "CUST-008", "customer": "Amina Term Deposit", "principal": 25_000_000, "interest": 1_750_000, "tenor": 365, "rate": 7.0,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-MAT-001-P", DebitGL: "2103", DebitName: "Fixed Deposit Liability (release)", CreditGL: "2101", CreditName: "Customer Savings Account", Amount: 25_000_000, Narration: "FD maturity - principal release"},
-					{EntryID: "JE-FD-MAT-001-I", DebitGL: "5102", DebitName: "Interest Expense on FD", CreditGL: "2101", CreditName: "Customer Savings Account", Amount: 1_750_000, Narration: "FD maturity - interest payout"},
-					{EntryID: "JE-FD-MAT-001-W", DebitGL: "2101", DebitName: "Customer Account (WHT debit)", CreditGL: "2312", CreditName: "WHT Payable to FIRS", Amount: 175_000, Narration: "10% WHT on FD interest (FIRS remittance)"},
-				}},
-			{"eventId": "FD-EARLY-001", "type": "early_liquidation", "customerId": "CUST-022", "customer": "Urgency Corp", "principal": 10_000_000, "penalty": 200_000, "interestForfeited": 350_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-EARLY-001", DebitGL: "2103", DebitName: "Fixed Deposit Liability", CreditGL: "2101", CreditName: "Customer Account (net)", Amount: 9_800_000, Narration: "Early liquidation (principal - penalty)"},
-					{EntryID: "JE-FD-PENALTY-001", DebitGL: "2103", DebitName: "FD Liability (penalty portion)", CreditGL: "4209", CreditName: "Early Liquidation Penalty Income", Amount: 200_000, Narration: "Penalty for breaking FD before maturity"},
-				}},
-		},
-		"summary": map[string]interface{}{
-			"placements":        1,
-			"maturities":        1,
-			"earlyLiquidations": 1,
-			"glCodesImpacted":   []string{"2101 (Savings)", "2103 (FD Liability)", "5102 (Interest Expense)", "2312 (WHT Payable)", "4209 (Penalty Income)"},
-		},
-		"pipeline": map[string]string{
-			"step1": "FD event triggered (placement/maturity/early liquidation/top-up/rollover)",
-			"step2": "Placement: Dr 2101 (savings) / Cr 2103 (FD liability) — funds locked",
-			"step3": "Maturity: Dr 2103 / Cr 2101 (principal + interest released)",
-			"step4": "Deduct WHT at 10% on interest earned → GL 2312 (WHT Payable)",
-			"step5": "Early break: Apply penalty, forfeit accrued interest, release net",
-			"step6": "Auto-rollover: Re-book at prevailing rate if instruction exists",
-		},
-		"middleware": middlewareActions("banking.fixed_deposit.lifecycle"),
-	}
-	respondJSON(w, result)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error":  "not_implemented",
+		"detail": "fixed-deposit lifecycle GL posting is not implemented: no FD ledger or event source exists (MN-22). This endpoint previously returned fabricated journals; it now fails closed.",
+	})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GAP 12: STANDING INSTRUCTIONS → GL (scheduled execution posting)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// MN-22: The previous implementation served hardcoded standing-instruction GL
+// executions (SI-001..004) stamped as posted via the middlewareActions fiction.
+// No standing-instruction scheduler/executor exists in the fleet. Fail honestly.
 func standingInstructionsToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("SI-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"executions": []map[string]interface{}{
-			{"siId": "SI-001", "type": "salary_payment", "customer": "Dangote Cement PLC", "beneficiaries": 450, "totalAmount": 180_000_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-SAL-001", DebitGL: "2101", DebitName: "Corporate Current Account", CreditGL: "2101", CreditName: "Staff Salary Accounts (batch)", Amount: 180_000_000, Narration: "Salary bulk payment - 450 beneficiaries"},
-					{EntryID: "JE-SI-SAL-FEE-001", DebitGL: "2101", DebitName: "Corporate (bulk fee)", CreditGL: "4208", CreditName: "Bulk Payment Fee Income", Amount: 22_500, Narration: "₦50/head × 450 salary credits"},
-				}},
-			{"siId": "SI-002", "type": "sweep", "customer": "Access Industries", "from": "Current", "to": "Investment", "amount": 25_000_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-SWEEP-001", DebitGL: "2101", DebitName: "Current Account", CreditGL: "2104", CreditName: "Call Deposit / Investment Account", Amount: 25_000_000, Narration: "Auto-sweep: balance above ₦50M to investment"},
-				}},
-			{"siId": "SI-003", "type": "loan_repayment", "customer": "Aisha Mohammed", "loanId": "LN-002", "amount": 125_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-REPAY-001", DebitGL: "2101", DebitName: "Customer Savings", CreditGL: "1301", CreditName: "Loans & Advances", Amount: 100_000, Narration: "Auto loan repayment - principal portion"},
-					{EntryID: "JE-SI-REPAY-INT-001", DebitGL: "2101", DebitName: "Customer Savings", CreditGL: "4101", CreditName: "Interest Income", Amount: 25_000, Narration: "Auto loan repayment - interest portion"},
-				}},
-			{"siId": "SI-004", "type": "bill_payment", "customer": "Zenith Construction", "biller": "EKEDC", "amount": 450_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-BILL-001", DebitGL: "2101", DebitName: "Customer Account", CreditGL: "2301", CreditName: "Bills Payable / Clearing", Amount: 450_000, Narration: "Auto bill payment to EKEDC"},
-				}},
-		},
-		"summary": map[string]interface{}{
-			"executed":          4,
-			"totalAmount":       205_575_000,
-			"failed":            0,
-			"insufficientFunds": 0,
-			"glCodesImpacted":   []string{"2101 (Current/Savings)", "2104 (Investment)", "2301 (Clearing)", "1301 (Loans)", "4101 (Interest Income)", "4208 (Bulk Fee)"},
-		},
-		"pipeline": map[string]string{
-			"step1": "Temporal workflow triggers at scheduled time (daily/weekly/monthly)",
-			"step2": "Check source account balance ≥ instruction amount",
-			"step3": "Execute transfer: Dr source GL / Cr destination GL",
-			"step4": "If cross-bank: route through NIP/NEFT with settlement GL posting",
-			"step5": "On failure: retry up to 3x, then mark failed + notify customer",
-			"step6": "Update execution counter + next execution date",
-		},
-		"middleware": middlewareActions("banking.standing_instructions.executed"),
-	}
-	respondJSON(w, result)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error":  "not_implemented",
+		"detail": "standing-instruction execution GL posting is not implemented: no scheduler or execution pipeline exists (MN-22). This endpoint previously returned fabricated journals; it now fails closed.",
+	})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -558,16 +542,8 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
-		}
-	}()
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -755,108 +731,36 @@ func init() {
 	}
 }
 
-// redisConn dials Redis and returns the connection plus a buffered reader with
-// a hard deadline (M-23: no partial reads against the raw socket).
-func redisConn() (net.Conn, *bufio.Reader, error) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil {
-		return nil, nil, err
-	}
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	return conn, bufio.NewReader(conn), nil
-}
+// W11 GPT-01: pooled go-redis client shared per service (replaces per-op TCP dial).
+// Lazy init so REDIS_URL env override in init() is honored; DialTimeout kept as dial fallback.
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
+)
 
-// writeRESPCommand serializes args as a RESP multi-bulk request.
-func writeRESPCommand(w *bufio.Writer, args ...string) {
-	fmt.Fprintf(w, "*%d\r\n", len(args))
-	for _, a := range args {
-		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(a), a)
-	}
-	w.Flush()
-}
-
-// readRESPReply parses one RESP reply: simple string, error, integer, bulk
-// string (length-prefixed read), or multi-bulk (recursive). Redis error
-// replies are returned as Go errors.
-func readRESPReply(r *bufio.Reader) (interface{}, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return nil, err
-	}
-	if len(line) < 3 || !strings.HasSuffix(line, "\r\n") {
-		return nil, fmt.Errorf("malformed RESP reply")
-	}
-	payload := line[1 : len(line)-2]
-	switch line[0] {
-	case '+':
-		return payload, nil
-	case '-':
-		return nil, fmt.Errorf("redis error: %s", payload)
-	case ':':
-		n, err := strconv.ParseInt(payload, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("malformed integer reply: %v", err)
-		}
-		return n, nil
-	case '$':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil // nil bulk string
-		}
-		buf := make([]byte, n+2) // payload + trailing CRLF
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
-		return string(buf[:n]), nil
-	case '*':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed multi-bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil
-		}
-		items := make([]interface{}, 0, n)
-		for i := 0; i < n; i++ {
-			it, err := readRESPReply(r)
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, it)
-		}
-		return items, nil
-	}
-	return nil, fmt.Errorf("unknown RESP type byte %q", line[0])
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
 }
 
 func cacheGet(key string) (string, bool) {
-	conn, rd, err := redisConn()
+	s, err := getRedisClient().Get(redisCtx, key).Result()
 	if err != nil {
 		return "", false
 	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "GET", key)
-	rep, err := readRESPReply(rd)
-	if err != nil || rep == nil {
-		return "", false
-	}
-	s, ok := rep.(string)
-	return s, ok
+	return s, true
 }
-
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, rd, err := redisConn()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "SET", key, value, "EX", strconv.Itoa(ttlSeconds))
-	if _, err := readRESPReply(rd); err != nil { // detects -ERR replies
+	if err := getRedisClient().Set(redisCtx, key, value, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
 		log.Printf("[%s] cacheSet(%s) failed: %v", serviceName, key, err)
 	}
 }
@@ -1330,11 +1234,10 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 	if !_cb.allow() {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond))
 		}
 		var req *http.Request
 		if body != nil {
@@ -1345,21 +1248,22 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Source-Service", serviceName)
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -1483,11 +1387,12 @@ func main() {
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -1534,11 +1439,10 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		_cbOpen.Store(false)
 		_cbFailures.Store(0)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond))
 		}
 		var req *http.Request
 		if body != nil {
@@ -1549,7 +1453,7 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 			req, _ = http.NewRequest(method, url, nil)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cbFailures.Add(1)
@@ -1559,8 +1463,8 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 			}
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
 			_cbFailures.Add(1)
 			_cbLastFailUnix.Store(time.Now().UnixNano())
@@ -1571,6 +1475,7 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cbFailures.Store(0)
 		_cbOpen.Store(false)
 		return result, nil

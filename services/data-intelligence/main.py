@@ -1,6 +1,7 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from utils import get_config
 from dapr.ext.fastapi import DaprApp  # type: ignore
 
@@ -21,6 +22,7 @@ app = FastAPI(
     description="54link data intelligence service.",
     version="0.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL

@@ -10,9 +10,9 @@ class InsuranceService {
   final ApiService _apiService = ApiService();
 
   // Get all Etherisc policy templates
-  Future<List<EtheriscPolicy>> getAllEtheriscPolicies() async {
+  Future<List<EtheriscPolicy>> getAllEtheriscPolicies({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/etherisc/api/v1/etherisc/policies/all');
+      final response = await _apiService.get('/etherisc/api/v1/etherisc/policies/all', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;
@@ -65,9 +65,9 @@ class InsuranceService {
   }
 
   // Get all available insurance policies (old endpoint - kept for compatibility)
-  Future<List<InsurancePolicy>> getAllPolicies() async {
+  Future<List<InsurancePolicy>> getAllPolicies({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/insurance/api/v1/insurance/policies/all');
+      final response = await _apiService.get('/insurance/api/v1/insurance/policies/all', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;
@@ -214,9 +214,9 @@ class InsuranceService {
   }
 
   // Get all insurance policies for the current customer
-  Future<List<InsurancePolicy>> getCustomerPolicies() async {
+  Future<List<InsurancePolicy>> getCustomerPolicies({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/insurance/api/v1/insurance/policies/customer/all');
+      final response = await _apiService.get('/insurance/api/v1/insurance/policies/customer/all', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;

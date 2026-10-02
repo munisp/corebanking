@@ -7,6 +7,7 @@
 
 import '../../utils/text_case_utils.dart';
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:provider/provider.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/theme_provider.dart';
@@ -203,13 +204,15 @@ class _RegisterScreenState extends State<RegisterScreen> {
                             ),
                             child: Center(
                               child: tenant.logo.isNotEmpty
-                                  ? Image.network(
-                                      tenant.logo,
+                                  ? CachedNetworkImage(
+                                        imageUrl: tenant.logo,
                                       width: 64,
+                                      memCacheWidth: 128, // MOB-08
                                       height: 64,
+                                      memCacheHeight: 128, // MOB-08: decode at ~2x display size, not full-res
                                       fit: BoxFit.contain,
-                                      errorBuilder:
-                                          (context, error, stackTrace) {
+                                      errorWidget:
+                                          (context, url, error) {
                                         return Text(
                                             toUpperCase(tenant.name.substring(0, 2)),
                                           style: const TextStyle(

@@ -1,3 +1,4 @@
+import 'dart:math' show Random;
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import '../config/app_config.dart';
@@ -23,7 +24,7 @@ class ApiRequest<T> {
     this.data,
     this.cacheExpiry,
     this.useCache = true,
-    this.maxRetries = 3,
+    this.maxRetries = 2, // MOB-10: capped retry budget (was 3)
     this.retryDelay = const Duration(seconds: 1),
     this.parser,
   });
@@ -100,15 +101,41 @@ class EnhancedApiService {
   static EnhancedApiService get instance => _instance;
 
   late final Dio _dio;
+  // Insertion-ordered maps double as the LRU structure (oldest first).
   final Map<String, CachedResponse> _cache = {};
   final Map<String, DateTime> _cacheExpiry = {};
 
+  /// MOB-06: entries without an explicit cacheExpiry previously lived
+  /// forever; they now default to a 5-minute TTL.
+  static const Duration defaultCacheExpiry = Duration(minutes: 5);
+
+  /// MOB-06: bound the cache — evict oldest entries beyond this size.
+  static const int maxCacheEntries = 200;
+
+  /// MOB-05: cache key must include query parameters, otherwise
+  /// `?page=2` would return cached page-1 data.
+  String _cacheKey(ApiRequest<dynamic> request) {
+    final qp = request.queryParameters;
+    if (qp == null || qp.isEmpty) return request.endpoint;
+    final keys = qp.keys.toList()..sort();
+    final query = keys.map((k) => '$k=${qp[k]}').join('&');
+    return '${request.endpoint}?$query';
+  }
+
   bool _isInitialized = false;
+  final Random _retryRandom = Random();
+
+  /// MOB-10: exponential backoff with jitter (replaces linear backoff that
+  /// could block a screen ~90-190s combined with the old 60s timeout).
+  Duration _jitteredDelay(Duration base, int attempt) {
+    final ms = base.inMilliseconds * (attempt + 1);
+    return Duration(milliseconds: ms ~/ 2 + _retryRandom.nextInt(ms ~/ 2 + 1));
+  }
 
   void initialize({
     String? baseUrl,
-    Duration connectTimeout = const Duration(seconds: 30),
-    Duration receiveTimeout = const Duration(seconds: 30),
+    Duration connectTimeout = const Duration(seconds: AppConfig.apiConnectTimeout), // MOB-10: was 30s
+    Duration receiveTimeout = const Duration(seconds: AppConfig.apiReceiveTimeout), // MOB-10: was 30s
     bool debug = false,
   }) {
     if (_isInitialized) return;
@@ -145,7 +172,7 @@ class EnhancedApiService {
     T? Function(dynamic)? parser,
     Duration? cacheExpiry,
     bool useCache = true,
-    int maxRetries = 3,
+    int maxRetries = 2, // MOB-10: capped retry budget (was 3)
   }) async {
     return _executeRequest<T>(
       ApiRequest<T>(
@@ -242,10 +269,14 @@ class EnhancedApiService {
 
   /// Internal request execution with retry and caching
   Future<ApiResponse<T>> _executeRequest<T>(ApiRequest<T> request) async {
-    // Check cache first
-    if (request.isCacheable && _isResponseCached(request.endpoint)) {
-      final cachedResponse = _cache[request.endpoint];
-      if (cachedResponse != null && !_isResponseExpired(request.endpoint)) {
+    // Check cache first (keyed on endpoint + sorted query params — MOB-05)
+    final cacheKey = _cacheKey(request);
+    if (request.isCacheable && _isResponseCached(cacheKey)) {
+      final cachedResponse = _cache[cacheKey];
+      if (cachedResponse != null && !_isResponseExpired(cacheKey)) {
+        // LRU touch: re-insert so this entry becomes most-recently-used.
+        _cache.remove(cacheKey);
+        _cache[cacheKey] = cachedResponse;
         try {
           final data = request.parser != null
               ? request.parser!(cachedResponse.data)
@@ -266,12 +297,18 @@ class EnhancedApiService {
             ? request.parser!(response.data)
             : response.data as T;
 
-        // Cache if applicable
+        // Cache if applicable — always with an expiry (MOB-06 default TTL)
         if (request.isCacheable) {
-          _cache[request.endpoint] = CachedResponse(response.data, DateTime.now());
-          if (request.cacheExpiry != null) {
-            _cacheExpiry[request.endpoint] = DateTime.now().add(request.cacheExpiry!);
+          if (!_cache.containsKey(cacheKey) &&
+              _cache.length >= maxCacheEntries) {
+            final oldest = _cache.keys.first; // LRU eviction
+            _cache.remove(oldest);
+            _cacheExpiry.remove(oldest);
           }
+          _cache.remove(cacheKey);
+          _cache[cacheKey] = CachedResponse(response.data, DateTime.now());
+          _cacheExpiry[cacheKey] = DateTime.now()
+              .add(request.cacheExpiry ?? defaultCacheExpiry);
         }
 
         return ApiResponse<T>.success(parsedData as T);
@@ -280,13 +317,13 @@ class EnhancedApiService {
         if (!request.isRetryable || attempt == request.maxRetries - 1) {
           return _handleApiError<T>(e);
         }
-        await Future.delayed(request.retryDelay * (attempt + 1));
+        await Future.delayed(_jitteredDelay(request.retryDelay, attempt));
       } catch (e) {
         lastException = ErrorHandler.handle(e);
         if (!request.isRetryable || attempt == request.maxRetries - 1) {
           return _handleApiError<T>(lastException as AppException);
         }
-        await Future.delayed(request.retryDelay * (attempt + 1));
+        await Future.delayed(_jitteredDelay(request.retryDelay, attempt));
       }
     }
 
@@ -338,8 +375,15 @@ class EnhancedApiService {
   bool _isResponseCached(String endpoint) => _cache.containsKey(endpoint);
 
   bool _isResponseExpired(String endpoint) {
-    if (!_cacheExpiry.containsKey(endpoint)) return false;
-    return DateTime.now().isAfter(_cacheExpiry[endpoint]!);
+    final expiry = _cacheExpiry[endpoint];
+    if (expiry == null) {
+      // MOB-06: entries without an expiry are treated as stale after the
+      // default TTL measured from cachedAt.
+      final cached = _cache[endpoint];
+      if (cached == null) return true;
+      return DateTime.now().difference(cached.cachedAt) > defaultCacheExpiry;
+    }
+    return DateTime.now().isAfter(expiry);
   }
 
   void clearCache([String? endpoint]) {

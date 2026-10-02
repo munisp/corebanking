@@ -9,9 +9,9 @@ class CarbonService {
   final ApiService _apiService = ApiService();
 
   // Get all carbon footprints for the current user
-  Future<List<CarbonFootprint>> getFootprints() async {
+  Future<List<CarbonFootprint>> getFootprints({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/carbon/api/v1/carbon/footprints');
+      final response = await _apiService.get('/carbon/api/v1/carbon/footprints', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;
@@ -60,9 +60,9 @@ class CarbonService {
   }
 
   // Get all carbon credits for the current user
-  Future<List<CarbonCredit>> getCredits() async {
+  Future<List<CarbonCredit>> getCredits({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/carbon/api/v1/carbon/credits');
+      final response = await _apiService.get('/carbon/api/v1/carbon/credits', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;
@@ -131,9 +131,9 @@ class CarbonService {
   }
 
   // Get all carbon projects
-  Future<List<CarbonProject>> getProjects() async {
+  Future<List<CarbonProject>> getProjects({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/carbon/api/v1/carbon/projects');
+      final response = await _apiService.get('/carbon/api/v1/carbon/projects', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;
@@ -202,9 +202,9 @@ class CarbonService {
   }
 
   // Get all carbon trades for the current user
-  Future<List<CarbonTrade>> getTrades() async {
+  Future<List<CarbonTrade>> getTrades({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/carbon/api/v1/carbon/trades');
+      final response = await _apiService.get('/carbon/api/v1/carbon/trades', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;

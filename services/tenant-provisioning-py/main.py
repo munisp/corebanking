@@ -11,8 +11,10 @@ from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import time
@@ -46,7 +48,6 @@ OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 PORT = int(os.getenv("PORT", "8031"))
 
-db_conn = None
 
 # Rate limiter state (module-level, guarded by _rl_lock)
 _rl_tokens = 100
@@ -170,22 +171,65 @@ def inc_errors():
 
 # --- Database ---
 _db_pool = None
+_db_pool_lock = threading.Lock()
 
-def get_db():
-    global db_conn
-    if db_conn is None or db_conn.closed:
-        db_conn = psycopg2.connect(DATABASE_URL)
-        db_conn.autocommit = True
-    return db_conn
-
-def release_db(conn):
-    """Return a connection to the pool."""
+def _get_db_pool():
+    """Lazily create the process-wide connection pool (thread-safe)."""
     global _db_pool
-    if _db_pool and conn:
+    if _db_pool is None or _db_pool.closed:
+        with _db_pool_lock:
+            if _db_pool is None or _db_pool.closed:
+                _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+    return _db_pool
+
+class _PooledConn:
+    """Borrowed pooled connection.
+
+    Returned to the pool on close() or when the last reference is dropped
+    (CPython refcounting), so existing `conn = get_db()` call sites remain
+    safe without an explicit release_db() call."""
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        raw, self._raw = self._raw, None
+        if raw is not None:
+            try:
+                _get_db_pool().putconn(raw)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+
+    def __del__(self):
         try:
-            _db_pool.putconn(conn)
+            self.close()
         except Exception:
             pass
+
+def get_db():
+    """Borrow a connection from the pool (thread-safe)."""
+    raw = _get_db_pool().getconn()
+    raw.autocommit = True
+    return _PooledConn(raw)
+
+def release_db(conn):
+    """Return a borrowed connection to the pool."""
+    if conn:
+        conn.close()
 
 def init_schema():
     """Create the tables this service actually uses. Never crash startup:
@@ -202,8 +246,12 @@ def init_schema():
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             tenant_id UUID,
             status VARCHAR(32) DEFAULT 'active',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
+        # PL-01: column drift — PUT/DELETE referenced updated_at which
+        # init_schema never created (500s on pre-existing tables).
+        cur.execute("ALTER TABLE service_configs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -229,12 +277,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"[tenant-provisioning-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
     yield
-    if db_conn:
-        db_conn.close()
+    if _db_pool:
+        _db_pool.closeall()
 
 
 app = FastAPI(title="tenant-provisioning-py", version="1.0.0", lifespan=lifespan)
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
 import inspect as _jwt_inspect
 from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
@@ -429,135 +478,14 @@ def delete_record(record_id: str):
     conn.commit()
 
 
-# --- Domain constants: provisioning workflow definitions ---
-PROVISIONING_STEPS = [
-    {"step": 1, "name": "tenant_identity", "description": "Create tenant org record and admin principal"},
-    {"step": 2, "name": "schema_provisioning", "description": "Provision database schema and RLS policies"},
-    {"step": 3, "name": "ledger_setup", "description": "Create chart of accounts and ledger accounts"},
-    {"step": 4, "name": "compliance_profile", "description": "Attach KYC/AML and regulatory reporting profile"},
-    {"step": 5, "name": "feature_activation", "description": "Enable tier-entitled product features"},
-]
-GROWTH_FEATURE_SETUP = [
-    {"feature": "chatbot", "min_tier": "starter"},
-    {"feature": "smart_savings", "min_tier": "starter"},
-    {"feature": "virtual_cards", "min_tier": "commercial"},
-    {"feature": "qr_payments", "min_tier": "commercial"},
-    {"feature": "bnpl", "min_tier": "enterprise"},
-    {"feature": "investments", "min_tier": "enterprise"},
-    {"feature": "remittances", "min_tier": "enterprise"},
-    {"feature": "gamification", "min_tier": "enterprise"},
-]
-
-# --- Domain Logic ---
-def middleware_status():
-    return {
-        "kafka": {"topic": "provisioning.workflow.events", "status": "connected"},
-        "temporal": {"namespace": "54link-dev-provisioning", "workflows_active": 3, "status": "running"},
-        "postgres": {"tables": "onboarding_executions, tier_changes, feature_provisions", "status": "connected"},
-        "keycloak": {"realm": "platform-admin", "status": "authorized"},
-        "permify": {"schema": "provisioning:execute_onboarding", "status": "enforcing"},
-        "redis": {"cache": "provisioning_status", "status": "connected"},
-        "tigerbeetle": {"account": "setup_fee_ledger", "status": "posting"},
-        "opensearch": {"index": "provisioning-audit-2026", "status": "indexed"},
-        "dapr": {"pubsub": "provisioning-events", "status": "publishing"},
-        "fluvio": {"stream": "onboarding-progress", "status": "streaming"},
-        "openappsec": {"policy": "admin-only-provisioning", "status": "active"},
-        "apisix": {"route": "platform_operator_authenticated", "status": "enforcing"},
-        "mojaloop": {"purpose": "settlement_account_creation", "status": "ready"},
-        "lakehouse": {"table": "kpi_catalog.provisioning.history_iceberg", "status": "written"},
-    }
-
-
-def _state_query(table):
-    """Read tenant-onboarding state rows from Postgres. Raises on failure."""
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT id, status, created_at FROM {table} ORDER BY created_at DESC LIMIT 100")
-        rows = cur.fetchall()
-    return [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
-
-
-def handle_request(path: str) -> dict:
-    if path == "/healthz":
-        return {
-            "status": "healthy", "service": "tenant-provisioning-py", "version": "1.0.0",
-            "capabilities": [
-                "tenant_onboarding", "white_label_onboarding", "feature_provisioning",
-                "tier_upgrade_downgrade", "growth_feature_setup", "rollback_workflows",
-            ],
-        }
-    elif path == "/v1/provisioning/workflow-steps":
-        return {"steps": PROVISIONING_STEPS, "total": len(PROVISIONING_STEPS), "middleware": middleware_status()}
-    elif path == "/v1/provisioning/growth-feature-setup":
-        return {"features": GROWTH_FEATURE_SETUP, "total": len(GROWTH_FEATURE_SETUP), "middleware": middleware_status()}
-    elif path == "/v1/provisioning/history":
-        try:
-            items = _state_query("onboarding_history")
-        except Exception as e:
-            logger.error(f"onboarding_history query failed: {e}")
-            raise HTTPException(status_code=503, detail="state_unavailable")
-        return {"items": items, "total": len(items), "middleware": middleware_status()}
-    elif path == "/v1/provisioning/pending":
-        try:
-            items = _state_query("pending_onboardings")
-        except Exception as e:
-            logger.error(f"pending_onboardings query failed: {e}")
-            raise HTTPException(status_code=503, detail="state_unavailable")
-        return {"items": items, "total": len(items), "middleware": middleware_status()}
-    elif path == "/v1/provisioning/tier-changes":
-        try:
-            items = _state_query("tier_changes")
-        except Exception as e:
-            logger.error(f"tier_changes query failed: {e}")
-            raise HTTPException(status_code=503, detail="state_unavailable")
-        return {"items": items, "total": len(items), "middleware": middleware_status()}
-    elif path == "/v1/provisioning/cost-calculator":
-        return {
-            "calculator": {
-                "enterprise": {"base": 25_000_000, "setup": 50_000_000, "growth_features": "all included", "add_ons": "none needed"},
-                "commercial": {"base": 12_000_000, "setup": 25_000_000, "growth_included": ["chatbot", "smart_savings", "virtual_cards", "qr_payments"], "add_ons_available": {"bnpl": 2_000_000, "investments": 3_000_000, "remittances": 2_500_000, "gamification": 1_000_000}},
-                "standard": {"base": 5_000_000, "setup": 10_000_000, "growth_included": ["chatbot", "smart_savings"], "add_ons_available": {"virtual_cards": 1_500_000, "qr_payments": 1_000_000, "bnpl": 2_000_000, "investments": 3_000_000, "remittances": 2_500_000, "gamification": 1_000_000}},
-                "starter": {"base": 1_500_000, "setup": 3_000_000, "growth_included": ["chatbot"], "add_ons_available": {"smart_savings": 500_000, "virtual_cards": 1_500_000, "qr_payments": 800_000, "gamification": 500_000}},
-                "wl_platinum": {"base": 40_000_000, "setup": 100_000_000, "growth_features": "all included", "sub_tenants": "unlimited"},
-                "wl_gold": {"base": 20_000_000, "setup": 50_000_000, "growth_included": ["chatbot", "smart_savings", "virtual_cards", "qr_payments", "bnpl", "gamification"], "add_ons_available": {"investments": 4_000_000, "remittances": 3_500_000}},
-                "wl_silver": {"base": 8_000_000, "setup": 20_000_000, "growth_included": ["chatbot", "smart_savings", "qr_payments"], "add_ons_available": {"virtual_cards": 2_000_000, "bnpl": 2_500_000, "gamification": 1_500_000, "investments": 4_000_000, "remittances": 3_500_000}},
-            },
-            "middleware": middleware_status(),
-        }
-    elif path == "/v1/provisioning/revenue-projection":
-        return {
-            "current_mrr_ngn": 118_288_000,
-            "tenants": {
-                "count": 4, "revenue_ngn": 53_100_000,
-                "breakdown": [
-                    {"tenant": "Zenith Bank", "tier": "Enterprise", "monthly_ngn": 25_300_000},
-                    {"tenant": "UBA Nigeria", "tier": "Enterprise", "monthly_ngn": 25_000_000},
-                    {"tenant": "LAPO MFB", "tier": "Starter + Add-ons", "monthly_ngn": 2_800_000},
-                ]
-            },
-            "white_label": {
-                "count": 3, "revenue_ngn": 64_288_000,
-                "breakdown": [
-                    {"partner": "Kuda Bank", "tier": "Platinum", "monthly_ngn": 40_000_000},
-                    {"partner": "Moniepoint", "tier": "Gold + Add-ons", "monthly_ngn": 24_168_000},
-                    {"partner": "OPay", "tier": "Silver + Add-ons", "monthly_ngn": 12_120_000},
-                ]
-            },
-            "growth_feature_revenue_ngn": {
-                "included_in_base": 85_000_000,
-                "add_on_revenue": 9_300_000,
-                "overage_revenue": 588_000,
-                "total_growth_attribution": 94_888_000,
-            },
-            "pipeline": [
-                {"tenant": "Wema Bank (ALAT)", "tier": "Commercial", "status": "onboarding", "expected_monthly_ngn": 14_000_000},
-                {"tenant": "Sterling Bank", "tier": "Commercial", "status": "negotiation", "expected_monthly_ngn": 12_000_000},
-                {"tenant": "PalmPay", "tier": "WL-Gold", "status": "negotiation", "expected_monthly_ngn": 22_000_000},
-            ],
-            "middleware": middleware_status(),
-        }
-    else:
-        return {"error": "not found"}
+# PL-01: the fiction provisioning catalog was deleted outright. This file
+# previously carried (a) a PROVISIONING_STEPS constant claiming schema/RLS
+# provisioning that was never executed, (b) a hardcoded Nigerian-bank revenue
+# projection, (c) a middleware_status() reporting 14 systems as
+# "connected"/"enforcing" unconditionally, and (d) a dead handle_request()
+# with zero callers serving all of the above. Real tenant provisioning is
+# orchestrator-service's Temporal createTenantWorkflow; this service's live
+# surface is the service_configs CRUD below.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -648,13 +576,13 @@ def grpc_call(target, method, payload, retries=3):
     if not _grpc_cb.allow():
         logger.warning(f"Circuit breaker open for {target}/{method}")
         return None
+    data = json.dumps({"method": method, "payload": payload}).encode()
     for attempt in range(retries):
         try:
             host, port = target.rsplit(":", 1)
             sock = _grpc_socket.socket(_grpc_socket.AF_INET, _grpc_socket.SOCK_STREAM)
             sock.settimeout(5.0)
             sock.connect((host, int(port)))
-            data = json.dumps({"method": method, "payload": payload}).encode()
             sock.sendall(_grpc_struct.pack(">I", len(data)) + data)
             length_bytes = sock.recv(4)
             if len(length_bytes) == 4:
@@ -678,9 +606,9 @@ def call_service(method, url, body=None, retries=3, timeout=15):
     if not _grpc_cb.allow():
         return None
     import urllib.request, urllib.error
+    data = json.dumps(body).encode() if body else None
     for attempt in range(retries):
         try:
-            data = json.dumps(body).encode() if body else None
             req = urllib.request.Request(url, data=data, method=method,
                                          headers={"Content-Type": "application/json"})
             resp = urllib.request.urlopen(req, timeout=timeout)
@@ -831,4 +759,4 @@ def db_insert(record_id, body):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, workers=int(os.environ.get("UVICORN_WORKERS", "4")))

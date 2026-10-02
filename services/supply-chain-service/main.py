@@ -3,7 +3,7 @@ Complete Supply Chain Finance Service - Invoice financing, PO financing, supplie
 Production-ready implementation
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
@@ -530,6 +530,7 @@ async def assess_supply_chain_risk(financing_id: str, supplier_id: str, buyer_id
         relationship = await conn.fetchrow("""
             SELECT * FROM supply_chain_relationships
             WHERE supplier_id = $1 AND buyer_id = $2
+            LIMIT 1
         """, supplier_id, buyer_id)
         
         risk_score = 50  # Base score
@@ -567,22 +568,27 @@ async def get_financing(
         row = await conn.fetchrow("""
             SELECT * FROM financing_applications
             WHERE tenant_id = $1 AND buyer_id = $2 AND financing_id = $3
+            LIMIT 1
         """, tenant_id, keycloak_id, financing_id)
         return dict(row)
 
 @app.get("/api/v1/supply-chain/financing")
 async def get_all_financing(
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=500),
     db=Depends(lambda: db_pool),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
     ledger_id: str = Header(..., alias="x-ledger-id"),
 ):
-    """Get all customer financings"""
+    """Get customer financings (paginated — W11 PY-448)."""
+    offset = (page - 1) * size
     async with db.acquire() as conn:
         rows = await conn.fetch("""
             SELECT * FROM financing_applications
             WHERE tenant_id = $1 AND buyer_id = $2 ORDER BY created_at DESC
-        """, tenant_id, keycloak_id)
+            LIMIT $3 OFFSET $4
+        """, tenant_id, keycloak_id, size, offset)
         return [dict(row) for row in rows]
 
 @app.post("/api/v1/supply-chain/financing/{financing_id}/approve")
@@ -812,24 +818,29 @@ async def list_supplier_financing(
 async def list_buyer_financing(
     buyer_id: str,
     status: Optional[FinancingStatus] = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=500),
     db=Depends(lambda: db_pool)
 ):
-    """List financing for buyer"""
-    query = "SELECT * FROM financing_applications WHERE buyer_id = $1 ORDER BY created_at DESC"
+    """List financing for buyer (paginated — W11 PY-447/PY-448)."""
+    query = "SELECT * FROM financing_applications WHERE buyer_id = $1"
     params = [buyer_id]
-    
+
     if status:
         query += " AND status = $2"
         params.append(status.value)
-    
-    query += " ORDER BY created_at DESC"
-    
+
+    params.extend([size, (page - 1) * size])
+    query += f" ORDER BY created_at DESC LIMIT ${len(params) - 1} OFFSET ${len(params)}"
+
     async with db.acquire() as conn:
         rows = await conn.fetch(query, *params)
         return {
             "buyer_id": buyer_id,
             "financing": [dict(row) for row in rows],
-            "total": len(rows)
+            "total": len(rows),
+            "page": page,
+            "size": size,
         }
 
 if __name__ == "__main__":

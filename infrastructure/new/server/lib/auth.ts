@@ -98,14 +98,24 @@ export interface JWTPayload {
 }
 
 // Password hashing using PBKDF2 (no bcrypt dependency needed)
-function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
+// TS-08: async pbkdf2 — the sync variant blocked the event loop ~50-100ms per
+// login attempt on the demo-mode in-memory path.
+function pbkdf2Async(password: string, salt: string, iterations: number, keylen: number, digest: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, iterations, keylen, digest, (err, derivedKey) =>
+      err ? reject(err) : resolve(derivedKey),
+    );
+  });
+}
+
+async function hashPassword(password: string, salt?: string): Promise<{ hash: string; salt: string }> {
   const s = salt || crypto.randomBytes(16).toString("hex");
-  const hash = crypto.pbkdf2Sync(password, s, 100000, 64, "sha512").toString("hex");
+  const hash = (await pbkdf2Async(password, s, 100000, 64, "sha512")).toString("hex");
   return { hash, salt: s };
 }
 
-function verifyPassword(password: string, storedHash: string, salt: string): boolean {
-  const { hash } = hashPassword(password, salt);
+async function verifyPassword(password: string, storedHash: string, salt: string): Promise<boolean> {
+  const { hash } = await hashPassword(password, salt);
   return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(storedHash));
 }
 
@@ -145,10 +155,10 @@ const DEMO_USERS = [
 ];
 
 // Initialize demo users (only when explicitly opted in outside production)
-function initDemoUsers() {
+async function initDemoUsers() {
   if (!DEMO_MODE) return;
   for (const u of DEMO_USERS) {
-    const { hash, salt } = hashPassword(u.password);
+    const { hash, salt } = await hashPassword(u.password);
     inMemoryUsers.set(u.email, {
       user: {
         id: inMemoryUsers.size + 1,
@@ -164,7 +174,7 @@ function initDemoUsers() {
   logger.warn("BANKING_DEMO_MODE enabled: seeded in-memory demo users with random passwords. Never enable this in production.");
 }
 
-initDemoUsers();
+initDemoUsers().catch((err) => logger.warn("Demo user seeding failed", { error: String(err) }));
 
 // Brute force protection
 const loginAttempts: Map<string, { count: number; lockedUntil: number }> = new Map();
@@ -395,7 +405,7 @@ export function registerAuthRoutes(app: Express) {
     // This map is always empty in production, so this block can never authenticate anyone there.
     if (DEMO_MODE) {
       const memUser = inMemoryUsers.get(email);
-      if (memUser && verifyPassword(password, memUser.passwordHash, memUser.salt)) {
+      if (memUser && (await verifyPassword(password, memUser.passwordHash, memUser.salt))) {
         const tokens = generateTokens(memUser.user);
         res.cookie("access_token", tokens.accessToken, {
           httpOnly: true,

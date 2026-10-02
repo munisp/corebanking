@@ -3,6 +3,7 @@
 import json
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 import uvicorn, asyncpg, os
@@ -19,6 +20,7 @@ load_dotenv()
 
 app = FastAPI(title="54Link Card Service", version="1.0.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
 # is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
@@ -404,4 +406,4 @@ async def submit_report(
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8025")))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8025")), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

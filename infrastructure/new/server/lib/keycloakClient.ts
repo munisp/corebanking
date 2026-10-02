@@ -87,6 +87,7 @@ export async function introspectToken(token: string): Promise<{ active: boolean;
   try {
     const res = await fetch(`${config.url}/realms/${config.realm}/protocol/openid-connect/token/introspect`, {
       method: "POST",
+      signal: AbortSignal.timeout(5000),
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         token,
@@ -108,6 +109,7 @@ export async function rotateSession(userId: string): Promise<boolean> {
     // Get admin token
     const tokenRes = await fetch(`${config.url}/realms/${config.realm}/protocol/openid-connect/token`, {
       method: "POST",
+      signal: AbortSignal.timeout(5000),
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "client_credentials",
@@ -120,6 +122,7 @@ export async function rotateSession(userId: string): Promise<boolean> {
     // Logout user sessions
     await fetch(`${config.url}/admin/realms/${config.realm}/users/${userId}/logout`, {
       method: "POST",
+      signal: AbortSignal.timeout(5000),
       headers: { Authorization: `Bearer ${tokenData.access_token}` },
     });
     return true;

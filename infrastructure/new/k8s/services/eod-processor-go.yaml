@@ -122,6 +122,25 @@ spec:
                   name: 54bank-secrets
                   key: jwt-secret
                   optional: true
+            # MN-24/F2-01: real downstream targets for EOD pipeline steps.
+            # All in-cluster Services expose port 8080 (see sibling manifests).
+            - name: INTEREST_ACCRUAL_URL
+              value: "http://interest-accrual-engine-go:8080"
+            - name: RECON_URL
+              value: "http://reconciliation-engine-rs:8080"
+            - name: GL_ENGINE_URL
+              value: "http://gl-engine-go:8080"
+            - name: NFIU_CTR_STR_URL
+              value: "http://nfiu-ctr-str-filing-py:8080"
+            # Service token attached as Authorization: Bearer on downstream
+            # calls — interest-accrual-engine-go, reconciliation-engine-rs and
+            # gl-engine-go all enforce JWT (fail-closed).
+            - name: EOD_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: eod-processor-go-secrets
+                  key: service-token
+                  optional: true
           resources:
             requests:
               cpu: 100m

@@ -11,6 +11,16 @@ class Config:
     ROOT_PATH = os.getenv("ROOT_PATH", "")
     DAPR_PUBSUB_NAME = os.getenv("DAPR_PUBSUB_NAME", "")
     ACCOUNT_SVC_URL = os.getenv("ACCOUNT_SVC_URL", "")
+    # AU-01: shared secret authorizing service-to-service audit ingestion
+    # (X-Audit-Ingest-Token header). Empty disables the header path (fail-closed).
+    AUDIT_INGEST_TOKEN = os.getenv("AUDIT_INGEST_TOKEN", "")
+    # CP-07: HMAC key for signed regulator export bundles. Empty = export
+    # endpoint fails fast with 503.
+    AUDIT_EXPORT_SECRET = os.getenv("AUDIT_EXPORT_SECRET", "")
+    # PL-10: retention/archival policy for scripts/archive_audit.py.
+    AUDIT_RETENTION_MONTHS = int(os.getenv("AUDIT_RETENTION_MONTHS", "84"))
+    AUDIT_ARCHIVE_S3_BUCKET = os.getenv("AUDIT_ARCHIVE_S3_BUCKET", "")
+    AUDIT_ARCHIVE_LOCAL_DIR = os.getenv("AUDIT_ARCHIVE_LOCAL_DIR", "/var/backups/audit")
 
 
 class DevelopmentConfig(Config):

@@ -15,13 +15,11 @@ on:
       - 'services/core-banking-go/**'
       - 'services/credit-bureau-rs/**'
       - 'services/credit-facility-go/**'
-      - 'services/dispute-management-py/**'
       - 'services/docling-service/**'
       - 'services/document-management-py/**'
       - 'services/document-service/**'
       - 'services/erpnext-bridge-go/**'
       - 'services/erpnext-integration-service/**'
-      - 'services/erpnext-sync-py/**'
       - 'services/fixed-assets-go/**'
       - 'services/immutable-audit-rs/**'
       - 'services/inventory-py/**'
@@ -77,7 +75,7 @@ jobs:
           file: ./docker/Dockerfile.consolidated
           push: true
           build-args: |
-            SERVICES=animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,cac-realtime-api-go,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-management-py,docling-service,document-management-py,document-service,erpnext-bridge-go,erpnext-integration-service,erpnext-sync-py,fixed-assets-go,immutable-audit-rs,inventory-py,ndpr-compliance-py,ocr-service,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-security-infra-go,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,tax-reporting-py,teller-operations-go,typology-detector-rs,ubo-ownership-graph-rs,vault-integration-rs
+            SERVICES=animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,cac-realtime-api-go,core-banking-go,credit-bureau-rs,credit-facility-go,docling-service,document-management-py,document-service,erpnext-bridge-go,erpnext-integration-service,fixed-assets-go,immutable-audit-rs,inventory-py,ndpr-compliance-py,ocr-service,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-security-infra-go,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,tax-reporting-py,teller-operations-go,typology-detector-rs,ubo-ownership-graph-rs,vault-integration-rs
             PRIMARY_LANG=go
             PORT_BASE=9671
           tags: registry.digitalocean.com/talentgraph-auth/54link-dev-workflow-operations:${{ env.TAG }}

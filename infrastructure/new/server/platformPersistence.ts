@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 
 import {
   auditEntries,
@@ -1743,11 +1743,12 @@ export async function upsertCustomerSessionPreference(input: {
       .filter((entry) => existing.id === undefined || entry.id === existing.id)
       .map((entry) => entry.id);
 
-    for (const id of targetIds) {
+    // TS-07: single multi-row UPDATE instead of one round-trip per id.
+    if (targetIds.length > 0) {
       await db
         .update(customerSessionPreferences)
         .set({ activeCustomerId: input.activeCustomerId, updatedAt: new Date() })
-        .where(eq(customerSessionPreferences.id, id));
+        .where(inArray(customerSessionPreferences.id, targetIds));
     }
   } else {
     await db.insert(customerSessionPreferences).values({

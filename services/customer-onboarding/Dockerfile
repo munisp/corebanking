@@ -15,4 +15,4 @@ USER appuser
 EXPOSE 8003
 
 # Run application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port 8003 --workers ${UVICORN_WORKERS:-4}"]

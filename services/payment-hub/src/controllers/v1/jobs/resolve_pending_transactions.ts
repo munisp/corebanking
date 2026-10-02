@@ -31,7 +31,10 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
 
   if (transactions.length == 0) return;
 
-  transactions.forEach(async (transaction) => {
+  // TS-49: for..of + await — the async forEach was fire-and-forget and the
+  // bulk update below raced the per-transaction hold refreshes.
+  for (const transaction of transactions) {
+    try {
     // Refresh own hold_id if exists
     if (transaction.hold_id) {
       // Release funds, incase not already released
@@ -44,7 +47,9 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
       const reserve_funds_response = await CoreBankingApiClient.getInstance().reserve_funds(
         transaction.payer.idValue,
         transaction.amount,
-        "Failed Retriable Transaction"
+        "Failed Retriable Transaction",
+        `${transaction.transaction_id}:${transaction.hold_id || "initial"}`,
+        transaction.tenant
       );
 
       transaction.hold_id = reserve_funds_response?.resourceId || transaction.hold_id;
@@ -70,7 +75,9 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
         const reserve_funds_response = await CoreBankingApiClient.getInstance().reserve_funds(
           parentTransaction.payer.idValue,
           parentTransaction.amount,
-          "Failed Retriable Transaction"
+          "Failed Retriable Transaction",
+          `${parentTransaction.transaction_id}:${parentTransaction.hold_id || "initial"}`,
+          parentTransaction.tenant
         );
 
         parentTransaction.hold_id = reserve_funds_response?.resourceId || parentTransaction.hold_id;
@@ -78,7 +85,10 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
         await transactionRepository.repo.save(parentTransaction);
       }
     }
-  });
+    } catch (e) {
+      logger.error(`Failed to refresh holds for transaction - ${transaction.id}: ${e}`);
+    }
+  }
 
   // --- Bulk update ---
   await transactionRepository.repo

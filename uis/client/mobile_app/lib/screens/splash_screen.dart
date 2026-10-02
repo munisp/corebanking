@@ -68,9 +68,9 @@ class _SplashScreenState extends State<SplashScreen>
   /// Navigate to appropriate screen after loading
   Future<void> _navigateToNextScreen() async {
     try {
-      // Wait for minimum display duration
-      await Future.delayed(_minimumDisplayDuration);
-      if (!mounted) return;
+      // MOB-14: overlap the artificial minimum-display delay with the
+      // tenant/auth waits instead of serially awaiting it first.
+      final minDisplay = Future.delayed(_minimumDisplayDuration);
 
       // Wait for tenant configuration to load
       await _waitForTenantLoad();
@@ -78,6 +78,11 @@ class _SplashScreenState extends State<SplashScreen>
 
       // Wait for authentication state
       await _waitForAuthLoad();
+      if (!mounted) return;
+
+      // Ensure the splash was shown for at least the minimum duration
+      // (usually already elapsed while the providers loaded).
+      await minDisplay;
       if (!mounted) return;
 
       // Navigate based on authentication state

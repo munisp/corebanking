@@ -28,7 +28,11 @@ export const AppDataSource = new DataSource({
   synchronize: false,
   logging: STAGE === "development",
   entities: [Tenant, Transaction, SanctionsBlockedAlert],
-  migrations: [],
+  // PL-04: register the 17 migration files under src/database/migrations using
+  // the standard TypeORM glob. synchronize stays false — schema changes come
+  // only from `migrations:run` (or migrationsRun at boot), never from entity sync.
+  migrations: [__dirname + "/migrations/*{.ts,.js}"],
+  migrationsTableName: "typeorm_migrations",
   subscribers: [],
   ssl: { rejectUnauthorized: !ALLOW_INSECURE_TLS },
 });

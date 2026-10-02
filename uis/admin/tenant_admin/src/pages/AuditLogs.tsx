@@ -29,7 +29,8 @@ import {
   Search,
   Shield,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
 const PAGE_SIZE = 25;
 
@@ -54,9 +55,6 @@ interface AuditLog {
 }
 
 export default function AuditLogs() {
-  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [filterAction, setFilterAction] = useState<string>("all");
   const [dateRange, setDateRange] = useState<{ start: string; end: string }>({
@@ -64,8 +62,55 @@ export default function AuditLogs() {
     end: "",
   });
   const [currentPage, setCurrentPage] = useState(1);
-  const [totalCount, setTotalCount] = useState(0);
   const { primaryColor } = useTenantBranding();
+
+  // Data fetching via react-query: cached per (tenant, page), deduped, 30s staleTime
+  const tenantId = tenantService.getTenantConfig()?.tenant_id;
+  const {
+    data: queryData,
+    isLoading: loading,
+    error: queryError,
+  } = useQuery({
+    queryKey: ["audit-logs", tenantId, currentPage],
+    staleTime: 30_000,
+    retry: 1,
+    queryFn: async () => {
+      if (!tenantId) {
+        throw new Error("Tenant ID not found");
+      }
+
+      const params = new URLSearchParams({
+        page: String(currentPage),
+        limit: String(PAGE_SIZE),
+      });
+
+      const response = await fetch(
+        `${BACKEND_URL}/audit/audits/tenant/${tenantId}?${params}`,
+      );
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch audit logs: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      // Handle both old (plain array) and new (paginated object) response shapes
+      if (Array.isArray(result)) {
+        return { logs: result as AuditLog[], total: result.length };
+      }
+      return {
+        logs: (result.data || []) as AuditLog[],
+        total: result.total ?? result.data?.length ?? 0,
+      };
+    },
+  });
+
+  const auditLogs = queryData?.logs ?? [];
+  const totalCount = queryData?.total ?? 0;
+  const error = queryError
+    ? queryError instanceof Error
+      ? queryError.message
+      : "Failed to fetch audit logs"
+    : null;
 
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
   const hasNextPage = totalCount > 0
@@ -73,53 +118,7 @@ export default function AuditLogs() {
     : auditLogs.length === PAGE_SIZE;
   const hasPrevPage = currentPage > 1;
 
-  useEffect(() => {
-    const fetchAuditLogs = async () => {
-      try {
-        setLoading(true);
-        setError(null);
 
-        const tenantConfig = tenantService.getTenantConfig();
-        const tenantId = tenantConfig?.tenant_id;
-
-        if (!tenantId) {
-          throw new Error("Tenant ID not found");
-        }
-
-        const params = new URLSearchParams({
-          page: String(currentPage),
-          limit: String(PAGE_SIZE),
-        });
-
-        const response = await fetch(
-          `${BACKEND_URL}/audit/audits/tenant/${tenantId}?${params}`,
-        );
-
-        if (!response.ok) {
-          throw new Error(`Failed to fetch audit logs: ${response.statusText}`);
-        }
-
-        const result = await response.json();
-        // Handle both old (plain array) and new (paginated object) response shapes
-        if (Array.isArray(result)) {
-          setAuditLogs(result);
-          setTotalCount(result.length);
-        } else {
-          setAuditLogs(result.data || []);
-          setTotalCount(result.total ?? result.data?.length ?? 0);
-        }
-      } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to fetch audit logs",
-        );
-        console.error("Error fetching audit logs:", err);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchAuditLogs();
-  }, [currentPage]);
 
   const filteredLogs = useMemo(() => {
     return auditLogs.filter((log) => {

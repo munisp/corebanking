@@ -474,16 +474,54 @@ async fn load_watchlist(client: &tokio_postgres::Client) -> Vec<WatchlistEntry> 
     }).collect()
 }
 
+// Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
+// or every 100 rows by a spawned task (was: one blocking INSERT per request).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
-        let id = uuid::Uuid::new_v4().to_string();
+        let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let id = format!("{}_{}_{}", "sanctions_screening_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         let svc_name = String::from("sanctions-screening-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let client = client.clone();
+            let buf = buf.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+                loop {
+                    tick.tick().await;
+                    let rows: Vec<(String, String, String, String, String)> = {
+                        let mut b = buf.lock().unwrap();
+                        if b.is_empty() { continue; }
+                        std::mem::take(&mut *b)
+                    };
+                    for (id, svc, ep, st, d) in rows {
+                        let _ = client.execute(
+                            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                            &[&id, &svc, &ep, &st, &d],
+                        ).await;
+                    }
+                }
+            });
+        }
+        let mut b = buf.lock().unwrap();
+        b.push((id, svc_name, endpoint.to_string(), status, data_str));
+        if b.len() >= 100 {
+            let rows = std::mem::take(&mut *b);
+            drop(b);
+            let client = client.clone();
+            tokio::spawn(async move {
+                for (id, svc, ep, st, d) in rows {
+                    let _ = client.execute(
+                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                        &[&id, &svc, &ep, &st, &d],
+                    ).await;
+                }
+            });
+        }
     }
 }
 

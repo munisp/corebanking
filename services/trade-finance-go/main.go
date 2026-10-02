@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
@@ -10,17 +11,47 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/IBM/sarama"
+	"io"
 	"log"
+	"math"
 	"math/big"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(rand.Int63n(int64(d)/2))
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var serviceName = "trade-finance-go"
+
+// Package-level DB pool. W10 build repair: this declaration was missing upstream
+// (module never compiled at HEAD); initDB() assigns it, handlers nil-guard it.
+var db *sql.DB
+
+// nowISO was lost with the OR-01 deletion of enhancements.go; createHandler uses it.
+func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // Inter-service URLs
 var sanctionsURL = func() string {
@@ -192,8 +223,9 @@ func initDB() {
 		db = nil
 		return
 	}
-	defer db.Close()
-
+	// W10 build repair: the upstream `defer db.Close()` here closed the pool the
+	// moment initDB returned, breaking every subsequent query. The pool lives
+	// for the process lifetime; it is intentionally not closed here.
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -222,6 +254,10 @@ func initSchema() {
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(config_key, environment, tenant_id)
 	)`)
+	if err != nil {
+		// W10 build repair: err was declared and never checked upstream.
+		log.Printf("[%s] service_configs schema init failed: %v", serviceName, err)
+	}
 	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default', status TEXT DEFAULT 'active', data JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS trade_transactions (id SERIAL PRIMARY KEY, trade_id TEXT, lc_number TEXT, applicant TEXT, beneficiary TEXT, amount NUMERIC(15,2), currency TEXT, status TEXT, incoterm TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
@@ -257,13 +293,19 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamURL == "" {
 		upstreamURL = "http://localhost:8120"
 	}
+	// W10 build repair: was `log.Fatalf("schema init failed", err)` — killed the
+	// process on any AML upstream error, with a copy-pasted wrong message, and
+	// discarded the screening verdict. Now fail-closed with an honest 502; the
+	// persisted record id is returned so the trade is not lost for audit.
 	result, err := callService("POST", upstreamURL+"/v1/screen", body)
 	if err != nil {
-		log.Fatalf("schema init failed: %v", err)
+		log.Printf("[%s] AML screening upstream failed: %v", serviceName, err)
+		jsonResp(w, 502, map[string]interface{}{"created": true, "id": id, "aml_screening": "unavailable", "error": "aml_upstream_unavailable"})
+		return
 	}
 
 	cacheSet(tenantID+":"+"trade_finance_list", "", 1) // invalidate list cache
-	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "data": body, "source": dbSourceTag()})
+	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "data": body, "aml_screening": result, "source": dbSourceTag()})
 }
 func lcFee(amount float64, tenor int) float64 {
 	rate := 0.0015
@@ -272,15 +314,48 @@ func lcFee(amount float64, tenor int) float64 {
 	}
 	return math.Round(amount*rate*float64(tenor)/365.0*100) / 100
 }
-func domainHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		listRecords(w, r)
-	case "POST":
-		createRecord(w, r)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+
+// W10 build repair: the unrouted domainHandler (referencing listRecords /
+// createRecord, which were never defined anywhere upstream) is deleted as
+// orphan code. Its intended functionality is already served by the mounted
+// routes /api/list (listHandler) and /api/create (createHandler).
+
+// requiredDocuments returns the LC presentation document checklist for the
+// given Incoterm. Used by the mounted issueLCHandler. Base set follows UCP 600
+// art. 18-28; insurance document only when the Incoterm obliges the seller to
+// insure (CIF/CIP); transport document type follows carriage mode implied by
+// the term (any-mode vs sea/inland-waterway-only).
+func requiredDocuments(incoterm string) []string {
+	docs := []string{"commercial_invoice", "packing_list", "certificate_of_origin"}
+	seaOnly := map[string]bool{"FAS": true, "FOB": true, "CFR": true, "CIF": true}
+	if seaOnly[strings.ToUpper(incoterm)] {
+		docs = append(docs, "bill_of_lading")
+	} else {
+		docs = append(docs, "transport_document")
 	}
+	switch strings.ToUpper(incoterm) {
+	case "CIF", "CIP":
+		docs = append(docs, "insurance_certificate")
+	}
+	return docs
+}
+
+// validatePresentation checks a document presentation against the required
+// checklist (UCP 600 art. 14 documentary compliance). Returns compliant=true
+// only when every required document type was presented. W10 build repair:
+// referenced by the mounted presentDocHandler but never defined upstream.
+func validatePresentation(presented, required []string) (bool, []string) {
+	set := make(map[string]bool, len(presented))
+	for _, d := range presented {
+		set[strings.ToLower(strings.TrimSpace(d))] = true
+	}
+	missing := []string{}
+	for _, req := range required {
+		if !set[strings.ToLower(req)] {
+			missing = append(missing, req)
+		}
+	}
+	return len(missing) == 0, missing
 }
 
 func lcStatus(issued bool, expired bool, utilized bool) string {
@@ -399,12 +474,11 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond))
 		}
 
 		var req *http.Request
@@ -416,16 +490,16 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[inter-service] %s %s attempt %d failed: %v", method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
@@ -433,6 +507,7 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -636,8 +711,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -959,11 +1033,12 @@ func main() {
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Start binary RPC server for inter-service calls

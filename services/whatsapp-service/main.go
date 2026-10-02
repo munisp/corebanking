@@ -26,6 +26,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var startTime = time.Now()
 
 func getEnv(k, v string) string {
@@ -273,8 +284,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -365,7 +375,7 @@ func main() {
 	r.HandleFunc("/v1/whatsapp/templates", templates).Methods("GET")
 	r.HandleFunc("/v1/whatsapp/stats", stats).Methods("GET")
 	log.Printf("[whatsapp-service] WhatsApp Business Cloud API v18.0 on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, jwtAuthMiddleware(r)))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(r), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 func healthz(w http.ResponseWriter, _ *http.Request) {

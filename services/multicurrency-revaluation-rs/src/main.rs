@@ -17,7 +17,9 @@ fn middleware_config() -> serde_json::Value {
         "permify": {"url": get_env("PERMIFY_URL", "http://localhost:3476"), "schema": "fx:revalue,fx:override-rate,fx:close-position"},
         "dapr": {"url": get_env("DAPR_URL", "http://localhost:3500"), "pubsub": "fx-events"},
         "fluvio": {"url": get_env("FLUVIO_URL", "localhost:9003"), "topic": "fx-rate-feed"},
-        "temporal": {"url": get_env("TEMPORAL_URL", "localhost:7233"), "workflow": "FXRevaluationBatchWorkflow"},
+        // OR-23: "FXRevaluationBatchWorkflow" descriptor removed — no such Temporal
+        // workflow is defined anywhere in the fleet; the string was healthz fiction.
+        "temporal": {"url": get_env("TEMPORAL_URL", "localhost:7233"), "workflow": null},
         "mojaloop": {"url": get_env("MOJALOOP_URL", "http://localhost:4000"), "purpose": "cross-border-fx-settlement"},
         "tigerbeetle": {"url": get_env("TIGERBEETLE_URL", "localhost:3000"), "purpose": "fx-pnl-double-entry"},
         "lakehouse": {"url": get_env("LAKEHOUSE_URL", "http://localhost:8206"), "tables": "fx_rate_history,revaluation_pnl"},
@@ -42,6 +44,7 @@ fn with_db<T>(f: impl FnOnce(&mut Client) -> Result<T, String>) -> Result<T, Str
     if url.is_empty() {
         return Err("DATABASE_URL empty; refusing to fabricate FX data".to_string());
     }
+    let _span = otelkit::pg_span("FX revaluation query (multicurrency-revaluation)").entered();
     let mut client = Client::connect(&url, NoTls)
         .map_err(|e| format!("postgres connect failed: {}", e))?;
     f(&mut client)
@@ -383,6 +386,21 @@ fn handle_request(request: &str) -> (u16, String) {
 }
 
 fn main() {
+    // Wave-9 otelkit (TEMPLATE, SPEC §2.5): this is a synchronous raw-TcpListener
+    // service — the OTLP tonic batch exporter needs a tokio runtime, so one is
+    // created and entered here. Keep both guards alive for the process lifetime.
+    let _otel_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("otelkit: failed to build tokio runtime for OTLP exporter");
+    let _otel_rt_enter = _otel_rt.enter();
+    let _otel_guard = match otelkit::init("multicurrency-revaluation-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[multicurrency-revaluation-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
     let port = get_env("PORT", "8211");
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("Failed to bind");
     eprintln!("[multicurrency-revaluation] Listening on :{} — FX rates/positions from Postgres (fail-fast 503 when unavailable)", port);

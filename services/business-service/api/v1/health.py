@@ -62,5 +62,10 @@ def dapr_config():
 
 @router.get("/dapr/subscribe")
 def dapr_subscribe():
-    """Dapr subscription endpoint."""
+    """Dapr subscription endpoint.
+
+    OR-26: returning [] is intentional — business-service has no event
+    subscriptions (W10 orphan audit P4). The endpoint exists only so the
+    Dapr sidecar's subscription poll gets a valid empty answer.
+    """
     return []

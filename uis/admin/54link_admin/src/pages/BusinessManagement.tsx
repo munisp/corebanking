@@ -527,9 +527,9 @@ export default function BusinessManagement() {
                               Uploaded Documents ({newBusiness.documents.length}
                               )
                             </p>
-                            {newBusiness.documents.map((doc, index) => (
+                            {newBusiness.documents.map((doc) => (
                               <div
-                                key={index}
+                                key={doc.title}
                                 className="flex items-center justify-between bg-muted p-2 rounded text-sm"
                               >
                                 <span className="flex-1 truncate">
@@ -981,9 +981,9 @@ function BusinessDetailsDialog({ business }: { business: Business }) {
           <CardContent>
             {business.documents && business.documents.length > 0 ? (
               <div className="space-y-2">
-                {business.documents.map((doc, index) => (
+                {business.documents.map((doc) => (
                   <div
-                    key={index}
+                    key={doc.title}
                     className="flex items-center justify-between p-3 border rounded-lg"
                   >
                     <span className="font-medium">{doc.title}</span>

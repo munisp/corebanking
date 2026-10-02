@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional, Any
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from opensearchpy import OpenSearch, RequestsHttpConnection
 
@@ -29,6 +30,7 @@ INDEX_NAME          = "transactions"
 
 app = FastAPI(title="opensearch-indexer-py", version="1.0.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # ---------------------------------------------------------------------------
 # OpenSearch client
 # ---------------------------------------------------------------------------

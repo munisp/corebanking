@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from "axios";
 import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
 import { IAgentProfilePayload } from "../types/agent";
+import { serviceAuthClient } from "../lib/serviceAuthClient";
 
 class AgentService {
   private _axiosInstance: AxiosInstance;
@@ -9,6 +10,7 @@ class AgentService {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: readEnv("AGENT_SVC_URL"),
+      timeout: 10000,
       headers: {
         "content-type": "application/json",
       },
@@ -22,6 +24,8 @@ class AgentService {
         headers: {
           "x-tenant-id": payload.tenant_id,
           "x-keycloak-id": payload.keycloak_id,
+          // OB-03: service-to-service bearer (role="service")
+          "Authorization": serviceAuthClient.getAuthHeader(payload.tenant_id),
         },
       });
     } catch (error: unknown) {
@@ -52,6 +56,8 @@ class AgentService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         },
       );
@@ -69,6 +75,8 @@ class AgentService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         },
       );
@@ -86,6 +94,8 @@ class AgentService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         },
       );

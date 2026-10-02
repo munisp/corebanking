@@ -24,7 +24,20 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"shared/otel/go/otelkit"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var startTime = time.Now()
 
@@ -281,8 +294,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -364,6 +376,17 @@ func tenantFromClaims(claims map[string]interface{}) string {
 func main() {
 	port := getEnv("PORT", "9172")
 
+	shutdown, oerr := otelkit.Init(context.Background(), "ussd-gateway-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", healthz)
@@ -375,7 +398,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           loggingMiddleware(jwtAuthMiddleware(mux)),
+		Handler:           otelkit.HTTPMiddleware(loggingMiddleware(jwtAuthMiddleware(mux))),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

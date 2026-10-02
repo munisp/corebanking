@@ -25,13 +25,28 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	_ "github.com/lib/pq"
+	"golang.org/x/sync/errgroup"
+
+	"shared/otel/go/otelkit"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var db *sql.DB
 
@@ -125,30 +140,60 @@ func nextExecutionAfter(freq string, from time.Time) time.Time {
 
 var railHTTPClient = &http.Client{Timeout: 20 * time.Second}
 
+// MN-20: default to the REAL payment-hub. In-cluster it is deployed by the
+// core-payments chart as service core-payments:9336 (namespace 54link-dev —
+// see infrastructure/charts/core-payments/values.yaml and
+// infrastructure/apisix-resources/routes/payment-hub.yaml). PAYMENTS_RAIL_URL
+// (or legacy PAYMENTS_HUB_URL) overrides the base URL.
 func paymentsRailURL() string {
-	if v := os.Getenv("PAYMENTS_RAIL_URL"); v != "" {
-		return v
+	if v := strings.TrimSpace(os.Getenv("PAYMENTS_RAIL_URL")); v != "" {
+		return strings.TrimRight(v, "/")
 	}
-	return os.Getenv("PAYMENTS_HUB_URL")
+	if v := strings.TrimSpace(os.Getenv("PAYMENTS_HUB_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://core-payments:9336"
 }
 
 // executeTransfer posts a real transfer to the payments rail. Only a
 // confirmed rail response counts as executed.
+//
+// MN-20: previously POSTed to base+"/v1/transfers" — a route that exists on
+// NEITHER payment-hub (real: POST /api/v1/transfers/initiate, verified in
+// services/payment-hub/src/routes/v1/transfers.ts) NOR payments-hub-go. With
+// an empty default base URL this meant every standing order failed forever.
+// The payload now matches payment-hub's InitiateTransferSchema (VFD variant)
+// and the mandatory extract_custom_headers headers are sent.
 func executeTransfer(accountID, beneficiaryID string, amount float64, narration, reference string) error {
 	base := paymentsRailURL()
-	if base == "" {
-		return fmt.Errorf("payments rail unconfigured (set PAYMENTS_RAIL_URL or PAYMENTS_HUB_URL)")
-	}
+	switchName := getEnv("PAYMENTS_SWITCH_NAME", "vfd")
 	payload, _ := json.Marshal(map[string]interface{}{
+		"switch_name":   switchName,
 		"fromAccountId": accountID,
-		"beneficiaryId": beneficiaryID,
-		"amount":        amount,
-		"currency":      "NGN",
-		"narration":     narration,
-		"reference":     reference,
-		"source":        "standing-orders-go",
+		"toAccount": map[string]string{
+			"number": beneficiaryID,
+			"id":     beneficiaryID,
+			"name":   "standing-order-beneficiary",
+			"status": "active",
+		},
+		"toBank": getEnv("PAYMENTS_DEFAULT_TO_BANK", "999999"), // 999999 = intra-bank
+		"amount": strconv.FormatFloat(amount, 'f', 2, 64),
+		"remark": narration,
+		"tag":    reference,
 	})
-	resp, err := railHTTPClient.Post(base+"/v1/transfers", "application/json", bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", base+"/api/v1/transfers/initiate", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("payments rail request build failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// payment-hub's extract_custom_headers middleware REQUIRES these headers
+	// (HeaderSchema: x-switch-name, x-tenant-name, x-ams-name).
+	req.Header.Set("x-switch-name", switchName)
+	req.Header.Set("x-ams-name", getEnv("PAYMENTS_AMS_NAME", "core_banking"))
+	req.Header.Set("x-tenant-name", getEnv("TENANT_NAME", "54bank"))
+	req.Header.Set("x-tenant-id", getEnv("TENANT_ID", "tenant-lagos-main"))
+
+	resp, err := railHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("payments rail call failed: %w", err)
 	}
@@ -167,6 +212,44 @@ func executeTransfer(accountID, beneficiaryID string, amount float64, narration,
 		}
 	}
 	return nil
+}
+
+// ─── Failure notification (MN-20) ───────────────────────────────────────────
+
+// publishFailureEvent publishes a standing_orders.failed event via Dapr
+// pub/sub so notification-service can alert the customer with the rail's
+// error. Best-effort by design: event loss never blocks the scheduler — the
+// durable failure record in Postgres (standing_order_executions +
+// standing_orders.failure_reason) remains the source of truth.
+func publishFailureEvent(payload map[string]interface{}) {
+	daprURL := getEnv("DAPR_URL", "http://localhost:3500")
+	pubsub := getEnv("DAPR_PUBSUB", "pubsub")
+	url := fmt.Sprintf("%s/v1.0/publish/%s/standing_orders.failed", daprURL, pubsub)
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[scheduler] WARN build standing_orders.failed event: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := sharedHTTPClient.Do(req)
+	if err != nil {
+		log.Printf("[scheduler] WARN publish standing_orders.failed: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// maxConsecutiveFailures is the auto-pause threshold for standing orders
+// (MN-20): after this many consecutive rail failures the order is paused
+// instead of retried forever. Default 3.
+func maxConsecutiveFailures() int {
+	if v := strings.TrimSpace(os.Getenv("STANDING_ORDER_MAX_CONSECUTIVE_FAILURES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 3
 }
 
 // ─── Scheduler: real execution engine ───────────────────────────────────────
@@ -194,6 +277,13 @@ func startScheduler(ctx context.Context) {
 // in 'running' by a crashed scheduler are reclaimed after a grace period.
 // The schedule (next_execution_at) advances ONLY after a confirmed rail
 // execution; failures are recorded and retried on the next poll.
+type dueOrder struct {
+	id, accountID, beneficiaryID, narration, frequency string
+	amount                                             float64
+	execCount, maxExec                                 int
+	endDate                                            sql.NullString
+}
+
 func executeDueStandingOrders() {
 	if db == nil {
 		return
@@ -216,12 +306,6 @@ func executeDueStandingOrders() {
 		log.Printf("[scheduler] due orders claim failed: %v", err)
 		return
 	}
-	type dueOrder struct {
-		id, accountID, beneficiaryID, narration, frequency string
-		amount                                             float64
-		execCount, maxExec                                 int
-		endDate                                            sql.NullString
-	}
 	var due []dueOrder
 	for rows.Next() {
 		var o dueOrder
@@ -231,7 +315,26 @@ func executeDueStandingOrders() {
 	}
 	rows.Close()
 
+	// GCM-074 (AP-09): execute due orders concurrently (bounded at 8) — 50
+	// sequential executions x 20s rail timeout could take ~16min vs the 30s
+	// tick. Per-order idempotency refs are unchanged (unique per execution).
+	g := new(errgroup.Group)
+	g.SetLimit(8)
 	for _, o := range due {
+		o := o
+		g.Go(func() error {
+			processDueStandingOrder(o)
+			return nil
+		})
+	}
+	_ = g.Wait()
+}
+
+// processDueStandingOrder executes one claimed standing order and records the
+// outcome. Errors are handled internally (recorded + notified); the schedule
+// is advanced only on confirmed execution.
+func processDueStandingOrder(o dueOrder) {
+	{
 		ref := "SO-EXEC-" + o.id + "-" + fmt.Sprint(time.Now().UnixNano())
 		execErr := executeTransfer(o.accountID, o.beneficiaryID, o.amount, o.narration, ref)
 
@@ -250,14 +353,41 @@ func executeDueStandingOrders() {
 			// Failure: release the claim WITHOUT advancing the schedule — the
 			// order stays due and is retried on the next poll. The failure is
 			// recorded above and on the order row.
-			if _, err := db.Exec(`UPDATE standing_orders SET
-				status = 'active', failure_reason = $2, updated_at = NOW()
-				WHERE id = $1 AND status = 'running'`,
-				o.id, errText); err != nil {
+			// MN-20: consecutive-failure counter; auto-pause after N failures.
+			consec := 0
+			if err := db.QueryRow(`UPDATE standing_orders SET
+				consecutive_failures = consecutive_failures + 1,
+				failure_reason = $2, updated_at = NOW()
+				WHERE id = $1 AND status = 'running'
+				RETURNING consecutive_failures`,
+				o.id, errText).Scan(&consec); err != nil {
+				log.Printf("[scheduler] order %s failure counter update failed: %v", o.id, err)
+			}
+			autoPaused := consec >= maxConsecutiveFailures()
+			finalStatus := "active"
+			if autoPaused {
+				finalStatus = "paused"
+			}
+			if _, err := db.Exec(`UPDATE standing_orders SET status = $2, updated_at = NOW()
+				WHERE id = $1 AND status = 'running'`, o.id, finalStatus); err != nil {
 				log.Printf("[scheduler] order %s claim release after failure failed: %v", o.id, err)
 			}
-			log.Printf("[scheduler] order %s execution FAILED (recorded, schedule NOT advanced): %v", o.id, execErr)
-			continue
+			// MN-20: notify via standing_orders.failed (Dapr pub/sub) including
+			// the rail's error — failures are no longer invisible.
+			publishFailureEvent(map[string]interface{}{
+				"orderType":           "standing_order",
+				"orderId":             o.id,
+				"accountId":           o.accountID,
+				"amount":              o.amount,
+				"reference":           ref,
+				"error":               errText,
+				"consecutiveFailures": consec,
+				"autoPaused":          autoPaused,
+				"failedAt":            time.Now().UTC().Format(time.RFC3339),
+			})
+			log.Printf("[scheduler] order %s execution FAILED (recorded, schedule NOT advanced, consec=%d, autoPaused=%v): %v",
+				o.id, consec, autoPaused, execErr)
+			return
 		}
 
 		// Confirmed execution: advance the schedule exactly once.
@@ -274,7 +404,8 @@ func executeDueStandingOrders() {
 		}
 		if _, err := db.Exec(`UPDATE standing_orders SET
 			status = $2, execution_count = $3, last_executed_at = NOW(),
-			next_execution_at = $4, failure_reason = '', updated_at = NOW()
+			next_execution_at = $4, failure_reason = '', consecutive_failures = 0,
+			updated_at = NOW()
 			WHERE id = $1 AND status = 'running'`,
 			o.id, newStatus, o.execCount, next); err != nil {
 			log.Printf("[scheduler] order update failed for %s (execution DID succeed at rail, ref=%s): %v", o.id, ref, err)
@@ -287,6 +418,11 @@ func executeDueStandingOrders() {
 // before executing it, so concurrent schedulers never double-debit. The final
 // status is written only after the rail confirms (executed) or rejects
 // (failed) the transfer.
+type due struct {
+	id, accountID, paymentType, reference string
+	amount                                float64
+}
+
 func executeDueScheduledPayments() {
 	if db == nil {
 		return
@@ -306,10 +442,6 @@ func executeDueScheduledPayments() {
 		log.Printf("[scheduler] scheduled payment claim failed: %v", err)
 		return
 	}
-	type due struct {
-		id, accountID, paymentType, reference string
-		amount                                float64
-	}
 	var payments []due
 	for rows.Next() {
 		var p due
@@ -319,12 +451,38 @@ func executeDueScheduledPayments() {
 	}
 	rows.Close()
 
+	// GCM-074 (AP-09): bounded concurrency (8) for due scheduled payments.
+	g := new(errgroup.Group)
+	g.SetLimit(8)
 	for _, p := range payments {
+		p := p
+		g.Go(func() error {
+			processDueScheduledPayment(p)
+			return nil
+		})
+	}
+	_ = g.Wait()
+}
+
+// processDueScheduledPayment executes one claimed scheduled payment.
+func processDueScheduledPayment(p due) {
+	{
 		err := executeTransfer(p.accountID, "", p.amount, "scheduled payment "+p.id, p.reference)
 		status := "executed"
 		if err != nil {
 			status = "failed"
 			log.Printf("[scheduler] scheduled payment %s failed: %v", p.id, err)
+			// MN-20: scheduled-payment failures are notified on the same topic.
+			publishFailureEvent(map[string]interface{}{
+				"orderType":  "scheduled_payment",
+				"orderId":    p.id,
+				"accountId":  p.accountID,
+				"amount":     p.amount,
+				"reference":  p.reference,
+				"error":      err.Error(),
+				"autoPaused": false,
+				"failedAt":   time.Now().UTC().Format(time.RFC3339),
+			})
 		}
 		if _, uerr := db.Exec(`UPDATE scheduled_payments SET status = $2, updated_at = NOW() WHERE id = $1 AND status = 'running'`, p.id, status); uerr != nil {
 			log.Printf("[scheduler] scheduled payment update failed for %s: %v", p.id, uerr)
@@ -712,8 +870,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -896,6 +1053,9 @@ func initSchema() {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		// MN-20: consecutive-failure counter for auto-pause (expand-migrate;
+		// existing rows default to 0).
+		`ALTER TABLE standing_orders ADD COLUMN IF NOT EXISTS consecutive_failures INT NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS standing_order_executions (
 			id BIGSERIAL PRIMARY KEY,
 			order_id VARCHAR(64) NOT NULL,
@@ -954,13 +1114,24 @@ func main() {
 		port = "8115"
 	}
 
+	shutdown, oerr := otelkit.Init(context.Background(), "standing-orders-go")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		log.Fatalf("[standing-orders-go] DATABASE_URL env var is required; refusing to start with default database credentials")
 	}
 	var err error
-	db, err = sql.Open("postgres", dsn)
+	db, err = otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
 	}
@@ -993,5 +1164,5 @@ func main() {
 
 	handler := corsMiddleware(jwtAuthMiddleware(rateLimitMiddleware(mux))) // CORS is handled by APISIX gateway
 	log.Printf("Standing Orders Service starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, handler))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(handler), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }

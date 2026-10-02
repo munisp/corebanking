@@ -55,7 +55,11 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
+  # PL-12: Dapr pubsub component name for the Python Dapr services in this
+  # group (config.py default is "", which makes publish/subscribe calls fail).
+  # Matches the platform component infrastructure/manifests/dapr/pubsub.yaml.
+  DAPR_PUBSUB_NAME: "pubsub"
   APP_PORT: "9278"
   PORT_BASE: "9278"
   SERVICE_GROUP: core-accounts
-  SERVICES: "account-closure-go,account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go"
+  SERVICES: "account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go"

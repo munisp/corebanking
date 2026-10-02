@@ -21,6 +21,9 @@ class CreateApplicationPayload(BaseModel):
     dateOfBirth: Optional[str] = None
     address: Optional[str] = None
     tier: Optional[str] = None
+    # MN-04: required when the applicant is a minor (DOB-derived, not caller-asserted)
+    guardianId: Optional[str] = None
+    dailyLimitKobo: Optional[int] = None
 
 
 @opening_router.get("/list")
@@ -78,6 +81,31 @@ def create_application(
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
 ):
+    # MN-04: age derived server-side from DOB (caller cannot self-declare).
+    is_minor = False
+    if payload.dateOfBirth:
+        import datetime as _dt
+
+        try:
+            dob = _dt.date.fromisoformat(str(payload.dateOfBirth)[:10])
+        except ValueError:
+            raise HTTPException(status_code=422, detail="dateOfBirth must be ISO format (YYYY-MM-DD)")
+        today = _dt.date.today()
+        age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        is_minor = age < 18
+        if is_minor and not payload.guardianId:
+            raise HTTPException(
+                status_code=422,
+                detail="Applicant is a minor; guardianId is required",
+            )
+    if is_minor:
+        import os as _os
+
+        default_limit = int(_os.getenv("MINOR_DAILY_LIMIT_KOBO", "5000000"))  # ₦50,000
+        daily_limit = payload.dailyLimitKobo or default_limit
+    else:
+        daily_limit = payload.dailyLimitKobo
+
     app_ref = f"ACOP-{uuid.uuid4().hex[:8].upper()}"
     record = AccountOpeningApplication(
         id=str(uuid.uuid4()),
@@ -91,6 +119,9 @@ def create_application(
         date_of_birth=payload.dateOfBirth,
         address=payload.address,
         tier=payload.tier,
+        guardian_id=payload.guardianId,
+        is_minor=is_minor,
+        daily_limit_kobo=daily_limit,
         status="pending",
         tenant_id=tenant_id,
         keycloak_id=keycloak_id,

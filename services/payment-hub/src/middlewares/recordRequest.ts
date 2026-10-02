@@ -3,7 +3,11 @@ import { PrometheusService } from "../services/prometheus";
 
 const recordRequest = (req: Request, res: Response, next: NextFunction) => {
   res.on("finish", () => {
-    PrometheusService.getInstance().recordRequest(req.method, req.path, res.statusCode);
+    // TS-47: use the matched route template (not the raw req.path, which embeds
+    // entity IDs) so Prometheus label cardinality stays bounded.
+    const routePath = typeof req.route?.path === "string" ? req.route.path : "unmatched";
+    const template = `${req.baseUrl ?? ""}${routePath}` || "unmatched";
+    PrometheusService.getInstance().recordRequest(req.method, template, res.statusCode);
   });
   next();
 };

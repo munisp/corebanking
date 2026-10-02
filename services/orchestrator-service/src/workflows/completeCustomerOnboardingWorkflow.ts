@@ -9,6 +9,7 @@ export async function completeCustomerOnboardingWorkflow(
     createAccountProfile,
     getUserProfile,
     markCustomerKycComplete,
+    markCustomerKycFailed,
     markAdminKycComplete,
     assignCustomerTier,
   } = proxyActivities<typeof activities>({
@@ -60,6 +61,19 @@ export async function completeCustomerOnboardingWorkflow(
 
     return null;
   } catch (e: any) {
+    // OR-22: failure path wiring — a customer whose onboarding completion
+    // failed must not stay PENDING forever; mark the KYC as failed so the
+    // directory state matches reality (user-service /user/kyc/fail).
+    if (!args.metadata.is_admin) {
+      try {
+        await markCustomerKycFailed(
+          args.metadata.tenant_id,
+          args.metadata.keycloak_id,
+        );
+      } catch {
+        // Never mask the original failure with a failure-path update error.
+      }
+    }
     throw new ApplicationFailure(e.message);
   }
 }

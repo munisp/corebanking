@@ -1,13 +1,20 @@
 import axios, { AxiosInstance } from "axios";
+import http from "http";
+import https from "https";
 import {
   TInitiateTransferSchemaVfd,
   TLookupPartySchemaVfd,
   TVfdInflowSchema,
 } from "../validations/v1";
+import logger from "../config/logger.config";
 import { readEnv } from "../config/readEnv.config";
 import { IVfdLookupResponse } from "../types";
 
 const url = readEnv("VFD_CONNECTOR_URL") as string;
+
+// TS-41: keepAlive agents avoid TCP(+TLS) setup per VFD connector call.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
 export class VfdConnectorApiClient {
   private static __instance: VfdConnectorApiClient | null = null;
@@ -16,6 +23,9 @@ export class VfdConnectorApiClient {
   private constructor() {
     this.clientAxios = axios.create({
       baseURL: url,
+      timeout: 10000,
+      httpAgent,
+      httpsAgent,
     });
   }
 
@@ -38,12 +48,13 @@ export class VfdConnectorApiClient {
     body: TInitiateTransferSchemaVfd,
     tenant: string
   ) {
-    console.log("initialize transfer", body, tenant);
+    // TS-40: full transfer bodies only at debug level (LOG_LEVEL=debug).
+    logger.debug("initialize transfer", { body, tenant });
     const { data } = await this.clientAxios.post("/transfers/initiate", {
       ...body,
       tenant,
     });
-    console.log("initialize transfer response", data);
+    logger.debug("initialize transfer response", { data });
     return data;
   }
 

@@ -60,4 +60,4 @@ uvicorn==0.34.3
 uvloop==0.22.1
 watchfiles==1.1.1
 websockets==15.0.1
-yarl==1.22.0
+yarl==1.22.0boto3==1.35.99  # PL-10: optional, used by scripts/archive_audit.py when AUDIT_ARCHIVE_S3_BUCKET is set

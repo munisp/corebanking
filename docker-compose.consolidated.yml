@@ -335,12 +335,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile.consolidated
       args:
-        SERVICES: "agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,compliance-service,ctr-auto-filer-go,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"
+        SERVICES: "agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,compliance-service,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"
         PRIMARY_LANG: "python"
     environment:
       <<: *common-env
       SERVICE_GROUP: "compliance-regulatory"
-      SERVICES: "agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,compliance-service,ctr-auto-filer-go,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"
+      SERVICES: "agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,compliance-service,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"
       PORT_BASE: "9244"
     ports: ["9244-9267:9244-9267"]
     restart: unless-stopped
@@ -389,12 +389,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile.consolidated
       args:
-        SERVICES: "account-closure-go,account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go"
+        SERVICES: "account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go"
         PRIMARY_LANG: "go"
     environment:
       <<: *common-env
       SERVICE_GROUP: "core-accounts"
-      SERVICES: "account-closure-go,account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go"
+      SERVICES: "account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go"
       PORT_BASE: "9278"
     ports: ["9278-9287:9278-9287"]
     restart: unless-stopped
@@ -470,12 +470,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile.consolidated
       args:
-        SERVICES: "agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go"
+        SERVICES: "agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go"
         PRIMARY_LANG: "go"
     environment:
       <<: *common-env
       SERVICE_GROUP: "core-lending"
-      SERVICES: "agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go"
+      SERVICES: "agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go"
       PORT_BASE: "9310"
     ports: ["9310-9327:9310-9327"]
     restart: unless-stopped
@@ -1169,12 +1169,12 @@ services:
       context: .
       dockerfile: docker/Dockerfile.consolidated
       args:
-        SERVICES: "accessibility-auditor-py,animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,business-service,cac-realtime-api-go,contract-test-rs,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-management-py,dispute-service,docling-service,document-management-py,document-service,employee-service,eod-processor-go,erpnext-bridge-go,erpnext-integration-service,erpnext-sync-py,fast-json-serializer-rs,fixed-assets-go,idempotency-go,immutable-audit-rs,inventory-py,load-test-runner-py,middleware-go,ndpr-compliance-py,ocr-service,offline-resilience-rs,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-operations-engine-py,platform-security-infra-go,request-coalescer-go,resilience-service-rs,response-compressor-rs,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,stress-testing-rs,tax-reporting-py,teller-operations-go,teller-service,typology-detector-rs,ubo-ownership-graph-rs,unit-test-runner-py,vault-integration-rs"
+        SERVICES: "accessibility-auditor-py,animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,business-service,cac-realtime-api-go,contract-test-rs,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-service,docling-service,document-management-py,document-service,employee-service,eod-processor-go,erpnext-bridge-go,erpnext-integration-service,fast-json-serializer-rs,fixed-assets-go,idempotency-go,immutable-audit-rs,inventory-py,load-test-runner-py,ndpr-compliance-py,ocr-service,offline-resilience-rs,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-operations-engine-py,platform-security-infra-go,request-coalescer-go,resilience-service-rs,response-compressor-rs,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,stress-testing-rs,tax-reporting-py,teller-operations-go,teller-service,typology-detector-rs,ubo-ownership-graph-rs,unit-test-runner-py,vault-integration-rs"
         PRIMARY_LANG: "go"
     environment:
       <<: *common-env
       SERVICE_GROUP: "workflow-operations"
-      SERVICES: "accessibility-auditor-py,animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,business-service,cac-realtime-api-go,contract-test-rs,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-management-py,dispute-service,docling-service,document-management-py,document-service,employee-service,eod-processor-go,erpnext-bridge-go,erpnext-integration-service,erpnext-sync-py,fast-json-serializer-rs,fixed-assets-go,idempotency-go,immutable-audit-rs,inventory-py,load-test-runner-py,middleware-go,ndpr-compliance-py,ocr-service,offline-resilience-rs,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-operations-engine-py,platform-security-infra-go,request-coalescer-go,resilience-service-rs,response-compressor-rs,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,stress-testing-rs,tax-reporting-py,teller-operations-go,teller-service,typology-detector-rs,ubo-ownership-graph-rs,unit-test-runner-py,vault-integration-rs"
+      SERVICES: "accessibility-auditor-py,animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,business-service,cac-realtime-api-go,contract-test-rs,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-service,docling-service,document-management-py,document-service,employee-service,eod-processor-go,erpnext-bridge-go,erpnext-integration-service,fast-json-serializer-rs,fixed-assets-go,idempotency-go,immutable-audit-rs,inventory-py,load-test-runner-py,ndpr-compliance-py,ocr-service,offline-resilience-rs,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-operations-engine-py,platform-security-infra-go,request-coalescer-go,resilience-service-rs,response-compressor-rs,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,stress-testing-rs,tax-reporting-py,teller-operations-go,teller-service,typology-detector-rs,ubo-ownership-graph-rs,unit-test-runner-py,vault-integration-rs"
       PORT_BASE: "9671"
     ports: ["9671-9726:9671-9726"]
     restart: unless-stopped

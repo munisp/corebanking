@@ -23,6 +23,25 @@ import (
 	"sync"
 )
 
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
 var db *sql.DB
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -123,16 +142,8 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
-		}
-	}()
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -402,11 +413,12 @@ func main() {
 	mux.Handle("/api/v1/service_configs/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(domainDetailHandler)))
 
 	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8676"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + getEnv("PORT", "8676"),
+		Handler:           loggingMiddleware(corsMiddleware(mux)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

@@ -1,0 +1,62 @@
+# Grafana provisioning — contact points
+# Target tree path: infrastructure/observability/grafana/provisioning/alerting/contactpoints.yaml
+# All endpoints are env-driven (Grafana provisioning supports $VAR / ${VAR} expansion).
+# NO secrets inline: set these env vars on the Grafana container:
+#   ALERT_EMAIL_TO            - comma-separated on-call addresses
+#   ALERT_WEBHOOK_URL         - generic webhook receiver URL
+#   ALERT_WEBHOOK_TOKEN       - optional bearer token for the generic webhook
+#   SLACK_WEBHOOK_URL         - Slack incoming webhook URL
+#   TENANT_WEBHOOK_URL        - per-tenant alert fan-out webhook (e.g. tenant router service)
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: platform-email
+    receivers:
+      - uid: cb-cp-email-platform
+        type: email
+        settings:
+          addresses: ${ALERT_EMAIL_TO}
+          subject: "[{{ .Status }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.service_name }})"
+        disableResolveMessage: false
+
+  - orgId: 1
+    name: generic-webhook
+    receivers:
+      - uid: cb-cp-webhook-generic
+        type: webhook
+        settings:
+          url: ${ALERT_WEBHOOK_URL}
+          httpMethod: POST
+          maxAlerts: "0"
+          authorization_scheme: Bearer
+          authorization_credentials: ${ALERT_WEBHOOK_TOKEN}
+        disableResolveMessage: false
+
+  - orgId: 1
+    name: slack-alerts
+    receivers:
+      - uid: cb-cp-slack-alerts
+        type: slack
+        settings:
+          url: ${SLACK_WEBHOOK_URL}
+          title: "[{{ .Status }}] {{ .CommonLabels.alertname }}"
+          text: >-
+            Service: {{ .CommonLabels.service_name }}
+            Tenant: {{ .CommonLabels.tenant_id }}
+            Severity: {{ .CommonLabels.severity }}
+            {{ range .Alerts }}{{ .Annotations.summary }}
+            Runbook: {{ .Annotations.runbook_hint }}
+            {{ end }}
+        disableResolveMessage: false
+
+  # Dedicated receiver for per-tenant routed alerts (see policies.yaml tenant route).
+  - orgId: 1
+    name: tenant-webhook
+    receivers:
+      - uid: cb-cp-webhook-tenant
+        type: webhook
+        settings:
+          url: ${TENANT_WEBHOOK_URL}
+          httpMethod: POST
+        disableResolveMessage: false

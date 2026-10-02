@@ -1,3 +1,10 @@
+import 'package:flutter/foundation.dart' show kDebugMode;
+
+/// MOB-12: print() executes in release builds — gate parser hot-path logs.
+void _dbg(String msg) {
+  if (kDebugMode) print(msg);
+}
+
 enum VoiceCommandType {
   checkBalance,
   transfer,
@@ -603,14 +610,14 @@ Umarnin da ake da su:
     final normalizedText = text.toLowerCase().trim();
 
     // DEBUG: Log what we're trying to match
-    print('🔍 Parsing command:');
-    print('   Text: "$normalizedText"');
-    print('   Locale: $locale');
-    print('   Language: $lang');
+    _dbg('🔍 Parsing command:');
+    _dbg('   Text: "$normalizedText"');
+    _dbg('   Locale: $locale');
+    _dbg('   Language: $lang');
 
     // Check balance
     if (_anyPatternMatch(normalizedText, _patterns[lang]?['balance'] ?? [])) {
-      print('   ✅ Matched: checkBalance');
+      _dbg('   ✅ Matched: checkBalance');
       return VoiceCommand(
         type: VoiceCommandType.checkBalance,
         parameters: {},
@@ -621,7 +628,7 @@ Umarnin da ake da su:
 
     // Transfer - CHECK THIS FIRST before other commands
     if (_anyPatternMatch(normalizedText, _patterns[lang]?['transfer'] ?? [])) {
-      print('   ✅ Matched: transfer');
+      _dbg('   ✅ Matched: transfer');
       return VoiceCommand(
         type: VoiceCommandType.transfer,
         parameters: _parseTransferCommand(normalizedText, lang),
@@ -632,7 +639,7 @@ Umarnin da ake da su:
 
     // Pay bill
     if (_anyPatternMatch(normalizedText, _patterns[lang]?['bill'] ?? [])) {
-      print('   ✅ Matched: payBill');
+      _dbg('   ✅ Matched: payBill');
       return VoiceCommand(
         type: VoiceCommandType.payBill,
         parameters: _parseBillPaymentCommand(normalizedText, lang),
@@ -643,7 +650,7 @@ Umarnin da ake da su:
 
     // View transactions
     if (_anyPatternMatch(normalizedText, _patterns[lang]?['transactions'] ?? [])) {
-      print('   ✅ Matched: viewTransactions');
+      _dbg('   ✅ Matched: viewTransactions');
       return VoiceCommand(
         type: VoiceCommandType.viewTransactions,
         parameters: {},
@@ -654,7 +661,7 @@ Umarnin da ake da su:
 
     // Apply for loan
     if (_anyPatternMatch(normalizedText, _patterns[lang]?['loan'] ?? [])) {
-      print('   ✅ Matched: applyLoan');
+      _dbg('   ✅ Matched: applyLoan');
       return VoiceCommand(
         type: VoiceCommandType.applyLoan,
         parameters: _parseLoanCommand(normalizedText, lang),
@@ -665,7 +672,7 @@ Umarnin da ake da su:
 
     // View savings
     if (_anyPatternMatch(normalizedText, _patterns[lang]?['savings'] ?? [])) {
-      print('   ✅ Matched: openSavings');
+      _dbg('   ✅ Matched: openSavings');
       return VoiceCommand(
         type: VoiceCommandType.openSavings,
         parameters: _parseSavingsCommand(normalizedText, lang),
@@ -676,7 +683,7 @@ Umarnin da ake da su:
 
     // Help
     if (_anyPatternMatch(normalizedText, _patterns[lang]?['help'] ?? [])) {
-      print('   ✅ Matched: help');
+      _dbg('   ✅ Matched: help');
       return VoiceCommand(
         type: VoiceCommandType.help,
         parameters: {},
@@ -686,10 +693,10 @@ Umarnin da ake da su:
     }
 
     // Unknown command
-    print('   ❌ No match found - returning unknown');
-    print('   Available patterns for $lang:');
+    _dbg('   ❌ No match found - returning unknown');
+    _dbg('   Available patterns for $lang:');
     _patterns[lang]?.forEach((key, patterns) {
-      print('     $key: ${patterns.take(3).join(", ")}...');
+      _dbg('     $key: ${patterns.take(3).join(", ")}...');
     });
     
     return VoiceCommand(

@@ -1,4 +1,3 @@
-import { uuid4 } from "@temporalio/workflow";
 import httpStatus from "http-status";
 import { asyncHandler } from "../../middlewares/async";
 import { notificationService } from "../../services/notificationService";
@@ -12,8 +11,11 @@ import { completeAgentOnboardingWorkflow } from "../../workflows/completeAgentOn
 export const postAgentKycCallback = asyncHandler(async (req, res) => {
   const payload = validateRequest(KycAgentCallbackSchema, req.body);
 
+  // OB-11: kycVerificationScore returns 0–1; KYC_MINIMUM_SCORE is 0–100 scale.
+  // Normalize exactly like postKycCallback.ts (customer route).
   const kycMinimumScore = parseInt(process.env.KYC_MINIMUM_SCORE || "80", 10);
-  if (payload.score < kycMinimumScore) {
+  const scorePercent = payload.score <= 1 ? payload.score * 100 : payload.score;
+  if (scorePercent < kycMinimumScore) {
     await markAgentKycFailed(payload.metadata.tenant_id, payload.metadata.keycloak_id);
 
     await notificationService.event({
@@ -32,7 +34,8 @@ export const postAgentKycCallback = asyncHandler(async (req, res) => {
 
   await workflowRunner(completeAgentOnboardingWorkflow, {
     args: payload,
-    workflowId: `54link_complete_agent_onboarding_${payload.metadata.keycloak_id}_${uuid4()}`,
+    // OB-08: deterministic id (keycloak_id + verification id) dedups repeat callback deliveries.
+    workflowId: `54link_complete_agent_onboarding_${payload.metadata.keycloak_id}_${payload.id}`,
     defaultErrorMessage: "Complete agent onboarding failed.",
     withTimeOut: 40000,
     timeOutFn: () => {

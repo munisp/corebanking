@@ -1,0 +1,56 @@
+# =============================================================================
+# Dapr Configuration CRD — OpenTelemetry tracing
+#
+# Replaces the tracing section of the existing repo config
+# (infrastructure/new/dapr/config.yaml — verified-static: it ships Zipkin on
+# localhost:9411). Everything else (mtls, accessControl, metrics) is preserved
+# verbatim so this file is a drop-in replacement.
+#
+# SPEC §2.1: OTLP gRPC endpoint default http://otel-collector:4317.
+# If the collector Service lives in the `observability` namespace
+# (verified-static: infrastructure/new/k8s/otel-collector.yaml), sidecars in
+# `54bank` need the FQDN below — it is used here.
+#
+# Sampling 1.0 (SPEC: money services always 1.0).
+#
+# NOTE on "isReversed": Dapr's `tracing.otel` schema has NO `isReversed`
+# field (valid fields: endpointAddress, isSecure, protocol). The requested
+# "isReversed: false" was mapped to `isSecure: false` (plaintext OTLP inside
+# the cluster). Adding an unknown field would fail CRD validation.
+# =============================================================================
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: 54bank-config
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+spec:
+  tracing:
+    samplingRate: "1"          # 1.0 — full sampling on the money path
+    otel:
+      endpointAddress: "otel-collector.observability.svc.cluster.local:4317"
+      isSecure: false          # plaintext OTLP/gRPC inside the cluster (was: "isReversed false")
+      protocol: grpc
+  metric:
+    enabled: true              # dapr sidecar metrics (prometheus, default :9090 on the sidecar)
+  mtls:
+    enabled: true
+    workloadCertTTL: "24h"
+    allowedClockSkew: "15m"
+  accessControl:
+    defaultAction: allow
+    trustDomain: "54bank.com"
+    policies:
+      - appId: gateway
+        defaultAction: allow
+        trustDomain: "54bank.com"
+        namespace: "54bank"
+      - appId: teller-operations
+        defaultAction: allow
+        trustDomain: "54bank.com"
+        namespace: "54bank"
+        operations:
+          - name: /v1/*
+            httpVerb: ["GET", "POST", "PUT", "DELETE"]
+            action: allow

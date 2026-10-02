@@ -1,0 +1,17 @@
+# OR-09: kafka-backed Dapr pubsub component created to satisfy code reference.
+# Mirrors components/pubsub.yaml (pubsub.kafka, ns 54bank). Referenced by: payment-hub daprServer.ts:45 / daprClient.ts:23 (TXN_PUBSUB_NAME default)
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: 54link-txn-pubsub
+  namespace: 54bank
+spec:
+  type: pubsub.kafka
+  version: v1
+  metadata:
+    - name: brokers
+      value: "localhost:9092"
+    - name: consumerGroup
+      value: "54bank-payment-hub-txn"
+    - name: authType
+      value: "none"

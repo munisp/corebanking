@@ -36,8 +36,28 @@ from schemas import (
 )
 from events import publish_transaction_event
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
 import uuid
+
+from utils import get_config as _get_config
+
+config = _get_config()
+
+# --- OpenTelemetry (SPEC w9 §2.5): manual spans on TB money moves + counters.
+# otelkit path is inserted by main.py before this module is imported; when the
+# kit is absent (e.g. isolated unit tests) these become no-ops.
+try:
+    from otelkit import inc_counter, tb_span
+except Exception:
+    from contextlib import contextmanager as _contextmanager
+
+    def inc_counter(name, attrs=None):
+        return None
+
+    @_contextmanager
+    def tb_span(op, **attrs):
+        yield None
 from adapters import payment_rails_connector_adapter
 from schemas.payment import ExternalTransferSchema, ExternalDebitSchema
 
@@ -61,10 +81,29 @@ class PaymentService:
         self.__compliance_adapter = ComplianceServiceAdapter()
         self.__loyalty_adapter = LoyaltyServiceAdapter()
         self.__network_ops_adapter = NetworkOpsAdapter()
+        # MN-11: lien service client (fail-closed on debit paths)
+        lien_headers = {"Content-Type": "application/json"}
+        _service_token = str(getattr(config, "INTERNAL_SERVICE_TOKEN", "") or "")
+        if _service_token:
+            lien_headers["Authorization"] = f"Bearer {_service_token}"
+        from utils import ExternalAPIClient as _ExternalAPIClient
+
+        self.__lien_client = _ExternalAPIClient(
+            base_url=str(getattr(config, "LIEN_SVC_URL", "") or ""),
+            headers=lien_headers,
+        )
 
     @staticmethod
     def _to_minor_units(amount: float) -> int:
-        return int(round(float(amount)))
+        # MN-10 (F13-1): `amount` is in MAJOR units (ExternalAmount.amount ==
+        # amount_kobo / 100). Minor units (kobo) must be amount * 100 with
+        # explicit ROUND_HALF_UP (F13-8); the previous int(round(amount))
+        # mis-scaled every transfer by 100x.
+        return int(
+            (Decimal(str(amount)) * 100).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
 
     @staticmethod
     def _to_major_units(minor_units: int) -> float:
@@ -132,6 +171,155 @@ class PaymentService:
             raise Exception(f"Mint account not found for ledger {ledger_id}")
         return int(mint_account_id)
 
+    # ------------------------------------------------------------------
+    # MN-11: lien / hold enforcement on debit paths
+    # ------------------------------------------------------------------
+    def _get_active_lien_total_minor(self, account_id: int, context: Context) -> int:
+        """Return total active liens (kobo) on an account from account-lien-go.
+
+        Fail-closed: if the lien service is unreachable the debit is rejected —
+        a court-ordered freeze must never be bypassed by an outage (S11/F3-07).
+        """
+        try:
+            response = self.__lien_client._get(
+                f"/api/v1/lien/account?account_id={account_id}"
+            )
+        except Exception as err:
+            logger.error(
+                "Lien service unavailable; rejecting debit (fail-closed) account_id=%s error=%s",
+                account_id,
+                str(err),
+            )
+            raise Exception(
+                "Lien check unavailable; debit rejected (fail-closed)"
+            ) from err
+        return int((response or {}).get("total_active_kobo", 0))
+
+    def _enforce_available_balance(
+        self,
+        *,
+        account_id: int,
+        required_minor: int,
+        ledger_id: int,
+        context: Context,
+    ) -> None:
+        """MN-11: available = TB balance - pending holds - sum(active liens)."""
+        tb_account = self.__tigerbeetle_adapter.get_account(int(account_id))
+        if tb_account is None:
+            raise Exception(f"TigerBeetle account {account_id} not found")
+        balance_minor = int(tb_account.credits_posted) - int(tb_account.debits_posted)
+        pending_holds_minor = int(tb_account.debits_pending)
+        liens_minor = self._get_active_lien_total_minor(int(account_id), context)
+        available_minor = balance_minor - pending_holds_minor - liens_minor
+        logger.info(
+            "Available balance check account_id=%s balance=%d pending=%d liens=%d required=%d available=%d",
+            account_id, balance_minor, pending_holds_minor, liens_minor,
+            required_minor, available_minor,
+        )
+        if available_minor < required_minor:
+            raise Exception(
+                "Insufficient available balance (balance minus pending holds and active liens)"
+            )
+
+    @staticmethod
+    def _enforce_account_debit_allowed(
+        account_data: dict, account_id: Any, metadata: Any = None
+    ) -> None:
+        """MN-01/MN-02/MN-05: DORMANT, CLOSED, DECEASED and otherwise non-ACTIVE
+        accounts must not be debited on the external money paths.
+        MN-03: mandate='all' debits must carry a maker-checker approval id."""
+        status = str((account_data or {}).get("status") or "").upper()
+        if status and status != "ACTIVE":
+            raise Exception(
+                f"Account {account_id} is {status}; debits are not permitted"
+            )
+        mandate = str((account_data or {}).get("mandate") or "single").lower()
+        if mandate == "all":
+            approval = (metadata or {}).get("mandate_approval_id") if isinstance(metadata, dict) else None
+            if not approval:
+                raise Exception(
+                    f"Account {account_id} has mandate=all: debit requires "
+                    "maker-checker approval from all signatories "
+                    "(metadata.mandate_approval_id missing)"
+                )
+
+    # ------------------------------------------------------------------
+    # MN-07: real fund reservation via TigerBeetle pending transfers
+    # ------------------------------------------------------------------
+    def reserve_funds(
+        self,
+        *,
+        account_id: int,
+        amount_minor: int,
+        ledger_id: int,
+        transaction_id: str,
+        context: Context,
+    ) -> dict:
+        """Create a real TB pending transfer holding funds on the account.
+
+        Hold id is deterministic (`reserve:{transaction_id}`) so retries and
+        releases are idempotent. Fail-closed on liens/available balance.
+        """
+        if amount_minor <= 0:
+            raise Exception("Reserve amount must be greater than zero")
+        account = self.__account_service_adapter.get_account_by_id(
+            str(account_id), context
+        )
+        account_data = account.get("account") if isinstance(account, dict) else {}
+        self._enforce_account_debit_allowed(account_data, account_id)
+        self._enforce_available_balance(
+            account_id=int(account_id),
+            required_minor=int(amount_minor),
+            ledger_id=int(ledger_id),
+            context=context,
+        )
+        mint_account_id = self._get_mint_account_for_ledger(int(ledger_id), context)
+        hold_key = f"reserve:{transaction_id}"
+        hold_id = self.__tigerbeetle_adapter.pending_transfer(
+            payer=int(account_id),
+            payee=int(mint_account_id),
+            amount=int(amount_minor),
+            ledger=int(ledger_id),
+            idempotency_key=hold_key,
+        )
+        logger.info(
+            "Funds reserved account_id=%s amount_minor=%s hold_id=%s key=%s",
+            account_id, amount_minor, hold_id, hold_key,
+        )
+        # hold_id is the idempotency KEY (not the numeric TB id) so callers
+        # can hand it straight back to release_funds.
+        return {"hold_id": hold_key, "resourceId": hold_key, "tb_transfer_id": str(hold_id)}
+
+    def release_funds(
+        self,
+        *,
+        transaction_id: str,
+        ledger_id: int,
+    ) -> dict:
+        """MN-07: void the pending transfer created by reserve_funds.
+        `transaction_id` is the hold key returned as hold_id by reserve_funds
+        (`reserve:{transaction_id}`); raw transaction ids are also accepted.
+        Idempotent — releasing an already-released/unknown hold succeeds."""
+        hold_key = (
+            transaction_id
+            if transaction_id.startswith("reserve:")
+            else f"reserve:{transaction_id}"
+        )
+        self.__tigerbeetle_adapter.void_pending_transfer(hold_key, int(ledger_id))
+        logger.info("Funds released key=%s", hold_key)
+        return {"success": True}
+
+    def _get_fee_income_account_id(self, commission_minor: int) -> int:
+        """MN-10: fee-income TB account for the commission leg. Fail-closed:
+        a nonzero commission may never silently vanish."""
+        raw = str(getattr(config, "FEE_INCOME_ACCOUNT_ID", "") or "").strip()
+        if commission_minor > 0 and not raw:
+            raise Exception(
+                "Commission greater than zero but FEE_INCOME_ACCOUNT_ID is not "
+                "configured; refusing to drop the fee leg (fail-closed)"
+            )
+        return int(raw) if raw else 0
+
     @staticmethod
     def _to_uuid_string(value: Any, prefix: str) -> str:
         raw_value = str(value or "").strip()
@@ -187,12 +375,35 @@ class PaymentService:
                 fraud_payload, context
             )
         except Exception as fraud_err:
-            logger.warning(
-                "Fraud engine unavailable, proceeding with transaction transaction_ref=%s error=%s",
+            # Alerting contract (w9 addendum): fraud precheck failure counter.
+            inc_counter(
+                "fraud_precheck_errors_total",
+                {
+                    "service": "payment-processing-service",
+                    "tenant_id": str(getattr(context, "tenant_id", "") or "unknown"),
+                },
+            )
+            # PL-07 (F15-15): fail-closed. A transaction may NOT proceed when
+            # the fraud engine is unreachable unless the explicit break-glass
+            # flag FRAUD_PRECHECK_EMERGENCY_ALLOW=true is set, and every such
+            # use is logged CRITICAL for audit.
+            if getattr(config, "FRAUD_PRECHECK_EMERGENCY_ALLOW", False):
+                logger.critical(
+                    "FRAUD PRECHECK EMERGENCY OVERRIDE: proceeding without fraud "
+                    "screening transaction_ref=%s error=%s (FRAUD_PRECHECK_EMERGENCY_ALLOW=true)",
+                    transaction_ref,
+                    str(fraud_err),
+                )
+                return
+            logger.error(
+                "Fraud engine unavailable; rejecting transaction (fail-closed) "
+                "transaction_ref=%s error=%s",
                 transaction_ref,
                 str(fraud_err),
             )
-            return
+            raise Exception(
+                "Fraud precheck unavailable; transaction rejected (fail-closed)"
+            ) from fraud_err
 
         decision = str((fraud_result or {}).get("decision") or "").lower()
         score = float((fraud_result or {}).get("score") or 0.0)
@@ -231,6 +442,7 @@ class PaymentService:
         customer_name: str = "",
         customer_bvn: str | None = None,
         customer_account: str = "",
+        tenant_id: str = "",
     ) -> None:
         try:
             self.__compliance_adapter.notify_transaction(
@@ -243,8 +455,11 @@ class PaymentService:
                 customer_bvn=customer_bvn,
                 customer_account=customer_account,
                 transaction_date=datetime.now(timezone.utc).isoformat(),
+                tenant_id=tenant_id,
             )
         except Exception as e:
+            # CP-01: adapter already ERROR-logs + increments
+            # nfiu_ctr_publish_errors_total; keep payment flow unblocked.
             logger.warning("Compliance notification failed transaction_id=%s error=%s", transaction_id, str(e))
 
     def _notify_loyalty(
@@ -330,16 +545,27 @@ class PaymentService:
 
         logger.info("Initiating deposit payer=%s payee=%s", context.mint_account_id, payload.recipient)
 
+        # MN-10: amount_kobo is already minor units; the commission adapter
+        # takes major units and scales internally (x100, ROUND_HALF_UP).
+        deposit_major = float(payload.amount_kobo) / 100.0
         commission = self.__commission_service_adapter.calculate_commission(
             agent_id=context.keycloak_id,
             transaction_type="deposit",
-            amount=float(payload.amount),
+            amount=deposit_major,
             currency="NGN",
-            transaction_ref=f"deposit:{context.tenant_id}:{context.mint_account_id}:{payload.recipient}:{payload.amount}",
+            transaction_ref=f"deposit:{context.tenant_id}:{context.mint_account_id}:{payload.recipient}:{payload.amount_kobo}",
             context=context,
             metadata={"recipient": str(payload.recipient), "note": payload.note},
         )
         amount_minor = int(commission["net_amount_minor"])
+
+        # MN-07/MN-14: deterministic TB id when a reference is supplied
+        # (e.g. reversal:{transaction_id}) so replays are ledger no-ops.
+        deposit_idem_key = (
+            f"deposit:{payload.reference}"
+            if getattr(payload, "reference", None)
+            else None
+        )
 
         transaction_id = None
         try:
@@ -348,6 +574,7 @@ class PaymentService:
                 payee=payload.recipient,
                 amount=amount_minor,
                 ledger=int(context.ledger_id),
+                idempotency_key=deposit_idem_key,
             )
             transaction_id = str(id)
             logger.info("Deposit transfer created transaction_id=%s", transaction_id)
@@ -369,8 +596,11 @@ class PaymentService:
                 ),
             )
 
+            # MN-07: the SUCCESS event must go to the SUCCESS topic — that is
+            # what transaction-ledger consumes to post the balancing GL journal
+            # (previously both events went to INITIATED and no journal posted).
             publish_transaction_event(
-                PubsubTopics.TRANSACTION_INITIATED,
+                PubsubTopics.TRANSACTION_SUCCESS,
                 TransactionEventSchema(
                     transaction_id=transaction_id,
                     amount=str(amount_minor),
@@ -390,6 +620,7 @@ class PaymentService:
                 transaction_type="cash_in",
                 amount_ngn=float(payload.amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,
@@ -631,6 +862,7 @@ class PaymentService:
                 transaction_type="cash_out",
                 amount_ngn=float(payload.amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,
@@ -1154,6 +1386,10 @@ class PaymentService:
             },
         )
         amount_minor = int(commission["net_amount_minor"])
+        # MN-10: deposit commission is charged out of the gross mint outflow;
+        # fee leg = mint -> fee-income as a second TB transfer.
+        gross_minor = int(commission.get("gross_amount_minor") or amount_minor)
+        commission_minor = gross_minor - amount_minor
 
         transfer_ledger_id = int(CurrencyLedgerId.from_currency(payee_currency))
 
@@ -1174,13 +1410,46 @@ class PaymentService:
 
         transaction_id = None
         try:
-            reference = self.__tigerbeetle_adapter.transfer(
+            with tb_span(
+                "transfer",
+                kind="external_credit",
                 payer=int(mint_account_id),
                 payee=int(payee_account_id),
-                amount=amount_minor,
+                amount_minor=amount_minor,
                 ledger=transfer_ledger_id,
-            )
+                tenant_id=str(context.tenant_id or "unknown"),
+            ):
+                reference = self.__tigerbeetle_adapter.transfer(
+                    payer=int(mint_account_id),
+                    payee=int(payee_account_id),
+                    amount=amount_minor,
+                    ledger=transfer_ledger_id,
+                    # MN-14: replay of the same deposit is a ledger no-op.
+                    idempotency_key=f"external_credit:{payload.transactionId}",
+                )
             transaction_id = str(reference)
+
+            # MN-10: fee leg mint -> fee-income (deterministic, replay-safe).
+            if commission_minor > 0:
+                fee_income_account_id = self._get_fee_income_account_id(
+                    commission_minor
+                )
+                with tb_span(
+                    "transfer",
+                    kind="external_credit_fee",
+                    payer=int(mint_account_id),
+                    payee=int(fee_income_account_id),
+                    amount_minor=commission_minor,
+                    ledger=transfer_ledger_id,
+                    tenant_id=str(context.tenant_id or "unknown"),
+                ):
+                    self.__tigerbeetle_adapter.transfer(
+                        payer=int(mint_account_id),
+                        payee=int(fee_income_account_id),
+                        amount=commission_minor,
+                        ledger=transfer_ledger_id,
+                        idempotency_key=f"fee:{payload.transactionId}",
+                    )
 
             logger.info(
                 "External credit processed mint=%s payee=%s amount_minor=%s currency=%s ledger=%s reference=%s",
@@ -1208,6 +1477,13 @@ class PaymentService:
                     tag="external_credit",
                     tenant_id=context.tenant_id,
                     ledger_id=context.ledger_id,
+                    # MN-10: fee leg for the multi-leg GL journal.
+                    fee_amount_kobo=commission_minor if commission_minor > 0 else None,
+                    fee_account=(
+                        str(self._get_fee_income_account_id(commission_minor))
+                        if commission_minor > 0
+                        else None
+                    ),
                 ),
             )
             self._notify_compliance(
@@ -1215,6 +1491,7 @@ class PaymentService:
                 transaction_type="cash_in",
                 amount_ngn=float(payload.amount.amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,
@@ -1330,6 +1607,11 @@ class PaymentService:
             },
         )
 
+        # MN-01/MN-02/MN-05: block debits on DORMANT/CLOSED/DECEASED/etc.
+        self._enforce_account_debit_allowed(
+            payer_account_data, payer_account_id, payload.metadata
+        )
+
         commission = self.__commission_service_adapter.calculate_commission(
             agent_id=context.keycloak_id,
             transaction_type="withdrawal",
@@ -1343,6 +1625,19 @@ class PaymentService:
         if amount_minor <= 0:
             raise Exception("Transfer amount must be greater than zero")
 
+        # MN-10: the payer must cover net + fee; the fee leg is posted as a
+        # SECOND TigerBeetle transfer to the fee-income account below.
+        gross_minor = int(commission.get("gross_amount_minor") or amount_minor)
+        commission_minor = gross_minor - amount_minor
+
+        # MN-11: enforce available balance = TB balance - pending holds - liens.
+        self._enforce_available_balance(
+            account_id=int(payer_account_id),
+            required_minor=gross_minor,
+            ledger_id=int(context.ledger_id),
+            context=context,
+        )
+
         # Resolve mint account for the transfer currency
         mint_account_id = self._get_mint_account_for_currency(
             payload.amount.currency, context
@@ -1354,14 +1649,55 @@ class PaymentService:
         transaction_id = None
        
         try:
-            reference = self.__tigerbeetle_adapter.transfer(
+            with tb_span(
+                "transfer",
+                kind="external_debit",
                 payer=int(payer_account_id),
                 payee=int(mint_account_id),
-                amount=amount_minor,
+                amount_minor=amount_minor,
                 ledger=int(context.ledger_id),
-            )
+                tenant_id=str(context.tenant_id or "unknown"),
+            ):
+                reference = self.__tigerbeetle_adapter.transfer(
+                    payer=int(payer_account_id),
+                    payee=int(mint_account_id),
+                    amount=amount_minor,
+                    ledger=int(context.ledger_id),
+                    # MN-14: replay of the same withdrawal is a ledger no-op.
+                    idempotency_key=f"external_debit:{payload.transactionId}",
+                )
             transaction_id = str(reference)
-           
+
+            # MN-10: post the commission/fee as a SECOND TB transfer
+            # payer -> fee-income account (deterministic id => replay-safe).
+            if commission_minor > 0:
+                fee_income_account_id = self._get_fee_income_account_id(
+                    commission_minor
+                )
+                with tb_span(
+                    "transfer",
+                    kind="external_debit_fee",
+                    payer=int(payer_account_id),
+                    payee=int(fee_income_account_id),
+                    amount_minor=commission_minor,
+                    ledger=int(context.ledger_id),
+                    tenant_id=str(context.tenant_id or "unknown"),
+                ):
+                    self.__tigerbeetle_adapter.transfer(
+                        payer=int(payer_account_id),
+                        payee=int(fee_income_account_id),
+                        amount=commission_minor,
+                        ledger=int(context.ledger_id),
+                        idempotency_key=f"fee:{payload.transactionId}",
+                    )
+                logger.info(
+                    "Fee leg posted payer=%s fee_income=%s commission_minor=%s ref=%s",
+                    str(payer_account_id),
+                    str(fee_income_account_id),
+                    str(commission_minor),
+                    str(payload.transactionId),
+                )
+
             logger.info(
                 "External debit processed payer=%s mint=%s amount_minor=%s currency=%s reference=%s",
                 str(payer_account_id),
@@ -1387,6 +1723,13 @@ class PaymentService:
                     tag="external_debit",
                     tenant_id=context.tenant_id,
                     ledger_id=context.ledger_id,
+                    # MN-10: fee leg for the multi-leg GL journal.
+                    fee_amount_kobo=commission_minor if commission_minor > 0 else None,
+                    fee_account=(
+                        str(self._get_fee_income_account_id(commission_minor))
+                        if commission_minor > 0
+                        else None
+                    ),
                 ),
             )
             self._notify_compliance(
@@ -1394,6 +1737,7 @@ class PaymentService:
                 transaction_type="cash_out",
                 amount_ngn=float(payload.amount.amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,
@@ -1573,6 +1917,7 @@ class PaymentService:
                 transaction_type="loan_payment",
                 amount_ngn=float(payload.amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,
@@ -1699,6 +2044,7 @@ class PaymentService:
                 transaction_type="lpo_payment",
                 amount_ngn=float(amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,
@@ -1835,6 +2181,7 @@ class PaymentService:
                 transaction_type="insurance_premium",
                 amount_ngn=float(amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,
@@ -1987,6 +2334,7 @@ class PaymentService:
                 transaction_type="supply_chain",
                 amount_ngn=float(amount),
                 agent_id=context.keycloak_id,
+                tenant_id=str(context.tenant_id or ""),
             )
             self._notify_loyalty(
                 transaction_id=transaction_id,

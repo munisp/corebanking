@@ -33,6 +33,18 @@ from lakehouse.quality.checks import DataQualityEngine
 
 import pandas as pd
 
+# --- OpenTelemetry (wave-9) ---------------------------------------------------
+# Optional shared-kit instrumentation. No-op when the kit/opentelemetry is not
+# installed or when OTEL_SDK_DISABLED=true (kit honors it per SPEC §2.1).
+try:
+    from shared.otel.python.otelkit import init_telemetry
+    from opentelemetry import trace
+
+    _tracer = trace.get_tracer("54bank.lakehouse")
+except ImportError:  # kit or opentelemetry not installed — telemetry disabled
+    init_telemetry = None
+    _tracer = None
+
 logger = logging.getLogger("54bank.lakehouse.server")
 
 PORT = int(os.getenv("LAKEHOUSE_PORT", "8020"))
@@ -103,6 +115,25 @@ class LakehouseHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        self._serve_with_span("GET", self._do_GET)
+
+    def do_POST(self):
+        self._serve_with_span("POST", self._do_POST)
+
+    def _serve_with_span(self, method: str, handler):
+        """Wrap request handling in an OTel span; no-op when telemetry is off."""
+        if _tracer is None:
+            return handler()
+        path = self.path.split("?")[0]
+        with _tracer.start_as_current_span(f"lakehouse {method} {path}") as span:
+            span.set_attribute("http.request.method", method)
+            span.set_attribute("url.path", path)
+            tenant_id = self.headers.get("x-tenant-id")  # SPEC §2.3
+            if tenant_id:
+                span.set_attribute("tenant.id", tenant_id)
+            return handler()
+
+    def _do_GET(self):
         srv = get_server()
         path = self.path.split("?")[0]
 
@@ -179,7 +210,7 @@ class LakehouseHandler(BaseHTTPRequestHandler):
             logger.error(f"GET {path} error: {e}")
             self._json_response(500, {"error": str(e)})
 
-    def do_POST(self):
+    def _do_POST(self):
         srv = get_server()
         path = self.path.split("?")[0]
 
@@ -302,6 +333,8 @@ def main():
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    if init_telemetry is not None:
+        init_telemetry(service_name="lakehouse")  # OTLP via env, SPEC §2.1
     srv = get_server()
     srv.bootstrap()
 

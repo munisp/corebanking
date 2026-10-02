@@ -38,10 +38,29 @@ else
 fi
 
 # WAL archiving (if enabled)
+# PL-11: `|| true` removed — a failed basebackup must fail the job loudly
+# (non-zero exit → CronJob failed → alert), not be silently swallowed.
 if [ "${ENABLE_WAL_ARCHIVE:-false}" = "true" ]; then
   WAL_DIR="${BACKUP_DIR}/wal"
   mkdir -p "$WAL_DIR"
-  pg_basebackup -h "$DB_HOST" -U "$DB_USER" -D "$WAL_DIR/base_${TIMESTAMP}" -Ft -z -P 2>&1 || true
+  PGPASSWORD="${DB_PASSWORD}" pg_basebackup -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -D "$WAL_DIR/base_${TIMESTAMP}" -Ft -z -P 2>&1
+fi
+
+# Offsite upload to S3-compatible object storage with server-side encryption.
+# PL-11: local-only backups die with the node. Set S3_BUCKET (e.g. via the
+# backup-credentials secret in k8s/backups/backup-cronjob.yaml) to enable.
+if [ -n "${S3_BUCKET:-}" ]; then
+  S3_PREFIX="${S3_PREFIX:-postgres}"
+  echo "[$(date)] Uploading backup to s3://${S3_BUCKET}/${S3_PREFIX}/ ..."
+  aws s3 cp "$BACKUP_FILE" "s3://${S3_BUCKET}/${S3_PREFIX}/$(basename "$BACKUP_FILE")" \
+    --sse AES256 --only-show-errors
+  if [ "${ENABLE_WAL_ARCHIVE:-false}" = "true" ]; then
+    aws s3 cp --recursive "${BACKUP_DIR}/wal/base_${TIMESTAMP}" \
+      "s3://${S3_BUCKET}/${S3_PREFIX}/wal/base_${TIMESTAMP}" --sse AES256 --only-show-errors
+  fi
+  echo "[$(date)] S3 upload complete (SSE-AES256)."
+else
+  echo "[$(date)] WARNING: S3_BUCKET not set — backup remains LOCAL ONLY at ${BACKUP_FILE}." >&2
 fi
 
 # Cleanup old backups

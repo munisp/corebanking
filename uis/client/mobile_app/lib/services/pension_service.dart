@@ -79,9 +79,9 @@ class PensionService {
 
   PensionService(this._apiService);
 
-  Future<List<PensionAccount>> listAccounts() async {
+  Future<List<PensionAccount>> listAccounts({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('$_base/pension_accounts');
+      final response = await _apiService.get('$_base/pension_accounts', queryParameters: {'page': page, 'limit': limit});
       if (response.statusCode == 200) {
         final data = response.data;
         List<dynamic> items;

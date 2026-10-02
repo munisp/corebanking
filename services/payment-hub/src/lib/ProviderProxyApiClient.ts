@@ -1,4 +1,6 @@
 import axios, { AxiosInstance } from "axios";
+import http from "http";
+import https from "https";
 import { readEnv } from "../config/readEnv.config";
 import { ICreateVfdSubWalletInput, ICreateVfdWalletInput, ICreateVfdWalletResponse } from "../types";
 import logger from "../config/logger.config";
@@ -12,6 +14,9 @@ export class ProviderProxyApiClient {
   private constructor() {
     this.clientAxios = axios.create({
       baseURL: url,
+      timeout: 10000,
+      httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+      httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
     });
   }
 

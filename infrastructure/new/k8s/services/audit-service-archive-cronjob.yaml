@@ -1,0 +1,61 @@
+# PL-10: monthly audit retention archival job.
+# Runs scripts/archive_audit.py: exports audit rows older than
+# AUDIT_RETENTION_MONTHS (default 84) to JSONL bundles (S3 when
+# AUDIT_ARCHIVE_S3_BUCKET is set, else local path with a loud warning),
+# writes an audit_archive_certificate row, then delete-after-archive.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-service-archive
+  namespace: 54bank
+  labels:
+    app: audit-service
+    tier: microservice
+spec:
+  schedule: "17 2 1 * *"  # 02:17 on the 1st of each month
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 12
+  failedJobsHistoryLimit: 6
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: audit-service
+            job: audit-archive
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+            - name: audit-archive
+              image: ghcr.io/54bank/audit-service:latest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "scripts/archive_audit.py"]
+              env:
+                - name: AUDIT_RETENTION_MONTHS
+                  value: "84"
+                # Set AUDIT_ARCHIVE_S3_BUCKET (and AWS creds via the pod
+                # identity) for compliant off-cluster archive storage.
+                - name: AUDIT_ARCHIVE_LOCAL_DIR
+                  value: "/var/backups/audit"
+              envFrom:
+                - secretRef:
+                    name: 54link-shared-database-svc-secret
+                    optional: true
+              volumeMounts:
+                - name: audit-archive-local
+                  mountPath: /var/backups/audit
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 1Gi
+          volumes:
+            - name: audit-archive-local
+              emptyDir: {}

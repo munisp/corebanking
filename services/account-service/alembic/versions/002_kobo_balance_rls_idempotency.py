@@ -21,22 +21,37 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # 1. Add balance_kobo (BIGINT) — backfill from existing balance string.
-    #    Old balance column was unreliable (String, "Not trust-worthy") so default=0 is safe.
+    # Expand-migrate-contract (PL-04/PL-05):
+    # 1. EXPAND — add balance_kobo (BIGINT) alongside the legacy string column.
     op.add_column("account", sa.Column("balance_kobo", sa.BigInteger(), nullable=False, server_default="0"))
 
-    # 2. Drop the old string balance column — it was never trustworthy.
+    # 2. MIGRATE — explicit backfill BEFORE any DROP. Rows whose legacy string
+    #    balance is not a plain integer (the column was unreliable) fall back
+    #    to 0; everything else is preserved. Never silently zero real balances.
+    op.execute("""
+        UPDATE account
+           SET balance_kobo = CASE
+               WHEN balance ~ '^-?[0-9]+$' THEN CAST(balance AS BIGINT)
+               ELSE 0
+           END
+    """)
+
+    # 3. CONTRACT — only after the backfill, drop the old string column.
     op.drop_column("account", "balance")
 
-    # 3. Optimistic locking version column.
+    # 4. Optimistic locking version column.
     op.add_column("account", sa.Column("version", sa.Integer(), nullable=False, server_default="1"))
 
-    # 4. soft-delete column (if not already present via SoftDeleteMixin).
+    # 5. tier column (moved here from account-service main.py import-time DDL;
+    #    schema changes belong in the migration chain, not in app boot).
+    op.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS tier VARCHAR DEFAULT 'tier1'")
+
+    # 6. soft-delete column (if not already present via SoftDeleteMixin).
     op.execute("""
         ALTER TABLE account ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     """)
 
-    # 5. Enable RLS and create tenant isolation policy.
+    # 7. Enable RLS and create tenant isolation policy.
     op.execute("ALTER TABLE account ENABLE ROW LEVEL SECURITY;")
     op.execute("ALTER TABLE account FORCE ROW LEVEL SECURITY;")
     op.execute("""

@@ -14,7 +14,17 @@ class YarnGPTService {
   final String baseUrl;
   
   VoiceProfile? _selectedProfile;
-  
+
+  /// MOB-19: reuse a single HTTP client so TTS calls share keep-alive
+  /// connections instead of opening/closing a client per call.
+  final http.Client _client = http.Client();
+
+  /// MOB-19: small LRU cache of synthesized audio (insertion-ordered map;
+  /// oldest evicted beyond [_maxAudioCacheEntries]) so repeated phrases do
+  /// not hit the network again.
+  final Map<String, Uint8List> _audioCache = {};
+  static const int _maxAudioCacheEntries = 20;
+
   YarnGPTService({
     String? apiKey,
     String? baseUrl,
@@ -58,15 +68,20 @@ class YarnGPTService {
       };
       
       final endpoint = '$baseUrl/tts';
-      
-      debugPrint('🗣️ YarnGPT TTS Request:');
-      debugPrint('   Endpoint: $endpoint');
-      debugPrint('   Text: "$text"');
-      debugPrint('   Voice: $voiceName');
-      debugPrint('   Format: $responseFormat');
-      debugPrint('   API Key: ${apiKey.substring(0, 10)}...');
-      
-      final response = await http.post(
+
+      // MOB-19: serve repeated phrases from the audio cache.
+      final cacheKey = '$voiceName|$responseFormat|$text';
+      final cached = _audioCache.remove(cacheKey);
+      if (cached != null) {
+        _audioCache[cacheKey] = cached; // LRU touch
+        return cached;
+      }
+
+      if (kDebugMode) {
+        debugPrint('🗣️ YarnGPT TTS Request: $endpoint voice=$voiceName format=$responseFormat len=${text.length}');
+      }
+
+      final response = await _client.post(
         Uri.parse(endpoint),
         headers: {
           'Content-Type': 'application/json',
@@ -74,17 +89,22 @@ class YarnGPTService {
         },
         body: jsonEncode(requestBody),
       ).timeout(const Duration(seconds: 30));
-      
-      debugPrint('📡 YarnGPT TTS Response:');
-      debugPrint('   Status: ${response.statusCode}');
-      debugPrint('   Body length: ${response.bodyBytes.length} bytes');
-      
+
       if (response.statusCode == 200) {
-        debugPrint('✅ YarnGPT TTS successful (${response.bodyBytes.length} bytes)');
-        return response.bodyBytes;
+        if (kDebugMode) {
+          debugPrint('✅ YarnGPT TTS successful (${response.bodyBytes.length} bytes)');
+        }
+        final bytes = response.bodyBytes;
+        if (_audioCache.length >= _maxAudioCacheEntries) {
+          _audioCache.remove(_audioCache.keys.first); // evict oldest (LRU)
+        }
+        _audioCache[cacheKey] = bytes;
+        return bytes;
       } else {
-        debugPrint('❌ YarnGPT TTS failed: ${response.statusCode}');
-        debugPrint('   Response body: ${response.body}');
+        if (kDebugMode) {
+          debugPrint('❌ YarnGPT TTS failed: ${response.statusCode}');
+          debugPrint('   Response body: ${response.body}');
+        }
         return null;
       }
     } catch (e) {

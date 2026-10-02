@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../../config/app_theme.dart';
@@ -677,11 +678,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     applicationVersion: '1.0.0',
                     applicationLegalese: l10n.secureDigitalBanking,
                     applicationIcon: tenantProvider.logoUrl.isNotEmpty
-                        ? Image.network(
-                            tenantProvider.logoUrl,
+                        ? CachedNetworkImage(
+                              imageUrl: tenantProvider.logoUrl,
                             height: 48,
+                            memCacheHeight: 96, // MOB-08
                             width: 48,
-                            errorBuilder: (context, error, stackTrace) {
+                            memCacheWidth: 96, // MOB-08
+                            errorWidget: (context, url, error) {
                               return Icon(
                                 Icons.account_balance,
                                 size: 48,

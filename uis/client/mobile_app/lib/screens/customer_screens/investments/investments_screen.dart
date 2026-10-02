@@ -168,9 +168,15 @@ class _InvestmentsScreenState extends State<InvestmentsScreen> with SingleTicker
           // My Portfolio Tab
           RefreshIndicator(
             onRefresh: _handleRefresh,
-            child: ListView(
+            // MOB-03: lazy builder — only visible cards are built.
+            child: ListView.builder(
               padding: const EdgeInsets.all(16),
-              children: [
+              itemCount: 1 + (_investments.isEmpty ? 1 : _investments.length),
+              itemBuilder: (context, index) {
+              if (index == 0) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
                 // Portfolio Summary Card
                 Card(
                   elevation: 4,
@@ -257,64 +263,76 @@ class _InvestmentsScreenState extends State<InvestmentsScreen> with SingleTicker
                 ),
                 const SizedBox(height: 12),
                 
-                if (_investments.isEmpty)
-                  Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const SizedBox(height: 32),
-                        Icon(Icons.trending_up_outlined, size: 64, color: Colors.grey[400]),
-                        const SizedBox(height: 16),
-                        Text(
-                          'No Active Investments',
-                          style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.grey[700],
-                          ),
+                ],
+              );
+              }
+              if (_investments.isEmpty) {
+                return Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const SizedBox(height: 32),
+                      Icon(Icons.trending_up_outlined, size: 64, color: Colors.grey[400]),
+                      const SizedBox(height: 16),
+                      Text(
+                        'No Active Investments',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey[700],
                         ),
-                        const SizedBox(height: 8),
-                        Text(
-                          'Start investing to grow your wealth',
-                          style: TextStyle(color: Colors.grey[600]),
-                        ),
-                      ],
-                    ),
-                  )
-                else
-                  ...(_investments.map((investment) => _buildInvestmentCard(investment, currencyFormat)).toList()),
-              ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Start investing to grow your wealth',
+                        style: TextStyle(color: Colors.grey[600]),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              return _buildInvestmentCard(_investments[index - 1], currencyFormat);
+              },
             ),
           ),
           
           // Products Tab
           RefreshIndicator(
             onRefresh: _handleRefresh,
-            child: ListView(
+            // MOB-03: lazy builder — only visible cards are built.
+            child: ListView.builder(
               padding: const EdgeInsets.all(16),
-              children: [
-                Card(
-                  color: AppTheme.primaryColor.withOpacity(0.1),
-                  elevation: 0,
-                  child: Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: Row(
-                      children: [
-                        Icon(Icons.info_outline, color: AppTheme.primaryColor),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            'Choose from our range of investment products tailored to your goals',
-                            style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+              itemCount: 1 + _availableProducts.length,
+              itemBuilder: (context, index) {
+                if (index == 0) {
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Card(
+                        color: AppTheme.primaryColor.withOpacity(0.1),
+                        elevation: 0,
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Row(
+                            children: [
+                              Icon(Icons.info_outline, color: AppTheme.primaryColor),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  'Choose from our range of investment products tailored to your goals',
+                                  style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 16),
-                ...(_availableProducts.map((product) => _buildProductCard(product, currencyFormat)).toList()),
-              ],
+                      ),
+                      const SizedBox(height: 16),
+                    ],
+                  );
+                }
+                return _buildProductCard(_availableProducts[index - 1], currencyFormat);
+              },
             ),
           ),
         ],

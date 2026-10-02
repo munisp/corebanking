@@ -22,4 +22,4 @@ COPY . /app/
 
 EXPOSE 8024
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8024}"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8024} --workers ${UVICORN_WORKERS:-4}"]

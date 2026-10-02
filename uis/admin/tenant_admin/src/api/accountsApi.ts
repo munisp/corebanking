@@ -5,7 +5,6 @@
  * │ UI Route                     │ APISIX Prefix               │ Backend Service              │ Port  │
  * ├──────────────────────────────┼─────────────────────────────┼──────────────────────────────┼───────┤
  * │ /account-opening             │ /account-opening            │ account-opening-go           │ 8114  │
- * │ /account-closure             │ /account-closure            │ account-closure-go           │ 8334  │
  * │ /account-statements          │ /account-statements         │ account-statement-go         │ 8138  │
  * │ /statement-generator         │ /statement-gen              │ statement-generator-py       │ 8215  │
  * │ /beneficiary-management      │ /beneficiaries              │ beneficiary-management-go    │ 8116  │

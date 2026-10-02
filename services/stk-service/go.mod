@@ -2,6 +2,10 @@ module stk-service
 
 go 1.26.2
 
+require shared/otel/go v0.0.0
+
+replace shared/otel/go => ../../shared/otel/go
+
 require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1

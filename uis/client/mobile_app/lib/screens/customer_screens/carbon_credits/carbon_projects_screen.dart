@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import '../../../models/carbon_project.dart';
 import '../../../services/carbon_service.dart';
 import '../../../services/error_handler_service.dart';
@@ -68,12 +69,13 @@ class _CarbonProjectsScreenState extends State<CarbonProjectsScreen> {
                 if (project.imageUrl != null)
                   ClipRRect(
                     borderRadius: BorderRadius.circular(8),
-                    child: Image.network(
-                      project.imageUrl!,
+                    child: CachedNetworkImage(
+                        imageUrl: project.imageUrl!,
                       height: 150,
+                      memCacheHeight: 300, // MOB-08
                       width: double.infinity,
                       fit: BoxFit.cover,
-                      errorBuilder: (context, error, stackTrace) => Container(
+                      errorWidget: (context, url, error) => Container(
                         height: 150,
                         color: Colors.grey[300],
                         child: const Icon(Icons.park, size: 50),

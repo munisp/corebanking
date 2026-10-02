@@ -4,3 +4,4 @@ from .qr import qr_router
 from .system import system_router
 from .charges import charges_router
 from .transfers import transfers_router
+from .internal_funds import internal_funds_router  # MN-07

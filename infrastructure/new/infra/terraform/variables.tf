@@ -1,3 +1,10 @@
+# PL-13: SINGLE-REGION REALITY. This IaC builds ONE region (af-south-1): one
+# VPC, one EKS cluster; there is no second-region module, no Route53/GSLB, and
+# no cross-region replication. Any documentation or API claiming a multi-region
+# or London/Abuja DR topology is aspirational — the audited disaster-recovery
+# posture is single-region + backups (see infrastructure/new/k8s/backups/ and
+# k8s/dr/disaster-recovery.yaml). Do not add region claims here until a real
+# second-region module exists.
 variable "environment" { default = "staging" }
 variable "aws_region" { default = "af-south-1" }
 variable "vpc_cidr" { default = "10.0.0.0/16" }

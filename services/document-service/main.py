@@ -1,6 +1,7 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 
 from database import Base, engine
 from api.v1 import health_router, document_router
@@ -19,6 +20,7 @@ app = FastAPI(
     description="54link document service.",
     version="0.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL

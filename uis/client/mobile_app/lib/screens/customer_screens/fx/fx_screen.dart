@@ -39,7 +39,8 @@ class _FXScreenState extends State<FXScreen> with SingleTickerProviderStateMixin
   Future<void> _loadRates() async {
     setState(() { _loadingRates = true; _ratesError = null; });
     try {
-      final response = await _api.get('${AppConfig.fxEndpoint}/rates');
+      final response = await _api.get('${AppConfig.fxEndpoint}/rates',
+          queryParameters: {'limit': 50}); // MOB-03: bound the fetch
       final data = response.data;
       List<dynamic> raw = [];
       if (data is List) {
@@ -61,7 +62,8 @@ class _FXScreenState extends State<FXScreen> with SingleTickerProviderStateMixin
   Future<void> _loadTransactions() async {
     setState(() { _loadingTransactions = true; _transactionsError = null; });
     try {
-      final response = await _api.get('${AppConfig.fxEndpoint}/transactions');
+      final response = await _api.get('${AppConfig.fxEndpoint}/transactions',
+          queryParameters: {'page': 1, 'limit': 50}); // MOB-03: bound the fetch
       final data = response.data;
       List<dynamic> raw = [];
       if (data is List) {
@@ -183,31 +185,40 @@ class _FXScreenState extends State<FXScreen> with SingleTickerProviderStateMixin
                     ? _buildError(_ratesError!, _loadRates)
                     : _exchangeRates.isEmpty
                         ? _buildEmpty('No exchange rates available', Icons.currency_exchange_outlined)
-                        : ListView(
+                        // MOB-03: lazy builder — only visible rate cards are built.
+                        : ListView.builder(
                             padding: const EdgeInsets.all(16),
-                            children: [
-                              Card(
-                                color: AppTheme.primaryColor.withOpacity(0.1),
-                                elevation: 0,
-                                child: Padding(
-                                  padding: const EdgeInsets.all(16),
-                                  child: Row(
-                                    children: [
-                                      Icon(Icons.info_outline, color: AppTheme.primaryColor),
-                                      const SizedBox(width: 12),
-                                      Expanded(
-                                        child: Text(
-                                          'Rates are updated in real-time and may vary slightly at checkout',
-                                          style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+                            itemCount: 1 + _exchangeRates.length,
+                            itemBuilder: (context, index) {
+                              if (index == 0) {
+                                return Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Card(
+                                      color: AppTheme.primaryColor.withOpacity(0.1),
+                                      elevation: 0,
+                                      child: Padding(
+                                        padding: const EdgeInsets.all(16),
+                                        child: Row(
+                                          children: [
+                                            Icon(Icons.info_outline, color: AppTheme.primaryColor),
+                                            const SizedBox(width: 12),
+                                            Expanded(
+                                              child: Text(
+                                                'Rates are updated in real-time and may vary slightly at checkout',
+                                                style: TextStyle(fontSize: 13, color: Colors.grey[700]),
+                                              ),
+                                            ),
+                                          ],
                                         ),
                                       ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(height: 16),
-                              ..._exchangeRates.map((rate) => _buildRateCard(rate, currencyFormat)),
-                            ],
+                                    ),
+                                    const SizedBox(height: 16),
+                                  ],
+                                );
+                              }
+                              return _buildRateCard(_exchangeRates[index - 1], currencyFormat);
+                            },
                           ),
           ),
 

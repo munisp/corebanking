@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,90 @@ import (
 	tigerbeetle "github.com/tigerbeetle/tigerbeetle-go"
 	"github.com/tigerbeetle/tigerbeetle-go/pkg/types"
 )
+
+// F1-03/F11-03 (Wave-10): escrow money-movement safety primitives.
+//
+// deterministicTransferID derives a stable TigerBeetle transfer ID from an
+// idempotency key (e.g. "escrow:{contract_id}:release"). TigerBeetle treats a
+// create carrying an identical, already-existing transfer as an idempotent
+// no-op, so client/Temporal retries can never double-post a payout. The
+// previous code used a random snowflake ID per attempt, so every retry was a
+// brand-new transfer — the core of the F11-03 double-spend.
+func deterministicTransferID(key string) types.Uint128 {
+	sum := sha256.Sum256([]byte(key))
+	var id types.Uint128
+	copy(id[:], sum[:16])
+	return id
+}
+
+// claimContractStatus atomically moves a contract out of one of `allowed`
+// into `target` (compare-and-set on the status column). Exactly one
+// concurrent caller wins; losers get an error and MUST NOT move money. It
+// returns the previous status so the winner can compensate (revert) if the
+// downstream ledger posting fails. F11-03: the old code did a plain SELECT
+// followed by a guardless UPDATE, so concurrent release/refund requests both
+// passed the status check and both posted transfers.
+func (s *EscrowService) claimContractStatus(ctx context.Context, contractID string, target ContractStatus, allowed ...ContractStatus) (ContractStatus, error) {
+	var prev ContractStatus
+	if err := s.db.QueryRow(ctx, `SELECT status FROM escrow_contracts WHERE id = $1`, contractID).Scan(&prev); err != nil {
+		return "", fmt.Errorf("failed to read contract for state transition: %w", err)
+	}
+	ok := false
+	for _, a := range allowed {
+		if prev == a {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return "", fmt.Errorf("contract cannot transition to %s from status: %s", target, prev)
+	}
+	// Conditional UPDATE: under READ COMMITTED a concurrent winner commits
+	// first and this statement re-evaluates the WHERE clause against the new
+	// status, matching 0 rows.
+	tag, err := s.db.Exec(ctx, `
+		UPDATE escrow_contracts SET status = $1, updated_at = NOW() WHERE id = $2 AND status = $3
+	`, target, contractID, prev)
+	if err != nil {
+		return "", fmt.Errorf("failed to transition contract status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		escrowTransitionConflicts.WithLabelValues(string(target)).Inc()
+		return "", fmt.Errorf("concurrent state transition on contract %s rejected: contract no longer in status %s", contractID, prev)
+	}
+	return prev, nil
+}
+
+// revertContractStatus compensates a claimed transition after a downstream
+// ledger failure. A failed revert is logged CRITICAL for manual
+// reconciliation — the contract row and ledger must never diverge silently.
+func (s *EscrowService) revertContractStatus(ctx context.Context, contractID string, from, to ContractStatus) {
+	if _, err := s.db.Exec(ctx, `
+		UPDATE escrow_contracts SET status = $1, updated_at = NOW() WHERE id = $2 AND status = $3
+	`, to, contractID, from); err != nil {
+		log.Printf("CRITICAL: failed to revert escrow contract %s status %s -> %s after ledger failure: %v — manual reconciliation required", contractID, from, to, err)
+	}
+}
+
+// escrowBalanceKobo returns the posted balance (credits - debits), in kobo
+// (integer minor units), of the contract's TigerBeetle escrow account.
+// F1-03: release/refund must verify the escrow is actually funded at the
+// ledger before posting a payout.
+func (s *EscrowService) escrowBalanceKobo(contract *EscrowContract) (uint64, error) {
+	accounts, err := s.tbClient.LookupAccounts([]types.Uint128{contract.TigerBeetleID})
+	if err != nil {
+		return 0, fmt.Errorf("failed to look up escrow ledger account: %w", err)
+	}
+	if len(accounts) != 1 {
+		return 0, fmt.Errorf("escrow ledger account for contract %s not found", contract.ID)
+	}
+	credits := binary.LittleEndian.Uint64(accounts[0].CreditsPosted[:8])
+	debits := binary.LittleEndian.Uint64(accounts[0].DebitsPosted[:8])
+	if debits > credits {
+		return 0, fmt.Errorf("escrow ledger account for contract %s is overdrawn (debits %d > credits %d)", contract.ID, debits, credits)
+	}
+	return credits - debits, nil
+}
 
 // toUint128 converts a uint64 to TigerBeetle's Uint128 type
 func toUint128(value uint64) types.Uint128 {
@@ -33,15 +118,13 @@ func (s *EscrowService) PingDB(ctx context.Context) error {
 	return s.db.Ping(ctx)
 }
 
-// PingTigerBeetle checks if TigerBeetle is reachable (stub, always returns nil unless implemented)
+// PingTigerBeetle checks TigerBeetle connectivity honestly (F1-03): an
+// unconnected client is an error, so readiness reflects the ledger that all
+// escrow money movement depends on.
 func (s *EscrowService) PingTigerBeetle(ctx context.Context) error {
-	// TODO: Implement actual TigerBeetle health check if available
-	return nil
-}
-
-// PingTemporal checks if Temporal is reachable (stub, always returns nil unless implemented)
-func (s *EscrowService) PingTemporal(ctx context.Context) error {
-	// TODO: Implement actual Temporal health check if available
+	if s.tbClient == nil {
+		return fmt.Errorf("tigerbeetle client not connected")
+	}
 	return nil
 }
 
@@ -105,6 +188,17 @@ var (
 			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30},
 		},
 		[]string{"operation"},
+	)
+
+	// escrowTransitionConflicts counts rejected concurrent terminal
+	// transitions (F11-03 guard firing). A sustained non-zero rate means
+	// double-release/double-refund attempts are reaching the service.
+	escrowTransitionConflicts = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "escrow_transition_conflicts_total",
+			Help: "Concurrent escrow terminal-state transitions rejected by the atomic status guard",
+		},
+		[]string{"target_status"},
 	)
 )
 
@@ -569,27 +663,35 @@ func (s *EscrowService) CreateContract(ctx context.Context, input CreateContract
 	// Generate contract number
 	contractNumber := fmt.Sprintf("ESC-%s-%d", string(input.UseCase)[:3], time.Now().UnixNano()%1000000)
 
-	// Create TigerBeetle account for the contract (only if client is available)
-	var tbID types.Uint128
-	tbID = s.idGenerator.NextID()
+	// Create TigerBeetle account for the contract. F1-03: fail closed — a
+	// contract without a ledger account can never be funded/released/refunded
+	// honestly, so ledger unavailability must block creation rather than mint
+	// a contract that only pretends to hold funds.
+	if s.tbClient == nil {
+		return nil, fmt.Errorf("tigerbeetle ledger unavailable — refusing to create escrow contract")
+	}
 
-	if s.tbClient != nil {
-		accounts := []types.Account{
-			{
-				ID:     tbID,
-				Ledger: LedgerCodeEscrowContract,
-				Code:   uint16(LedgerCodeEscrowContract),
-				Flags:  AccountFlagDebits | AccountFlagHistory,
-			},
-		}
+	// Deterministic ledger account ID per contract attempt is NOT possible
+	// before the contract UUID exists; the snowflake ID is fine here because
+	// account creation happens once per contract row and a DB insert failure
+	// orphans only an empty zero-balance account.
+	tbID := s.idGenerator.NextID()
 
-		results, err := s.tbClient.CreateAccounts(accounts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create TigerBeetle account: %w", err)
-		}
-		if len(results) > 0 {
-			return nil, fmt.Errorf("TigerBeetle account creation failed: %v", results[0].Result)
-		}
+	accounts := []types.Account{
+		{
+			ID:     tbID,
+			Ledger: LedgerCodeEscrowContract,
+			Code:   uint16(LedgerCodeEscrowContract),
+			Flags:  AccountFlagDebits | AccountFlagHistory,
+		},
+	}
+
+	acctResults, err := s.tbClient.CreateAccounts(accounts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create TigerBeetle account: %w", err)
+	}
+	if len(acctResults) > 0 {
+		return nil, fmt.Errorf("TigerBeetle account creation failed: %v", acctResults[0].Result)
 	}
 
 	// Create contract
@@ -791,10 +893,6 @@ func (s *EscrowService) FundContract(ctx context.Context, contractID string, amo
 		return nil, err
 	}
 
-	if contract.Status != StatusAwaitingFunding && contract.Status != StatusCreated {
-		return nil, fmt.Errorf("contract cannot be funded in status: %s", contract.Status)
-	}
-
 	if amount < contract.TotalAmount {
 		return nil, fmt.Errorf("funding amount %.2f is less than required %.2f", amount, contract.TotalAmount)
 	}
@@ -804,9 +902,24 @@ func (s *EscrowService) FundContract(ctx context.Context, contractID string, amo
 		return nil, fmt.Errorf("funding deadline has passed")
 	}
 
-	// Create TigerBeetle transfer (only if client is available)
-	transferID := s.idGenerator.NextID()
+	// F1-03: fail closed — funding is a money movement; without the ledger we
+	// must NOT stamp a "completed" funding transaction (the old code silently
+	// skipped the transfer when tbClient was nil — and tbClient was ALWAYS nil).
+	if s.tbClient == nil {
+		return nil, fmt.Errorf("tigerbeetle ledger unavailable — refusing to fund escrow contract %s", contractID)
+	}
+
+	// F11-03: atomic claim — exactly one concurrent funding transitions the
+	// contract; losers get an error before any money moves.
+	prevStatus, err := s.claimContractStatus(ctx, contractID, StatusFunded, StatusAwaitingFunding, StatusCreated)
+	if err != nil {
+		return nil, err
+	}
+
+	// F11-03: deterministic idempotency key — retrying this funding with the
+	// same parameters is a ledger no-op, never a second transfer.
 	amountInKobo := uint64(amount * 100)
+	transferID := deterministicTransferID(fmt.Sprintf("escrow:%s:fund:%d", contractID, amountInKobo))
 
 	// Get buyer's account (source)
 	var buyerTBID types.Uint128
@@ -817,25 +930,25 @@ func (s *EscrowService) FundContract(ctx context.Context, contractID string, amo
 		}
 	}
 
-	if s.tbClient != nil {
-		transfers := []types.Transfer{
-			{
-				ID:              transferID,
-				DebitAccountID:  buyerTBID,
-				CreditAccountID: contract.TigerBeetleID,
-				Amount:          toUint128(amountInKobo),
-				Ledger:          LedgerCodeEscrowContract,
-				Code:            uint16(LedgerCodeEscrowContract),
-			},
-		}
+	transfers := []types.Transfer{
+		{
+			ID:              transferID,
+			DebitAccountID:  buyerTBID,
+			CreditAccountID: contract.TigerBeetleID,
+			Amount:          toUint128(amountInKobo),
+			Ledger:          LedgerCodeEscrowContract,
+			Code:            uint16(LedgerCodeEscrowContract),
+		},
+	}
 
-		results, err := s.tbClient.CreateTransfers(transfers)
+	results, err := s.tbClient.CreateTransfers(transfers)
+	if err != nil || len(results) > 0 {
+		// Compensate the claim so the funding can be retried honestly.
+		s.revertContractStatus(ctx, contractID, StatusFunded, prevStatus)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TigerBeetle transfer: %w", err)
 		}
-		if len(results) > 0 {
-			return nil, fmt.Errorf("TigerBeetle transfer failed: %v", results[0].Result)
-		}
+		return nil, fmt.Errorf("TigerBeetle transfer failed: %v", results[0].Result)
 	}
 
 	contractID = sanitizeUTF8(contractID)
@@ -868,11 +981,12 @@ func (s *EscrowService) FundContract(ctx context.Context, contractID string, amo
 		return nil, fmt.Errorf("failed to store transaction: %w", err)
 	}
 
-	// Update contract status
+	// Contract status was already transitioned to funded by the atomic claim
+	// above (F11-03) — record the timestamp.
 	contract.Status = StatusFunded
 	contract.FundedAt = &now
-	if err := s.updateContractStatus(ctx, contractID, StatusFunded); err != nil {
-		return nil, fmt.Errorf("failed to update contract status: %w", err)
+	if _, err := s.db.Exec(ctx, `UPDATE escrow_contracts SET funded_at = $1 WHERE id = $2`, now, contractID); err != nil {
+		log.Printf("ERROR: failed to stamp funded_at on contract %s: %v", contractID, err)
 	}
 
 	// If milestones exist, fund first milestone
@@ -926,8 +1040,10 @@ func (s *EscrowService) ReleaseContract(ctx context.Context, contractID string, 
 		return nil, err
 	}
 
-	if contract.Status != StatusFunded && contract.Status != StatusInProgress {
-		return nil, fmt.Errorf("contract cannot be released in status: %s", contract.Status)
+	// F1-03: fail closed — release is a money movement; never stamp a
+	// "completed" release when the ledger is unavailable.
+	if s.tbClient == nil {
+		return nil, fmt.Errorf("tigerbeetle ledger unavailable — refusing to release escrow contract %s", contractID)
 	}
 
 	// Calculate fee
@@ -944,65 +1060,99 @@ func (s *EscrowService) ReleaseContract(ctx context.Context, contractID string, 
 			break
 		}
 	}
+	if sellerPartyID == "" {
+		return nil, fmt.Errorf("contract %s has no seller party — cannot release", contractID)
+	}
 
-	// Create transfers: escrow -> seller, escrow -> fee account (only if TigerBeetle available)
-	transferID := s.idGenerator.NextID()
-	feeTransferID := s.idGenerator.NextID()
 	releaseAmountKobo := uint64(releaseAmount * 100)
 	feeAmountKobo := uint64(fee * 100)
+	totalKobo := uint64(contract.TotalAmount * 100)
+
+	// F1-03: refuse to release an unfunded/underfunded escrow — verify the
+	// ledger balance covers the full payout BEFORE posting anything.
+	balance, err := s.escrowBalanceKobo(contract)
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify escrow funding: %w", err)
+	}
+	if balance < totalKobo {
+		return nil, fmt.Errorf("escrow contract %s is not funded at the ledger: balance %d kobo < required %d kobo", contractID, balance, totalKobo)
+	}
+
+	// F11-03: atomic claim. Allowed sources include `disputed` because the
+	// dispute-resolution "full_release" path resolves a disputed contract to
+	// the seller (previously ReleaseContract rejected `disputed`, so the
+	// ResolveDispute full_release branch at ResolveDispute always failed).
+	prevStatus, err := s.claimContractStatus(ctx, contractID, StatusReleased, StatusFunded, StatusInProgress, StatusDisputed)
+	if err != nil {
+		return nil, err
+	}
+
+	// F11-03: deterministic idempotency keys — one money movement per terminal
+	// transition, retries are ledger no-ops.
+	transferID := deterministicTransferID(fmt.Sprintf("escrow:%s:release", contractID))
+	feeTransferID := deterministicTransferID(fmt.Sprintf("escrow:%s:release:fee", contractID))
 
 	// Get fee account
 	var feeAccountID types.Uint128
 	binary.LittleEndian.PutUint64(feeAccountID[:8], uint64(LedgerCodeEscrowFee))
 
-	if s.tbClient != nil {
-		transfers := []types.Transfer{
-			{
-				ID:              transferID,
-				DebitAccountID:  contract.TigerBeetleID,
-				CreditAccountID: sellerTBID,
-				Amount:          toUint128(releaseAmountKobo),
-				Ledger:          LedgerCodeEscrowContract,
-				Code:            uint16(LedgerCodeEscrowContract),
-			},
-		}
+	transfers := []types.Transfer{
+		{
+			ID:              transferID,
+			DebitAccountID:  contract.TigerBeetleID,
+			CreditAccountID: sellerTBID,
+			Amount:          toUint128(releaseAmountKobo),
+			Ledger:          LedgerCodeEscrowContract,
+			Code:            uint16(LedgerCodeEscrowContract),
+		},
+	}
 
-		if feeAmountKobo > 0 {
-			transfers = append(transfers, types.Transfer{
-				ID:              feeTransferID,
-				DebitAccountID:  contract.TigerBeetleID,
-				CreditAccountID: feeAccountID,
-				Amount:          toUint128(feeAmountKobo),
-				Ledger:          LedgerCodeEscrowFee,
-				Code:            uint16(LedgerCodeEscrowFee),
-			})
-		}
+	if feeAmountKobo > 0 {
+		transfers = append(transfers, types.Transfer{
+			ID:              feeTransferID,
+			DebitAccountID:  contract.TigerBeetleID,
+			CreditAccountID: feeAccountID,
+			Amount:          toUint128(feeAmountKobo),
+			Ledger:          LedgerCodeEscrowFee,
+			Code:            uint16(LedgerCodeEscrowFee),
+		})
+	}
 
-		// Record journal entry in Chart of Accounts (fire-and-forget — never blocks release)
-		escrowAcct := coaClient.GetMapping(contract.TenantID, "escrow.liability")
-		customerAcct := coaClient.GetMapping(contract.TenantID, "payments.customer.liability")
-		if escrowAcct != "" && customerAcct != "" {
-			amountKobo := int64(releaseAmount * 100)
-			coaEntry := CreateJournalEntryRequest{
-				Date:        time.Now(),
-				Description: fmt.Sprintf("Escrow release for contract %s", contractID),
-				Reference:   contractID,
-				PostedBy:    releasedBy,
-				Lines: []JournalLineRequest{
-					{AccountID: escrowAcct, Description: "Escrow funds released", DebitAmount: amountKobo, CreditAmount: 0},
-					{AccountID: customerAcct, Description: "Seller payment credited", DebitAmount: 0, CreditAmount: amountKobo},
-				},
-				Metadata: map[string]interface{}{"contract_id": contractID, "fee": fee, "source": "escrow-service"},
-			}
-			coaClient.PostAsync(contract.TenantID, releasedBy, "bank_admin", coaEntry)
-		}
-
-		results, err := s.tbClient.CreateTransfers(transfers)
+	results, err := s.tbClient.CreateTransfers(transfers)
+	if err != nil || len(results) > 0 {
+		// Compensate the claim so the release can be retried honestly.
+		s.revertContractStatus(ctx, contractID, StatusReleased, prevStatus)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TigerBeetle transfers: %w", err)
 		}
-		if len(results) > 0 {
-			return nil, fmt.Errorf("TigerBeetle transfer failed: %v", results[0].Result)
+		return nil, fmt.Errorf("TigerBeetle transfer failed: %v", results[0].Result)
+	}
+
+	// F2-06: journal the release in the Chart of Accounts SYNCHRONOUSLY with
+	// retry — the previous fire-and-forget PostAsync silently dropped ledger
+	// journals. The TB transfer above is the authoritative money movement; a
+	// journal failure here increments audit_ship_failures_total and is logged
+	// for reconciliation, never silently lost. Runs on a background context so
+	// client disconnects do not abort the retry loop after money has moved.
+	escrowAcct := coaClient.GetMapping(contract.TenantID, "escrow.liability")
+	customerAcct := coaClient.GetMapping(contract.TenantID, "payments.customer.liability")
+	if escrowAcct != "" && customerAcct != "" {
+		amountKobo := int64(releaseAmount * 100)
+		coaEntry := CreateJournalEntryRequest{
+			Date:        time.Now(),
+			Description: fmt.Sprintf("Escrow release for contract %s", contractID),
+			Reference:   fmt.Sprintf("escrow:%s:release", contractID),
+			PostedBy:    releasedBy,
+			Lines: []JournalLineRequest{
+				{AccountID: escrowAcct, Description: "Escrow funds released", DebitAmount: amountKobo, CreditAmount: 0},
+				{AccountID: customerAcct, Description: "Seller payment credited", DebitAmount: 0, CreditAmount: amountKobo},
+			},
+			Metadata: map[string]interface{}{"contract_id": contractID, "fee": fee, "source": "escrow-service"},
+		}
+		jctx, jcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer jcancel()
+		if _, err := coaClient.PostJournalEntrySync(jctx, contract.TenantID, releasedBy, "bank_admin", coaEntry); err != nil {
+			log.Printf("ALERT: COA journal for escrow release of contract %s not posted after retries: %v — manual reconciliation required", contractID, err)
 		}
 	}
 
@@ -1026,11 +1176,12 @@ func (s *EscrowService) ReleaseContract(ctx context.Context, contractID string, 
 		return nil, fmt.Errorf("failed to store transaction: %w", err)
 	}
 
-	// Update contract status
+	// Status was already transitioned to released by the atomic claim (F11-03);
+	// stamp the completion timestamp.
 	contract.Status = StatusReleased
 	contract.CompletedAt = &now
-	if err := s.updateContractStatus(ctx, contractID, StatusReleased); err != nil {
-		return nil, fmt.Errorf("failed to update contract status: %w", err)
+	if _, err := s.db.Exec(ctx, `UPDATE escrow_contracts SET completed_at = $1 WHERE id = $2`, now, contractID); err != nil {
+		log.Printf("ERROR: failed to stamp completed_at on contract %s: %v", contractID, err)
 	}
 
 	// Log audit event
@@ -1077,8 +1228,10 @@ func (s *EscrowService) RefundContract(ctx context.Context, contractID string, r
 		return nil, err
 	}
 
-	if contract.Status != StatusFunded && contract.Status != StatusInProgress && contract.Status != StatusDisputed {
-		return nil, fmt.Errorf("contract cannot be refunded in status: %s", contract.Status)
+	// F1-03: fail closed — refund is a money movement; never stamp a
+	// "completed" refund when the ledger is unavailable.
+	if s.tbClient == nil {
+		return nil, fmt.Errorf("tigerbeetle ledger unavailable — refusing to refund escrow contract %s", contractID)
 	}
 
 	// Get buyer's account
@@ -1091,30 +1244,50 @@ func (s *EscrowService) RefundContract(ctx context.Context, contractID string, r
 			break
 		}
 	}
+	if buyerPartyID == "" {
+		return nil, fmt.Errorf("contract %s has no buyer party — cannot refund", contractID)
+	}
 
-	// Create transfer: escrow -> buyer (only if TigerBeetle available)
-	transferID := s.idGenerator.NextID()
 	amountKobo := uint64(contract.TotalAmount * 100)
 
-	if s.tbClient != nil {
-		transfers := []types.Transfer{
-			{
-				ID:              transferID,
-				DebitAccountID:  contract.TigerBeetleID,
-				CreditAccountID: buyerTBID,
-				Amount:          toUint128(amountKobo),
-				Ledger:          LedgerCodeEscrowContract,
-				Code:            uint16(LedgerCodeEscrowContract),
-			},
-		}
+	// F1-03: refuse to refund from an unfunded/underfunded escrow account.
+	balance, err := s.escrowBalanceKobo(contract)
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify escrow funding: %w", err)
+	}
+	if balance < amountKobo {
+		return nil, fmt.Errorf("escrow contract %s cannot be refunded: ledger balance %d kobo < refund %d kobo", contractID, balance, amountKobo)
+	}
 
-		results, err := s.tbClient.CreateTransfers(transfers)
+	// F11-03: atomic claim — exactly one of release/refund/settlement can win
+	// a funded contract; the double-refund and refund-after-release races are
+	// closed here.
+	prevStatus, err := s.claimContractStatus(ctx, contractID, StatusRefunded, StatusFunded, StatusInProgress, StatusDisputed)
+	if err != nil {
+		return nil, err
+	}
+
+	// F11-03: deterministic idempotency key — refund retries are ledger no-ops.
+	transferID := deterministicTransferID(fmt.Sprintf("escrow:%s:refund", contractID))
+
+	transfers := []types.Transfer{
+		{
+			ID:              transferID,
+			DebitAccountID:  contract.TigerBeetleID,
+			CreditAccountID: buyerTBID,
+			Amount:          toUint128(amountKobo),
+			Ledger:          LedgerCodeEscrowContract,
+			Code:            uint16(LedgerCodeEscrowContract),
+		},
+	}
+
+	results, err := s.tbClient.CreateTransfers(transfers)
+	if err != nil || len(results) > 0 {
+		s.revertContractStatus(ctx, contractID, StatusRefunded, prevStatus)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TigerBeetle transfer: %w", err)
 		}
-		if len(results) > 0 {
-			return nil, fmt.Errorf("TigerBeetle transfer failed: %v", results[0].Result)
-		}
+		return nil, fmt.Errorf("TigerBeetle transfer failed: %v", results[0].Result)
 	}
 
 	// Create transaction record
@@ -1137,11 +1310,12 @@ func (s *EscrowService) RefundContract(ctx context.Context, contractID string, r
 		return nil, fmt.Errorf("failed to store transaction: %w", err)
 	}
 
-	// Update contract status
+	// Status was already transitioned to refunded by the atomic claim (F11-03);
+	// stamp the completion timestamp.
 	contract.Status = StatusRefunded
 	contract.CompletedAt = &now
-	if err := s.updateContractStatus(ctx, contractID, StatusRefunded); err != nil {
-		return nil, fmt.Errorf("failed to update contract status: %w", err)
+	if _, err := s.db.Exec(ctx, `UPDATE escrow_contracts SET completed_at = $1 WHERE id = $2`, now, contractID); err != nil {
+		log.Printf("ERROR: failed to stamp completed_at on contract %s: %v", contractID, err)
 	}
 
 	// Log audit event
@@ -1220,16 +1394,21 @@ func (s *EscrowService) RaiseDispute(ctx context.Context, input RaiseDisputeInpu
 		CreatedAt:         now,
 	}
 
-	// Store dispute
-	if err := s.storeDispute(ctx, dispute); err != nil {
-		return nil, fmt.Errorf("failed to store dispute: %w", err)
+	// F11-03: atomic claim BEFORE persisting the dispute — a dispute raised
+	// concurrently with a release/refund must not win after the terminal
+	// transition, and an orphaned dispute row must never outlive a failed
+	// claim.
+	prevStatus, err := s.claimContractStatus(ctx, input.ContractID, StatusDisputed, StatusFunded, StatusInProgress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transition contract to disputed: %w", err)
 	}
 
-	// Update contract status
-	contract.Status = StatusDisputed
-	if err := s.updateContractStatus(ctx, input.ContractID, StatusDisputed); err != nil {
-		return nil, fmt.Errorf("failed to update contract status: %w", err)
+	// Store dispute
+	if err := s.storeDispute(ctx, dispute); err != nil {
+		s.revertContractStatus(ctx, input.ContractID, StatusDisputed, prevStatus)
+		return nil, fmt.Errorf("failed to store dispute: %w", err)
 	}
+	contract.Status = StatusDisputed
 
 	// Log audit event
 	s.auditService.LogEvent(ctx, AuditEvent{
@@ -1361,8 +1540,9 @@ func (s *EscrowService) ResolveDispute(ctx context.Context, input ResolveDispute
 // EscalateDispute escalates an unresolved dispute: it transitions the dispute
 // to "escalated", persists the state change, writes an audit event, and
 // notifies all contract parties. Any persistence failure is returned so the
-// caller (Temporal EscalateDispute activity) retries instead of silently
-// dropping the escalation (W7-C-05).
+// caller (the HTTP escalate handler) can retry instead of silently dropping
+// the escalation (W7-C-05; OR-19: the Temporal activity caller was removed
+// with the phantom workflow registrations).
 func (s *EscrowService) EscalateDispute(ctx context.Context, disputeID string, reason string) (*Dispute, error) {
 	dispute, err := s.GetDispute(ctx, disputeID)
 	if err != nil {
@@ -1426,6 +1606,57 @@ type ResolveDisputeInput struct {
 
 // Helper methods
 
+// SweepEscrowLifecycle (F11-02, Wave-10) performs one pass of escrow lifecycle
+// maintenance:
+//  1. Expires contracts still awaiting funding past their funding deadline
+//     (status -> expired; no money movement, plain status sweep).
+//  2. Auto-releases funded contracts whose auto_release_after_days window has
+//     elapsed, via ReleaseContract — atomic claim, ledger balance check,
+//     deterministic TB idempotency key, fail-closed on ledger outage. Each
+//     failure is logged; the next tick retries safely.
+func (s *EscrowService) SweepEscrowLifecycle(ctx context.Context) {
+	// 1. Expire overdue unfunded contracts.
+	tag, err := s.db.Exec(ctx, `
+		UPDATE escrow_contracts SET status = $1, updated_at = NOW()
+		WHERE status = $2 AND funding_deadline IS NOT NULL AND funding_deadline < NOW()
+	`, StatusExpired, StatusAwaitingFunding)
+	if err != nil {
+		log.Printf("ERROR: escrow lifecycle sweeper failed to expire contracts: %v", err)
+	} else if tag.RowsAffected() > 0 {
+		log.Printf("escrow lifecycle sweeper: expired %d unfunded contracts past funding deadline", tag.RowsAffected())
+	}
+
+	// 2. Auto-release funded contracts past their auto-release window.
+	rows, err := s.db.Query(ctx, `
+		SELECT id FROM escrow_contracts
+		WHERE status = $1 AND auto_release_after_days IS NOT NULL AND funded_at IS NOT NULL
+		  AND funded_at + make_interval(days => auto_release_after_days) < NOW()
+	`, StatusFunded)
+	if err != nil {
+		log.Printf("ERROR: escrow lifecycle sweeper failed to list auto-releasable contracts: %v", err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		if _, err := s.ReleaseContract(ctx, id, "system", "auto-release after auto_release_after_days elapsed"); err != nil {
+			// Fail-visible: logged and retried on the next tick. Common causes:
+			// ledger outage (fail-closed), underfunded account, or a concurrent
+			// terminal transition (refund/dispute won the race).
+			log.Printf("ERROR: auto-release of escrow contract %s failed: %v", id, err)
+		} else {
+			log.Printf("escrow lifecycle sweeper: auto-released contract %s", id)
+		}
+	}
+}
+
 func (s *EscrowService) validateCreateInput(input CreateContractInput) error {
 	if input.TenantID == "" {
 		return fmt.Errorf("tenant_id is required")
@@ -1481,6 +1712,16 @@ func (s *EscrowService) calculateFee(contract *EscrowContract) float64 {
 }
 
 func (s *EscrowService) handlePartialSettlement(ctx context.Context, contract *EscrowContract, amountToBuyer, amountToSeller float64) error {
+	// F1-03: fail closed — settlement moves money; never record it without the
+	// ledger.
+	if s.tbClient == nil {
+		return fmt.Errorf("tigerbeetle ledger unavailable — refusing partial settlement of contract %s", contract.ID)
+	}
+
+	if amountToBuyer < 0 || amountToSeller < 0 || (amountToBuyer == 0 && amountToSeller == 0) {
+		return fmt.Errorf("invalid settlement split: buyer %.2f, seller %.2f", amountToBuyer, amountToSeller)
+	}
+
 	// Get party accounts
 	var buyerTBID, sellerTBID types.Uint128
 	var buyerPartyID, sellerPartyID string
@@ -1495,38 +1736,57 @@ func (s *EscrowService) handlePartialSettlement(ctx context.Context, contract *E
 		}
 	}
 
+	buyerKobo := uint64(amountToBuyer * 100)
+	sellerKobo := uint64(amountToSeller * 100)
+
+	// F1-03: the ledger balance must cover both legs before posting.
+	balance, err := s.escrowBalanceKobo(contract)
+	if err != nil {
+		return fmt.Errorf("cannot verify escrow funding: %w", err)
+	}
+	if balance < buyerKobo+sellerKobo {
+		return fmt.Errorf("escrow contract %s underfunded for settlement: balance %d kobo < settlement %d kobo", contract.ID, balance, buyerKobo+sellerKobo)
+	}
+
+	// F11-03: atomic claim — a partial settlement is a terminal transition and
+	// must be single-winner against release/refund.
+	prevStatus, err := s.claimContractStatus(ctx, contract.ID, StatusPartialSettlement, StatusFunded, StatusInProgress, StatusDisputed)
+	if err != nil {
+		return err
+	}
+
 	var transfers []types.Transfer
 
-	if amountToBuyer > 0 {
+	// F11-03: deterministic idempotency keys per leg.
+	if buyerKobo > 0 {
 		transfers = append(transfers, types.Transfer{
-			ID:              s.idGenerator.NextID(),
+			ID:              deterministicTransferID(fmt.Sprintf("escrow:%s:settle:buyer", contract.ID)),
 			DebitAccountID:  contract.TigerBeetleID,
 			CreditAccountID: buyerTBID,
-			Amount:          toUint128(uint64(amountToBuyer * 100)),
+			Amount:          toUint128(buyerKobo),
 			Ledger:          LedgerCodeEscrowContract,
 			Code:            uint16(LedgerCodeEscrowContract),
 		})
 	}
 
-	if amountToSeller > 0 {
+	if sellerKobo > 0 {
 		transfers = append(transfers, types.Transfer{
-			ID:              s.idGenerator.NextID(),
+			ID:              deterministicTransferID(fmt.Sprintf("escrow:%s:settle:seller", contract.ID)),
 			DebitAccountID:  contract.TigerBeetleID,
 			CreditAccountID: sellerTBID,
-			Amount:          toUint128(uint64(amountToSeller * 100)),
+			Amount:          toUint128(sellerKobo),
 			Ledger:          LedgerCodeEscrowContract,
 			Code:            uint16(LedgerCodeEscrowContract),
 		})
 	}
 
-	if s.tbClient != nil {
-		results, err := s.tbClient.CreateTransfers(transfers)
+	results, err := s.tbClient.CreateTransfers(transfers)
+	if err != nil || len(results) > 0 {
+		s.revertContractStatus(ctx, contract.ID, StatusPartialSettlement, prevStatus)
 		if err != nil {
 			return err
 		}
-		if len(results) > 0 {
-			return fmt.Errorf("transfer failed: %v", results[0].Result)
-		}
+		return fmt.Errorf("transfer failed: %v", results[0].Result)
 	}
 
 	// Create transaction records
@@ -1563,10 +1823,14 @@ func (s *EscrowService) handlePartialSettlement(ctx context.Context, contract *E
 		s.storeTransaction(ctx, txn)
 	}
 
-	// Update contract status
+	// Status was already transitioned by the atomic claim (F11-03); stamp the
+	// completion timestamp.
 	contract.Status = StatusPartialSettlement
 	contract.CompletedAt = &now
-	return s.updateContractStatus(ctx, contract.ID, StatusPartialSettlement)
+	if _, err := s.db.Exec(ctx, `UPDATE escrow_contracts SET completed_at = $1 WHERE id = $2`, now, contract.ID); err != nil {
+		log.Printf("ERROR: failed to stamp completed_at on contract %s: %v", contract.ID, err)
+	}
+	return nil
 }
 
 // Database operations (stubs - implement with actual SQL)

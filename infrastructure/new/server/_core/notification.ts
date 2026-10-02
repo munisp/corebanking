@@ -45,6 +45,7 @@ export async function notifyOwner(payload: NotificationPayload): Promise<boolean
 
   try {
     const response = await fetch(webhookUrl, {
+      signal: AbortSignal.timeout(10_000),
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ title, content, timestamp: new Date().toISOString() }),

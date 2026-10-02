@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto"
@@ -15,6 +14,7 @@ import (
 	_ "github.com/lib/pq"
 	"io"
 	"math/big"
+	"math/rand"
 	"os/signal"
 	"strconv"
 	"sync"
@@ -30,7 +30,45 @@ import (
 	"time"
 
 	"net"
+
+	"github.com/redis/go-redis/v9"
 )
+
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(rand.Int63n(int64(d)/2))
+}
+
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // secureUint32 returns a CSPRNG-derived uint32 for internal record IDs (L-16).
 // Fails fast if the system CSPRNG is unavailable.
@@ -79,7 +117,7 @@ type DomainStats struct {
 }
 
 var (
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	records = []Record{
 		{ID: "AML-001", Type: "primary", Status: "active", Data: map[string]interface{}{"domain": "AML/Compliance", "priority": "high", "region": "lagos"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1},
 		{ID: "AML-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "AML/Compliance", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
@@ -95,6 +133,72 @@ var (
 		},
 	}
 )
+
+const (
+	maxInMemoryRecords = 5000
+	maxAuditEntries    = 2000
+)
+
+// appendRecord appends to the in-memory store, evicting the oldest entries
+// once the store exceeds maxInMemoryRecords (bounded store, GPT-06).
+func appendRecord(rec Record) {
+	records = append(records, rec)
+	if len(records) > maxInMemoryRecords {
+		copy(records, records[len(records)-maxInMemoryRecords:])
+		records = records[:maxInMemoryRecords]
+	}
+}
+
+// appendAudit appends to the audit log, evicting the oldest entries once the
+// log exceeds maxAuditEntries (bounded store, GPT-06).
+func appendAudit(e AuditEntry) {
+	auditLog = append(auditLog, e)
+	if len(auditLog) > maxAuditEntries {
+		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
+		auditLog = auditLog[:maxAuditEntries]
+	}
+}
+
+// parsePageParams extracts limit/offset query params with a hard cap (GPT-07).
+func parsePageParams(r *http.Request, defLimit, maxLimit int) (limit, offset int) {
+	limit = defLimit
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o > 0 {
+		offset = o
+	}
+	return
+}
+
+// paginateRecords bounds list responses (default 100, max 500 per page).
+func paginateRecords(all []Record, r *http.Request) []Record {
+	limit, offset := parsePageParams(r, 100, 500)
+	if offset >= len(all) {
+		return []Record{}
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end]
+}
+
+// paginateAudit bounds audit responses (default 100, max 500 per page).
+func paginateAudit(all []AuditEntry, r *http.Request) []AuditEntry {
+	limit, offset := parsePageParams(r, 100, 500)
+	if offset >= len(all) {
+		return []AuditEntry{}
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end]
+}
 
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -149,9 +253,9 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		log.Printf("aml-case-manager-go: DB query failed, falling back to in-memory: %v", err)
 	}
 	// In-memory fallback
-	mu.Lock()
-	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
+	mu.RLock()
+	defer mu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "in-memory"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -162,17 +266,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	// Inter-service call: aml_screening
-	_upstreamURL := os.Getenv("AML_ENGINE_URL")
-	if _upstreamURL == "" {
-		_upstreamURL = "http://localhost:8127"
-	}
-	_result, _err := callService("POST", _upstreamURL+"/v1/screen", nil)
-	if _err != nil {
-		log.Printf("aml-case-manager-go: aml_screening failed: %v", _err)
-	} else {
-		log.Printf("aml-case-manager-go: aml_screening ok: %v", _result)
-	}
+	// CP-03: removed decorative "aml_screening" inter-service call — it posted
+	// a nil body to /v1/screen, a path no AML/sanctions service exposes, and
+	// discarded the result.
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -191,7 +287,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if rec.Type == "" {
 		rec.Type = "primary"
 	}
-	records = append(records, rec)
+	appendRecord(rec)
 	domainStats.TotalRecords = len(records)
 
 	// Persist to database
@@ -201,7 +297,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	auditLog = append(auditLog, AuditEntry{
+	appendAudit(AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
@@ -234,7 +330,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
-			auditLog = append(auditLog, AuditEntry{
+			appendAudit(AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
@@ -255,9 +351,9 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog)})
+	mu.RLock()
+	defer mu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -521,16 +617,8 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
-		}
-	}()
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -718,108 +806,36 @@ func init() {
 	}
 }
 
-// redisConn dials Redis and returns the connection plus a buffered reader with
-// a hard deadline (M-23: no partial reads against the raw socket).
-func redisConn() (net.Conn, *bufio.Reader, error) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil {
-		return nil, nil, err
-	}
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	return conn, bufio.NewReader(conn), nil
-}
+// W11 GPT-01: pooled go-redis client shared per service (replaces per-op TCP dial).
+// Lazy init so REDIS_URL env override in init() is honored; DialTimeout kept as dial fallback.
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
+)
 
-// writeRESPCommand serializes args as a RESP multi-bulk request.
-func writeRESPCommand(w *bufio.Writer, args ...string) {
-	fmt.Fprintf(w, "*%d\r\n", len(args))
-	for _, a := range args {
-		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(a), a)
-	}
-	w.Flush()
-}
-
-// readRESPReply parses one RESP reply: simple string, error, integer, bulk
-// string (length-prefixed read), or multi-bulk (recursive). Redis error
-// replies are returned as Go errors.
-func readRESPReply(r *bufio.Reader) (interface{}, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return nil, err
-	}
-	if len(line) < 3 || !strings.HasSuffix(line, "\r\n") {
-		return nil, fmt.Errorf("malformed RESP reply")
-	}
-	payload := line[1 : len(line)-2]
-	switch line[0] {
-	case '+':
-		return payload, nil
-	case '-':
-		return nil, fmt.Errorf("redis error: %s", payload)
-	case ':':
-		n, err := strconv.ParseInt(payload, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("malformed integer reply: %v", err)
-		}
-		return n, nil
-	case '$':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil // nil bulk string
-		}
-		buf := make([]byte, n+2) // payload + trailing CRLF
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
-		return string(buf[:n]), nil
-	case '*':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed multi-bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil
-		}
-		items := make([]interface{}, 0, n)
-		for i := 0; i < n; i++ {
-			it, err := readRESPReply(r)
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, it)
-		}
-		return items, nil
-	}
-	return nil, fmt.Errorf("unknown RESP type byte %q", line[0])
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
 }
 
 func cacheGet(key string) (string, bool) {
-	conn, rd, err := redisConn()
+	s, err := getRedisClient().Get(redisCtx, key).Result()
 	if err != nil {
 		return "", false
 	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "GET", key)
-	rep, err := readRESPReply(rd)
-	if err != nil || rep == nil {
-		return "", false
-	}
-	s, ok := rep.(string)
-	return s, ok
+	return s, true
 }
-
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, rd, err := redisConn()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "SET", key, value, "EX", strconv.Itoa(ttlSeconds))
-	if _, err := readRESPReply(rd); err != nil { // detects -ERR replies
+	if err := getRedisClient().Set(redisCtx, key, value, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
 		log.Printf("[%s] cacheSet(%s) failed: %v", serviceName, key, err)
 	}
 }
@@ -1014,6 +1030,31 @@ func initSchema() {
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_compliance_records_status ON compliance_records(status)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_compliance_records_created ON compliance_records(created_at DESC)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
+
+	// CP-05: real AML case entity linking alerts ↔ SARs ↔ NFIU STRs with a
+	// status lifecycle. The case is the connective tissue of the
+	// alert → investigation → escalation → STR → closure flow.
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS aml_cases (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		tenant_id VARCHAR(128) NOT NULL,
+		title TEXT NOT NULL,
+		description TEXT,
+		status VARCHAR(20) NOT NULL DEFAULT 'open'
+			CHECK (status IN ('open','investigating','escalated','str_filed','closed')),
+		priority VARCHAR(10) NOT NULL DEFAULT 'medium',
+		alert_ids JSONB NOT NULL DEFAULT '[]',
+		sar_ids JSONB NOT NULL DEFAULT '[]',
+		nfiu_str_ids JSONB NOT NULL DEFAULT '[]',
+		assignee VARCHAR(255),
+		created_by VARCHAR(255),
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("aml_cases table creation failed: %v", err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_aml_cases_tenant ON aml_cases(tenant_id, created_at DESC)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_aml_cases_status ON aml_cases(status)`)
 }
 
 func domainHandler(w http.ResponseWriter, r *http.Request) {
@@ -1385,8 +1426,12 @@ func validateSTRFiling(caseID, narration string, amount float64) (bool, string) 
 	if narration == "" {
 		return false, "Narration required for STR"
 	}
-	if amount < 1000000 {
-		return false, "CTR threshold is ₦1M (NFIU)"
+	// CP-05: corrected threshold — CBN AML/CFT Regulations 2022 set the
+	// individual CTR threshold at ₦5,000,000 (₦10,000,000 corporate), per
+	// nfiu-ctr-str-filing-py (CTR_INDIVIDUAL_THRESHOLD_KOBO = 500,000,000 kobo).
+	// The previous ₦1M constant was wrong. `amount` is in NGN here.
+	if amount < 5000000 {
+		return false, "below CTR threshold (₦5M individual / ₦10M corporate, CBN AML/CFT 2022)"
 	}
 	return true, "Valid for filing"
 }
@@ -1434,11 +1479,10 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 	if !_cb.allow() {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond))
 		}
 		var req *http.Request
 		if body != nil {
@@ -1449,21 +1493,22 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Source-Service", serviceName)
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -1584,17 +1629,27 @@ func main() {
 	mux.Handle("/v1/aml-case-manager/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	mux.Handle("/v1/aml-case-manager/screen", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(aml_case_managerScreenHandler)))
 	mux.Handle("/v1/aml-case-manager/risk-score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(aml_case_managerRiskScoreHandler)))
+	// CP-05: real AML case entity + lifecycle
+	mux.Handle("/v1/aml-case-manager/cases", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			handleCreateCase(w, r)
+		} else {
+			handleListCases(w, r)
+		}
+	})))
+	mux.Handle("/v1/aml-case-manager/cases/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCaseDetail)))
 	log.Printf("Aml Case Manager v2.0 (AML/Compliance) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// Start binary RPC server for inter-service calls
@@ -1619,6 +1674,238 @@ func main() {
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
 
+// ── CP-05: AML case lifecycle (real Postgres entity) ────────────────────────
+
+// amlCaseLifecycle defines the only legal status transitions.
+var amlCaseLifecycle = map[string][]string{
+	"open":          {"investigating", "closed"},
+	"investigating": {"escalated", "str_filed", "closed"},
+	"escalated":     {"str_filed", "closed"},
+	"str_filed":     {"closed"},
+	"closed":        {},
+}
+
+func amlCaseDB(w http.ResponseWriter) bool {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return false
+	}
+	return true
+}
+
+func handleCreateCase(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	if !amlCaseDB(w) {
+		return
+	}
+	var body struct {
+		TenantID    string   `json:"tenant_id"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Priority    string   `json:"priority"`
+		AlertIDs    []string `json:"alert_ids"`
+		CreatedBy   string   `json:"created_by"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondJSON(w, 400, map[string]string{"error": "invalid json"})
+		return
+	}
+	if body.TenantID == "" || body.Title == "" {
+		respondJSON(w, 400, map[string]string{"error": "tenant_id and title required"})
+		return
+	}
+	if body.Priority == "" {
+		body.Priority = "medium"
+	}
+	alerts, _ := json.Marshal(body.AlertIDs)
+	if body.AlertIDs == nil {
+		alerts = []byte("[]")
+	}
+	var id string
+	err := db.QueryRow(
+		`INSERT INTO aml_cases (tenant_id, title, description, priority, alert_ids, created_by)
+		 VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+		body.TenantID, body.Title, body.Description, body.Priority, string(alerts), body.CreatedBy,
+	).Scan(&id)
+	if err != nil {
+		log.Printf("create aml case failed: %v", err)
+		respondJSON(w, 500, map[string]string{"error": "case creation failed"})
+		return
+	}
+	respondJSON(w, 201, map[string]interface{}{"id": id, "status": "open"})
+}
+
+func handleListCases(w http.ResponseWriter, r *http.Request) {
+	if !amlCaseDB(w) {
+		return
+	}
+	tenant := r.URL.Query().Get("tenant_id")
+	status := r.URL.Query().Get("status")
+	query := `SELECT id, tenant_id, title, status, priority, alert_ids, sar_ids, nfiu_str_ids, assignee, created_at, updated_at FROM aml_cases`
+	args := []interface{}{}
+	conds := []string{}
+	if tenant != "" {
+		conds = append(conds, fmt.Sprintf("tenant_id = $%d", len(args)+1))
+		args = append(args, tenant)
+	}
+	if status != "" {
+		conds = append(conds, fmt.Sprintf("status = $%d", len(args)+1))
+		args = append(args, status)
+	}
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	query += " ORDER BY created_at DESC LIMIT 200"
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "query failed"})
+		return
+	}
+	defer rows.Close()
+	cases := []map[string]interface{}{}
+	for rows.Next() {
+		var id, tenantID, title, st, prio string
+		var alerts, sars, strs string
+		var assignee *string
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(&id, &tenantID, &title, &st, &prio, &alerts, &sars, &strs, &assignee, &createdAt, &updatedAt); err != nil {
+			continue
+		}
+		cases = append(cases, map[string]interface{}{
+			"id": id, "tenant_id": tenantID, "title": title, "status": st, "priority": prio,
+			"alert_ids": json.RawMessage(alerts), "sar_ids": json.RawMessage(sars),
+			"nfiu_str_ids": json.RawMessage(strs), "assignee": assignee,
+			"created_at": createdAt, "updated_at": updatedAt,
+		})
+	}
+	respondJSON(w, 200, map[string]interface{}{"cases": cases, "total": len(cases)})
+}
+
+func amlCaseIDFromPath(r *http.Request) (string, string) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/aml-case-manager/cases/")
+	parts := strings.Split(rest, "/")
+	if len(parts) >= 2 {
+		return parts[0], parts[1]
+	}
+	return parts[0], ""
+}
+
+func handleCaseDetail(w http.ResponseWriter, r *http.Request) {
+	if !amlCaseDB(w) {
+		return
+	}
+	id, sub := amlCaseIDFromPath(r)
+	if id == "" {
+		respondJSON(w, 400, map[string]string{"error": "case id required"})
+		return
+	}
+	switch {
+	case sub == "" && r.Method == "GET":
+		var tenantID, title, st, prio string
+		var desc *string
+		var alerts, sars, strs string
+		var assignee *string
+		var createdAt, updatedAt time.Time
+		err := db.QueryRow(
+			`SELECT tenant_id, title, description, status, priority, alert_ids, sar_ids, nfiu_str_ids, assignee, created_at, updated_at
+			 FROM aml_cases WHERE id = $1`, id,
+		).Scan(&tenantID, &title, &desc, &st, &prio, &alerts, &sars, &strs, &assignee, &createdAt, &updatedAt)
+		if err != nil {
+			respondJSON(w, 404, map[string]string{"error": "case not found"})
+			return
+		}
+		respondJSON(w, 200, map[string]interface{}{
+			"id": id, "tenant_id": tenantID, "title": title, "description": desc, "status": st,
+			"priority": prio, "alert_ids": json.RawMessage(alerts), "sar_ids": json.RawMessage(sars),
+			"nfiu_str_ids": json.RawMessage(strs), "assignee": assignee,
+			"created_at": createdAt, "updated_at": updatedAt,
+		})
+	case sub == "transition" && r.Method == "POST":
+		var body struct {
+			Status   string `json:"status"`
+			Actor    string `json:"actor"`
+			Assignee string `json:"assignee"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondJSON(w, 400, map[string]string{"error": "invalid json"})
+			return
+		}
+		var current string
+		if err := db.QueryRow(`SELECT status FROM aml_cases WHERE id = $1`, id).Scan(&current); err != nil {
+			respondJSON(w, 404, map[string]string{"error": "case not found"})
+			return
+		}
+		allowed := false
+		for _, s := range amlCaseLifecycle[current] {
+			if s == body.Status {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			respondJSON(w, 409, map[string]string{
+				"error": fmt.Sprintf("illegal transition %s -> %s", current, body.Status),
+			})
+			return
+		}
+		_, err := db.Exec(
+			`UPDATE aml_cases SET status=$2, assignee=COALESCE(NULLIF($3,''), assignee), updated_at=NOW() WHERE id=$1`,
+			id, body.Status, body.Assignee,
+		)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "transition failed"})
+			return
+		}
+		log.Printf("[aml-case-manager] case %s transition %s -> %s by %s", id, current, body.Status, body.Actor)
+		respondJSON(w, 200, map[string]string{"id": id, "status": body.Status})
+	case sub == "link" && r.Method == "POST":
+		var body struct {
+			AlertID   string `json:"alert_id"`
+			SarID     string `json:"sar_id"`
+			NfiuStrID string `json:"nfiu_str_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondJSON(w, 400, map[string]string{"error": "invalid json"})
+			return
+		}
+		col, val := "", ""
+		switch {
+		case body.AlertID != "":
+			col, val = "alert_ids", body.AlertID
+		case body.SarID != "":
+			col, val = "sar_ids", body.SarID
+		case body.NfiuStrID != "":
+			col, val = "nfiu_str_ids", body.NfiuStrID
+		default:
+			respondJSON(w, 400, map[string]string{"error": "one of alert_id|sar_id|nfiu_str_id required"})
+			return
+		}
+		// Idempotent link: append only when not already present.
+		res, err := db.Exec(fmt.Sprintf(
+			`UPDATE aml_cases SET %s = %s || to_jsonb($2::text), updated_at = NOW()
+			 WHERE id = $1 AND NOT (%s @> to_jsonb($2::text))`, col, col, col), id, val)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "link failed"})
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			// Distinguish not-found from already-linked.
+			var exists string
+			if err := db.QueryRow(`SELECT id FROM aml_cases WHERE id=$1`, id).Scan(&exists); err != nil {
+				respondJSON(w, 404, map[string]string{"error": "case not found"})
+				return
+			}
+		}
+		respondJSON(w, 200, map[string]string{"id": id, "linked": val, "field": col})
+	default:
+		respondJSON(w, 405, map[string]string{"error": "unsupported method/path"})
+	}
+}
+
 // jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
 // scripts/fix-go-wire-jwt.py).
 func jwtRealmURL() string {
@@ -1636,11 +1923,10 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		_cbOpen.Store(false)
 		_cbFailures.Store(0)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond))
 		}
 		var req *http.Request
 		if body != nil {
@@ -1651,7 +1937,7 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 			req, _ = http.NewRequest(method, url, nil)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cbFailures.Add(1)
@@ -1661,8 +1947,8 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 			}
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
 			_cbFailures.Add(1)
 			_cbLastFailUnix.Store(time.Now().UnixNano())
@@ -1673,6 +1959,7 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cbFailures.Store(0)
 		_cbOpen.Store(false)
 		return result, nil

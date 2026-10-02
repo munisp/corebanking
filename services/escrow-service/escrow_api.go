@@ -268,10 +268,11 @@ func (api *EscrowAPI) SetupRoutes() *chi.Mux {
 
 // Ready check handler
 func (api *EscrowAPI) readyCheck(w http.ResponseWriter, r *http.Request) {
+	// OR-19: no Temporal dependency remains (phantom workflow registrations
+	// removed) — readiness now honestly reports only real dependencies.
 	status := map[string]string{
 		"database":    "ok",
 		"tigerbeetle": "ok",
-		"temporal":    "ok",
 		"status":      "ready",
 		"service":     "escrow-service",
 		"version":     "1.0.0",
@@ -285,15 +286,9 @@ func (api *EscrowAPI) readyCheck(w http.ResponseWriter, r *http.Request) {
 		status["status"] = "not-ready"
 	}
 
-	// Check TigerBeetle (if implemented)
+	// Check TigerBeetle (F1-03: real check — the ledger backs all money movement)
 	if err := api.escrowService.PingTigerBeetle(ctx); err != nil {
 		status["tigerbeetle"] = "unavailable"
-		status["status"] = "not-ready"
-	}
-
-	// Check Temporal (if implemented)
-	if err := api.escrowService.PingTemporal(ctx); err != nil {
-		status["temporal"] = "unavailable"
 		status["status"] = "not-ready"
 	}
 
@@ -318,6 +313,22 @@ type APIMeta struct {
 	PerPage    int `json:"per_page,omitempty"`
 	Total      int `json:"total,omitempty"`
 	TotalPages int `json:"total_pages,omitempty"`
+}
+
+// respondMoneyOpError maps escrow money-operation errors to honest HTTP
+// statuses (F11-03/F1-03): a rejected concurrent/illegal state transition is
+// a 409, a ledger outage is a 503 (fail-closed dependency), everything else
+// remains a 500.
+func respondMoneyOpError(w http.ResponseWriter, err error) {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "cannot transition") || strings.Contains(msg, "concurrent state transition") || strings.Contains(msg, "not funded at the ledger") || strings.Contains(msg, "cannot be refunded") || strings.Contains(msg, "underfunded"):
+		SendErrorWithKey(w, "conflict", msg, http.StatusConflict, nil)
+	case strings.Contains(msg, "tigerbeetle ledger unavailable"):
+		SendErrorWithKey(w, "dependency_unavailable", msg, http.StatusServiceUnavailable, nil)
+	default:
+		SendErrorWithKey(w, "internal_error", msg, http.StatusInternalServerError, nil)
+	}
 }
 
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
@@ -465,7 +476,20 @@ func (api *EscrowAPI) createContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Publish event to Kafka
+	// Publish event to Kafka. OR-16/T2 (Wave-10): the payload must be complete
+	// enough for downstream consumers (lifecycle emails) — include the
+	// contract id, amount/currency and the parties (role + contact points).
+	parties := make([]map[string]interface{}, 0, len(contract.Parties))
+	for _, p := range contract.Parties {
+		parties = append(parties, map[string]interface{}{
+			"party_id": p.ID,
+			"role":     p.Role,
+			"user_id":  p.UserID,
+			"name":     p.Name,
+			"email":    p.Email,
+			"phone":    p.Phone,
+		})
+	}
 	event := EscrowEvent{
 		Type:      "escrow.contract.created",
 		EntityID:  contract.ID,
@@ -473,11 +497,13 @@ func (api *EscrowAPI) createContract(w http.ResponseWriter, r *http.Request) {
 		Status:    string(contract.Status),
 		Timestamp: time.Now(),
 		Metadata: map[string]interface{}{
+			"contract_id":     contract.ID,
 			"contract_number": contract.ContractNumber,
 			"use_case":        contract.UseCase,
 			"total_amount":    contract.TotalAmount,
 			"currency":        contract.Currency,
 			"created_by":      contract.CreatedBy,
+			"parties":         parties,
 		},
 	}
 	escrowKafkaClient.PublishEvent("escrow.contract.created", event)
@@ -559,7 +585,7 @@ func (api *EscrowAPI) fundContract(w http.ResponseWriter, r *http.Request) {
 
 	txn, err := api.escrowService.FundContract(r.Context(), contractID, input.Amount, input.FundingSource, input.Reference)
 	if err != nil {
-		SendErrorWithKey(w, "internal_error", err.Error(), http.StatusInternalServerError, nil)
+		respondMoneyOpError(w, err)
 		return
 	}
 
@@ -580,7 +606,7 @@ func (api *EscrowAPI) releaseContract(w http.ResponseWriter, r *http.Request) {
 	userID := input.UserID
 	txn, err := api.escrowService.ReleaseContract(r.Context(), contractID, userID, input.Notes)
 	if err != nil {
-		SendErrorWithKey(w, "internal_error", err.Error(), http.StatusInternalServerError, nil)
+		respondMoneyOpError(w, err)
 		return
 	}
 
@@ -601,7 +627,7 @@ func (api *EscrowAPI) refundContract(w http.ResponseWriter, r *http.Request) {
 	userID := input.UserID
 	txn, err := api.escrowService.RefundContract(r.Context(), contractID, userID, input.Reason)
 	if err != nil {
-		SendErrorWithKey(w, "internal_error", err.Error(), http.StatusInternalServerError, nil)
+		respondMoneyOpError(w, err)
 		return
 	}
 

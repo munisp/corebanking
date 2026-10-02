@@ -29,6 +29,8 @@ export const EnvSchema = z.object({
   KYB_CALLBACK_URL: z.string().optional(),
   DEFAULT_CLIENT_ID: z.string().optional(),
   DEFAULT_CLIENT_SECRET: z.string().optional(),
+  // OB-15: comma-separated host allowlist for client callback URLs.
+  CALLBACK_HOST_ALLOWLIST: z.string().optional(),
 });
 
 export const ContactValidationSchema = z.object({

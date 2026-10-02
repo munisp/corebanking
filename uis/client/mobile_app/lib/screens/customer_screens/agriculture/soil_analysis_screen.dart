@@ -17,6 +17,15 @@ class _SoilAnalysisScreenState extends State<SoilAnalysisScreen> {
   Map<String, dynamic> _stats = {};
   bool _loading = true;
 
+  // MOB-03: pagination state — records are fetched page-by-page (page size
+  // 50) and rendered lazily via ListView.builder instead of an eager
+  // ListView(children: [..._records.map(...)]) that built every row at once.
+  static const int _pageSize = 50;
+  int _page = 1;
+  bool _hasMore = false;
+  bool _loadingMore = false;
+  final ScrollController _scrollCtrl = ScrollController();
+
   final _farmIdCtrl = TextEditingController();
   final _stateCtrl = TextEditingController();
   final _depthCtrl = TextEditingController();
@@ -31,13 +40,16 @@ class _SoilAnalysisScreenState extends State<SoilAnalysisScreen> {
   @override
   void initState() {
     super.initState();
+    _scrollCtrl.addListener(_onScroll);
     _load();
   }
 
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final res = await service.listSoilAnalysis();
+      final res = await service.listSoilAnalysis(page: 1, limit: _pageSize);
+      _page = 1;
+      _hasMore = res is List && res.length >= _pageSize;
       final statsRes = await service.getSoilAnalysisStats();
       setState(() {
         _records = (res is List && res.isNotEmpty) ? res : _fallbackRecords;
@@ -50,6 +62,35 @@ class _SoilAnalysisScreenState extends State<SoilAnalysisScreen> {
       });
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  void _onScroll() {
+    if (_loading || _loadingMore || !_hasMore) return;
+    if (!_scrollCtrl.hasClients) return;
+    if (_scrollCtrl.position.pixels >=
+        _scrollCtrl.position.maxScrollExtent - 200) {
+      _loadMore();
+    }
+  }
+
+  Future<void> _loadMore() async {
+    setState(() => _loadingMore = true);
+    try {
+      final res = await service.listSoilAnalysis(page: _page + 1, limit: _pageSize);
+      if (res is List && res.isNotEmpty) {
+        setState(() {
+          _page += 1;
+          _records = [..._records, ...res];
+          _hasMore = res.length >= _pageSize;
+        });
+      } else {
+        setState(() => _hasMore = false);
+      }
+    } catch (_) {
+      setState(() => _hasMore = false);
+    } finally {
+      setState(() => _loadingMore = false);
     }
   }
 
@@ -154,6 +195,7 @@ class _SoilAnalysisScreenState extends State<SoilAnalysisScreen> {
     _farmIdCtrl.dispose();
     _stateCtrl.dispose();
     _depthCtrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
@@ -179,67 +221,82 @@ class _SoilAnalysisScreenState extends State<SoilAnalysisScreen> {
           ? Center(child: CircularProgressIndicator(color: primary))
           : RefreshIndicator(
               onRefresh: _load,
-              child: ListView(
+              child: ListView.builder(
+                controller: _scrollCtrl,
                 padding: const EdgeInsets.all(16),
-                children: [
-                  const Text('Soil Analysis', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 4),
-                  Text('NPK levels, pH testing, and fertility ratings for farm soils', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
-                  const SizedBox(height: 16),
-                  Row(children: [
-                    _statCard('Samples', _stats['samples_analyzed']?.toString() ?? '3,420', Icons.biotech, primary),
-                    _statCard('Avg pH', _stats['avg_ph']?.toString() ?? '6.4', Icons.water_drop, Colors.blue),
-                    _statCard('High Fertility', _stats['high_fertility_pct']?.toString() ?? '38%', Icons.spa, Colors.green),
-                  ]),
-                  const SizedBox(height: 20),
-                  ..._records.map((item) {
-                    final m = item is Map ? item : {};
-                    final fertility = m['fertility']?.toString() ?? '-';
-                    final isPending = m['status']?.toString().toLowerCase() == 'pending';
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text('${m['farm'] ?? m['id'] ?? 'Farm'} — ${m['state'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                              if (!isPending)
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                  decoration: BoxDecoration(color: _fertilityColor(fertility).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
-                                  child: Text('$fertility Fertility', style: TextStyle(color: _fertilityColor(fertility), fontSize: 11, fontWeight: FontWeight.w600)),
-                                )
-                              else
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                  decoration: BoxDecoration(color: Colors.orange.withOpacity(0.12), borderRadius: BorderRadius.circular(20)),
-                                  child: const Text('Pending', style: TextStyle(color: Colors.orange, fontSize: 11, fontWeight: FontWeight.w600)),
-                                ),
-                            ],
-                          ),
-                          if (!isPending) ...[
-                            const SizedBox(height: 12),
-                            Row(children: [
-                              _npkCell('Nitrogen', m['nitrogen']?.toString() ?? '-'),
-                              _npkCell('Phosphorus', m['phosphorus']?.toString() ?? '-'),
-                              _npkCell('Potassium', m['potassium']?.toString() ?? '-'),
-                              _npkCell('pH', m['ph']?.toString() ?? '-'),
-                            ]),
-                          ] else
-                            Padding(
-                              padding: const EdgeInsets.only(top: 8),
-                              child: Text('Analysis in progress', style: TextStyle(color: Colors.grey.shade500, fontSize: 13)),
-                            ),
-                        ],
-                      ),
+                itemCount: 1 + _records.length + ((_hasMore || _loadingMore) ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (index == 0) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                          const Text('Soil Analysis', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 4),
+                          Text('NPK levels, pH testing, and fertility ratings for farm soils', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+                          const SizedBox(height: 16),
+                          Row(children: [
+                            _statCard('Samples', _stats['samples_analyzed']?.toString() ?? '3,420', Icons.biotech, primary),
+                            _statCard('Avg pH', _stats['avg_ph']?.toString() ?? '6.4', Icons.water_drop, Colors.blue),
+                            _statCard('High Fertility', _stats['high_fertility_pct']?.toString() ?? '38%', Icons.spa, Colors.green),
+                          ]),
+                          const SizedBox(height: 20),
+                      ],
                     );
-                  }),
-                ],
-              ),
+                  }
+                  final recIndex = index - 1;
+                  if (recIndex >= _records.length) {
+                    return const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  }
+                  final item = _records[recIndex];
+                      final m = item is Map ? item : {};
+                      final fertility = m['fertility']?.toString() ?? '-';
+                      final isPending = m['status']?.toString().toLowerCase() == 'pending';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text('${m['farm'] ?? m['id'] ?? 'Farm'} — ${m['state'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                                if (!isPending)
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                    decoration: BoxDecoration(color: _fertilityColor(fertility).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
+                                    child: Text('$fertility Fertility', style: TextStyle(color: _fertilityColor(fertility), fontSize: 11, fontWeight: FontWeight.w600)),
+                                  )
+                                else
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                    decoration: BoxDecoration(color: Colors.orange.withOpacity(0.12), borderRadius: BorderRadius.circular(20)),
+                                    child: const Text('Pending', style: TextStyle(color: Colors.orange, fontSize: 11, fontWeight: FontWeight.w600)),
+                                  ),
+                              ],
+                            ),
+                            if (!isPending) ...[
+                              const SizedBox(height: 12),
+                              Row(children: [
+                                _npkCell('Nitrogen', m['nitrogen']?.toString() ?? '-'),
+                                _npkCell('Phosphorus', m['phosphorus']?.toString() ?? '-'),
+                                _npkCell('Potassium', m['potassium']?.toString() ?? '-'),
+                                _npkCell('pH', m['ph']?.toString() ?? '-'),
+                              ]),
+                            ] else
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: Text('Analysis in progress', style: TextStyle(color: Colors.grey.shade500, fontSize: 13)),
+                              ),
+                          ],
+                        ),
+                      );
+                },
+                ),
             ),
     );
   }

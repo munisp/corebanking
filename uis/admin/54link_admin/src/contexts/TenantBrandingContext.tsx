@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { tenantService, type Tenant, type TenantBranding } from '../services/tenant';
 import { getTenantHeaders } from '../services/tenant/getTenantHeaders';
 // COMMENTED OUT: UserRole removed - app is only for 54link
@@ -99,22 +99,38 @@ export function TenantBrandingProvider({ children }: { children: ReactNode }) {
   const domain = PLATFORM_BRANDING.domain;
 
   // Extract headers from tenant config
-  const headers = getTenantHeaders(tenant);
+  const headers = useMemo(() => getTenantHeaders(tenant), [tenant]);
+
+  const value = useMemo(
+    () => ({
+      tenant,
+      branding,
+      name,
+      logoUrl,
+      faviconUrl,
+      primaryColor,
+      secondaryColor,
+      domain,
+      headers,
+      isLoading,
+    }),
+    [
+      tenant,
+      branding,
+      name,
+      logoUrl,
+      faviconUrl,
+      primaryColor,
+      secondaryColor,
+      domain,
+      headers,
+      isLoading,
+    ]
+  );
 
   return (
     <TenantBrandingContext.Provider
-      value={{
-        tenant,
-        branding,
-        name,
-        logoUrl,
-        faviconUrl,
-        primaryColor,
-        secondaryColor,
-        domain,
-        headers,
-        isLoading,
-      }}
+      value={value}
     >
       {children}
     </TenantBrandingContext.Provider>

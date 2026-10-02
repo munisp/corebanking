@@ -1,0 +1,96 @@
+# =============================================================================
+# OpenSearch — Prometheus exporter integration
+#
+# Target (verified-static): StatefulSet/opensearch ns `54bank`,
+# image opensearchproject/opensearch:2.12.0, single-node, security plugin
+# DISABLED (DISABLE_SECURITY_PLUGIN=true) — metrics endpoints are reachable
+# without auth inside the cluster.
+#
+# Contract (SPEC §3): collector scrape job `opensearch` -> :9600.
+#
+# Two facts make this non-trivial (README has details):
+#   1. OpenSearch has NO built-in Prometheus exporter. The community
+#      Aiven `prometheus-exporter` plugin serves /_prometheus/metrics on the
+#      HTTP port (9200), not 9600. Port 9600 is Performance Analyzer, whose
+#      output is NOT Prometheus format.
+#   2. Plugin install requires the plugin zip matching the OpenSearch version
+#      (2.12.0) baked into the image or installed via initContainer — the
+#      plugin is not present in the in-tree image.
+#
+# This file: (a) plugin settings for opensearch.yml, (b) scrape Service that
+# satisfies the :9600 contract by remapping to 9200/_prometheus/metrics.
+# =============================================================================
+
+# --- (a) opensearch.yml fragment (mount/merge via ConfigMap) -----------------
+# Only needed when the Aiven plugin is installed.
+# ConfigMap key: opensearch.yml-fragment
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensearch-prometheus-settings
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+data:
+  opensearch.yml-fragment: |
+    # Aiven prometheus-exporter plugin settings (plugin >= 2.12.0.0)
+    # Metric families to include — keep cluster+node+index stats.
+    prometheus.cluster.settings: true
+    prometheus.nodes.filter: _all
+    prometheus.indices: true
+    # Cardinality guard: disable per-index level if index count explodes.
+    # prometheus.indices: false
+---
+# --- (b) scrape Service: contract port 9600 -> pod 9200 ----------------------
+# B1's `opensearch` job scrapes :9600; this Service exposes port 9600 and
+# forwards to the pod's HTTP port where the plugin serves metrics.
+# NOTE: the scrape path is /_prometheus/metrics (not /metrics) — B1 must set
+# metrics_path accordingly on the `opensearch` job.
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch-metrics
+  namespace: 54bank
+  labels:
+    observability.corebanking/scrape: "true"
+spec:
+  selector:
+    app: opensearch
+  ports:
+    - name: metrics
+      port: 9600                  # SPEC §3 contract
+      targetPort: 9200            # plugin serves on the HTTP listener
+---
+# --- (c) StatefulSet patch: install the plugin via initContainer --------------
+# Requires network access at pod start; pin the plugin version to the
+# OpenSearch version (2.12.0). Adjust URL only if the project renames releases.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opensearch
+  namespace: 54bank
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: install-prometheus-exporter
+          image: opensearchproject/opensearch:2.12.0
+          command:
+            - sh
+            - -c
+            - >-
+              bin/opensearch-plugin install --batch
+              https://github.com/Aiven-Open/prometheus-exporter-plugin-for-opensearch/releases/download/2.12.0.0/prometheus-exporter-2.12.0.0.zip
+              && cp -r plugins /shared-plugins
+          volumeMounts:
+            - name: prometheus-exporter-plugin
+              mountPath: /shared-plugins
+      containers:
+        - name: opensearch
+          volumeMounts:
+            - name: prometheus-exporter-plugin
+              mountPath: /usr/share/opensearch/plugins/prometheus-exporter
+              subPath: plugins/prometheus-exporter
+      volumes:
+        - name: prometheus-exporter-plugin
+          emptyDir: {}

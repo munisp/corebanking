@@ -1,0 +1,125 @@
+# =============================================================================
+# Standalone kafka-jmx-exporter sidecar variant (port contract :5556)
+#
+# Use this ONLY if Kafka is deployed WITHOUT Strimzi's jmxPrometheusExporter
+# wiring, or when the collector scrape job `kafka-jmx` must hit :5556 exactly
+# (SPEC §3 contract). The container args below are a Deployment-patch fragment:
+# merge into the broker pod template. No secrets.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-jmx-exporter-5556
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+    observability.corebanking/component: kafka-jmx
+data:
+  # Same rule set as kafka-metrics-configmap.yaml; mounted into the sidecar.
+  config.yaml: |
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      - pattern: kafka.controller<type=(KafkaController|ControllerStats), name=(.+)><>(\w+)
+        name: kafka_controller_$1_$2
+      - pattern: kafka.coordinator.group<type=(GroupMetadataManager), name=(.+)><>(\w+)
+        name: kafka_coordinator_group_$1_$2
+      - pattern: kafka.network<type=RequestMetrics, name=RequestsPerSec, request=(.+)><>(Count|OneMinuteRate)
+        name: kafka_network_requestmetrics_requestspersec
+        labels:
+          request: "$1"
+      - pattern: kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(.+)><>(Count|Mean|50thPercentile|99thPercentile)
+        name: kafka_network_requestmetrics_totaltimems_$2
+        labels:
+          request: "$1"
+      - pattern: kafka.network<type=RequestChannel, name=RequestQueueSize><>Value
+        name: kafka_network_requestchannel_requestqueuesize
+      - pattern: kafka.network<type=Processor, name=IdlePercent, networkProcessor=(.+)><>Value
+        name: kafka_network_processor_idlepercent
+        labels:
+          network_processor: "$1"
+      - pattern: kafka.server<type=KafkaRequestHandlerPool, name=RequestHandlerAvgIdlePercent><>(OneMinuteRate|MeanRate)
+        name: kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent_$1
+      - pattern: kafka.server<type=ReplicaManager, name=(.+)><>Value
+        name: kafka_server_replicamanager_$1
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec|MessagesInPerSec), topic=(.*)><>(Count|OneMinuteRate)
+        name: kafka_server_brokertopicmetrics_$1_$3
+        labels:
+          topic: "$2"
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec|MessagesInPerSec)><>(Count|OneMinuteRate)
+        name: kafka_server_brokertopicmetrics_$1_$2
+      - pattern: kafka.server<type=DelayedOperationPurgatory, name=PurgatorySize, delayedOperation=(.+)><>Value
+        name: kafka_server_delayedoperationpurgatory_purgatorysize
+        labels:
+          delayed_operation: "$1"
+      - pattern: kafka.log<type=LogFlushStats, name=LogFlushRateAndTimeMs><>(Count|Mean)
+        name: kafka_log_logflushstats_logflushrateandtimems_$1
+      - pattern: kafka.cluster<type=Partition, name=(UnderReplicated|InSyncReplicasCount|ReplicasCount|LastStableOffsetLag), topic=(.+), partition=(.+)><>Value
+        name: kafka_cluster_partition_$1
+        labels:
+          topic: "$2"
+          partition: "$3"
+      - pattern: java.lang<type=Memory><HeapMemoryUsage>(\w+)
+        name: jvm_memory_heap_$1
+      - pattern: java.lang<type=GarbageCollector, name=(.+)><>(CollectionCount|CollectionTime)
+        name: jvm_gc_$2
+        labels:
+          gc: "$1"
+---
+# Deployment-patch fragment (strategic merge) — add the javaagent to the broker
+# JVM and expose :5556. Apply with:
+#   kubectl -n kafka patch deployment <kafka-broker-deploy> --patch-file kafka-jmx-sidecar-patch.yaml
+# For Strimzi clusters DO NOT use this; use kafka-metrics-configmap.yaml and
+# remap the metrics Service (9404 -> 5556) instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-broker            # adjust to the actual broker deployment name
+  namespace: kafka
+spec:
+  template:
+    spec:
+      containers:
+        - name: kafka           # must match the broker container name
+          env:
+            - name: KAFKA_OPTS
+              # javaagent attaches on port 5556 — the SPEC kafka-jmx scrape port
+              value: >-
+                -javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=5556:/opt/jmx/config.yaml
+          ports:
+            - containerPort: 5556
+              name: jmx-metrics
+          volumeMounts:
+            - name: jmx-exporter-config
+              mountPath: /opt/jmx/config.yaml
+              subPath: config.yaml
+            - name: jmx-exporter-jar
+              mountPath: /opt/jmx/jmx_prometheus_javaagent.jar
+              subPath: jmx_prometheus_javaagent.jar
+      volumes:
+        - name: jmx-exporter-config
+          configMap:
+            name: kafka-jmx-exporter-5556
+        # Populate via an initContainer or image bake; jar is NOT in this repo.
+        - name: jmx-exporter-jar
+          emptyDir: {}
+      # initContainers:
+      #   - name: fetch-jmx-exporter
+      #     image: curlimages/curl:8.6.0
+      #     command: ["sh","-c","curl -fsSL -o /opt/jmx/jmx_prometheus_javaagent.jar https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/<PINNED_VERSION>/jmx_prometheus_javaagent-<PINNED_VERSION>.jar"]
+      #     volumeMounts: [{ name: jmx-exporter-jar, mountPath: /opt/jmx }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-jmx
+  namespace: kafka
+  labels:
+    observability.corebanking/scrape: "true"
+spec:
+  selector:
+    app: kafka                # adjust to broker pod label
+  ports:
+    - name: metrics
+      port: 5556
+      targetPort: 5556

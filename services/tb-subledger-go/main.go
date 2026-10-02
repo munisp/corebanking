@@ -23,6 +23,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // TigerBeetle Sub-Ledger per Product
 // Each banking product (savings, current, fixed deposit, loan) gets its own
 // TB ledger ID. Enables product-level P&L, trial balance, and regulatory
@@ -279,8 +290,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -449,7 +459,13 @@ func main() {
 		port = "8302"
 	}
 
-	server := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux)}
+	server := &http.Server{
+		Addr: ":" + port, Handler: jwtAuthMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		log.Printf("[tb-subledger-go] Starting on :%s with %d product ledgers", port, len(productLedgers))

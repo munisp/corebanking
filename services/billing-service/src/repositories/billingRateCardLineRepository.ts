@@ -4,12 +4,13 @@ import { BillingRateCardLine } from "../models/BillingRateCardLine";
 export const billingRateCardLineRepository = {
   repo: () => AppDataSource.getRepository(BillingRateCardLine),
 
-  findAll(): Promise<BillingRateCardLine[]> {
-    return this.repo().find();
+  // TS-55: bounded by default (take 500); callers may paginate via limit/offset.
+  findAll(limit = 500, offset = 0): Promise<BillingRateCardLine[]> {
+    return this.repo().find({ take: limit, skip: offset });
   },
 
-  findByCard(rateCardId: string): Promise<BillingRateCardLine[]> {
-    return this.repo().find({ where: { rateCardId } });
+  findByCard(rateCardId: string, limit = 500, offset = 0): Promise<BillingRateCardLine[]> {
+    return this.repo().find({ where: { rateCardId }, take: limit, skip: offset });
   },
 
   findByMeter(rateCardId: string, meterKey: string): Promise<BillingRateCardLine | null> {

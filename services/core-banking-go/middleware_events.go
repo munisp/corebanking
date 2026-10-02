@@ -30,6 +30,17 @@ import (
 	"github.com/IBM/sarama"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ── JWT / JWKS ──────────────────────────────────────────────────────────────
 
 var (
@@ -58,8 +69,7 @@ func fetchJWKS() (map[string]*rsa.PublicKey, error) {
 	if jwtJWKSURL == "" {
 		return nil, fmt.Errorf("JWT_JWKS_URL not configured")
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(jwtJWKSURL)
+	resp, err := sharedHTTPClient.Get(jwtJWKSURL)
 	if err != nil {
 		return nil, fmt.Errorf("jwks fetch: %w", err)
 	}

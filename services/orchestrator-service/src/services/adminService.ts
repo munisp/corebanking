@@ -1,7 +1,9 @@
 import axios, { AxiosInstance } from "axios";
 import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
+import logger from "../config/logger.config";
 import { IAdminProfilePayload } from "../types/admin";
+import { serviceAuthClient } from "../lib/serviceAuthClient";
 
 class AdminService {
   private _axiosInstance: AxiosInstance;
@@ -29,10 +31,14 @@ class AdminService {
         tenantRole: payload.tenant_role,
         branchId: payload.branch_id,
       };
-      console.log("[adminService.createAdminProfile] sending to admin-service:", JSON.stringify(body));
+      // TS-33: full body only at debug level (LOG_LEVEL=debug), not on the
+      // default info path.
+      logger.debug("[adminService.createAdminProfile] sending to admin-service", { body });
       await this._axiosInstance.post("/admin", body, {
         headers: {
           "x-tenant-id": payload.tenant_id,
+          // OB-03: service-to-service bearer (role="service")
+          "Authorization": serviceAuthClient.getAuthHeader(payload.tenant_id),
         },
       });
     } catch (error: any) {
@@ -60,6 +66,8 @@ class AdminService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         },
       );
@@ -77,11 +85,18 @@ class AdminService {
           headers: {
             "x-tenant-id": tenant_id,
             "x-keycloak-id": keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
           },
         },
       );
     } catch (error: any) {
-      // Fail gracefully.
+      // OB-06: KYC completion must not fail silently — throw so the workflow
+      // retries/fails instead of leaving a pending-forever admin record.
+      if (error.response) {
+        throw new Error(error.response.data?.message ?? "Mark admin KYC complete failed");
+      }
+      throw new Error("Network error — admin service unreachable");
     }
   }
 }

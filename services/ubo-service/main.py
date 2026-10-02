@@ -8,6 +8,7 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import structlog
 import networkx as nx
@@ -19,6 +20,7 @@ app = FastAPI(
     description="Ultimate Beneficial Owner identification and verification",
     version="1.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -291,4 +293,4 @@ async def identify_ubo(request: OwnershipStructureRequest, x_tenant_id: str = He
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8021)))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8021)), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

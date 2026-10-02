@@ -1,0 +1,83 @@
+# =============================================================================
+# Kafka broker JMX metrics — Strimzi `jmxPrometheusExporter` ConfigMap
+#
+# Target cluster (verified-static in repo):
+#   infrastructure/kafka/kafka-cluster.yaml — Kafka CR `link54-kafka-cluster`,
+#   namespace `kafka`, spec.kafka.metricsConfig.type: jmxPrometheusExporter
+#   valueFrom.configMapKeyRef: { name: kafka-metrics, key: kafka-metrics-config.yml }
+#
+# This ConfigMap satisfies that reference. Apply BEFORE (or together with) the
+# Kafka CR so Strimzi rolls the brokers with the JMX exporter javaagent.
+#
+# PORT CONTRACT (SPEC §3): the OTel Collector scrape job `kafka-jmx` targets
+# :5556. Strimzi's jmxPrometheusExporter sidecar publishes on TCP 9404 by
+# default. Reconcile by either:
+#   (a) pointing B1's scrape at the Strimzi metrics service on 9404, or
+#   (b) deploying jmx-exporter-standalone.yaml (sibling file) which runs the
+#       javaagent on :5556 directly.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics
+  namespace: kafka
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+    observability.corebanking/component: kafka-jmx
+data:
+  kafka-metrics-config.yml: |
+    # jmx_prometheus_javaagent rules for Apache Kafka broker metrics.
+    # Standard rule set (Kafka >= 2.0 MBean naming).
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      # Per-broker controller / coordinator state
+      - pattern: kafka.controller<type=(KafkaController|ControllerStats), name=(.+)><>(\w+)
+        name: kafka_controller_$1_$2
+      - pattern: kafka.coordinator.group<type=(GroupMetadataManager), name=(.+)><>(\w+)
+        name: kafka_coordinator_group_$1_$2
+      # Request handler / network processor utilization
+      - pattern: kafka.network<type=RequestMetrics, name=RequestsPerSec, request=(.+)><>(Count|OneMinuteRate)
+        name: kafka_network_requestmetrics_requestspersec
+        labels:
+          request: "$1"
+      - pattern: kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(.+)><>(Count|Mean|50thPercentile|99thPercentile)
+        name: kafka_network_requestmetrics_totaltimems_$2
+        labels:
+          request: "$1"
+      - pattern: kafka.network<type=RequestChannel, name=RequestQueueSize><>Value
+        name: kafka_network_requestchannel_requestqueuesize
+      - pattern: kafka.network<type=Processor, name=IdlePercent, networkProcessor=(.+)><>Value
+        name: kafka_network_processor_idlepercent
+        labels:
+          network_processor: "$1"
+      - pattern: kafka.server<type=KafkaRequestHandlerPool, name=RequestHandlerAvgIdlePercent><>(OneMinuteRate|MeanRate)
+        name: kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent_$1
+      # Broker / replica / partition counts
+      - pattern: kafka.server<type=ReplicaManager, name=(.+)><>Value
+        name: kafka_server_replicamanager_$1
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec|MessagesInPerSec), topic=(.*)><>(Count|OneMinuteRate)
+        name: kafka_server_brokertopicmetrics_$1_$3
+        labels:
+          topic: "$2"
+      - pattern: kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec|BytesOutPerSec|MessagesInPerSec)><>(Count|OneMinuteRate)
+        name: kafka_server_brokertopicmetrics_$1_$2
+      - pattern: kafka.server<type=DelayedOperationPurgatory, name=PurgatorySize, delayedOperation=(.+)><>Value
+        name: kafka_server_delayedoperationpurgatory_purgatorysize
+        labels:
+          delayed_operation: "$1"
+      # Log flush, offline/under-replicated partitions
+      - pattern: kafka.log<type=LogFlushStats, name=LogFlushRateAndTimeMs><>(Count|Mean)
+        name: kafka_log_logflushstats_logflushrateandtimems_$1
+      - pattern: kafka.cluster<type=Partition, name=(UnderReplicated|InSyncReplicasCount|ReplicasCount|LastStableOffsetLag), topic=(.+), partition=(.+)><>Value
+        name: kafka_cluster_partition_$1
+        labels:
+          topic: "$2"
+          partition: "$3"
+      # JVM basics (exporter also emits jvm_* by default via DefaultExports)
+      - pattern: java.lang<type=Memory><HeapMemoryUsage>(\w+)
+        name: jvm_memory_heap_$1
+      - pattern: java.lang<type=GarbageCollector, name=(.+)><>(CollectionCount|CollectionTime)
+        name: jvm_gc_$2
+        labels:
+          gc: "$1"

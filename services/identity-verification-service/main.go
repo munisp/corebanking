@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 )
 
 const serviceName = "identity-verification-service"
@@ -58,7 +59,7 @@ func main() {
 
 	port := getenv("PORT", "8080")
 	log.Printf("%s listening on :%s", serviceName, port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 func getenv(key, fallback string) string {

@@ -52,6 +52,8 @@ export default function Liveness() {
   // Challenge tracking
   const challengeStartRef = useRef<number>(0);
   const challengeDetectedRef = useRef<boolean>(false);
+  // Throttle progress state updates out of the rAF loop (~60fps) to ~2/sec
+  const lastProgressUpdateRef = useRef<number>(0);
 
   const finalizeLiveness = useCallback(() => {
     setStatus("VERIFYING");
@@ -137,7 +139,15 @@ export default function Liveness() {
       const baseProgress = (currentChallengeIndex / challenges.length) * 100;
       const currentProgress =
         baseProgress + challengeProgress / challenges.length;
-      setProgress(Math.min(currentProgress, 100));
+      const nextProgress = Math.min(currentProgress, 100);
+      const now = Date.now();
+      if (
+        nextProgress >= 100 ||
+        now - lastProgressUpdateRef.current >= 500
+      ) {
+        lastProgressUpdateRef.current = now;
+        setProgress(nextProgress);
+      }
 
       if (elapsed > 10000) {
         // Auto-complete current challenge

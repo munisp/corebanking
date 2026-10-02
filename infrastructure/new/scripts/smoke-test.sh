@@ -84,11 +84,6 @@ echo "--- Group Lending (:8098) ---"
 check "Group health" "http://localhost:8098/healthz"
 check "Lending groups" "http://localhost:8098/v1/group-lending/groups"
 
-# Education Loans (Python :8099)
-echo "--- Education Loans (:8099) ---"
-check "Education health" "http://localhost:8099/healthz"
-check "Education loans" "http://localhost:8099/v1/education-loans/loans"
-
 # Ledger Reconciliation (Rust :8100)
 echo "--- Ledger Reconciliation (:8100) ---"
 check "Ledger health" "http://localhost:8100/healthz"
@@ -96,11 +91,6 @@ check "Ledger health" "http://localhost:8100/healthz"
 # Identity & Channels (Go :8101)
 echo "--- Identity & Channels (:8101) ---"
 check "Identity health" "http://localhost:8101/healthz"
-
-# Dispute Management (Python :8102)
-echo "--- Dispute Management (:8102) ---"
-check "Dispute health" "http://localhost:8102/healthz"
-check "Dispute cases" "http://localhost:8102/v1/disputes/cases"
 
 # ERPNext Sync (Python :8103)
 echo "--- ERPNext Sync (:8103) ---"

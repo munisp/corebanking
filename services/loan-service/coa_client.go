@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"time"
@@ -30,16 +29,6 @@ func NewCoAClient() *CoAClient {
 		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 60 * time.Second},
 	}
-}
-
-// PostAsync fires a COA journal entry in a background goroutine.
-// Failures are logged but never bubble up to the caller — same pattern as audit.
-func (c *CoAClient) PostAsync(tenantID, userID, userRole string, entry CreateJournalEntryRequest) {
-	go func() {
-		if _, err := c.CreateJournalEntry(tenantID, userID, userRole, entry); err != nil {
-			log.Printf("WARN [coa] async journal entry failed (tenant=%s ref=%s): %v", tenantID, entry.Reference, err)
-		}
-	}()
 }
 
 // GetMapping resolves a semantic key (e.g. "loans.interest.sme") to the
@@ -165,13 +154,16 @@ func (c *CoAClient) CreateJournalEntry(tenantID, userID, userRole string, entry 
 //
 //	loans.receivable          → asset (Loans Receivable)
 //	loans.customer.liability  → liability (Customer Deposits / Nostro)
-func (c *CoAClient) RecordLoanDisbursement(tenantID, userID, userRole, loanID, loanType string, amount int64) {
+//
+// LN-03 (L3): returns an error and ENQUEUES to the outbox (persist + retry)
+// instead of fire-and-forget. Missing account mappings are an error — a
+// disbursement without its balanced journal must not proceed.
+func (c *CoAClient) RecordLoanDisbursement(tenantID, userID, userRole, loanID, loanType string, amount int64) error {
 	principalAcct := c.GetMapping(tenantID, "loans.receivable")
 	customerAcct := c.GetMapping(tenantID, "loans.customer.liability")
 
 	if principalAcct == "" || customerAcct == "" {
-		log.Printf("WARN [coa] disbursement skipped for loan %s — mappings not configured for tenant %s", loanID, tenantID)
-		return
+		return fmt.Errorf("COA mappings not configured for tenant %s (loans.receivable / loans.customer.liability)", tenantID)
 	}
 
 	entry := CreateJournalEntryRequest{
@@ -187,7 +179,7 @@ func (c *CoAClient) RecordLoanDisbursement(tenantID, userID, userRole, loanID, l
 			"loan_id": loanID, "loan_type": loanType, "source": "loan-service", "event_type": "disbursement",
 		},
 	}
-	c.PostAsync(tenantID, userID, userRole, entry)
+	return enqueueCoAOutbox(tenantID, userID, userRole, entry)
 }
 
 // RecordLoanRepayment posts the journal entry for a loan repayment.
@@ -196,7 +188,7 @@ func (c *CoAClient) RecordLoanDisbursement(tenantID, userID, userRole, loanID, l
 //	loans.receivable               → asset (Loans Receivable)
 //	loans.interest.<loanType>      → revenue (Interest Income, specific to loan type)
 //	loans.customer.liability       → liability (Customer Deposits)
-func (c *CoAClient) RecordLoanRepayment(tenantID, userID, userRole, loanID, loanType string, principalAmount, interestAmount int64) {
+func (c *CoAClient) RecordLoanRepayment(tenantID, userID, userRole, loanID, loanType string, principalAmount, interestAmount int64) error {
 	principalAcct := c.GetMapping(tenantID, "loans.receivable")
 	customerAcct := c.GetMapping(tenantID, "loans.customer.liability")
 	interestAcct := c.GetMapping(tenantID, "loans.interest."+loanType)
@@ -206,8 +198,7 @@ func (c *CoAClient) RecordLoanRepayment(tenantID, userID, userRole, loanID, loan
 	}
 
 	if principalAcct == "" || customerAcct == "" {
-		log.Printf("WARN [coa] repayment skipped for loan %s — mappings not configured for tenant %s", loanID, tenantID)
-		return
+		return fmt.Errorf("COA mappings not configured for tenant %s (loans.receivable / loans.customer.liability)", tenantID)
 	}
 
 	totalAmount := principalAmount + interestAmount
@@ -236,5 +227,5 @@ func (c *CoAClient) RecordLoanRepayment(tenantID, userID, userRole, loanID, loan
 			"interest_amount":  interestAmount,
 		},
 	}
-	c.PostAsync(tenantID, userID, userRole, entry)
+	return enqueueCoAOutbox(tenantID, userID, userRole, entry)
 }

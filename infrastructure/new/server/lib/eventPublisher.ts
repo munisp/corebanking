@@ -20,6 +20,10 @@ import { cacheGet, cacheSet } from "./redisClient";
 import { logger } from "./logger";
 
 // Topics forwarded to SSE subscribers — real banking domain events only.
+// OR-27: "audit.event" removed — the monolith published it for every write
+// request but no consumer persisted or processed it (T24 unread topic), and
+// there is no real audit sink in this codebase to subscribe it to. The
+// publish middleware was deleted rather than left emitting write-only traffic.
 const SSE_STREAM_TOPICS = [
   "txn.created",
   "txn.completed",
@@ -40,7 +44,6 @@ const SSE_STREAM_TOPICS = [
   "auth.login",
   "auth.logout",
   "auth.failed",
-  "audit.event",
 ];
 
 /** Respond 503/502 for a failed publish — never { published: true }. */
@@ -56,31 +59,11 @@ function respondPublishFailure(res: Response, eventType: string, err: unknown): 
 
 // Event publishing middleware — publishes events based on route patterns
 export function registerEventPublisher(app: Express): void {
-  // Publish audit events for all write operations. When no real producer is
-  // configured the event is DROPPED with a loud log — never silently treated
-  // as delivered.
-  app.use((req: Request, res: Response, next: NextFunction) => {
-    if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method)) {
-      const originalSend = res.send.bind(res);
-      res.send = function (body: any) {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          publish("audit.event", {
-            method: req.method,
-            path: req.path,
-            statusCode: res.statusCode,
-            userId: (req as any).user?.id || "anonymous",
-            ip: req.ip,
-            timestamp: new Date().toISOString(),
-          }).catch((err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            logger.warn(`[EventPublisher] Audit event dropped (not published): ${msg}`);
-          });
-        }
-        return originalSend(body);
-      };
-    }
-    next();
-  });
+  // OR-27: the blanket audit.event publish middleware was deleted. It emitted
+  // an "audit.event" for every mutating request to a topic with no consumer
+  // (write-only traffic), and this codebase has no real audit persistence path
+  // to wire it to. The central audit intake is audit-service's HTTP API
+  // (services/audit-service), not this monolith topic.
 
   // Subscribe to key events and log them
   subscribe("txn.created", (topic, msg) => {

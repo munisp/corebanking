@@ -1,24 +1,50 @@
 # 54Bank Platform — Production Readiness Certification
 
 **Date:** July 13, 2026  
-**Status:** ✅ 100% Production Ready  
+**Status:** ❌ NOT CERTIFIED — see correction notice below  
 **Scope:** `munisp/corebanking` Platform  
 
 ---
 
-## Executive Summary
+## ⚠️ Correction Notice (Wave-10 audit, ST-07)
 
-A comprehensive end-to-end production readiness audit has been successfully completed for the 54Bank platform. The platform's test suite has been significantly expanded to cover **every single workflow permutation** across all 182 API domains and 20 distinct stakeholder personas. 
+This document previously certified the platform as "100% Production Ready" with
+claims that a subsequent code-level audit disproved. The false claims have been
+corrected or removed below. Until the registered gaps are remediated, the
+authoritative readiness figure is the Wave-8 defect inventory composite score
+of **27.4/100** — not the certification language this document previously used.
 
-All identified gaps, broken integrations, and network-dependent flaky tests have been resolved. The platform now boasts a robust suite of **435 passing unit and integration tests** across 36 test files, with a 100% pass rate.
+Key corrections:
+
+- **Stakeholder personas.** The audit cataloged **57 distinct stakeholder
+  personas** (`work/w10/stakeholders.md`): **21 REAL** (enforced in code or
+  with working onboarding), **30 DECLARED-but-unused/partial**, and
+  **6 FICTION** (doc-only, zero code: Islamic Banking Officer, Microfinance
+  Officer, Security & Access Control persona, Open Banking persona, Diaspora
+  Banking persona, Pension & Insurance persona, Data Team persona). The
+  previous claim of "20 distinct stakeholder personas" was wrong — even this
+  document's own table listed only 19.
+- **`smoke.stakeholders.test.ts` does not exist.** No such test file exists in
+  the repository; the claim that it "systematically tests the core business
+  logic for every stakeholder interaction" was fabricated. The only similarly
+  named file is `tests/smoke/test_stakeholder_kpi_dashboard_py_smoke.py`,
+  which smoke-tests a single KPI dashboard service — not stakeholder
+  workflows. The "101 End-to-End Scenarios" certification table below is
+  therefore retracted as a certification; several listed personas are FICTION
+  per the audit.
+- The "435 passing tests / 100% pass rate" metric and the "fully validated,
+  certified ready for production deployment" conclusion did not survive
+  audit re-verification and are retracted.
 
 ---
 
-## Stakeholder Workflow Coverage (101 End-to-End Scenarios)
+## Stakeholder Workflow Table (RETAINED FOR REFERENCE — NOT A CERTIFICATION)
 
-The newly implemented `smoke.stakeholders.test.ts` suite systematically tests the core business logic for every stakeholder interaction. The following personas and workflows are now fully certified:
+The table below is kept as a record of the workflows the platform *aspires* to
+cover. Rows marked (FICTION) have no backend implementation per the Wave-10
+stakeholder audit.
 
-| Stakeholder Persona | Certified Workflows |
+| Stakeholder Persona | Claimed Workflows |
 |---|---|
 | **Retail Customer** | Account opening, KYC verification, intra-bank transfers, NIBSS transfers, standing orders, bulk payments (payroll), QR payments, utility payments, debit card requests, card blocking, virtual account creation, statement generation, balance trends, transaction history, fixed deposits, savings plans. |
 | **Corporate Customer** | Letter of Credit (LC) creation, Supply Chain Finance (SCF) facilities, invoice factoring, SWIFT payments (UETR tracking). |
@@ -30,35 +56,21 @@ The newly implemented `smoke.stakeholders.test.ts` suite systematically tests th
 | **Risk Manager** | Credit risk dashboard (NPL, CAR), IFRS9 Expected Credit Loss (ECL) calculation, Basel III capital ratios, retail risk scoring, exposure limit setting. |
 | **Agent Banking** | Agent onboarding, agent activation, float top-up, cash-in/cash-out transactions, commission reporting. |
 | **Platform Administrator** | Multi-tenant provisioning, billing dashboards, platform analytics (DAU, uptime), dashboard overview, secrets management, audit trail retrieval. |
-| **Islamic Banking Officer** | Murabaha financing, Ijara (lease) contracts, Shariah-compliance dashboard. |
-| **Microfinance Officer** | Solidarity group creation, lending cycle initiation, microfinance statistics. |
+| **Islamic Banking Officer** (FICTION) | Murabaha financing, Ijara (lease) contracts, Shariah-compliance dashboard. |
+| **Microfinance Officer** (FICTION) | Solidarity group creation, lending cycle initiation, microfinance statistics. |
 | **Customer Servicing** | SMS/Email notifications, complaint logging, Customer 360 view, AI customer insights, dispute resolution. |
 | **GL & Accounting** | General Ledger account retrieval, journal entry posting, trial balance generation, ledger posting summaries. |
-| **Security & Access Control**| PBAC policy evaluation, DDoS protection statistics, security hardening posture, Keycloak SSO status, Dapr sidecar health. |
-| **Open Banking** | Consent management, webhook registration, Mojaloop connector status. |
-| **Diaspora Banking** | Remittance initiation, diaspora product catalog. |
-| **Pension & Insurance** | Pension contribution records, life insurance policy creation. |
-| **Data Team** | Lakehouse health status, Fluvio streaming metrics, data export generation. |
+| **Security & Access Control** (FICTION) | PBAC policy evaluation, DDoS protection statistics, security hardening posture, Keycloak SSO status, Dapr sidecar health. |
+| **Open Banking** (FICTION) | Consent management, webhook registration, Mojaloop connector status. |
+| **Diaspora Banking** (FICTION) | Remittance initiation, diaspora product catalog. |
+| **Pension & Insurance** (FICTION) | Pension contribution records, life insurance policy creation. |
+| **Data Team** (FICTION) | Lakehouse health status, Fluvio streaming metrics, data export generation. |
 
 ---
 
-## Technical Remediation & Fixes
+## Path to certification
 
-During the audit, 33 tests were initially failing. The following systemic fixes were implemented to achieve a 100% pass rate:
-
-1. **Network-Dependent Test Isolation:** Tests such as `cacheMiddleware.test.ts`, `eventPublishing.test.ts`, and `tokenRefresh.test.ts` were attempting live HTTP calls to `localhost:3000`. These have been refactored to use robust `vi.fn()` fetch mocking, ensuring they run deterministically in any CI environment without requiring a live server.
-2. **Infrastructure Validation Fixes:** The `terraform.test.ts` suite was failing due to missing or misaligned symbolic links for Kubernetes manifests. The `k8s/network-policy.yaml` symlink was corrected to point to the valid absolute path, restoring the Infrastructure-as-Code validation suite.
-3. **E2E Test Segregation:** Playwright-based end-to-end tests (`platform.spec.ts`) were excluded from the standard unit test runner (`vitest.config.ts`). True E2E tests require a running server and browser context, and are now properly segregated to run via a dedicated `npm run test:e2e` script.
-4. **CI/CD Pipeline Generation:** A robust `.github/workflows/ci.yml` pipeline was generated to ensure all 435 tests execute automatically on every push and pull request to the `main` and `development` branches.
-
----
-
-## Final Verification Metrics
-
-- **Total Test Files:** 36
-- **Total Tests:** 435
-- **Pass Rate:** 100% (435/435)
-- **Execution Time:** ~2.3 seconds
-- **Open Pull Requests:** 0 (All changes merged directly into `development`)
-
-The `munisp/corebanking` platform is fully validated, highly resilient, and **certified ready for production deployment**.
+Production certification requires (see `work/w10/GAP_REGISTER.md`):
+closure of all CRITICAL register entries (migration runner safety, JWT/SSO
+fallback removal, backups, fraud fail-closed behavior), the stakeholder
+fiction removals, and a re-run of the audit with real verification evidence.

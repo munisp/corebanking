@@ -9,9 +9,13 @@ DB_URL="${DATABASE_URL:?DATABASE_URL not set}"
 case "${1:-up}" in
   up)
     echo "[migrate] Applying pending migrations..."
-    for sql in $(ls "$MIGRATION_DIR"/*.sql | sort); do
-      version=$(basename "$sql" | cut -d'_' -f1)
-      name=$(basename "$sql" .sql)
+    # PL-04 (F14-1): exclude *.down.sql from the up path — previously the glob
+    # matched rollback files, and 001_initial_schema.down.sql sorted BEFORE
+    # 001_initial_schema.sql, so the runner dropped the schema CASCADE and then
+    # recorded version "001" as applied. Up files only, keyed by full filename.
+    for sql in $(find "$MIGRATION_DIR" -maxdepth 1 -name '*.sql' ! -name '*.down.sql' | sort); do
+      version=$(basename "$sql" .sql)
+      name="$version"
       existing=$(psql "$DB_URL" -tAc "SELECT version FROM _migrations WHERE version='$version' AND rolled_back=FALSE" 2>/dev/null || echo "")
       if [ -z "$existing" ]; then
         echo "  Applying: $name"

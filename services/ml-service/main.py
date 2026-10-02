@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
 
 from api.main import app as api_app
 
@@ -23,6 +24,7 @@ app = FastAPI(
     description="Root runtime wrapper for the existing ML API surface with readiness and bootstrap metadata.",
     version="1.0.0",
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -275,4 +277,4 @@ def bootstrap() -> JSONResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8061")))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8061")), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

@@ -14,8 +14,10 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
+	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -27,8 +29,54 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	_ "github.com/lib/pq"
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+	pq "github.com/lib/pq"
+	"shared/otel/go/otelkit"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// ─── SCHEMA MIGRATIONS (PL-04) ──────────────────────────────────────────────
+// Previously the files in migrations/ were referenced nowhere — the GL schema
+// was unreproducible from source. Migrations are now embedded and applied with
+// golang-migrate at boot; a dirty or failed migration state is fatal (the GL
+// must never serve against an unknown schema).
+
+//go:embed migrations
+var migrationFS embed.FS
+
+func runMigrations(db *sql.DB) error {
+	src, err := iofs.New(migrationFS, "migrations")
+	if err != nil {
+		return fmt.Errorf("migration source: %w", err)
+	}
+	drv, err := postgres.WithInstance(db, &postgres.Config{})
+	if err != nil {
+		return fmt.Errorf("migration driver: %w", err)
+	}
+	m, err := migrate.NewWithInstance("iofs", src, "postgres", drv)
+	if err != nil {
+		return fmt.Errorf("migration init: %w", err)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		// Includes migrate.ErrDirty — fail fast, never auto-force.
+		return fmt.Errorf("migration up: %w", err)
+	}
+	v, dirty, _ := m.Version()
+	log.Printf("[gl-engine-go] schema migrations applied (version=%d dirty=%v)", v, dirty)
+	return nil
+}
 
 // ─── MIDDLEWARE STATUS (honest: only probed systems report connected) ──────
 
@@ -156,7 +204,7 @@ func NewApp() *App {
 
 	app := &App{dbURL: dbURL}
 
-	db, err := sql.Open("postgres", dbURL)
+	db, err := otelkit.OpenSQLDB("postgres", dbURL)
 	if err == nil {
 		db.SetMaxOpenConns(20)
 		db.SetMaxIdleConns(5)
@@ -905,8 +953,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -1117,9 +1164,10 @@ func (app *App) relayOutbox(brokers string) {
 		}
 		publishedIDs = append(publishedIDs, id)
 	}
-	for _, id := range publishedIDs {
-		if _, err := app.db.Exec(`UPDATE outbox SET status = 'published' WHERE id = $1`, id); err != nil {
-			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+	// GCM-099 (AP-01): single batch UPDATE instead of one RTT per event.
+	if len(publishedIDs) > 0 {
+		if _, err := app.db.Exec(`UPDATE outbox SET status = 'published' WHERE id = ANY($1)`, pq.Array(publishedIDs)); err != nil {
+			log.Printf("[outbox-relay] failed to batch-mark %d events published: %v — events remain pending and will be retried", len(publishedIDs), err)
 		}
 	}
 	if len(publishedIDs) > 0 {
@@ -1242,6 +1290,24 @@ func tenantFromClaims(claims map[string]interface{}) string {
 func main() {
 	app := NewApp()
 	appInstance = app
+	if app.db != nil {
+		if err := runMigrations(app.db); err != nil {
+			log.Fatalf("[gl-engine-go] schema migration failed (refusing to start): %v", err)
+		}
+	} else {
+		log.Printf("[gl-engine-go] postgres unavailable at boot — migrations deferred; GL endpoints fail closed (503)")
+	}
+	shutdown, oerr := otelkit.Init(context.Background(), "gl-engine-go")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 
 	if os.Getenv("SEED_DEMO") == "true" {
 		app.seedDemoData()
@@ -1274,11 +1340,12 @@ func main() {
 	port := getEnv("PORT", "8090")
 
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	log.Printf("GL Engine (Go) listening on :%s", port)

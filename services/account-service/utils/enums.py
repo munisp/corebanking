@@ -6,6 +6,9 @@ class AccountStatus(enum.Enum):
     INACTIVE = "inactive"
     SUSPENDED = "suspended"
     DELETED = "deleted"
+    DORMANT = "dormant"      # MN-01: inactivity-enforced; debits blocked
+    CLOSED = "closed"        # MN-02: terminal; all posting blocked
+    DECEASED = "deceased"    # MN-05: estate handling; debits blocked
 
 
 class AccountType(enum.Enum):

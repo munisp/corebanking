@@ -1,0 +1,195 @@
+apiVersion: 1
+groups:
+- orgId: 1
+  name: corebanking-money-path
+  folder: Corebanking Alerts
+  interval: 1m
+  rules:
+  - uid: cb-moneypath-latency-p95
+    title: MoneyPathLatencyP95
+    condition: B
+    data:
+    - refId: A
+      queryType: ''
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: histogram_quantile(0.95, sum by (le, service_name, tenant_id, http_route) (rate(http_server_request_duration_seconds_bucket{http_route=~"/api/(transfers|payments)(/.*)?|/v1/(transfers|settlement.*|journal.*|disburse.*|escrow.*)|/api/v1/service_configs.*|/api/ctrs|/v1/trial-balance|/v1/funds-transfer|/disburse.*|/api/interest/accrue|/v1/interest/accrue"}[5m])))
+          > 2
+        instant: true
+        intervalMs: 1000
+        legendFormat: __auto
+        maxDataPoints: 43200
+        range: false
+        refId: A
+    - refId: B
+      queryType: ''
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 2
+            type: gt
+          operator:
+            type: and
+          query:
+            params:
+            - B
+          reducer:
+            params: []
+            type: last
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: B
+        type: classic_conditions
+    noDataState: NoData
+    execErrState: Error
+    for: 10m
+    annotations:
+      summary: p95 latency on money route {{ $labels.http_route }} ({{ $labels.service_name }}, tenant {{ $labels.tenant_id
+        }}) exceeds 2s.
+      runbook_hint: "Trace via Tempo using the alert's service_name/tenant_id; usual suspects: TigerBeetle batch contention,\
+        \ Dapr state (idempotency) latency, downstream fraud/sanctions prechecks. Money routes are sampled at 1.0 (SPEC \xA7\
+        2.1), so traces are complete."
+    labels:
+      severity: critical
+      team: money-ops
+      money_path: 'true'
+    isPaused: false
+  - uid: cb-double-disburse-guard
+    title: DoubleDisburseGuard
+    condition: B
+    data:
+    - refId: A
+      queryType: ''
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: sum by (loan_id, tenant_id, service_name) (increase(loan_disbursement_events_total[5m])) > 1
+        instant: true
+        intervalMs: 1000
+        legendFormat: __auto
+        maxDataPoints: 43200
+        range: false
+        refId: A
+    - refId: B
+      queryType: ''
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 1
+            type: gt
+          operator:
+            type: and
+          query:
+            params:
+            - B
+          reducer:
+            params: []
+            type: last
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: B
+        type: classic_conditions
+    noDataState: OK
+    execErrState: Error
+    for: 0m
+    annotations:
+      summary: Duplicate disbursement events for loan {{ $labels.loan_id }} (tenant {{ $labels.tenant_id }}) within 5 minutes.
+      runbook_hint: 'Audits F11-07/F4-5: loan-service disburseLoan has only a status guard (non-atomic) and payment-processing
+        withdraw/deposit have NO idempotency. Freeze the loan, compare TigerBeetle transfer ids for the two events, and reverse
+        the duplicate leg. Requires kit-emitted loan_disbursement_events_total counter.'
+    labels:
+      severity: critical
+      team: money-ops
+      money_path: 'true'
+      finding: F11-07/F4-5
+    isPaused: false
+  - uid: cb-eod-run-failed
+    title: EODRunFailed
+    condition: B
+    data:
+    - refId: A
+      queryType: ''
+      relativeTimeRange:
+        from: 600
+        to: 0
+      datasourceUid: prometheus
+      model:
+        editorMode: code
+        expr: sum(increase(eod_run_failures_total[6h])) > 0
+        instant: true
+        intervalMs: 1000
+        legendFormat: __auto
+        maxDataPoints: 43200
+        range: false
+        refId: A
+    - refId: B
+      queryType: ''
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        conditions:
+        - evaluator:
+            params:
+            - 0
+            type: gt
+          operator:
+            type: and
+          query:
+            params:
+            - B
+          reducer:
+            params: []
+            type: last
+          type: query
+        datasource:
+          type: __expr__
+          uid: __expr__
+        expression: A
+        intervalMs: 1000
+        maxDataPoints: 43200
+        refId: B
+        type: classic_conditions
+    noDataState: NoData
+    execErrState: Error
+    for: 0m
+    annotations:
+      summary: "End-of-day run failed in the last 6h \u2014 interest accrual, reconciliation, settlement or GL check did not\
+        \ complete."
+      runbook_hint: 'Audit F15-13/F2-01: eod-processor-go aborts at step 2 by default (dead downstream URLs, no Bearer token).
+        Check eod_runs table status, per-step notes, and the four downstream services. The books do not close until a full
+        run succeeds; do NOT mark the day closed manually without recon evidence.'
+    labels:
+      severity: critical
+      team: money-ops
+      money_path: 'true'
+      finding: F15-13/F2-01
+    isPaused: false

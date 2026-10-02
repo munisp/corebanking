@@ -17,6 +17,15 @@ class _CropYieldPredictionScreenState extends State<CropYieldPredictionScreen> {
   Map<String, dynamic> _stats = {};
   bool _loading = true;
 
+  // MOB-03: pagination state — records are fetched page-by-page (page size
+  // 50) and rendered lazily via ListView.builder instead of an eager
+  // ListView(children: [..._records.map(...)]) that built every row at once.
+  static const int _pageSize = 50;
+  int _page = 1;
+  bool _hasMore = false;
+  bool _loadingMore = false;
+  final ScrollController _scrollCtrl = ScrollController();
+
   final _farmIdCtrl = TextEditingController();
   final _cropCtrl = TextEditingController();
   final _seasonCtrl = TextEditingController();
@@ -31,13 +40,16 @@ class _CropYieldPredictionScreenState extends State<CropYieldPredictionScreen> {
   @override
   void initState() {
     super.initState();
+    _scrollCtrl.addListener(_onScroll);
     _load();
   }
 
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final res = await service.listCropYieldPredictions();
+      final res = await service.listCropYieldPredictions(page: 1, limit: _pageSize);
+      _page = 1;
+      _hasMore = res is List && res.length >= _pageSize;
       final statsRes = await service.getCropYieldPredictionStats();
       setState(() {
         _records = (res is List && res.isNotEmpty) ? res : _fallbackRecords;
@@ -50,6 +62,35 @@ class _CropYieldPredictionScreenState extends State<CropYieldPredictionScreen> {
       });
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  void _onScroll() {
+    if (_loading || _loadingMore || !_hasMore) return;
+    if (!_scrollCtrl.hasClients) return;
+    if (_scrollCtrl.position.pixels >=
+        _scrollCtrl.position.maxScrollExtent - 200) {
+      _loadMore();
+    }
+  }
+
+  Future<void> _loadMore() async {
+    setState(() => _loadingMore = true);
+    try {
+      final res = await service.listCropYieldPredictions(page: _page + 1, limit: _pageSize);
+      if (res is List && res.isNotEmpty) {
+        setState(() {
+          _page += 1;
+          _records = [..._records, ...res];
+          _hasMore = res.length >= _pageSize;
+        });
+      } else {
+        setState(() => _hasMore = false);
+      }
+    } catch (_) {
+      setState(() => _hasMore = false);
+    } finally {
+      setState(() => _loadingMore = false);
     }
   }
 
@@ -143,6 +184,7 @@ class _CropYieldPredictionScreenState extends State<CropYieldPredictionScreen> {
     _cropCtrl.dispose();
     _seasonCtrl.dispose();
     _areaHaCtrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
@@ -168,59 +210,74 @@ class _CropYieldPredictionScreenState extends State<CropYieldPredictionScreen> {
           ? Center(child: CircularProgressIndicator(color: primary))
           : RefreshIndicator(
               onRefresh: _load,
-              child: ListView(
+              child: ListView.builder(
+                controller: _scrollCtrl,
                 padding: const EdgeInsets.all(16),
-                children: [
-                  const Text('Crop Yield Prediction', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 4),
-                  Text('AI-powered yield forecasts using satellite & weather data', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
-                  const SizedBox(height: 16),
-                  Row(children: [
-                    _statCard('Predictions', _stats['total_predictions']?.toString() ?? '342', Icons.analytics, primary),
-                    _statCard('Avg Confidence', _stats['avg_confidence']?.toString() ?? '84%', Icons.verified, Colors.teal),
-                    _statCard('Avg Yield', _stats['avg_yield']?.toString() ?? '3.6 t/ha', Icons.grass, Colors.orange),
-                  ]),
-                  const SizedBox(height: 20),
-                  ..._records.map((item) {
-                    final m = item is Map ? item : {};
-                    final conf = m['confidence']?.toString() ?? '0%';
-                    final status = m['status']?.toString() ?? '-';
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
-                      child: ExpansionTile(
-                        tilePadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
-                        childrenPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
-                        title: Text('${m['crop'] ?? 'Crop'} — ${m['farm'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                        subtitle: Padding(
-                          padding: const EdgeInsets.only(top: 6),
-                          child: Row(children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                              decoration: BoxDecoration(color: _confidenceColor(conf).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
-                              child: Text('Confidence: $conf', style: TextStyle(color: _confidenceColor(conf), fontSize: 11, fontWeight: FontWeight.w600)),
-                            ),
-                            const SizedBox(width: 8),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                              decoration: BoxDecoration(color: _statusColor(status).withOpacity(0.12), borderRadius: BorderRadius.circular(20)),
-                              child: Text(status, style: TextStyle(color: _statusColor(status), fontSize: 11, fontWeight: FontWeight.w600)),
-                            ),
+                itemCount: 1 + _records.length + ((_hasMore || _loadingMore) ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (index == 0) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                          const Text('Crop Yield Prediction', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 4),
+                          Text('AI-powered yield forecasts using satellite & weather data', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+                          const SizedBox(height: 16),
+                          Row(children: [
+                            _statCard('Predictions', _stats['total_predictions']?.toString() ?? '342', Icons.analytics, primary),
+                            _statCard('Avg Confidence', _stats['avg_confidence']?.toString() ?? '84%', Icons.verified, Colors.teal),
+                            _statCard('Avg Yield', _stats['avg_yield']?.toString() ?? '3.6 t/ha', Icons.grass, Colors.orange),
                           ]),
-                        ),
-                        children: [
-                          _row('Farm ID', m['farm']),
-                          _row('Crop', m['crop']),
-                          _row('Season', m['season']),
-                          _row('Predicted Yield', m['predicted_yield']),
-                          _row('Confidence', m['confidence']),
-                          _row('Model', m['model']),
-                        ],
-                      ),
+                          const SizedBox(height: 20),
+                      ],
                     );
-                  }),
-                ],
-              ),
+                  }
+                  final recIndex = index - 1;
+                  if (recIndex >= _records.length) {
+                    return const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  }
+                  final item = _records[recIndex];
+                      final m = item is Map ? item : {};
+                      final conf = m['confidence']?.toString() ?? '0%';
+                      final status = m['status']?.toString() ?? '-';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
+                        child: ExpansionTile(
+                          tilePadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+                          childrenPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
+                          title: Text('${m['crop'] ?? 'Crop'} — ${m['farm'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                          subtitle: Padding(
+                            padding: const EdgeInsets.only(top: 6),
+                            child: Row(children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(color: _confidenceColor(conf).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
+                                child: Text('Confidence: $conf', style: TextStyle(color: _confidenceColor(conf), fontSize: 11, fontWeight: FontWeight.w600)),
+                              ),
+                              const SizedBox(width: 8),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(color: _statusColor(status).withOpacity(0.12), borderRadius: BorderRadius.circular(20)),
+                                child: Text(status, style: TextStyle(color: _statusColor(status), fontSize: 11, fontWeight: FontWeight.w600)),
+                              ),
+                            ]),
+                          ),
+                          children: [
+                            _row('Farm ID', m['farm']),
+                            _row('Crop', m['crop']),
+                            _row('Season', m['season']),
+                            _row('Predicted Yield', m['predicted_yield']),
+                            _row('Confidence', m['confidence']),
+                            _row('Model', m['model']),
+                          ],
+                        ),
+                      );
+                },
+                ),
             ),
     );
   }

@@ -303,21 +303,25 @@ export default function Home() {
       };
     }
 
-    void (async () => {
-      try {
-        const response = await searchPlatform(searchQuery.trim());
-        if (active) {
-          setUnifiedResults(response.items);
+    // Debounce: wait 300ms after the last keystroke before hitting the API
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const response = await searchPlatform(searchQuery.trim());
+          if (active) {
+            setUnifiedResults(response.items);
+          }
+        } catch {
+          if (active) {
+            setUnifiedResults([]);
+          }
         }
-      } catch {
-        if (active) {
-          setUnifiedResults([]);
-        }
-      }
-    })();
+      })();
+    }, 300);
 
     return () => {
       active = false;
+      clearTimeout(timer);
     };
   }, [searchQuery]);
 

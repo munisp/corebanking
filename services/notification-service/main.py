@@ -8,6 +8,7 @@ import os
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from database import init_db
 from handlers import router
@@ -17,6 +18,7 @@ app = FastAPI(
     description="Customer support, notifications, and chatbot service",
     version="1.1.0",
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -224,6 +226,14 @@ app.add_middleware(
 
 app.include_router(router, prefix="/api/v1", tags=["notifications"])
 
+# OR-12/OR-13/OR-16/OR-24: Dapr subscriptions for the previously-unread
+# high-value topics (sanctions block, high-value txn, payment lifecycle,
+# approvals, escrow, standing-order failures, NFIU SLA/filing alerts).
+# Events are persisted as pending notifications — see event_subscriptions.py.
+from event_subscriptions import router as events_router
+
+app.include_router(events_router, tags=["event-subscriptions"])
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -256,4 +266,4 @@ def root():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8091"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, workers=int(os.environ.get("UVICORN_WORKERS", "4")))

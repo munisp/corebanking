@@ -1,5 +1,6 @@
 import '../../utils/text_case_utils.dart';
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:provider/provider.dart';
 import '../../services/local_storage_service.dart';
 import '../../providers/auth_provider.dart';
@@ -173,14 +174,16 @@ class _PremiumLoginScreenState extends State<PremiumLoginScreen> {
                               width: 100,
                               height: 100,
                               fit: BoxFit.cover,
-                              errorBuilder: (context, error, stackTrace) {
+                              errorWidget: (context, url, error) {
                                 if (tenantProvider.tenantConfig.logo.isNotEmpty) {
-                                  return Image.network(
-                                    tenantProvider.tenantConfig.logo,
+                                  return CachedNetworkImage(
+                                      imageUrl: tenantProvider.tenantConfig.logo,
                                     width: 100,
+                                    memCacheWidth: 200, // MOB-08
                                     height: 100,
+                                    memCacheHeight: 200, // MOB-08: decode at ~2x display size, not full-res
                                     fit: BoxFit.cover,
-                                    errorBuilder: (context, error, stackTrace) {
+                                    errorWidget: (context, url, error) {
                                       return Center(
                                         child: Text(
                                           toUpperCase(tenantProvider.appName
@@ -493,7 +496,7 @@ class _PremiumLoginScreenState extends State<PremiumLoginScreen> {
         width: 56,
         height: 56,
         fit: BoxFit.contain,
-        errorBuilder: (context, error, stackTrace) {
+        errorWidget: (context, url, error) {
           return const SizedBox(width: 56, height: 56);
         },
       ),

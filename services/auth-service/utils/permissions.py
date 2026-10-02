@@ -1,12 +1,63 @@
 """Permission utilities for Permify integration"""
 
+import asyncio
 import logging
+import threading
+import time
 from functools import wraps
 from typing import Callable
 from fastapi import HTTPException
 from adapters.permify import check_permission, assign_role, remove_role
 
 logger = logging.getLogger(__name__)
+
+# W11 PY-004: the sync Permify check (requests.post, timeout=5) ran inline on
+# the event loop for EVERY protected request. It now runs via
+# asyncio.to_thread behind a 60s TTL in-memory decision cache keyed by
+# (tenant, subject, permission, resource). Fail-closed semantics are
+# unchanged: the adapter still returns False on any Permify error, and
+# denied decisions are cached identically to allowed ones.
+_DECISION_CACHE_TTL_SECONDS = 60.0
+_DECISION_CACHE_MAX_ENTRIES = 10000
+_decision_cache: dict = {}
+_decision_cache_lock = threading.Lock()
+
+
+async def _cached_check_permission(
+    *,
+    user_id: str,
+    tenant_id: str,
+    permission: str,
+    entity_type: str,
+    entity_id: str,
+) -> bool:
+    """Thread-offloaded Permify check with a 60s TTL decision cache."""
+    key = (tenant_id, user_id, permission, entity_type, entity_id)
+    now = time.monotonic()
+    with _decision_cache_lock:
+        entry = _decision_cache.get(key)
+        if entry is not None and entry[1] > now:
+            return entry[0]
+
+    decision = await asyncio.to_thread(
+        check_permission,
+        user_id=user_id,
+        tenant_id=tenant_id,
+        permission=permission,
+        entity_type=entity_type,
+        entity_id=entity_id,
+    )
+
+    with _decision_cache_lock:
+        if len(_decision_cache) >= _DECISION_CACHE_MAX_ENTRIES:
+            # Bound memory: drop expired entries first, then everything.
+            expired = [k for k, (_, exp) in _decision_cache.items() if exp <= now]
+            for k in expired:
+                _decision_cache.pop(k, None)
+            if len(_decision_cache) >= _DECISION_CACHE_MAX_ENTRIES:
+                _decision_cache.clear()
+        _decision_cache[key] = (decision, now + _DECISION_CACHE_TTL_SECONDS)
+    return decision
 
 
 def require_permission(entity_type: str, permission: str, entity_id_param: str = None):
@@ -42,8 +93,9 @@ def require_permission(entity_type: str, permission: str, entity_id_param: str =
             # Get entity_id from parameters or use tenant_id
             entity_id = kwargs.get(entity_id_param) if entity_id_param else tenant_id
 
-            # Check permission
-            has_permission = check_permission(
+            # Check permission (off the event loop, 60s TTL decision cache;
+            # fail-closed deny on Permify error preserved from the adapter).
+            has_permission = await _cached_check_permission(
                 user_id=user_id,
                 tenant_id=tenant_id,
                 permission=permission,
@@ -108,6 +160,10 @@ class PermissionManager:
         "loan_officer",
         "compliance_officer",
         "support_agent",
+        # ST-01: teller and fraud_analyst exist in v2.perm and in
+        # PermifyTenantRole but were missing here, making them unassignable.
+        "teller",
+        "fraud_analyst",
     ]
 
     @staticmethod

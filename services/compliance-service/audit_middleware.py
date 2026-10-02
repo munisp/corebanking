@@ -8,7 +8,25 @@ import urllib.request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
+# --- OpenTelemetry (SPEC w9 addendum): audit_ship_failures_total counter ---
+import sys as _otel_sys
+
+_otel_sys.path.insert(
+    0,
+    os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "shared", "otel", "python")
+    ),
+)
+try:
+    from otelkit import inc_counter
+except Exception:
+
+    def inc_counter(name, attrs=None):
+        return None
+
 _AUDIT_URL = os.getenv("AUDIT_SVC_URL", "http://audit-service:8000")
+# AU-01 (F15-1): shared-secret ingest credential (k8s secret audit-ingest-credentials).
+_AUDIT_INGEST_TOKEN = os.getenv("AUDIT_INGEST_TOKEN", "")
 _SKIP_METHODS = {"GET", "HEAD", "OPTIONS"}
 _SKIP_PREFIXES = ("/health", "/metrics", "/dapr", "/docs", "/openapi")
 _UUID_RE = re.compile(r"/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
@@ -42,9 +60,17 @@ def _emit(actor_id: str, tenant_id: str, event_type: str, event_data: dict) -> N
             },
             method="POST",
         )
+        # AU-01 (F15-1): present the shared ingest credential so the fail-closed
+        # audit-service accepts the event (secret: audit-ingest-credentials).
+        if _AUDIT_INGEST_TOKEN:
+            req.add_header("X-Audit-Ingest-Token", _AUDIT_INGEST_TOKEN)
         urllib.request.urlopen(req, timeout=3)
     except Exception:
-        pass
+        # Alerting contract (w9 addendum): count swallowed audit ship failures.
+        inc_counter(
+            "audit_ship_failures_total",
+            {"service": "compliance-service", "tenant_id": tenant_id or "unknown"},
+        )
 
 
 class AuditMiddleware(BaseHTTPMiddleware):

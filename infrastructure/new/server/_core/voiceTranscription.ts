@@ -28,7 +28,7 @@ export async function transcribeAudio(params: TranscribeParams): Promise<Transcr
   // (key is optional for Ollama)
 
   // Download the audio file from the URL
-  const audioResponse = await fetch(params.audioUrl);
+  const audioResponse = await fetch(params.audioUrl, { signal: AbortSignal.timeout(30_000) });
   if (!audioResponse.ok) {
     throw new Error(`Failed to download audio from ${params.audioUrl}: ${audioResponse.status}`);
   }
@@ -44,6 +44,7 @@ export async function transcribeAudio(params: TranscribeParams): Promise<Transcr
 
   const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
   const response = await fetch(`${base}/audio/transcriptions`, {
+    signal: AbortSignal.timeout(60_000),
     method: "POST",
     headers: { ...(ENV.ollamaApiKey ? { authorization: `Bearer ${ENV.ollamaApiKey}` } : {}) },
     body: formData,

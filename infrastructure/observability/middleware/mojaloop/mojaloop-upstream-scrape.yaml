@@ -1,0 +1,83 @@
+# =============================================================================
+# Mojaloop upstream stack — Prometheus scrape fragment
+#
+# SCOPE (SPEC §3, B7): scrape config for the UPSTREAM Mojaloop hub services
+# (central-ledger, ml-api-adapter, quoting-service, account-lookup-service,
+# bulk-api-adapter, ...). The in-tree `mojaloop-connector` is OURS and is
+# instrumented by B6 — out of scope here.
+#
+# Verified-static findings (see README):
+#   - NO upstream Mojaloop deployment exists in this repo. Only Service-name
+#     references in infrastructure/charts/mojaloop-connector/values.yaml:
+#       mojaloop-account-lookup-service.mojaloop.svc.cluster.local
+#       mojaloop-quoting-service.mojaloop.svc.cluster.local
+#       mojaloop-ml-api-adapter-service.mojaloop.svc.cluster.local
+#     and configmap key mojaloop-hub-url: http://mojaloop-hub:4000
+#   => The upstream stack is expected in namespace `mojaloop` with standard
+#      upstream Service names, deployed via the upstream Helm charts
+#      (requires-deployment). All targets below are ADJUST-marked stubs
+#      consistent with B1's commented-out `mojaloop` collector job.
+#
+# Delivery: ConfigMap holding a scrape-config FRAGMENT. B1 merges
+# `mojaloop-scrape.yaml` into the collector's prometheus receiver
+# (additional scrape configs) — B1 owns the job; this file owns the targets.
+# No secrets.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mojaloop-upstream-scrape-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+    observability.corebanking/component: mojaloop-upstream
+data:
+  mojaloop-scrape.yaml: |
+    # Fragment for the collector prometheus receiver (additionalScrapeConfigs).
+    # Two discovery strategies — keep BOTH; whichever matches the live
+    # deployment wins, the other yields zero targets.
+
+    # --- Strategy 1: kubernetes service discovery (preferred) ---------------
+    # Scrapes any Service in ns `mojaloop` annotated for prometheus, honoring
+    # prometheus.io/scrape|port|path annotations. Upstream helm charts ship
+    # these annotations on most services when metrics are enabled
+    # (INSTRUMENTATION_METRICS env of @mojaloop/central-services-metrics —
+    # requires-deployment verification).
+    - job_name: mojaloop                     # matches B1's commented job name
+      honor_labels: true
+      kubernetes_sd_configs:
+        - role: service
+          namespaces:
+            names: [mojaloop]                # ADJUST if upstream ns differs
+      relabel_configs:
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+          action: keep
+          regex: "true"
+        - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+          action: replace
+          target_label: __metrics_path__
+          regex: (.+)
+        - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+          target_label: __address__
+        - source_labels: [__meta_kubernetes_service_name]
+          target_label: mojaloop_service
+
+    # --- Strategy 2: static fallback (typical upstream helm patterns) --------
+    # Typical upstream pattern: each hub service exposes Prometheus /metrics
+    # on its admin port (commonly 4007/4008 across services) — VERIFY against
+    # the deployed helm release (`kubectl -n mojaloop get svc -o wide` and
+    # check each service's metrics port). Disabled by default; uncomment and
+    # ADJUST addresses after verification.
+    # - job_name: mojaloop-static
+    #   metrics_path: /metrics
+    #   static_configs:
+    #     - targets:
+    #         - mojaloop-central-ledger-service.mojaloop.svc.cluster.local:4008      # ADJUST: admin port
+    #         - mojaloop-ml-api-adapter-service.mojaloop.svc.cluster.local:4008      # ADJUST
+    #         - mojaloop-quoting-service.mojaloop.svc.cluster.local:4008             # ADJUST
+    #         - mojaloop-account-lookup-service.mojaloop.svc.cluster.local:4008      # ADJUST
+    #       labels:
+    #         component: mojaloop-upstream
