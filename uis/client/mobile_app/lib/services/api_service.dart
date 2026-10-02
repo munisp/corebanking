@@ -389,12 +389,17 @@ class ApiService {
           {Map<String, dynamic>? queryParameters, Options? options}) =>
       _dio.get(path, queryParameters: queryParameters, options: options);
 
+  // W12-A4B: optional per-call `headers` — fx-service POST /api/v1/fx/exchange
+  // requires an x-actor-id header that the interceptor does not set.
   Future<Response> post(String path,
           {dynamic data,
           Map<String, dynamic>? queryParameters,
-          Options? options}) =>
+          Options? options,
+          Map<String, dynamic>? headers}) =>
       _dio.post(path,
-          data: data, queryParameters: queryParameters, options: options);
+          data: data,
+          queryParameters: queryParameters,
+          options: options ?? (headers == null ? null : Options(headers: headers)));
 
   Future<Response> put(String path,
           {dynamic data,
@@ -403,9 +408,14 @@ class ApiService {
       _dio.put(path,
           data: data, queryParameters: queryParameters, options: options);
 
+  // W12-A4B: optional `data` body — beneficiary-management-go's
+  // DELETE /v1/beneficiaries takes {beneficiaryId} in the request body.
   Future<Response> delete(String path,
-          {Map<String, dynamic>? queryParameters, Options? options}) =>
-      _dio.delete(path, queryParameters: queryParameters, options: options);
+          {Map<String, dynamic>? queryParameters,
+          Options? options,
+          dynamic data}) =>
+      _dio.delete(path,
+          queryParameters: queryParameters, options: options, data: data);
 
   // ---------- Get Transaction by ID ----------
   Future<Map<String, dynamic>> getTransactionById(String transactionId) async {
