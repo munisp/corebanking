@@ -1,4 +1,6 @@
 import axios, { AxiosInstance } from "axios";
+import http from "http";
+import https from "https";
 import { readEnv } from "../config/readEnv.config";
 import logger from "../config/logger.config";
 
@@ -14,7 +16,12 @@ class UserServiceApiClient {
   private readonly http: AxiosInstance;
 
   constructor() {
-    this.http = axios.create({ baseURL: userServiceUrl });
+    this.http = axios.create({
+      baseURL: userServiceUrl,
+      timeout: 10000,
+      httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+      httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
+    });
   }
 
   async getUserProfile(tenantId: string, keycloakId: string): Promise<UserProfile> {

@@ -13,7 +13,9 @@ import (
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 	"math/big"
+	mathrand "math/rand"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 
@@ -29,6 +31,23 @@ import (
 
 	"net"
 )
+
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(mathrand.Int63n(int64(d)/2))
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // cryptoRandUint32 returns a cryptographically secure random uint32 for
 // record and audit identifiers (L-06/L-16-residual: math/rand IDs are
@@ -78,7 +97,7 @@ type DomainStats struct {
 }
 
 var (
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	records = []Record{
 		{ID: "TIG-001", Type: "primary", Status: "active", Data: map[string]interface{}{"domain": "Infrastructure/Data", "priority": "high", "region": "lagos"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1},
 		{ID: "TIG-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Infrastructure/Data", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
@@ -94,6 +113,72 @@ var (
 		},
 	}
 )
+
+const (
+	maxInMemoryRecords = 5000
+	maxAuditEntries    = 2000
+)
+
+// appendRecord appends to the in-memory store, evicting the oldest entries
+// once the store exceeds maxInMemoryRecords (bounded store, GPT-06).
+func appendRecord(rec Record) {
+	records = append(records, rec)
+	if len(records) > maxInMemoryRecords {
+		copy(records, records[len(records)-maxInMemoryRecords:])
+		records = records[:maxInMemoryRecords]
+	}
+}
+
+// appendAudit appends to the audit log, evicting the oldest entries once the
+// log exceeds maxAuditEntries (bounded store, GPT-06).
+func appendAudit(e AuditEntry) {
+	auditLog = append(auditLog, e)
+	if len(auditLog) > maxAuditEntries {
+		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
+		auditLog = auditLog[:maxAuditEntries]
+	}
+}
+
+// parsePageParams extracts limit/offset query params with a hard cap (GPT-07).
+func parsePageParams(r *http.Request, defLimit, maxLimit int) (limit, offset int) {
+	limit = defLimit
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o > 0 {
+		offset = o
+	}
+	return
+}
+
+// paginateRecords bounds list responses (default 100, max 500 per page).
+func paginateRecords(all []Record, r *http.Request) []Record {
+	limit, offset := parsePageParams(r, 100, 500)
+	if offset >= len(all) {
+		return []Record{}
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end]
+}
+
+// paginateAudit bounds audit responses (default 100, max 500 per page).
+func paginateAudit(all []AuditEntry, r *http.Request) []AuditEntry {
+	limit, offset := parsePageParams(r, 100, 500)
+	if offset >= len(all) {
+		return []AuditEntry{}
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end]
+}
 
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -148,9 +233,9 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		log.Printf("tigerbeetle-sync-go: DB query failed, falling back to in-memory: %v", err)
 	}
 	// In-memory fallback
-	mu.Lock()
-	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
+	mu.RLock()
+	defer mu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(records, r), "total": len(records), "source": "in-memory"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +275,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if rec.Type == "" {
 		rec.Type = "primary"
 	}
-	records = append(records, rec)
+	appendRecord(rec)
 	domainStats.TotalRecords = len(records)
 
 	// Persist to database
@@ -200,7 +285,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	auditLog = append(auditLog, AuditEntry{
+	appendAudit(AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
@@ -233,7 +318,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
-			auditLog = append(auditLog, AuditEntry{
+			appendAudit(AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
@@ -254,9 +339,9 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog)})
+	mu.RLock()
+	defer mu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -437,8 +522,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -1123,11 +1207,10 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 	if !_cb.allow() {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond))
 		}
 		var req *http.Request
 		if body != nil {
@@ -1138,21 +1221,22 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Source-Service", serviceName)
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -1291,11 +1375,12 @@ func main() {
 		log.Printf("[%s] TLS enabled (cert: %s)", serviceName, tlsCert)
 	}
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

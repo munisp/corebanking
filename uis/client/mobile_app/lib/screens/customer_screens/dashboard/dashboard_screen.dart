@@ -153,14 +153,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final authProvider = context.read<AuthProvider>();
     final walletProvider = context.read<WalletProvider>();
     
-    // Fetch account endpoint first - this updates localStorage with account and account_id
+    // Fetch account endpoint first - this updates localStorage with account
+    // and account_id, which the wallet/profile/transactions calls depend on.
     await _fetchAndStoreAccount();
-    
-    // Load wallet (which also stores account as backup)
-    await walletProvider.fetchWallet();
-    
-    // Then load user profile and transactions in parallel
+
+    // MOB-15: wallet, profile and transactions only depend on the stored
+    // account, not on each other — fetch them in parallel (saves ~2 RTTs).
     await Future.wait([
+      walletProvider.fetchWallet(),
       authProvider.fetchUserProfile(),
       walletProvider.fetchTransactions(refresh: true),
     ]);

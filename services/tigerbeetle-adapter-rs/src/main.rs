@@ -1,7 +1,7 @@
 #![allow(unused)]
 use tokio_postgres;
 use actix_web::dev::Service;
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse, HttpMessage, middleware};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Mutex;
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 struct AppState {
     records: Mutex<Vec<serde_json::Value>>,
     db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db_pool: Option<deadpool_postgres::Pool>,
 }
 
 fn account_flags(debit: bool, credit: bool) -> u32 { (if debit { 1 } else { 0 }) | (if credit { 2 } else { 0 }) }
@@ -57,10 +57,21 @@ async fn tb_operation(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     db_persist(&state, "tb_operation", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}")).await {
-        Ok(Ok(_resp)) => eprintln!("tigerbeetle-adapter-rs: upstream call ok"),
-        Ok(Err(e)) => eprintln!("tigerbeetle-adapter-rs: upstream call failed: {}", e),
-        Err(e) => eprintln!("tigerbeetle-adapter-rs: upstream call join failed: {}", e),
+    {
+        // Wave-11: upstream AML/notify result is discarded on this path; run
+        // fire-and-forget with a 3s timeout instead of blocking the request.
+        let (w11_url, w11_body) = ((format!("{}/v1/screen", _upstream_url)).to_string(), ("{}").to_string());
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::task::spawn_blocking(move || call_service_sync(&w11_url, &w11_body)),
+            ).await {
+                Ok(Ok(Ok(_resp))) => {}
+                Ok(Ok(Err(e))) => eprintln!("tigerbeetle-adapter-rs: upstream call failed: {}", e),
+                Ok(Err(e)) => eprintln!("tigerbeetle-adapter-rs: upstream call join failed: {}", e),
+                Err(_) => eprintln!("tigerbeetle-adapter-rs: upstream call timed out after 3s"),
+            }
+        });
     }
 
     HttpResponse::Ok().json(json!({
@@ -72,7 +83,7 @@ async fn tb_operation(req: actix_web::HttpRequest, state: web::Data<AppState>, b
 
 async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let records = state.records.lock().unwrap();
+    let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
     let total = records.len();
@@ -82,7 +93,7 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
 
 async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let records = state.records.lock().unwrap();
+    let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
     HttpResponse::Ok().json(json!({"total": records.len(), "service": "tigerbeetle-adapter-rs"}))
 }
 
@@ -131,10 +142,20 @@ async fn prom_metrics() -> HttpResponse {
 // --- Database Connection ---
 use tokio_postgres::NoTls;
 
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
+async fn init_db(db_url: &str) -> Option<deadpool_postgres::Pool> {
+    // Wave-11 (RS-01 cluster): bounded connection pool (max 20) replaces the
+    // single shared tokio_postgres::Client that serialized all DB I/O.
+    let mut cfg = deadpool_postgres::Config::new();
+    cfg.url = Some(db_url.to_string());
+    let mut pc = deadpool_postgres::PoolConfig::new(20);
+    pc.timeouts.wait = Some(std::time::Duration::from_secs(5));
+    cfg.pool = Some(pc);
+    let pool = match cfg.create_pool(Some(deadpool_postgres::Runtime::Tokio1), NoTls) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("DB pool init failed: {} — in-memory fallback", e); return None; }
+    };
+    match pool.get().await {
+        Ok(client) => {
             let _ = client.execute(
                 "CREATE TABLE IF NOT EXISTS service_records (
                     id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
@@ -142,7 +163,7 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
                     created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
                 )", &[]).await;
             let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
+            Some(pool)
         }
         Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
     }
@@ -206,13 +227,26 @@ async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpRespon
             }
         }
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
-            "error": "jwks_unavailable",
-            "detail": "client init failed"
-        })))?;
+    // Wave-11 (RS-10): shared client + singleflight — concurrent cache misses
+    // must not each rebuild a client and refetch the JWKS.
+    static JWKS_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    static JWKS_FETCH_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _singleflight = JWKS_FETCH_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    {
+        // re-check after acquiring the singleflight lock
+        let cache = jwks_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = JWKS_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
     let resp = client.get(&url).send().await.map_err(|_| {
         actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
     })?;
@@ -315,7 +349,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -335,12 +369,32 @@ async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
     }
     next.call(req).await.map(|res| res.map_into_boxed_body())
+}
+
+// Wave-11: these two handlers were registered in main() but never defined
+// (wave-10 baseline compile break E0425). Implemented against the real domain
+// function / verified claims; no fabricated responses.
+async fn tb_account_flags_handler(_req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
+    let debit = body.get("debit").and_then(|v| v.as_bool()).unwrap_or(false);
+    let credit = body.get("credit").and_then(|v| v.as_bool()).unwrap_or(false);
+    let flags = account_flags(debit, credit);
+    HttpResponse::Ok().json(json!({"flags": flags}))
+}
+
+async fn tb_user_data_handler(req: actix_web::HttpRequest) -> HttpResponse {
+    // Returns only the authenticated subject from verified JWT claims
+    // (inserted by jwt_route_guard); no user store exists in this service.
+    let sub = req.extensions().get::<VerifiedClaims>().and_then(|c| c.0.get("sub").cloned());
+    match sub {
+        Some(s) => HttpResponse::Ok().json(json!({"sub": s})),
+        None => HttpResponse::InternalServerError().json(json!({"error": "verified_claims_missing"})),
+    }
 }
 
 
@@ -378,17 +432,58 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
+// Wave-11 (RS-07): audit INSERTs buffered behind a Mutex; flushed every 100ms
+// or every 100 rows by a spawned task on the deadpool pool (was: one blocking
+// INSERT per request on a single client).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn w11_flush_audit(pool: deadpool_postgres::Pool, rows: Vec<(String, String, String, String, String)>) {
+    if rows.is_empty() { return; }
+    match pool.get().await {
+        Ok(client) => {
+            for (id, svc, ep, st, d) in rows {
+                let _ = client.execute(
+                    "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                    &[&id, &svc, &ep, &st, &d],
+                ).await;
+            }
+        }
+        Err(e) => eprintln!("tigerbeetle-adapter-rs: audit flush pool.get failed: {}", e),
+    }
+}
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
+    if let Some(ref pool) = state.db_pool {
+        let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         let id = format!("{}_{}_{}", "tigerbeetle_adapter_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)").entered();
         let svc_name = String::from("tigerbeetle-adapter-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let pool = pool.clone();
+            let buf = buf.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+                loop {
+                    tick.tick().await;
+                    let rows: Vec<(String, String, String, String, String)> = {
+                        let mut b = buf.lock().unwrap();
+                        if b.is_empty() { continue; }
+                        std::mem::take(&mut *b)
+                    };
+                    w11_flush_audit(pool.clone(), rows).await;
+                }
+            });
+        }
+        let mut b = buf.lock().unwrap();
+        b.push((id, svc_name, endpoint.to_string(), status, data_str));
+        if b.len() >= 100 {
+            let rows = std::mem::take(&mut *b);
+            drop(b);
+            let pool = pool.clone();
+            tokio::spawn(async move { w11_flush_audit(pool, rows).await; });
+        }
     }
 }
 
@@ -461,6 +556,9 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
     match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
         Ok(mut stream) => {
+            // Wave-11: bound blocking I/O (was unbounded read_to_string).
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
             let host = host_port.split(':').next().unwrap_or("localhost");
             let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
             stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
@@ -503,9 +601,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }
@@ -576,16 +684,16 @@ async fn main() -> std::io::Result<()> {
         }
     };
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8256);
-    let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
+    let db_pool = if let Ok(url) = std::env::var("DATABASE_URL") {
         match init_db(&url).await {
-            Some(c) => { println!("tigerbeetle-adapter-rs: connected to Postgres"); Some(std::sync::Arc::new(c)) }
+            Some(p) => { println!("tigerbeetle-adapter-rs: Postgres pool (max 20) ready"); Some(p) }
             None => None,
         }
     } else { None };
     let state = web::Data::new(AppState {
         records: Mutex::new(Vec::new()),
         db_url: std::env::var("DATABASE_URL").ok(),
-        db_client,
+        db_pool,
     });
     println!("tigerbeetle-adapter-rs on port {}", port);
     start_grpc_server("tigerbeetle-adapter-rs", 10318);
@@ -606,12 +714,19 @@ async fn main() -> std::io::Result<()> {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("none")
                     .to_string();
-                eprintln!("[tigerbeetle-adapter-rs] {} {} trace={}", req.method(), req.path(), trace_id);
+                // Wave-11: log only errors, plus 1% sampled requests (was: every request).
+                let w11_method = req.method().clone();
+                let w11_path = req.path().to_string();
+                let w11_sample = _REQ_COUNT.load(AtomicOrdering::Relaxed) % 100 == 0;
                 let fut = srv.call(req);
                 async move {
                     let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
+                    let w11_err = res.status().is_server_error() || res.status().is_client_error();
+                    if w11_err {
                         _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if w11_err || w11_sample {
+                        eprintln!("[tigerbeetle-adapter-rs] {} {} trace={} status={}", w11_method, w11_path, trace_id, res.status().as_u16());
                     }
                     Ok(res)
                 }

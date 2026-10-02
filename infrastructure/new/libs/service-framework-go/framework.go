@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +18,27 @@ import (
 	"syscall"
 	"time"
 )
+
+// sharedHTTPTransport is a pooled transport reused by all inter-service calls
+// (W11 GPT-13: avoid per-call http.Client -> TLS handshake + slow-start per call).
+var sharedHTTPTransport = &http.Transport{
+	MaxIdleConns:        100,
+	MaxIdleConnsPerHost: 25,
+	IdleConnTimeout:     90 * time.Second,
+	DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+}
+
+// sharedHTTPClient is the process-wide pooled client; per-call deadlines are
+// applied via request context, so a single client can serve all timeouts.
+var sharedHTTPClient = &http.Client{Transport: sharedHTTPTransport}
+
+// sleepWithJitter sleeps for a random duration in [0, d] (full jitter, W11 GPT-15).
+func sleepWithJitter(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	time.Sleep(time.Duration(rand.Int63n(int64(d)) + 1))
+}
 
 // --- Circuit Breaker ---
 
@@ -107,7 +130,7 @@ func Retry(cfg RetryConfig, fn func() error) error {
 		} else if attempt == cfg.MaxAttempts-1 {
 			return err
 		}
-		time.Sleep(wait)
+		sleepWithJitter(wait)
 		wait = time.Duration(float64(wait) * cfg.Multiplier)
 		if wait > cfg.MaxWait {
 			wait = cfg.MaxWait
@@ -342,39 +365,43 @@ func CallService(cb *CircuitBreaker, method, url string, body interface{}, timeo
 	if !cb.Allow() {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	client := &http.Client{Timeout: timeout}
 	var lastErr error
 	cfg := DefaultRetry
 	wait := cfg.InitialWait
 	for attempt := 0; attempt < cfg.MaxAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(wait)
+			sleepWithJitter(wait)
 			wait = time.Duration(float64(wait) * cfg.Multiplier)
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		var req *http.Request
 		if body != nil {
 			jsonData, _ := json.Marshal(body)
-			req, _ = http.NewRequest(method, url, nil)
+			req, _ = http.NewRequestWithContext(ctx, method, url, nil)
 			req.Body = http.NoBody
 			_ = jsonData // Use body in real implementation
 		} else {
-			req, _ = http.NewRequest(method, url, nil)
+			req, _ = http.NewRequestWithContext(ctx, method, url, nil)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = err
 			cb.RecordFailure()
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close() // W11 GPT-14: close per iteration, not deferred in loop
+			cancel()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			cb.RecordFailure()
 			continue
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		cancel()
 		cb.RecordSuccess()
 		return result, nil
 	}

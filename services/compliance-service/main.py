@@ -5,6 +5,7 @@ Handles regulatory reporting, AML/CFT, sanctions screening, transaction monitori
 
 from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from audit_middleware import AuditMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
@@ -37,6 +38,7 @@ app = FastAPI(
     description="Complete compliance and regulatory reporting service",
     version="1.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
 # OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
 # tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
@@ -1457,4 +1459,4 @@ async def get_entity_aml_assessments(
         }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8024)))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8024)), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

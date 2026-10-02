@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from adapters.permify import load_schema
 
@@ -49,9 +50,10 @@ if not _JWT_SECRET or _JWT_SECRET.startswith("${"):
 _JWT_ISSUER = _jwt_os.environ.get("JWT_ISSUER", "")
 _JWT_AUDIENCE = _jwt_os.environ.get("JWT_AUDIENCE", "")
 try:
-    _JWT_JWKS_TTL = int(_jwt_os.environ.get("JWKS_CACHE_TTL_SECONDS", "300"))
+    # W11 PY-706: 15min JWKS TTL (matches services/token.py).
+    _JWT_JWKS_TTL = int(_jwt_os.environ.get("JWKS_CACHE_TTL_SECONDS", "900"))
 except ValueError:
-    _JWT_JWKS_TTL = 300
+    _JWT_JWKS_TTL = 900
 _jwks_cache = {"fetched_at": 0.0, "keys": {}}
 
 
@@ -227,7 +229,9 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
             if _jwt_inspect.iscoroutinefunction(validate_jwt):
                 claims, err = await validate_jwt(request.headers)
             else:
-                claims, err = validate_jwt(request.headers)
+                # W11 PY-706: sync validate_jwt may perform a blocking JWKS
+                # fetch — never run it on the event loop.
+                claims, err = await asyncio.to_thread(validate_jwt, request.headers)
         except Exception as exc:
             return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
         if not claims:
@@ -280,5 +284,11 @@ app.include_router(permissions_router, prefix="/permissions", tags=["permissions
 
 @app.on_event("startup")
 async def startup_event():
-    load_schema()
+    # W11 PY-004: Permify schema load blocks (sync HTTP) — keep it off the
+    # event loop at boot.
+    await asyncio.to_thread(load_schema)
+    # W11 PY-706: start the background JWKS refresh task (15min TTL cache).
+    from services.token import ensure_jwks_background_refresh
+
+    ensure_jwks_background_refresh()
     logger.info("Auth Service is running..")

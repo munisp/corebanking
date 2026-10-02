@@ -1,0 +1,45 @@
+-- =============================================================================
+-- W11 TEMPLATE composite index (findings DI-06 / DI-11) — per-service DBs
+-- =============================================================================
+-- ~140 generated Go services (template: services/account-statement-go,
+-- services/cooperative-meetings-go, ...) create their own snake_case tables
+-- at boot with THREE separate single-column indexes:
+--     idx_<t>_tenant  ON <t>(tenant_id)
+--     idx_<t>_status  ON <t>(status)
+--     idx_<t>_created ON <t>(created_at DESC)
+-- (e.g. services/account-statement-go/main.go:466-468,
+--       services/cooperative-meetings-go/main.go:970-973)
+-- while the list endpoint paginates with
+--     WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3
+-- (services/account-statement-go/main.go:511) — a pattern no combination of
+-- the three single-column indexes can serve (DI-06).
+--
+-- This file is a TEMPLATE, not a runnable script: substitute __TABLE__ with
+-- the concrete table name (accounts, service_configs, service_records,
+-- audit_events, ...). Use infrastructure/new/scripts/apply_w11_template_indexes.sh
+-- which discovers the table list and renders/applies this template.
+--
+-- IMPORTANT: each service owns its OWN Postgres database (schema is created
+-- from that service's main.go at boot). The same table name (e.g. accounts)
+-- exists in many different service DBs. This index must therefore be applied
+-- ONCE PER SERVICE DATABASE that actually contains the table — never once
+-- against a shared/platform DB.
+--
+-- CONCURRENTLY cannot run inside a transaction block: the rendered output
+-- must be applied with psql -f in autocommit mode (no BEGIN/COMMIT). The
+-- APPLY script enforces this. IF NOT EXISTS makes re-runs no-ops — once the
+-- composite index exists, the service's boot-time CREATE INDEX IF NOT EXISTS
+-- statements remain harmless (DI-11: the boot-time non-CONCURRENTLY creates
+-- still run, but only for indexes that don't exist yet; the composite one
+-- below is created here, off-peak, without ACCESS EXCLUSIVE build locks).
+-- =============================================================================
+
+-- W11 perf (DI-06): supports <service>/main.go list endpoint:
+--   WHERE tenant_id::text=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3
+--   (template query site: services/account-statement-go/main.go:511)
+-- Table/column pattern verified against template DDL:
+--   services/account-statement-go/main.go:432-447
+--   (tenant_id @ :443, created_at @ :446) and
+--   services/cooperative-meetings-go/main.go:970-973.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx___TABLE___tenant_created
+  ON "__TABLE__" (tenant_id, created_at DESC);

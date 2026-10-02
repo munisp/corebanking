@@ -22,7 +22,10 @@ validated (positive, <=2dp, bounded) at the schema boundary and again here.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
@@ -39,6 +42,26 @@ from utils import TransactionStatus, AccountLookupError
 from utils.config import MAX_TRANSACTION_AMOUNT_NAIRA
 
 logger = logging.getLogger(__name__)
+
+# W11 PY-001: the repository's async methods are invoked from async event
+# handlers on the core ledger event loop, but they perform sync SQLAlchemy
+# session work (execute/commit/query) which would block the loop. All DB
+# calls are therefore dispatched to a dedicated module-level executor.
+# Each call is fully awaited before the next one runs, so the (not
+# thread-safe) Session is only ever touched by one thread at a time and
+# transaction ordering/atomicity are preserved exactly.
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ledger-db")
+
+
+async def _db_run(fn, *args, **kwargs):
+    """Run a blocking sync SQLAlchemy call off the event loop.
+
+    Mirrors the ``_db_run`` executor pattern used by the customer-onboarding
+    service, but backed by a bounded module-level ThreadPoolExecutor.
+    """
+    loop = asyncio.get_running_loop()
+    call = functools.partial(fn, *args, **kwargs)
+    return await loop.run_in_executor(_DB_EXECUTOR, call)
 
 # CoA account codes for double-entry routing
 # These must match the chart-of-accounts-service seed data / tenant COA setup
@@ -139,8 +162,9 @@ class TransactionRepository:
 
         # Resolve human-readable account metadata from account-service.
         # Failures here are non-fatal; we fall back to bare IDs.
-        payer_meta = self._safe_get_account(payload.payer, context)
-        payee_meta = self._safe_get_account(payload.payee, context)
+        # (Blocking HTTP — run off the event loop.)
+        payer_meta = await _db_run(self._safe_get_account, payload.payer, context)
+        payee_meta = await _db_run(self._safe_get_account, payload.payee, context)
 
         # STEP 1: Persist the durable record FIRST — atomic idempotency via
         # INSERT ... ON CONFLICT DO NOTHING (no check-then-act race).
@@ -166,13 +190,17 @@ class TransactionRepository:
             .on_conflict_do_nothing(constraint="uq_transaction_tenant_txn_id")
             .returning(Transaction.id)
         )
-        inserted_id = self._db.execute(stmt).scalar_one_or_none()
+        inserted_id = await _db_run(
+            lambda: self._db.execute(stmt).scalar_one_or_none()
+        )
 
         if inserted_id is None:
             # Duplicate delivery — the record already exists. Never re-post a
             # confirmed GL entry; do retry a previously failed one (outbox).
-            self._db.rollback()
-            existing = self._get_existing(payload.tenant_id, payload.transaction_id)
+            await _db_run(self._db.rollback)
+            existing = await _db_run(
+                self._get_existing, payload.tenant_id, payload.transaction_id
+            )
             if existing is None:
                 raise Exception("Transaction insert conflicted but no record found")
             logger.info(
@@ -185,8 +213,10 @@ class TransactionRepository:
                 await self._retry_gl_post(existing, payload)
             return existing
 
-        self._db.commit()
-        transaction = self._get_existing(payload.tenant_id, payload.transaction_id)
+        await _db_run(self._db.commit)
+        transaction = await _db_run(
+            self._get_existing, payload.tenant_id, payload.transaction_id
+        )
 
         # STEP 2: Post the journal entry to the Chart of Accounts service —
         # only now that a durable record exists.
@@ -202,8 +232,9 @@ class TransactionRepository:
                 exc,
                 exc_info=True,
             )
-            self._mark_gl_failed(
-                transaction, payload, amount_kobo, payer_meta, payee_meta, exc
+            await _db_run(
+                self._mark_gl_failed,
+                transaction, payload, amount_kobo, payer_meta, payee_meta, exc,
             )
             raise Exception(
                 "GL posting failed; transaction recorded as gl_failed "
@@ -211,9 +242,8 @@ class TransactionRepository:
             ) from exc
 
         # STEP 3: Only after a confirmed GL post move to the final state.
-        transaction.gl_posted_at = datetime.datetime.now()
-        transaction.status = payload.status
-        self._db.commit()
+        # Single commit covering gl_posted_at + final status, as before.
+        await _db_run(self._finalize_initiated, transaction, payload)
 
         logger.info(
             "Transaction recorded with GL entry "
@@ -331,6 +361,63 @@ class TransactionRepository:
         )
         await self._coa.create_journal_entry(tenant_id=transaction.tenant_id, **args)
 
+    # ------------------------------------------------------------------
+    # Sync DB finalizers (always invoked via _db_run off the event loop).
+    # Each preserves the original single-commit semantics of the async
+    # methods that call them.
+    # ------------------------------------------------------------------
+
+    def _pending_outbox_rows(self, transaction: Transaction):
+        return (
+            self._db.query(GLPostingOutbox)
+            .filter(
+                GLPostingOutbox.tenant_id == transaction.tenant_id,
+                GLPostingOutbox.transaction_id == transaction.transaction_id,
+                GLPostingOutbox.status == "pending",
+            )
+            .all()
+        )
+
+    def _finalize_initiated(
+        self, transaction: Transaction, payload: TransactionEventSchema
+    ) -> None:
+        """Move to the final state after a confirmed GL post (one commit)."""
+        transaction.gl_posted_at = datetime.datetime.now()
+        transaction.status = payload.status
+        self._db.commit()
+
+    def _finalize_retry(
+        self, transaction: Transaction, payload: TransactionEventSchema
+    ) -> None:
+        """After a successful GL retry: mark outbox rows done (one commit)."""
+        transaction.gl_posted_at = datetime.datetime.now()
+        transaction.status = payload.status
+        for row in self._pending_outbox_rows(transaction):
+            row.status = "done"
+        self._db.commit()
+
+    def _finalize_failed(self, transaction: Transaction) -> None:
+        """Mark FAILED and cancel pending outbox rows (one commit)."""
+        transaction.status = TransactionStatus.FAILED
+        for row in self._pending_outbox_rows(transaction):
+            row.status = "cancelled"
+        self._db.commit()
+
+    def _finalize_success(
+        self,
+        transaction: Transaction,
+        payload: TransactionEventSchema,
+        mark_outbox_done: bool,
+    ) -> None:
+        """Mark SUCCESS, resolving pending outbox rows when the GL post
+        happened in this call (one commit)."""
+        if mark_outbox_done:
+            for row in self._pending_outbox_rows(transaction):
+                row.status = "done"
+        transaction.status = TransactionStatus.SUCCESS
+        transaction.completed_at = payload.completed_at or transaction.completed_at
+        self._db.commit()
+
     def _mark_gl_failed(
         self,
         transaction: Transaction,
@@ -377,8 +464,8 @@ class TransactionRepository:
         """Retry the GL post for a record stuck in GL_FAILED (outbox drain)."""
         amount_kobo = _to_kobo(str(transaction.amount))
         context = Context(tenant_id=transaction.tenant_id)
-        payer_meta = self._safe_get_account(transaction.payer, context)
-        payee_meta = self._safe_get_account(transaction.payee, context)
+        payer_meta = await _db_run(self._safe_get_account, transaction.payer, context)
+        payee_meta = await _db_run(self._safe_get_account, transaction.payee, context)
         try:
             await self._post_journal(transaction, payload, amount_kobo, payer_meta, payee_meta)
         except Exception as exc:
@@ -388,20 +475,9 @@ class TransactionRepository:
             )
             raise Exception("GL posting retry failed; still queued") from exc
 
-        transaction.gl_posted_at = datetime.datetime.now()
-        transaction.status = payload.status
-        # Resolve pending outbox rows for this transaction.
-        for row in (
-            self._db.query(GLPostingOutbox)
-            .filter(
-                GLPostingOutbox.tenant_id == transaction.tenant_id,
-                GLPostingOutbox.transaction_id == transaction.transaction_id,
-                GLPostingOutbox.status == "pending",
-            )
-            .all()
-        ):
-            row.status = "done"
-        self._db.commit()
+        # Resolve pending outbox rows for this transaction and move to the
+        # final state — single commit, as before.
+        await _db_run(self._finalize_retry, transaction, payload)
         logger.info(
             "GL retry succeeded transaction_id=%s tenant_id=%s",
             transaction.transaction_id, transaction.tenant_id,
@@ -414,7 +490,7 @@ class TransactionRepository:
         pending/draft entry), we post a reversal journal entry to keep the
         GL balanced. If no prior record exists we create a minimal stub.
         """
-        transaction = self._ensure_stub(payload)
+        transaction = await _db_run(self._ensure_stub, payload)
         if transaction.status == TransactionStatus.SUCCESS:
             logger.error(
                 "Attempt to mark already-SUCCESS transaction as FAILED "
@@ -428,20 +504,10 @@ class TransactionRepository:
             # transaction (keeps the GL balanced; no phantom reversals).
             await self._post_reversal(payload, reason="transaction-failed")
 
-        transaction.status = TransactionStatus.FAILED
-        # Cancel any pending GL outbox rows — a failed transaction must not
-        # be posted to the GL later by the retry path.
-        for row in (
-            self._db.query(GLPostingOutbox)
-            .filter(
-                GLPostingOutbox.tenant_id == transaction.tenant_id,
-                GLPostingOutbox.transaction_id == transaction.transaction_id,
-                GLPostingOutbox.status == "pending",
-            )
-            .all()
-        ):
-            row.status = "cancelled"
-        self._db.commit()
+        # Mark FAILED and cancel any pending GL outbox rows — a failed
+        # transaction must not be posted to the GL later by the retry path.
+        # Single commit, as before.
+        await _db_run(self._finalize_failed, transaction)
         logger.info(
             "Transaction marked FAILED transaction_id=%s tenant_id=%s",
             payload.transaction_id,
@@ -456,7 +522,7 @@ class TransactionRepository:
         out-of-order stub) is never marked SUCCESS. The GL post is attempted
         first; if it fails the record goes to GL_FAILED with an outbox row.
         """
-        transaction = self._ensure_stub(payload)
+        transaction = await _db_run(self._ensure_stub, payload)
         if transaction.status == TransactionStatus.FAILED:
             logger.error(
                 "Attempt to mark already-FAILED transaction as SUCCESS "
@@ -465,11 +531,12 @@ class TransactionRepository:
             )
             return
 
+        mark_outbox_done = False
         if transaction.gl_posted_at is None:
             amount_kobo = _to_kobo(str(transaction.amount))
             context = Context(tenant_id=transaction.tenant_id)
-            payer_meta = self._safe_get_account(transaction.payer, context)
-            payee_meta = self._safe_get_account(transaction.payee, context)
+            payer_meta = await _db_run(self._safe_get_account, transaction.payer, context)
+            payee_meta = await _db_run(self._safe_get_account, transaction.payee, context)
             try:
                 await self._post_journal(
                     transaction, payload, amount_kobo, payer_meta, payee_meta
@@ -479,25 +546,17 @@ class TransactionRepository:
                     "GL post before SUCCESS failed transaction_id=%s error=%s",
                     payload.transaction_id, exc, exc_info=True,
                 )
-                self._mark_gl_failed(
-                    transaction, payload, amount_kobo, payer_meta, payee_meta, exc
+                await _db_run(
+                    self._mark_gl_failed,
+                    transaction, payload, amount_kobo, payer_meta, payee_meta, exc,
                 )
                 return
             transaction.gl_posted_at = datetime.datetime.now()
-            for row in (
-                self._db.query(GLPostingOutbox)
-                .filter(
-                    GLPostingOutbox.tenant_id == transaction.tenant_id,
-                    GLPostingOutbox.transaction_id == transaction.transaction_id,
-                    GLPostingOutbox.status == "pending",
-                )
-                .all()
-            ):
-                row.status = "done"
+            mark_outbox_done = True
 
-        transaction.status = TransactionStatus.SUCCESS
-        transaction.completed_at = payload.completed_at or transaction.completed_at
-        self._db.commit()
+        # Resolve pending outbox rows (only when the GL post happened in
+        # this call) and move to SUCCESS — single commit, as before.
+        await _db_run(self._finalize_success, transaction, payload, mark_outbox_done)
         logger.info(
             "Transaction marked SUCCESS transaction_id=%s tenant_id=%s",
             payload.transaction_id,

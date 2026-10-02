@@ -730,7 +730,8 @@ async def list_merchants(
     tenant_id: Optional[str] = Query(None),
     status: Optional[MerchantStatus] = Query(None),
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    # W11 PY-440: aligned with fleet pagination policy (default 50, max 500).
+    limit: int = Query(50, ge=1, le=500),
     db=Depends(get_db)
 ):
     """List all merchants with optional filtering"""

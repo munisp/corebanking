@@ -28,6 +28,7 @@ struct CreateRequest {
 
 struct AppState {
     db: PgPool,
+    db_url: Option<String>,
 }
 
 
@@ -173,24 +174,16 @@ async fn prom_metrics() -> HttpResponse {
 }
 
 
-// --- Database Connection ---
-use tokio_postgres::NoTls;
-
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS service_records (
-                    id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-                    status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
-    }
+// --- Database Connection (Wave-11: sqlx pool, max 25 connections) ---
+async fn init_db_pool(pool: &sqlx::PgPool) {
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS service_records (
+            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+        )",
+    ).execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)").execute(pool).await;
 }
 
 
@@ -423,17 +416,51 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
+// Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
+// or every 100 rows by a spawned task on the shared sqlx pool
+// (was: one blocking INSERT per request on a single tokio_postgres::Client).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "interest_computation_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)").entered();
-        let svc_name = String::from("interest-computation-rs");
-        let status = String::from("active");
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+    let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let id = format!("{}_{}_{}", "interest_computation_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let svc_name = String::from("interest-computation-rs");
+    let status = String::from("active");
+    let data_str = serde_json::to_string(data).unwrap_or_default();
+    if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let pool = state.db.clone();
+        let buf = buf.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                let rows: Vec<(String, String, String, String, String)> = {
+                    let mut b = buf.lock().unwrap();
+                    if b.is_empty() { continue; }
+                    std::mem::take(&mut *b)
+                };
+                for (id, svc, ep, st, d) in rows {
+                    let _ = sqlx::query(
+                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                    ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+                }
+            }
+        });
+    }
+    let mut b = buf.lock().unwrap();
+    b.push((id, svc_name, endpoint.to_string(), status, data_str));
+    if b.len() >= 100 {
+        let rows = std::mem::take(&mut *b);
+        drop(b);
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            for (id, svc, ep, st, d) in rows {
+                let _ = sqlx::query(
+                    "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+            }
+        });
     }
 }
 
@@ -621,14 +648,33 @@ async fn main() -> std::io::Result<()> {
         }
     };
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8103);
-    let state = web::Data::new(AppState {
-            db_url: std::env::var("DATABASE_URL").ok(),
-            db_client: {
-            let db_url = std::env::var("DATABASE_URL").ok();
-            if let Some(url) = db_url {
-                init_db(&url).await.map(|c| std::sync::Arc::new(c))
-            } else { None }
+    // Wave-11: shared sqlx pool (max 25) replaces the single tokio_postgres::Client.
+    let db: PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("interest-computation-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[interest-computation-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
         },
+        Err(_) => {
+            eprintln!("[interest-computation-rs] DATABASE_URL not set — DB endpoints will fail");
+            PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+        }
+    };
+    {
+        let schema_pool = db.clone();
+        tokio::spawn(async move { init_db_pool(&schema_pool).await; });
+    }
+    let state = web::Data::new(AppState {
+        db: db.clone(),
+        db_url: std::env::var("DATABASE_URL").ok(),
     });
     println!("interest-computation-rs listening on port {}", port);
     start_grpc_server("interest-computation-rs", 10358);

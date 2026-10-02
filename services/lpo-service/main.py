@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header, Re
 from fastapi.middleware.cors import CORSMiddleware
 from audit_middleware import AuditMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -26,6 +27,7 @@ load_dotenv()
 coa_client = CoAClient()
 
 app = FastAPI(title="54Link LPO Financing Service", version="1.0.0")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
 # OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
 # tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
@@ -1122,4 +1124,4 @@ async def get_supplier_profile(supplier_id: str, db=Depends(lambda: db_pool)):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8012)))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8012)), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

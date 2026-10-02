@@ -109,23 +109,27 @@ export async function businessKybWorkflow(args: {
     // ── 01. Verify each business document via OCR ─────────────────────────────
     const docResults: Record<string, boolean> = { cac: false, tin: false, directorId: false };
 
-    for (const doc of payload.businessDocuments ?? []) {
-      console.log(`[businessKybWorkflow] verifying document type=${doc.type}`);
-      try {
-        const result = await verifyDocument({
-          frontImage: doc.base64,
-          backImage:  doc.base64,
-          documentType: doc.type,
-          country: "NG",
-        });
-        const passed = result.isValid || result.confidence > 0.4;
-        console.log(`[businessKybWorkflow] doc ${doc.type}: isValid=${result.isValid} confidence=${result.confidence} → passed=${passed}`);
-        if (doc.type === "cac_certificate") docResults.cac = passed;
-        if (doc.type === "tin_certificate") docResults.tin = passed;
-      } catch (err: any) {
-        console.warn(`[businessKybWorkflow] doc ${doc.type} verification error: ${err.message} — treating as failed`);
-      }
-    }
+    // TS-66: verify documents concurrently — each verifyDocument activity is
+    // independent and writes to a distinct docResults key.
+    await Promise.all(
+      (payload.businessDocuments ?? []).map(async (doc) => {
+        console.log(`[businessKybWorkflow] verifying document type=${doc.type}`);
+        try {
+          const result = await verifyDocument({
+            frontImage: doc.base64,
+            backImage:  doc.base64,
+            documentType: doc.type,
+            country: "NG",
+          });
+          const passed = result.isValid || result.confidence > 0.4;
+          console.log(`[businessKybWorkflow] doc ${doc.type}: isValid=${result.isValid} confidence=${result.confidence} → passed=${passed}`);
+          if (doc.type === "cac_certificate") docResults.cac = passed;
+          if (doc.type === "tin_certificate") docResults.tin = passed;
+        } catch (err: any) {
+          console.warn(`[businessKybWorkflow] doc ${doc.type} verification error: ${err.message} — treating as failed`);
+        }
+      }),
+    );
 
     if (payload.directorDocument?.base64) {
       console.log(`[businessKybWorkflow] verifying director document type=${payload.directorDocument.type}`);

@@ -23,6 +23,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // TigerBeetle Pending Transfer Sweeper
 // Background goroutine that auto-voids expired pending transfers (>5 min default).
 // Prevents funds from being held indefinitely in 2PC pending state.
@@ -311,8 +322,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -484,7 +494,13 @@ func main() {
 		port = "8301"
 	}
 
-	server := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux)}
+	server := &http.Server{
+		Addr: ":" + port, Handler: jwtAuthMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		log.Printf("[tb-pending-sweeper-go] Starting on :%s (sweep every %v, timeout %v)", port, sweepInterval, defaultTimeout)

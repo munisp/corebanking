@@ -14,6 +14,7 @@ class AuthService {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: readEnv("AUTH_SVC_URL"),
+      timeout: 10000,
       headers: {
         "content-type": "application/json",
       },

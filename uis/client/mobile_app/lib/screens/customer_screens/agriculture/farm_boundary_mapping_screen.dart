@@ -17,6 +17,15 @@ class _FarmBoundaryMappingScreenState extends State<FarmBoundaryMappingScreen> {
   Map<String, dynamic> _stats = {};
   bool _loading = true;
 
+  // MOB-03: pagination state — records are fetched page-by-page (page size
+  // 50) and rendered lazily via ListView.builder instead of an eager
+  // ListView(children: [..._records.map(...)]) that built every row at once.
+  static const int _pageSize = 50;
+  int _page = 1;
+  bool _hasMore = false;
+  bool _loadingMore = false;
+  final ScrollController _scrollCtrl = ScrollController();
+
   final _farmerIdCtrl = TextEditingController();
   final _stateCtrl = TextEditingController();
   final _areaHaCtrl = TextEditingController();
@@ -31,13 +40,16 @@ class _FarmBoundaryMappingScreenState extends State<FarmBoundaryMappingScreen> {
   @override
   void initState() {
     super.initState();
+    _scrollCtrl.addListener(_onScroll);
     _load();
   }
 
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final res = await service.listFarmBoundaryMappings();
+      final res = await service.listFarmBoundaryMappings(page: 1, limit: _pageSize);
+      _page = 1;
+      _hasMore = res is List && res.length >= _pageSize;
       final statsRes = await service.getFarmBoundaryMappingStats();
       setState(() {
         _records = (res is List && res.isNotEmpty) ? res : _fallbackRecords;
@@ -50,6 +62,35 @@ class _FarmBoundaryMappingScreenState extends State<FarmBoundaryMappingScreen> {
       });
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  void _onScroll() {
+    if (_loading || _loadingMore || !_hasMore) return;
+    if (!_scrollCtrl.hasClients) return;
+    if (_scrollCtrl.position.pixels >=
+        _scrollCtrl.position.maxScrollExtent - 200) {
+      _loadMore();
+    }
+  }
+
+  Future<void> _loadMore() async {
+    setState(() => _loadingMore = true);
+    try {
+      final res = await service.listFarmBoundaryMappings(page: _page + 1, limit: _pageSize);
+      if (res is List && res.isNotEmpty) {
+        setState(() {
+          _page += 1;
+          _records = [..._records, ...res];
+          _hasMore = res.length >= _pageSize;
+        });
+      } else {
+        setState(() => _hasMore = false);
+      }
+    } catch (_) {
+      setState(() => _hasMore = false);
+    } finally {
+      setState(() => _loadingMore = false);
     }
   }
 
@@ -136,6 +177,7 @@ class _FarmBoundaryMappingScreenState extends State<FarmBoundaryMappingScreen> {
     _stateCtrl.dispose();
     _areaHaCtrl.dispose();
     _cropCtrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
@@ -161,54 +203,69 @@ class _FarmBoundaryMappingScreenState extends State<FarmBoundaryMappingScreen> {
           ? Center(child: CircularProgressIndicator(color: primary))
           : RefreshIndicator(
               onRefresh: _load,
-              child: ListView(
+              child: ListView.builder(
+                controller: _scrollCtrl,
                 padding: const EdgeInsets.all(16),
-                children: [
-                  const Text('Farm Boundary Mapping', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 4),
-                  Text('GPS-verified farm boundaries for collateral & insurance', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
-                  const SizedBox(height: 16),
-                  Row(children: [
-                    _statCard('Mapped Farms', _stats['mapped_farms']?.toString() ?? '2,841', Icons.map_outlined, primary),
-                    _statCard('Total Area', _stats['total_ha']?.toString() ?? '34,200 ha', Icons.crop_square, Colors.teal),
-                    _statCard('States', _stats['states_covered']?.toString() ?? '22', Icons.flag, Colors.orange),
-                  ]),
-                  const SizedBox(height: 20),
-                  ..._records.map((item) {
-                    final m = item is Map ? item : {};
-                    final status = m['status']?.toString() ?? '-';
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
-                      child: ExpansionTile(
-                        tilePadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
-                        childrenPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
-                        title: Text('${m['farmer'] ?? m['id'] ?? 'Farmer'} — ${m['state'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                        subtitle: Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Row(children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                              decoration: BoxDecoration(color: _statusColor(status).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
-                              child: Text(status, style: TextStyle(color: _statusColor(status), fontSize: 11, fontWeight: FontWeight.w600)),
-                            ),
-                            const SizedBox(width: 8),
-                            Text('${m['area_ha'] ?? '-'} ha', style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+                itemCount: 1 + _records.length + ((_hasMore || _loadingMore) ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (index == 0) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                          const Text('Farm Boundary Mapping', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 4),
+                          Text('GPS-verified farm boundaries for collateral & insurance', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+                          const SizedBox(height: 16),
+                          Row(children: [
+                            _statCard('Mapped Farms', _stats['mapped_farms']?.toString() ?? '2,841', Icons.map_outlined, primary),
+                            _statCard('Total Area', _stats['total_ha']?.toString() ?? '34,200 ha', Icons.crop_square, Colors.teal),
+                            _statCard('States', _stats['states_covered']?.toString() ?? '22', Icons.flag, Colors.orange),
                           ]),
-                        ),
-                        children: [
-                          _row('Farmer', m['farmer']),
-                          _row('State', m['state']),
-                          _row('Area', '${m['area_ha'] ?? '-'} ha'),
-                          _row('Primary Crop', m['crop_type']),
-                          _row('GPS Points', m['gps_points']),
-                          _row('Verified', m['verified']),
-                        ],
-                      ),
+                          const SizedBox(height: 20),
+                      ],
                     );
-                  }),
-                ],
-              ),
+                  }
+                  final recIndex = index - 1;
+                  if (recIndex >= _records.length) {
+                    return const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  }
+                  final item = _records[recIndex];
+                      final m = item is Map ? item : {};
+                      final status = m['status']?.toString() ?? '-';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
+                        child: ExpansionTile(
+                          tilePadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+                          childrenPadding: const EdgeInsets.fromLTRB(18, 0, 18, 16),
+                          title: Text('${m['farmer'] ?? m['id'] ?? 'Farmer'} — ${m['state'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                          subtitle: Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Row(children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(color: _statusColor(status).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
+                                child: Text(status, style: TextStyle(color: _statusColor(status), fontSize: 11, fontWeight: FontWeight.w600)),
+                              ),
+                              const SizedBox(width: 8),
+                              Text('${m['area_ha'] ?? '-'} ha', style: TextStyle(color: Colors.grey.shade600, fontSize: 12)),
+                            ]),
+                          ),
+                          children: [
+                            _row('Farmer', m['farmer']),
+                            _row('State', m['state']),
+                            _row('Area', '${m['area_ha'] ?? '-'} ha'),
+                            _row('Primary Crop', m['crop_type']),
+                            _row('GPS Points', m['gps_points']),
+                            _row('Verified', m['verified']),
+                          ],
+                        ),
+                      );
+                },
+                ),
             ),
     );
   }

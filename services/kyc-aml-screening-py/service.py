@@ -20,7 +20,7 @@ Middleware: Kafka, Redis, Postgres, OpenSearch, NIBSS BVN Validation.
 """
 
 from __future__ import annotations
-import os, uuid, json, re, csv, io, socket, difflib
+import os, uuid, json, re, csv, io, socket, difflib, threading
 import urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
@@ -51,7 +51,8 @@ OPENSEARCH_URL = os.environ.get("OPENSEARCH_ENDPOINT", "")
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_REALM_URL", "")
 APP_ENV = os.environ.get("APP_ENV", "production").lower()
 WATCHLIST_AUTO_SEED = os.environ.get("WATCHLIST_AUTO_SEED", "").lower() == "true"
-WATCHLIST_CACHE_TTL_SECONDS = int(os.environ.get("WATCHLIST_CACHE_TTL_SECONDS", "300"))
+# W11 PY-449: watchlist/candidate caches use a 60s TTL.
+WATCHLIST_CACHE_TTL_SECONDS = int(os.environ.get("WATCHLIST_CACHE_TTL_SECONDS", "60"))
 FUZZY_MATCH_THRESHOLD = float(os.environ.get("SCREENING_MATCH_THRESHOLD", "80"))
 HTTP_PROBE_TIMEOUT = float(os.environ.get("HEALTH_PROBE_TIMEOUT_SECONDS", "3"))
 
@@ -297,6 +298,111 @@ def load_watchlists(force: bool = False) -> tuple[list[dict], list[dict]]:
     return pep, sanctions
 
 
+# ── W11 PY-449: per-query SQL candidate filtering ──
+# Previously every screening request loaded the ENTIRE screening_watchlist
+# table and fuzzy-matched in Python. Readiness (table present + non-empty) is
+# now a cached COUNT(*) probe, and candidate narrowing happens in SQL
+# (WHERE name ILIKE ANY(...) LIMIT 50) with a 60s TTL per-name cache.
+# Fail-closed contract unchanged: empty/missing table or DB failure raises
+# ScreeningUnavailable; never returns synthetic entries.
+
+_watchlist_ready_cache: dict = {"checked_at": None}
+_screen_cache: dict = {}
+_screen_cache_lock = threading.Lock()
+_SCREEN_CACHE_MAX_ENTRIES = 1000
+
+
+def _cache_fresh(checked_at) -> bool:
+    return bool(
+        checked_at
+        and (datetime.now(timezone.utc) - checked_at).total_seconds()
+        < WATCHLIST_CACHE_TTL_SECONDS
+    )
+
+
+def _ensure_watchlist_ready() -> None:
+    """Fail-closed readiness probe (cached 60s): the screening_watchlist
+    table must exist and be non-empty before any name is screened."""
+    if _cache_fresh(_watchlist_ready_cache["checked_at"]):
+        return
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(WATCHLIST_DDL)
+            cur.execute("SELECT COUNT(*) FROM screening_watchlist")
+            count = cur.fetchone()[0]
+            if count == 0 and WATCHLIST_AUTO_SEED and APP_ENV != "production":
+                seeded = _seed_watchlists(conn)
+                print(f"[kyc-aml] seeded {seeded} watchlist entries from OFAC/UN downloads")
+                count = seeded
+            if count == 0:
+                raise ScreeningUnavailable(
+                    "screening_watchlist table is empty — load OFAC/UN data before screening")
+    finally:
+        conn.close()
+    _watchlist_ready_cache["checked_at"] = datetime.now(timezone.utc)
+
+
+def _screening_candidates(name: str) -> tuple[list[dict], list[dict]]:
+    """Return PEP/sanctions candidate entries for `name`, narrowed in SQL.
+
+    Tokens of the normalized query name are matched with ILIKE ANY(...) and
+    the result is hard-capped at LIMIT 50; fuzzy scoring then runs on those
+    candidates only. Results are cached per normalized name for 60s.
+    """
+    norm = _normalize_name(name)
+    if not norm:
+        _ensure_watchlist_ready()  # still fail closed on an empty/missing list
+        return [], []
+    with _screen_cache_lock:
+        entry = _screen_cache.get(norm)
+        if entry and _cache_fresh(entry["fetched_at"]):
+            return entry["pep"], entry["sanctions"]
+
+    _ensure_watchlist_ready()
+    tokens = [t for t in norm.split() if len(t) >= 2]
+    if not tokens:
+        return [], []
+    patterns = [f"%{t}%" for t in tokens]
+
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT list_type, name, category, country, reason, risk, list_name "
+                "FROM screening_watchlist WHERE name IS NOT NULL AND name <> '' "
+                "AND name ILIKE ANY(%s) LIMIT 50",
+                (patterns,),
+            )
+            rows = cur.fetchall()
+    except ScreeningUnavailable:
+        raise
+    except Exception as e:
+        # Fail closed: a failed candidate query must never auto-clear.
+        raise ScreeningUnavailable(f"watchlist candidate query failed: {e}")
+    finally:
+        conn.close()
+
+    pep, sanctions = [], []
+    for list_type, wname, category, country, reason, risk, list_name in rows:
+        entry = {"name": wname, "category": category or "", "country": country or "",
+                 "reason": reason or "", "risk": risk or "high", "list": list_name or ""}
+        (pep if list_type == "pep" else sanctions).append(entry)
+
+    with _screen_cache_lock:
+        if len(_screen_cache) >= _SCREEN_CACHE_MAX_ENTRIES:
+            expired = [k for k, v in _screen_cache.items()
+                       if not _cache_fresh(v["fetched_at"])]
+            for k in expired:
+                _screen_cache.pop(k, None)
+            if len(_screen_cache) >= _SCREEN_CACHE_MAX_ENTRIES:
+                _screen_cache.clear()
+        _screen_cache[norm] = {
+            "fetched_at": datetime.now(timezone.utc), "pep": pep, "sanctions": sanctions,
+        }
+    return pep, sanctions
+
+
 # ── State ──
 
 kyc_records: list[KYCRecord] = []
@@ -422,8 +528,11 @@ def screen_name(name: str) -> tuple[list[dict], str]:
 
     Fails closed: raises ScreeningUnavailable when watchlists cannot be loaded;
     callers must treat this as 'cannot clear', never auto-clear.
+
+    W11 PY-449: candidates are narrowed in SQL (ILIKE ANY + LIMIT 50) behind a
+    60s TTL cache instead of loading the entire watchlist table per request.
     """
-    pep_list, sanctions_list = load_watchlists()
+    pep_list, sanctions_list = _screening_candidates(name)
     matches = []
 
     # Check PEP list

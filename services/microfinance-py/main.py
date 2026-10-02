@@ -287,30 +287,60 @@ def list_records(x_tenant_id: Optional[str] = Header(None)):
             cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
         rows = cur.fetchall()
 
-def query_groups(tenant_id=None):
+# W11 PY-439: paginated group listing (no more unbounded SELECT).
+PAGE_SIZE_DEFAULT = 50
+PAGE_SIZE_MAX = 500
+
+
+def _clamp_pagination(page, size):
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = min(PAGE_SIZE_MAX, max(1, int(size)))
+    except (TypeError, ValueError):
+        size = PAGE_SIZE_DEFAULT
+    return page, size
+
+
+def query_groups(tenant_id=None, page=1, size=PAGE_SIZE_DEFAULT):
     pool = get_db()
     if pool is None:
         return None
+    page, size = _clamp_pagination(page, size)
+    offset = (page - 1) * size
     try:
         conn = pool.getconn()
         cur = conn.cursor()
         if tenant_id:
             cur.execute(
-                "SELECT id, group_name, location, members, total_savings, total_loans_outstanding, avg_loan_size, repayment_rate, meeting_day, officer, status FROM mfi_groups WHERE tenant_id = %s AND status != 'deleted' ORDER BY created_at DESC",
+                "SELECT COUNT(*) FROM mfi_groups WHERE tenant_id = %s AND status != 'deleted'",
                 (tenant_id,)
+            )
+            total = cur.fetchone()[0]
+            cur.execute(
+                "SELECT id, group_name, location, members, total_savings, total_loans_outstanding, avg_loan_size, repayment_rate, meeting_day, officer, status FROM mfi_groups WHERE tenant_id = %s AND status != 'deleted' ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                (tenant_id, size, offset)
             )
         else:
             cur.execute(
-                "SELECT id, group_name, location, members, total_savings, total_loans_outstanding, avg_loan_size, repayment_rate, meeting_day, officer, status FROM mfi_groups WHERE status != 'deleted' ORDER BY created_at DESC"
+                "SELECT COUNT(*) FROM mfi_groups WHERE status != 'deleted'"
+            )
+            total = cur.fetchone()[0]
+            cur.execute(
+                "SELECT id, group_name, location, members, total_savings, total_loans_outstanding, avg_loan_size, repayment_rate, meeting_day, officer, status FROM mfi_groups WHERE status != 'deleted' ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                (size, offset)
             )
         rows = cur.fetchall()
         pool.putconn(conn)
-        return [
+        items = [
             {"id": r[0], "group_name": r[1], "location": r[2], "members": r[3],
              "total_savings": r[4], "total_loans_outstanding": r[5], "avg_loan_size": r[6],
              "repayment_rate": float(r[7]), "meeting_day": r[8], "officer": r[9], "status": r[10]}
             for r in rows
         ]
+        return {"items": items, "total": total, "page": page, "size": size}
     except Exception as e:
         print(f"[{SERVICE_NAME}] query_groups failed: {e}", file=sys.stderr)
         return None
@@ -753,11 +783,14 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/v1/microfinance/groups"):
             qs = parse_qs(urlparse(self.path).query)
             tenant_id = qs.get("tenantId", [None])[0]
-            groups = query_groups(tenant_id)
-            if groups is None:
+            page, size = _clamp_pagination(
+                qs.get("page", [1])[0], qs.get("size", [PAGE_SIZE_DEFAULT])[0]
+            )
+            result = query_groups(tenant_id, page=page, size=size)
+            if result is None:
                 respond(self, 503, {"error": "database unavailable"})
                 return
-            respond(self, 200, {"items": groups, "total": len(groups)})
+            respond(self, 200, result)
             return
 
         if path.startswith("/v1/microfinance/stats"):

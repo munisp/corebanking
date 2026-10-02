@@ -44,13 +44,14 @@ class ChequeService {
   }
 
   // Get all cheques for user
-  Future<List<Cheque>> getCheques({String? accountId}) async {
+  Future<List<Cheque>> getCheques({String? accountId, int page = 1, int limit = 50}) async {
     try {
       final endpoint = accountId != null
           ? '/payment-processing/cheques?account_id=$accountId'
           : '/payment-processing/cheques';
-      
-      final response = await _apiService.get(endpoint);
+
+      final response = await _apiService.get(endpoint,
+          queryParameters: {'page': page, 'limit': limit});
 
       if (response.data['success'] == true) {
         final chequesData = response.data['data'] as List;

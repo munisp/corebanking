@@ -33,14 +33,16 @@ export default defineConfig({
 
   rollupOptions: {
     output: {
-      manualChunks(id) {
-        if (id.includes("node_modules")) {
-          return id
-            .toString()
-            .split("node_modules/")[1]
-            .split("/")[0]
-            .toString();
-        }
+      // Curated vendor groups instead of one chunk per package — per-package
+      // splitting produced 100s of tiny chunks (request overhead, no shared cache).
+      manualChunks(id: string) {
+        if (!id.includes("node_modules")) return undefined;
+        if (/node_modules[\\/](react|react-dom|wouter)[\\/]/.test(id)) return "vendor-react";
+        if (id.includes("node_modules/@radix-ui")) return "vendor-radix";
+        if (id.includes("node_modules/@tanstack")) return "vendor-query";
+        if (/node_modules[\\/](recharts|d3-[^\\/]+|victory-vendor)[\\/]/.test(id)) return "vendor-charts";
+        if (/node_modules[\\/](jspdf|jspdf-autotable|xlsx)[\\/]/.test(id)) return "vendor-export";
+        return "vendor";
       },
     },
   },

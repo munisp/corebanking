@@ -25,6 +25,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var serviceName = "perpetual-kyc-go"
 
 type ReKYCTrigger string
@@ -293,8 +304,7 @@ func freezeAccountForSanctions(customerID, eventID string) string {
 		"placed_by":   serviceName,
 	}
 	body, _ := json.Marshal(payload)
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(lienURL+"/api/v1/lien/place", "application/json", bytes.NewReader(body))
+	resp, err := sharedHTTPClient.Post(lienURL+"/api/v1/lien/place", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("[%s] CRITICAL: sanctions freeze lien FAILED for customer=%s event=%s: %v — manual freeze required", serviceName, customerID, eventID, err)
 		return "freeze_failed: " + err.Error()
@@ -502,8 +512,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -668,7 +677,13 @@ func main() {
 	mux.HandleFunc("/api/v1/rekyc/evaluate", evaluateTrigger)
 	mux.HandleFunc("/api/v1/rekyc/overdue", getOverdueReviews)
 	mux.HandleFunc("/api/v1/rekyc/profile", getCustomerProfile)
-	srv := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux)}
+	srv := &http.Server{
+		Addr: ":" + port, Handler: jwtAuthMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		log.Printf("[%s] Starting on :%s", serviceName, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

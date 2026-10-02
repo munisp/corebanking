@@ -10,7 +10,12 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
+
+// patternUpdateWorkers bounds the user-pattern update worker pool (GPT-29).
+const patternUpdateWorkers = 4
 
 // FraudRuleType represents the type of fraud detection rule
 type FraudRuleType string
@@ -313,6 +318,10 @@ type FraudDetectionEngine struct {
 	config       FraudDetectionConfig
 	tenantConfig map[string]FraudDetectionConfig
 	mu           sync.RWMutex
+
+	// patternCh feeds the bounded worker pool that applies user-pattern
+	// updates (GPT-29) — replaces unbounded fire-and-forget goroutines.
+	patternCh chan FraudCheckRequest
 }
 
 // NewFraudDetectionEngine creates a new fraud detection engine
@@ -321,6 +330,7 @@ func NewFraudDetectionEngine(db *sql.DB) *FraudDetectionEngine {
 		db:           db,
 		config:       DefaultFraudConfig,
 		tenantConfig: make(map[string]FraudDetectionConfig),
+		patternCh:    make(chan FraudCheckRequest, 1024),
 	}
 
 	// Load environment overrides
@@ -331,6 +341,15 @@ func NewFraudDetectionEngine(db *sql.DB) *FraudDetectionEngine {
 
 	// Load tenant-specific configs
 	fde.loadTenantConfigs()
+
+	// Bounded worker pool for user-pattern updates (GPT-29)
+	for i := 0; i < patternUpdateWorkers; i++ {
+		go func() {
+			for req := range fde.patternCh {
+				fde.updateUserPatterns(req)
+			}
+		}()
+	}
 
 	return fde
 }
@@ -507,26 +526,44 @@ func (fde *FraudDetectionEngine) CheckFraud(req FraudCheckRequest) (*FraudCheckR
 		log.Printf("Warning: Failed to get user patterns: %v", err)
 	}
 
-	// Evaluate each enabled rule
-	totalScore := 0
-	for _, rule := range config.Rules {
+	// Evaluate enabled rules concurrently with bounded parallelism (GPT-28);
+	// results are collected per rule index so the outcome order — and thus the
+	// risk score — is identical to sequential evaluation.
+	type ruleOutcome struct {
+		triggered bool
+		details   string
+	}
+	outcomes := make([]ruleOutcome, len(config.Rules))
+	var eg errgroup.Group
+	eg.SetLimit(8)
+	for i, rule := range config.Rules {
 		if !rule.Enabled {
 			continue
 		}
+		i, rule := i, rule
+		eg.Go(func() error {
+			triggered, details := fde.evaluateRule(rule, req, patterns)
+			outcomes[i] = ruleOutcome{triggered: triggered, details: details}
+			return nil
+		})
+	}
+	_ = eg.Wait() // evaluateRule never returns an error
 
-		triggered, details := fde.evaluateRule(rule, req, patterns)
-		if triggered {
-			totalScore += rule.Weight
-			result.TriggeredRules = append(result.TriggeredRules, TriggeredRule{
-				RuleID:   rule.ID,
-				RuleType: rule.Type,
-				RuleName: rule.Name,
-				Weight:   rule.Weight,
-				Action:   rule.Action,
-				Details:  details,
-			})
-			result.Reasons = append(result.Reasons, details)
+	totalScore := 0
+	for i, rule := range config.Rules {
+		if !rule.Enabled || !outcomes[i].triggered {
+			continue
 		}
+		totalScore += rule.Weight
+		result.TriggeredRules = append(result.TriggeredRules, TriggeredRule{
+			RuleID:   rule.ID,
+			RuleType: rule.Type,
+			RuleName: rule.Name,
+			Weight:   rule.Weight,
+			Action:   rule.Action,
+			Details:  outcomes[i].details,
+		})
+		result.Reasons = append(result.Reasons, outcomes[i].details)
 	}
 
 	// Cap the score at max
@@ -558,8 +595,13 @@ func (fde *FraudDetectionEngine) CheckFraud(req FraudCheckRequest) (*FraudCheckR
 		fde.recordFraudAlert(req, result)
 	}
 
-	// Update user patterns
-	go fde.updateUserPatterns(req)
+	// Update user patterns via the bounded worker pool (GPT-29); drop with a
+	// log line if the queue is full rather than piling up goroutines.
+	select {
+	case fde.patternCh <- req:
+	default:
+		log.Printf("fraud pattern update queue full; dropping update for user %s", req.UserID)
+	}
 
 	return result, nil
 }

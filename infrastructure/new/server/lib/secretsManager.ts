@@ -41,9 +41,15 @@ const REQUIRED_SECRETS: SecretConfig[] = [
 ];
 
 // Encryption key derived from JWT_SECRET (or generated)
+// TS-10: memoize the derived key — scryptSync is a ~50-100ms blocking call and
+// the inputs are static per process.
+let cachedEncryptionKey: Buffer | null = null;
 function getEncryptionKey(): Buffer {
-  const secret = process.env.JWT_SECRET || process.env.PLATFORM_TENANT_SECRET || "default-dev-key-change-in-production";
-  return crypto.scryptSync(secret, "54bank-salt", 32);
+  if (!cachedEncryptionKey) {
+    const secret = process.env.JWT_SECRET || process.env.PLATFORM_TENANT_SECRET || "default-dev-key-change-in-production";
+    cachedEncryptionKey = crypto.scryptSync(secret, "54bank-salt", 32);
+  }
+  return cachedEncryptionKey;
 }
 
 export function encryptSecret(plaintext: string): string {

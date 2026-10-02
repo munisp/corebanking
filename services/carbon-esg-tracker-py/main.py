@@ -12,8 +12,12 @@ from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
+import threading
+
+import psycopg2.pool
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 
@@ -43,15 +47,80 @@ OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 PORT = int(os.getenv("PORT", "8384"))
 
-db_conn = None
 
+
+# --- Database ---
+_db_pool = None
+_db_pool_lock = threading.Lock()
+
+def _get_db_pool():
+    """Lazily create the process-wide connection pool (thread-safe)."""
+    global _db_pool
+    if _db_pool is None or _db_pool.closed:
+        with _db_pool_lock:
+            if _db_pool is None or _db_pool.closed:
+                _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+    return _db_pool
+
+class _PooledConn:
+    """Borrowed pooled connection.
+
+    Returned to the pool on close() or when the last reference is dropped
+    (CPython refcounting), so existing `conn = get_db()` call sites remain
+    safe without an explicit release_db() call."""
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        raw, self._raw = self._raw, None
+        if raw is not None:
+            try:
+                _get_db_pool().putconn(raw)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 def get_db():
-    global db_conn
-    if db_conn is None or db_conn.closed:
-        db_conn = psycopg2.connect(DATABASE_URL)
-        db_conn.autocommit = True
-    return db_conn
+    """Borrow a connection from the pool (thread-safe)."""
+    raw = _get_db_pool().getconn()
+    raw.autocommit = True
+    return _PooledConn(raw)
+
+def release_db(conn):
+    """Return a borrowed connection to the pool."""
+    if conn:
+        conn.close()
+
+
+_schema_ready = threading.Event()
+
+def _init_schema_bg():
+    """Run blocking schema init off the event loop in a daemon thread;
+    sets _schema_ready when done (surfaced via /healthz)."""
+    try:
+        init_schema()
+    finally:
+        _schema_ready.set()
 
 
 def init_schema():
@@ -91,17 +160,19 @@ def init_schema():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_schema()
+    _schema_ready.clear()
+    threading.Thread(target=_init_schema_bg, daemon=True, name="init-schema").start()
     logger.info(f"[carbon-esg-tracker-py] ready on :%d", PORT)
     logger.info(f"[carbon-esg-tracker-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
     yield
-    if db_conn:
-        db_conn.close()
+    if _db_pool:
+        _db_pool.closeall()
 
 
 app = FastAPI(title="carbon-esg-tracker-py", version="1.0.0", lifespan=lifespan)
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
 # is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
@@ -318,7 +389,7 @@ class UpdateRequest(BaseModel):
 
 @app.get("/healthz")
 def health():
-    return {"status": "healthy", "service": "carbon-esg-tracker-py", "version": "1.0.0"}
+    return {"status": "healthy", "service": "carbon-esg-tracker-py", "version": "1.0.0", "schema_ready": _schema_ready.is_set()}
 
 
 @app.get("/readyz")

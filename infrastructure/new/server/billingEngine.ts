@@ -501,24 +501,27 @@ export async function ensureBillingEngineSeed() {
   return true;
 }
 
-export async function listBillingAccounts() {
+export async function listBillingAccounts(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingAccounts;
-  const rows = await db.select().from(billingAccounts).orderBy(desc(billingAccounts.updatedAt));
+  if (!db) return defaultBillingAccounts.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingAccounts).orderBy(desc(billingAccounts.updatedAt)).limit(limit);
   return rows.map(mapAccount);
 }
 
-export async function listBillingRateCards() {
+export async function listBillingRateCards(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingRateCards;
-  const rows = await db.select().from(billingRateCards).orderBy(desc(billingRateCards.updatedAt));
+  if (!db) return defaultBillingRateCards.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingRateCards).orderBy(desc(billingRateCards.updatedAt)).limit(limit);
   return rows.map(mapRateCard);
 }
 
-export async function listBillingRateCardLines() {
+export async function listBillingRateCardLines(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingRateCardLines;
-  const rows = await db.select().from(billingRateCardLines).orderBy(desc(billingRateCardLines.updatedAt));
+  if (!db) return defaultBillingRateCardLines.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingRateCardLines).orderBy(desc(billingRateCardLines.updatedAt)).limit(limit);
   return rows.map(mapRateCardLine);
 }
 
@@ -536,52 +539,59 @@ export async function listBillingRatedEvents(limit = 100) {
   return rows.map(mapRatedEvent);
 }
 
-export async function listBillingAccrualSnapshots() {
+export async function listBillingAccrualSnapshots(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingAccrualSnapshots;
-  const rows = await db.select().from(billingAccrualSnapshots).orderBy(desc(billingAccrualSnapshots.updatedAt));
+  if (!db) return defaultBillingAccrualSnapshots.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingAccrualSnapshots).orderBy(desc(billingAccrualSnapshots.updatedAt)).limit(limit);
   return rows.map(mapAccrualSnapshot);
 }
 
-export async function listBillingContractOverrides() {
+export async function listBillingContractOverrides(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingContractOverrides;
-  const rows = await db.select().from(billingContractOverrides).orderBy(desc(billingContractOverrides.updatedAt));
+  if (!db) return defaultBillingContractOverrides.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingContractOverrides).orderBy(desc(billingContractOverrides.updatedAt)).limit(limit);
   return rows.map(mapContractOverride);
 }
 
-export async function listBillingDiscountRules() {
+export async function listBillingDiscountRules(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingDiscountRules;
-  const rows = await db.select().from(billingDiscountRules).orderBy(desc(billingDiscountRules.updatedAt));
+  if (!db) return defaultBillingDiscountRules.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingDiscountRules).orderBy(desc(billingDiscountRules.updatedAt)).limit(limit);
   return rows.map(mapDiscountRule);
 }
 
-export async function listBillingRevenueShareRules() {
+export async function listBillingRevenueShareRules(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingRevenueShareRules;
-  const rows = await db.select().from(billingRevenueShareRules).orderBy(desc(billingRevenueShareRules.updatedAt));
+  if (!db) return defaultBillingRevenueShareRules.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingRevenueShareRules).orderBy(desc(billingRevenueShareRules.updatedAt)).limit(limit);
   return rows.map(mapRevenueShareRule);
 }
 
-export async function listBillingInvoices() {
+export async function listBillingInvoices(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingInvoices;
-  const rows = await db.select().from(billingInvoices).orderBy(desc(billingInvoices.updatedAt));
+  if (!db) return defaultBillingInvoices.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingInvoices).orderBy(desc(billingInvoices.updatedAt)).limit(limit);
   return rows.map(mapInvoice);
 }
 
-export async function listBillingInvoiceLines() {
+export async function listBillingInvoiceLines(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingInvoiceLines;
-  const rows = await db.select().from(billingInvoiceLines).orderBy(desc(billingInvoiceLines.createdAt));
+  if (!db) return defaultBillingInvoiceLines.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingInvoiceLines).orderBy(desc(billingInvoiceLines.createdAt)).limit(limit);
   return rows.map(mapInvoiceLine);
 }
 
-export async function listBillingInvoiceApprovals() {
+export async function listBillingInvoiceApprovals(limit = 500) {
   const db = await getDb();
-  if (!db) return defaultBillingInvoiceApprovals;
-  const rows = await db.select().from(billingInvoiceApprovals).orderBy(desc(billingInvoiceApprovals.updatedAt));
+  if (!db) return defaultBillingInvoiceApprovals.slice(0, limit);
+  // TS-20: bound full-table selects — default 500 rows per list call.
+  const rows = await db.select().from(billingInvoiceApprovals).orderBy(desc(billingInvoiceApprovals.updatedAt)).limit(limit);
   return rows.map(mapInvoiceApproval);
 }
 

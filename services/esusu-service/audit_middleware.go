@@ -14,6 +14,17 @@ import (
 	"shared/otel/go/otelkit"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var (
 	auditSvcURL      = os.Getenv("AUDIT_SVC_URL")
 	auditIngestToken = os.Getenv("AUDIT_INGEST_TOKEN") // AU-01
@@ -67,8 +78,7 @@ func sendAuditEvent(actorID, tenantID, eventType string, eventData map[string]in
 		// AU-01 (F15-1): shared ingest credential; audit-service fails closed without it.
 		req.Header.Set("X-Audit-Ingest-Token", auditIngestToken)
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		// w9 alerting contract: audit_ship_failures_total.
 		otelkit.IncCounter(context.Background(), "audit_ship_failures_total", otelkit.TenantIDAttributeKV(tenantID))

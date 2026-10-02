@@ -32,23 +32,31 @@ export const re_attempt_required_transactions = asyncHandler(async (req, res) =>
 
   if (transactions.length == 0) return;
 
-  for (const transaction of transactions) {
-    logger.info(`Re-attempting transaction - ${transaction.id}`);
+  // TS-50: re-attempt with bounded concurrency (5) — up to 100 transfers were
+  // previously re-attempted strictly sequentially. Iterations are independent
+  // (one Mojaloop transfer per transaction, per-transaction error handling).
+  const RE_ATTEMPT_CONCURRENCY = 5;
+  for (let i = 0; i < transactions.length; i += RE_ATTEMPT_CONCURRENCY) {
+    await Promise.allSettled(
+      transactions.slice(i, i + RE_ATTEMPT_CONCURRENCY).map(async (transaction) => {
+        logger.info(`Re-attempting transaction - ${transaction.id}`);
 
-    try {
-      await initiate_transfer_mojaloop({
-        switch_name: AppSwitchEnum.mojaloop,
-        amount: String(transaction.amount),
-        currency: transaction.currency,
-        to: transaction.payee,
-        from: transaction.payer,
-        note: transaction.note ?? undefined,
-        destination: transaction.payeeFsp,
-        tag: transaction.tag,
-        reference: transaction.transaction_id,
-      });
-    } catch (e) {
-      logger.error(`Re-attempt for transaction - ${transaction.id} failed with error - ${e}`);
-    }
+        try {
+          await initiate_transfer_mojaloop({
+            switch_name: AppSwitchEnum.mojaloop,
+            amount: String(transaction.amount),
+            currency: transaction.currency,
+            to: transaction.payee,
+            from: transaction.payer,
+            note: transaction.note ?? undefined,
+            destination: transaction.payeeFsp,
+            tag: transaction.tag,
+            reference: transaction.transaction_id,
+          });
+        } catch (e) {
+          logger.error(`Re-attempt for transaction - ${transaction.id} failed with error - ${e}`);
+        }
+      }),
+    );
   }
 });

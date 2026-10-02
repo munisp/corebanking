@@ -9,8 +9,10 @@ import logging
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from http.server import ThreadingHTTPServer
 import time
 import threading
@@ -104,22 +106,65 @@ def inc_errors():
 
 # --- Database ---
 _db_pool = None
+_db_pool_lock = threading.Lock()
 
-def get_db():
-    global db_conn
-    if db_conn is None or db_conn.closed:
-        db_conn = psycopg2.connect(DATABASE_URL)
-        db_conn.autocommit = True
-    return db_conn
-
-def release_db(conn):
-    """Return a connection to the pool."""
+def _get_db_pool():
+    """Lazily create the process-wide connection pool (thread-safe)."""
     global _db_pool
-    if _db_pool and conn:
+    if _db_pool is None or _db_pool.closed:
+        with _db_pool_lock:
+            if _db_pool is None or _db_pool.closed:
+                _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+    return _db_pool
+
+class _PooledConn:
+    """Borrowed pooled connection.
+
+    Returned to the pool on close() or when the last reference is dropped
+    (CPython refcounting), so existing `conn = get_db()` call sites remain
+    safe without an explicit release_db() call."""
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        raw, self._raw = self._raw, None
+        if raw is not None:
+            try:
+                _get_db_pool().putconn(raw)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+
+    def __del__(self):
         try:
-            _db_pool.putconn(conn)
+            self.close()
         except Exception:
             pass
+
+def get_db():
+    """Borrow a connection from the pool (thread-safe)."""
+    raw = _get_db_pool().getconn()
+    raw.autocommit = True
+    return _PooledConn(raw)
+
+def release_db(conn):
+    """Return a borrowed connection to the pool."""
+    if conn:
+        conn.close()
 
 def init_schema():
     """Create the tables this service actually uses. Never crash startup."""
@@ -152,6 +197,7 @@ def init_schema():
 
 app = FastAPI(title="kyc-workflow-orchestration-py", version="1.0.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
 import inspect as _jwt_inspect
 from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
@@ -285,12 +331,12 @@ def call_service(method, url, body=None, retries=3, timeout=15):
         raise Exception(f"Circuit breaker open for {url}")
     
     last_err = None
+    data = json.dumps(body).encode() if body else None
     for attempt in range(retries):
         try:
             if attempt > 0:
                 time.sleep(0.1 * (2 ** attempt))
             
-            data = json.dumps(body).encode() if body else None
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("Content-Type", "application/json")
             
@@ -727,11 +773,11 @@ def init_tracing(service_name):
 signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting"}))
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=PORT,
+        workers=int(os.environ.get("UVICORN_WORKERS", "4")),
+    )

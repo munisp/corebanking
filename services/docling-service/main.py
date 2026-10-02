@@ -13,6 +13,7 @@ from enum import Enum
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 import structlog
 
@@ -42,6 +43,7 @@ app = FastAPI(
     description="Advanced document processing with DeepSeek OCR and Docling integration",
     version="1.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # Initialize processors
 docling_processor = DoclingProcessor() if DoclingProcessor is not None else None
@@ -651,4 +653,4 @@ async def get_metrics():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=int(os.environ.get("UVICORN_WORKERS", "4")))

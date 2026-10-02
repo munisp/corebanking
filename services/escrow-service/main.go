@@ -177,11 +177,12 @@ func main() {
 
 	// Create HTTP server
 	server := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      otelkit.HTTPMiddleware(router),
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              ":" + cfg.Port,
+		Handler:           otelkit.HTTPMiddleware(router),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Start server in goroutine

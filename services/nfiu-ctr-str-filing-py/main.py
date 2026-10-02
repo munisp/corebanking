@@ -51,6 +51,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
@@ -397,6 +398,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- OpenTelemetry init (SPEC w9 §2.5): OTLP gRPC traces+metrics, W3C ---
 # propagation, FastAPI server spans, TenantMiddleware (tenant.id span attr),
@@ -1531,4 +1533,4 @@ async def dashboard(tenant_id: str = Depends(require_tenant)):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8283"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", workers=int(os.environ.get("UVICORN_WORKERS", "4")))

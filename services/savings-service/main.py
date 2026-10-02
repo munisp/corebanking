@@ -5,6 +5,7 @@ import logging as _logging
 _logging.warning("DEPRECATED: savings-service — migrate to savings-products-go")
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi.middleware.gzip import GZipMiddleware
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -23,6 +24,7 @@ from utils.coa_client import CoAClient
 load_dotenv()
 
 app = FastAPI(title="54Link Savings Service", version="1.0.0")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
 # OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
 # tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
@@ -604,4 +606,4 @@ async def resume_savings_goal(
         return {"data": dict(updated_row)}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8018")))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8018")), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

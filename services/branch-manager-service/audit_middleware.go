@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is declared in middleware_integration.go (single
+// process-wide pooled HTTP client per package).
+
 var (
 	auditSvcURL      = os.Getenv("AUDIT_SVC_URL")
 	auditIngestToken = os.Getenv("AUDIT_INGEST_TOKEN") // AU-01
@@ -76,8 +79,7 @@ func sendAuditEvent(actorID, tenantID, eventType string, eventData map[string]in
 		// AU-01 (F15-1): shared ingest credential; audit-service fails closed without it.
 		req.Header.Set("X-Audit-Ingest-Token", auditIngestToken)
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		auditShipFailures.WithLabelValues("branch-manager-service", tenantID).Inc()
 		return

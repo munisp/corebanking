@@ -42,6 +42,8 @@ class AuthService {
         value: data['refresh_token'],
       );
       }
+      // New session — drop ApiService's cached auth headers (MOB-02)
+      ApiService.invalidateAuthCache();
 
       // Get keycloak_id from response data (matching web app)
       String? keycloakId;
@@ -193,6 +195,7 @@ class AuthService {
     } catch (e) {
       // Continue with local logout even if API call fails
     } finally {
+      ApiService.invalidateAuthCache();
       await _storage.deleteAll();
     }
   }

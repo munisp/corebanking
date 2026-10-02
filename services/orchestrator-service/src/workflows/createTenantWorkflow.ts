@@ -63,31 +63,36 @@ export async function createTenantWorkflow(
       config: {},
     }));
 
-    // 03. Setup Auth Feature
-    // Create keycloak realm and save config
-    const keycloakConfig = await provisionKeycloakRealm(
+    // 03+04. Setup Auth & Account Features
+    // TS-32: provisionKeycloakRealm and createMintAccount are independent
+    // (inputs derive only from args) — run them concurrently. The realm side
+    // effect is recorded via .then so saga compensation still sees it even if
+    // createMintAccount rejects first.
+    const keycloakConfigPromise = provisionKeycloakRealm(
       `54link_${args.tenantId}`,
-    );
-    provisionedRealm = keycloakConfig.realm;
+    ).then((config) => {
+      provisionedRealm = config.realm;
+      return config;
+    });
+    const [keycloakConfig, mintAccountConfig] = await Promise.all([
+      keycloakConfigPromise,
+      createMintAccount({
+        name: `mint_account_${args.tenantId}`,
+        keycloak_id: `mint_account_${args.tenantId}`,
+        ledger_id: args.ledgerId,
+        tenant_id: args.tenantId,
+        bank: {
+          create:
+            args.type == TenantType.BANK || args.type == TenantType.MICROFINANCE,
+          name: args.name,
+          logo: args.branding?.logoUrl || "",
+        },
+      }),
+    ]);
     const authFeature = features.find(
       (feature) => feature.flag === TenantFeatureFlag.AUTH,
     );
     if (authFeature) authFeature.config = keycloakConfig;
-
-    // 04. Setup Account Feature
-    // Create mint account and save config
-    const mintAccountConfig = await createMintAccount({
-      name: `mint_account_${args.tenantId}`,
-      keycloak_id: `mint_account_${args.tenantId}`,
-      ledger_id: args.ledgerId,
-      tenant_id: args.tenantId,
-      bank: {
-        create:
-          args.type == TenantType.BANK || args.type == TenantType.MICROFINANCE,
-        name: args.name,
-        logo: args.branding?.logoUrl || "",
-      },
-    });
     const accountFeature = features.find(
       (feature) => feature.flag === TenantFeatureFlag.ACCOUNTS,
     );

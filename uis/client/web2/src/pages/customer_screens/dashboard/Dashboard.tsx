@@ -127,8 +127,10 @@ const Dashboard: React.FC = () => {
         console.warn('Could not get keycloak_id, trying alternative methods:', e);
       }
 
-      // Fetch account endpoint first - this updates localStorage with account and account_id
-      await fetchAndStoreAccount();
+      // Fetch account endpoint in parallel with the user-profile chain below.
+      // The profile lookup only needs keycloak_id (available now), not the
+      // account data, so the two independent calls run concurrently.
+      const accountPromise = fetchAndStoreAccount();
 
       // Load user data - try multiple methods
       let userData: User | null = null;
@@ -188,6 +190,10 @@ const Dashboard: React.FC = () => {
           localStorage.setItem('keycloak_id', userData.keycloakId);
         }
       }
+
+      // Ensure the account fetch (started above) has populated localStorage
+      // before wallet/transaction calls that may read account_id from it
+      await accountPromise;
 
       // Load wallet and transactions in parallel
       const [walletData, transactionsData] = await Promise.all([

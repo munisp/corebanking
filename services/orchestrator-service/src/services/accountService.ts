@@ -13,6 +13,7 @@ class AccountService {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: readEnv("ACCOUNT_SVC_URL"),
+      timeout: 10000,
       headers: {
         "content-type": "application/json",
       },

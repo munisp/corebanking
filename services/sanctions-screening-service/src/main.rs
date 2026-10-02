@@ -11,7 +11,7 @@
 //
 // Port: 8283
 
-use actix_web::{middleware, web, App, HttpResponse, HttpServer};
+use actix_web::{middleware, web, App, HttpMessage, HttpResponse, HttpServer};
 use chrono::Utc;
 use deadpool_postgres::{Config as PgConfig, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use log::{error, info, warn};
@@ -303,6 +303,16 @@ async fn ensure_schema(pool: &Pool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+
+// ── Wave-11 (RS-21/RS-22): process-wide reqwest client ──────────────────────
+// Was: a new Client (TLS config + connection pool) built per request.
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+
+
 // ── PBAC ──────────────────────────────────────────────────────────────────────
 
 async fn pbac_check(tenant_id: &str, user_id: &str, permission: &str) -> bool {
@@ -310,20 +320,14 @@ async fn pbac_check(tenant_id: &str, user_id: &str, permission: &str) -> bool {
         "{}/v1/authz/check",
         ev("AUTH_ENFORCER_URL", "http://auth-enforcer:8314")
     );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let client = shared_http_client();
     let body = json!({
         "userId": user_id,
         "tenantId": tenant_id,
         "permission": permission,
         "entityType": "financial_operation"
     });
-    match client.post(&url).json(&body).send().await {
+    match client.post(&url).json(&body).timeout(std::time::Duration::from_secs(5)).send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(j) => j
                 .get("allowed")
@@ -394,6 +398,77 @@ struct AddEntryReq {
     program: Option<String>,
 }
 
+
+// ── Wave-11 (RS-20/RS-23): TTL-cached sanctions list ─────────────────────────
+// Was: full-table SELECT + per-row to_lowercase + jaro-winkler over every row
+// on every screening request. Now: 60s TTL cache with precomputed lowercase
+// names, a 2-char prefix prefilter, and a 500-candidate cap before scoring.
+struct SanctionsEntry {
+    entry_id: Uuid,
+    list_name: String,
+    entity_name: String,
+    entity_name_lc: String,
+    aliases: Vec<String>,
+    aliases_lc: Vec<String>,
+    risk_level: String,
+}
+
+struct SanctionsCache {
+    fetched_at: std::time::Instant,
+    entries: std::sync::Arc<Vec<SanctionsEntry>>,
+}
+
+static SANCTIONS_CACHE: std::sync::OnceLock<tokio::sync::RwLock<Option<SanctionsCache>>> = std::sync::OnceLock::new();
+const SANCTIONS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const SANCTIONS_MAX_CANDIDATES: usize = 500;
+
+async fn load_sanctions_entries(client: &deadpool_postgres::Client) -> Result<std::sync::Arc<Vec<SanctionsEntry>>, HttpResponse> {
+    let cache = SANCTIONS_CACHE.get_or_init(|| tokio::sync::RwLock::new(None));
+    {
+        let guard = cache.read().await;
+        if let Some(c) = guard.as_ref() {
+            if c.fetched_at.elapsed() < SANCTIONS_CACHE_TTL {
+                return Ok(c.entries.clone());
+            }
+        }
+    }
+    let mut w = cache.write().await;
+    if let Some(c) = w.as_ref() { // singleflight: re-check under write lock
+        if c.fetched_at.elapsed() < SANCTIONS_CACHE_TTL {
+            return Ok(c.entries.clone());
+        }
+    }
+    let rows = client.query(
+        "SELECT id, list_name, entity_name, aliases, risk_level \
+         FROM sanctions_entries WHERE active = TRUE",
+        &[],
+    ).await.map_err(|e| {
+        error!("Failed to query sanctions entries: {}", e);
+        HttpResponse::ServiceUnavailable().json(json!({
+            "error": "sanctions list query failed — transaction blocked for compliance"
+        }))
+    })?;
+    let entries: Vec<SanctionsEntry> = rows.iter().map(|row| {
+        let entity_name: String = row.get("entity_name");
+        let aliases: Vec<String> = row.get("aliases");
+        SanctionsEntry {
+            entry_id: row.get("id"),
+            list_name: row.get("list_name"),
+            entity_name_lc: entity_name.to_lowercase(),
+            entity_name,
+            aliases_lc: aliases.iter().map(|a| a.to_lowercase()).collect(),
+            aliases,
+            risk_level: row.get("risk_level"),
+        }
+    }).collect();
+    let entries = std::sync::Arc::new(entries);
+    *w = Some(SanctionsCache { fetched_at: std::time::Instant::now(), entries: entries.clone() });
+    Ok(entries)
+}
+
+
+
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn screen(body: web::Json<ScreenReq>, data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
@@ -425,41 +500,45 @@ async fn screen(body: web::Json<ScreenReq>, data: web::Data<AppState>, req: acti
         }
     };
 
-    let rows = match client
-        .query(
-            "SELECT id, list_name, entity_name, aliases, risk_level \
-             FROM sanctions_entries WHERE active = TRUE",
-            &[],
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to query sanctions entries: {}", e);
-            return HttpResponse::ServiceUnavailable().json(json!({
-                "error": "sanctions list query failed — transaction blocked for compliance"
-            }));
-        }
+    let entries = match load_sanctions_entries(&client).await {
+        Ok(e) => e,
+        Err(resp) => return resp,
     };
 
     let name_lower = name.to_lowercase();
     let threshold = data.match_threshold;
 
-    let mut matches: Vec<MatchResult> = rows
+    // Wave-11 (RS-20): 2-char prefix prefilter against precomputed lowercase
+    // names/aliases; at most 500 candidates reach jaro-winkler scoring.
+    let prefix2: String = name_lower.chars().take(2).collect();
+    let candidates: Vec<&SanctionsEntry> = if prefix2.is_empty() {
+        entries.iter().take(SANCTIONS_MAX_CANDIDATES).collect()
+    } else {
+        entries
+            .iter()
+            .filter(|e| {
+                e.entity_name_lc.starts_with(&prefix2)
+                    || e.aliases_lc.iter().any(|a| a.starts_with(&prefix2))
+            })
+            .take(SANCTIONS_MAX_CANDIDATES)
+            .collect()
+    };
+
+    let mut matches: Vec<MatchResult> = candidates
         .iter()
-        .filter_map(|row| {
-            let entry_id: Uuid = row.get("id");
-            let list_name: String = row.get("list_name");
-            let entity_name: String = row.get("entity_name");
-            let aliases: Vec<String> = row.get("aliases");
-            let risk_level: String = row.get("risk_level");
+        .filter_map(|e| {
+            let entry_id: Uuid = e.entry_id;
+            let list_name: String = e.list_name.clone();
+            let entity_name: String = e.entity_name.clone();
+            let aliases: &Vec<String> = &e.aliases;
+            let risk_level: String = e.risk_level.clone();
 
-            let primary_score = jaro_winkler(&name_lower, &entity_name.to_lowercase());
+            let primary_score = jaro_winkler(&name_lower, &e.entity_name_lc);
 
-            let (alias_score, alias_idx) = aliases
+            let (alias_score, alias_idx) = e.aliases_lc
                 .iter()
                 .enumerate()
-                .map(|(i, a)| (jaro_winkler(&name_lower, &a.to_lowercase()), i))
+                .map(|(i, a)| (jaro_winkler(&name_lower, a), i))
                 .fold((0.0_f64, 0), |best, (s, i)| {
                     if s > best.0 { (s, i) } else { best }
                 });
@@ -619,20 +698,8 @@ async fn publish_screening_verdict(resp: &ScreeningResponse) {
         "http://127.0.0.1:{}/v1.0/publish/{}/compliance.screening",
         dapr_port, pubsub_component
     );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                "compliance.screening publish: http client init failed (verdict durable in DB): {}",
-                e
-            );
-            return;
-        }
-    };
-    match client.post(&url).json(resp).send().await {
+    let client = shared_http_client();
+    match client.post(&url).json(resp).timeout(std::time::Duration::from_secs(3)).send().await {
         Ok(r) if r.status().is_success() => {
             info!(
                 "published screening verdict id={} action={} to compliance.screening",
@@ -706,8 +773,12 @@ async fn add_entry(body: web::Json<AddEntryReq>, data: web::Data<AppState>, req:
     }
 }
 
-async fn list_entries(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+async fn list_entries(data: web::Data<AppState>, req: actix_web::HttpRequest, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    // Wave-11 (RS-26): paginate instead of a fixed unbounded LIMIT 500.
+    let limit: i64 = query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100).clamp(1, 500);
+    let page: i64 = query.get("page").and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+    let offset: i64 = (page - 1) * limit;
     let client = match data.pool.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -719,8 +790,8 @@ async fn list_entries(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
         .query(
             "SELECT id, list_id, list_name, entity_name, entity_type, aliases, risk_level, \
              program, active, created_at \
-             FROM sanctions_entries ORDER BY created_at DESC LIMIT 500",
-            &[],
+             FROM sanctions_entries ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            &[&limit, &offset],
         )
         .await
     {
@@ -1116,41 +1187,50 @@ async fn upsert_entries(
     risk_level: &str,
     entries: Vec<ListEntry>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let client = pool.get().await?;
+    // Wave-11 (RS-24): chunked multi-row INSERTs inside one transaction
+    // (was: one INSERT round-trip per entry — N+1).
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
     let mut count = 0usize;
-    for entry in &entries {
-        let id = Uuid::new_v4();
-        let affected = client
-            .execute(
-                "INSERT INTO sanctions_entries \
-                 (id, list_id, list_name, entity_name, entity_type, aliases, \
-                  risk_level, program, list_entry_ref) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
-                 ON CONFLICT (list_id, list_entry_ref) \
-                 WHERE list_entry_ref IS NOT NULL \
-                 DO UPDATE SET \
-                     entity_name = EXCLUDED.entity_name, \
-                     entity_type = EXCLUDED.entity_type, \
-                     aliases     = EXCLUDED.aliases, \
-                     program     = EXCLUDED.program, \
-                     active      = TRUE",
-                &[
-                    &id,
-                    &list_id,
-                    &list_name,
-                    &entry.entity_name,
-                    &entry.entity_type,
-                    &entry.aliases,
-                    &risk_level,
-                    &entry.program,
-                    &entry.list_entry_ref,
-                ],
-            )
-            .await?;
-        if affected > 0 {
-            count += 1;
+    for chunk in entries.chunks(100) {
+        let ids: Vec<Uuid> = chunk.iter().map(|_| Uuid::new_v4()).collect();
+        let mut sql = String::from(
+            "INSERT INTO sanctions_entries \
+             (id, list_id, list_name, entity_name, entity_type, aliases, \
+              risk_level, program, list_entry_ref) VALUES ",
+        );
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::with_capacity(chunk.len() * 9);
+        for (i, entry) in chunk.iter().enumerate() {
+            if i > 0 { sql.push(','); }
+            let b = i * 9;
+            sql.push_str(&format!(
+                "(${},${},${},${},${},${},${},${},${})",
+                b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8, b + 9
+            ));
+            params.push(&ids[i]);
+            params.push(&list_id);
+            params.push(&list_name);
+            params.push(&entry.entity_name);
+            params.push(&entry.entity_type);
+            params.push(&entry.aliases);
+            params.push(&risk_level);
+            params.push(&entry.program);
+            params.push(&entry.list_entry_ref);
         }
+        sql.push_str(
+            " ON CONFLICT (list_id, list_entry_ref) \
+             WHERE list_entry_ref IS NOT NULL \
+             DO UPDATE SET \
+                 entity_name = EXCLUDED.entity_name, \
+                 entity_type = EXCLUDED.entity_type, \
+                 aliases     = EXCLUDED.aliases, \
+                 program     = EXCLUDED.program, \
+                 active      = TRUE",
+        );
+        let affected = tx.execute(&sql, &params).await?;
+        count += affected as usize;
     }
+    tx.commit().await?;
     Ok(count)
 }
 
@@ -1214,9 +1294,19 @@ async fn sync_all_lists(
 
 async fn trigger_sync(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    // Wave-11 (RS-25): single-flight background sync (was: unbounded spawn per request).
+    static SYNC_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SYNC_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return HttpResponse::Conflict().json(json!({
+            "error": "sync_already_running",
+            "message": "a sanctions list sync is already in progress"
+        }));
+    }
     let pool = data.pool.clone();
     tokio::spawn(async move {
-        if let Err(e) = sync_all_lists(&pool).await {
+        let result = sync_all_lists(&pool).await;
+        SYNC_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Err(e) = result {
             error!("Triggered sync failed: {}", e);
         }
     });

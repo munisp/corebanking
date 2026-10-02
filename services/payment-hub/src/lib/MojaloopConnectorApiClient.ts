@@ -1,4 +1,6 @@
 import axios, { AxiosInstance } from "axios";
+import http from "http";
+import https from "https";
 import logger from "../config/logger.config";
 import { readEnv } from "../config/readEnv.config";
 import { IRegisterParticipantInput } from "../types";
@@ -10,6 +12,10 @@ import {
 
 const url = readEnv("MOJALOOP_CONNECTOR_URL") as string;
 
+// TS-42: keepAlive agents avoid TCP(+TLS) setup per transfer/lookup call.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
+
 export class MojaloopConnectorApiClient {
   private static instance: MojaloopConnectorApiClient | null = null;
   private readonly clientAxios: AxiosInstance;
@@ -17,6 +23,9 @@ export class MojaloopConnectorApiClient {
   private constructor() {
     this.clientAxios = axios.create({
       baseURL: url,
+      timeout: 10000,
+      httpAgent,
+      httpsAgent,
     });
   }
 
@@ -31,12 +40,13 @@ export class MojaloopConnectorApiClient {
     body: TInitiateTransferSchemaMojaloop,
     headers?: Record<string, string>,
   ) {
-    console.log("initialize transfer", body);
-    console.log("with headers", headers);
+    // TS-39: full transfer bodies/headers only at debug level (LOG_LEVEL=debug).
+    logger.debug("initialize transfer", { body });
+    logger.debug("with headers", { headers });
     const { data } = await this.clientAxios.post("/transfers/initiate", body, {
       headers,
     });
-    console.log("initialize transfer response", data);
+    logger.debug("initialize transfer response", { data });
     return data;
   }
 
@@ -56,7 +66,7 @@ export class MojaloopConnectorApiClient {
 
   public async register_participant(input: IRegisterParticipantInput) {
     try {
-      console.log("register_participant: init");
+      logger.debug("register_participant: init");
 
       const {
         currency = CurrencyEnum.NGN,
@@ -72,14 +82,14 @@ export class MojaloopConnectorApiClient {
         tenant_name,
       };
 
-      console.log("register_participant: payload", payload);
+      logger.debug("register_participant: payload", { payload });
 
       const { data } = await this.clientAxios.post(
         "/participants/register",
         payload,
       );
 
-      console.log("Response From Oracle", data);
+      logger.debug("Response From Oracle", { data });
     } catch (error) {
       logger.error("error registering participants", error);
     }

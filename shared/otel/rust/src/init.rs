@@ -22,8 +22,10 @@ pub const DEFAULT_OTLP_ENDPOINT: &str = "http://otel-collector:4317";
 #[derive(Debug)]
 pub enum InitError {
     /// The OTLP tonic exporter could not be built (bad endpoint URI, TLS
-    /// configuration failure, missing runtime, ...).
-    Exporter(opentelemetry_otlp::ExporterBuildError),
+    /// configuration failure, missing runtime, ...). Carried as a string:
+    /// the concrete `opentelemetry_otlp` error type is not nameable across
+    /// the 0.28 release line.
+    Exporter(String),
 }
 
 impl fmt::Display for InitError {
@@ -34,13 +36,7 @@ impl fmt::Display for InitError {
     }
 }
 
-impl Error for InitError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            InitError::Exporter(e) => Some(e),
-        }
-    }
-}
+impl Error for InitError {}
 
 /// RAII guard returned by [`init`]. Dropping the guard flushes pending spans
 /// and shuts the tracer provider down (SPEC §2.5: "drop flushes").
@@ -89,14 +85,17 @@ fn build_resource(service_name: &str) -> Resource {
         .build()
 }
 
-/// Parent-based trace-id-ratio sampler; `OTEL_TRACES_SAMPLER_ARG` defaults to
-/// `1.0` (money services always sample everything, SPEC §2.1). Unparseable or
-/// out-of-range values are clamped to `[0, 1]`.
+/// Parent-based trace-id-ratio sampler. Wave-11 (RS-38): the default ratio is
+/// `0.05` (5%) — 100% sampling saturated the collector on hot paths. Override
+/// with `OTEL_TRACE_SAMPLER_ARG` (or legacy `OTEL_TRACES_SAMPLER_ARG`), e.g.
+/// `1.0` for money-path services that must sample everything (SPEC §2.1).
+/// Unparseable or out-of-range values are clamped to `[0, 1]`.
 fn build_sampler() -> Sampler {
-    let ratio = env::var("OTEL_TRACES_SAMPLER_ARG")
+    let ratio = env::var("OTEL_TRACE_SAMPLER_ARG")
         .ok()
+        .or_else(|| env::var("OTEL_TRACES_SAMPLER_ARG").ok())
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(1.0)
+        .unwrap_or(0.05)
         .clamp(0.0, 1.0);
     Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio)))
 }
@@ -132,7 +131,7 @@ pub fn init(service_name: &str) -> Result<OtelGuard, InitError> {
         .with_tonic()
         .with_endpoint(endpoint)
         .build()
-        .map_err(InitError::Exporter)?;
+        .map_err(|e| InitError::Exporter(e.to_string()))?;
 
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)

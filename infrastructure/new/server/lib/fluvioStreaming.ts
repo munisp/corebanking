@@ -16,7 +16,7 @@ import {
   fluvioConsumerGroups,
   fluvioTopics,
 } from "../../drizzle/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, inArray } from "drizzle-orm";
 import { logger } from "./logger";
 import crypto from "crypto";
 
@@ -223,41 +223,57 @@ export async function relayOutboxEvents(batchSize = 100): Promise<{
   let relayed = 0;
   let failed = 0;
 
-  for (const event of pending) {
-    try {
-      const res = await fetch(`${FLUVIO_STREAMS_URL}/produce`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic: event.topic,
-          key: event.tenantId,
-          value: { eventId: event.eventId, ...event.payload },
-        }),
-        signal: AbortSignal.timeout(5000),
-      });
+  // TS-11: relay in small concurrent batches (10) instead of strictly
+  // sequentially; successfully produced events are marked processed with a
+  // single multi-row UPDATE per batch. Iterations are independent (each event
+  // has its own row/key), so batching is safe.
+  const RELAY_CONCURRENCY = 10;
+  for (let i = 0; i < pending.length; i += RELAY_CONCURRENCY) {
+    const chunk = pending.slice(i, i + RELAY_CONCURRENCY);
+    const outcomes = await Promise.allSettled(
+      chunk.map(async (event) => {
+        const res = await fetch(`${FLUVIO_STREAMS_URL}/produce`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            topic: event.topic,
+            key: event.tenantId,
+            value: { eventId: event.eventId, ...event.payload },
+          }),
+          signal: AbortSignal.timeout(5000),
+        });
 
-      if (res.ok) {
-        await db
-          .update(fluvioEventOutbox)
-          .set({ status: "processed", processedAt: new Date() })
-          .where(eq(fluvioEventOutbox.eventId, event.eventId));
-        relayed++;
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+      }),
+    );
+
+    const processedIds: string[] = [];
+    for (let j = 0; j < outcomes.length; j++) {
+      const outcome = outcomes[j];
+      const event = chunk[j];
+      if (outcome.status === "fulfilled") {
+        processedIds.push(event.eventId);
       } else {
+        const reason = outcome.reason;
         await db
           .update(fluvioEventOutbox)
-          .set({ attempts: (event.attempts ?? 0) + 1, lastError: `HTTP ${res.status}` })
+          .set({
+            attempts: (event.attempts ?? 0) + 1,
+            lastError: reason instanceof Error ? reason.message : String(reason),
+          })
           .where(eq(fluvioEventOutbox.eventId, event.eventId));
         failed++;
       }
-    } catch (err) {
+    }
+
+    if (processedIds.length > 0) {
       await db
         .update(fluvioEventOutbox)
-        .set({
-          attempts: (event.attempts ?? 0) + 1,
-          lastError: err instanceof Error ? err.message : String(err),
-        })
-        .where(eq(fluvioEventOutbox.eventId, event.eventId));
-      failed++;
+        .set({ status: "processed", processedAt: new Date() })
+        .where(inArray(fluvioEventOutbox.eventId, processedIds));
+      relayed += processedIds.length;
     }
   }
 

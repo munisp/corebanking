@@ -28,6 +28,17 @@ import (
 	"shared/otel/go/otelkit"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // TigerBeetle Overdraft Protection (MN-08 rework).
 //
 // Drawdown moves REAL money: a single non-pending TB transfer from the
@@ -334,12 +345,16 @@ func drawdownHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+
+	// GCM-045: the FOR UPDATE row lock is held ONLY for the validation read +
+	// atomic balance/seq claim (fast DB statements only). TigerBeetle RPCs run
+	// AFTER commit — no lock is held across network I/O. TB failure →
+	// compensating reversal + clean error.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		jsonErr(w, "db error", 500)
 		return
 	}
-	defer tx.Rollback()
 
 	// MN-08: DB is the source of truth; row lock serializes drawdowns.
 	var f OverdraftFacility
@@ -350,14 +365,17 @@ func drawdownHandler(w http.ResponseWriter, r *http.Request) {
 		Scan(&f.FacilityID, &f.AccountID, &f.ODAccountID, &f.LimitKobo, &f.UsedKobo, &f.AvailableKobo,
 			&f.InterestRate, &f.Status, &f.CreatedAt, &f.ExpiresAt, &drawSeq)
 	if err == sql.ErrNoRows {
+		tx.Rollback()
 		jsonErr(w, "no overdraft facility for this account", 404)
 		return
 	}
 	if err != nil {
+		tx.Rollback()
 		jsonErr(w, "db error", 500)
 		return
 	}
 	if f.Status != "active" {
+		tx.Rollback()
 		jsonErr(w, "facility not active", 403)
 		return
 	}
@@ -368,23 +386,14 @@ func drawdownHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.AmountKobo > f.AvailableKobo {
+		tx.Rollback()
 		jsonErr(w, fmt.Sprintf("exceeds available limit (available_kobo=%d, requested_kobo=%d)", f.AvailableKobo, req.AmountKobo), 403)
 		return
 	}
 
-	facTB, err := ensureFacilityTBAccount(ctx, f.FacilityID)
-	if err != nil {
-		jsonErr(w, "facility TB account unavailable: "+err.Error(), 502)
-		return
-	}
-
+	// Claim the sequence + balances atomically while the row lock is held.
 	seq := drawSeq + 1
 	transferKey := fmt.Sprintf("od:%s:%d", f.FacilityID, seq)
-	if err := odTransfer(ctx, transferKey, facTB, custTB, req.AmountKobo, transferDrawdown); err != nil {
-		jsonErr(w, "ledger transfer failed — drawdown NOT executed: "+err.Error(), 502)
-		return
-	}
-
 	balanceBefore := f.UsedKobo
 	f.UsedKobo += req.AmountKobo
 	f.AvailableKobo = f.LimitKobo - f.UsedKobo
@@ -399,17 +408,51 @@ func drawdownHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE tb_overdraft_facilities SET used_kobo=$1, available_kobo=$2, draw_seq=$3 WHERE facility_id=$4`,
 		f.UsedKobo, f.AvailableKobo, seq, f.FacilityID); err != nil {
+		tx.Rollback()
 		jsonErr(w, "db error", 500)
 		return
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO tb_od_transfers (transfer_id, facility_id, amount_kobo, type, balance_before_kobo, balance_after_kobo, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (transfer_id) DO NOTHING`,
 		transfer.TransferID, transfer.FacilityID, transfer.AmountKobo, transfer.Type, transfer.BalanceBefore, transfer.BalanceAfter, transfer.CreatedAt); err != nil {
+		tx.Rollback()
 		jsonErr(w, "db error", 500)
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		jsonErr(w, "commit failed", 500)
+		return
+	}
+	// Row lock RELEASED — only network I/O follows.
+
+	// GCM-046: use the persisted od_account_id instead of re-issuing
+	// CreateAccounts per drawdown; only legacy rows without one fall back to
+	// ensureFacilityTBAccount (then persisted for next time).
+	var facTB tbclient.Uint128
+	if f.ODAccountID != "" {
+		facTB, err = parseTBAccountID(f.ODAccountID)
+		if err != nil {
+			compensateDrawdown(f.FacilityID, req.AmountKobo, transferKey)
+			jsonErr(w, "stored od_account_id invalid: "+err.Error(), 500)
+			return
+		}
+	} else {
+		facTB, err = ensureFacilityTBAccount(ctx, f.FacilityID)
+		if err != nil {
+			compensateDrawdown(f.FacilityID, req.AmountKobo, transferKey)
+			jsonErr(w, "facility TB account unavailable: "+err.Error(), 502)
+			return
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE tb_overdraft_facilities SET od_account_id=$1 WHERE facility_id=$2 AND (od_account_id IS NULL OR od_account_id='')`,
+			u128Hex(facTB), f.FacilityID); err != nil {
+			log.Printf("warning: persist od_account_id failed for facility %s: %v", f.FacilityID, err)
+		}
+	}
+
+	if err := odTransfer(ctx, transferKey, facTB, custTB, req.AmountKobo, transferDrawdown); err != nil {
+		// TB failed — no lock held; undo the balance/record claim.
+		compensateDrawdown(f.FacilityID, req.AmountKobo, transferKey)
+		jsonErr(w, "ledger transfer failed — drawdown NOT executed: "+err.Error(), 502)
 		return
 	}
 
@@ -420,6 +463,34 @@ func drawdownHandler(w http.ResponseWriter, r *http.Request) {
 		"tb_transfer_id": u128Hex(detID(transferKey)),
 		"tb_result":      "success",
 	})
+}
+
+// compensateDrawdown reverts the balance claim and transfer record when the
+// TigerBeetle transfer (or facility-account resolution) fails after the claim
+// committed. draw_seq is intentionally left bumped (harmless gap) —
+// decrementing could clobber a concurrent claim. Best-effort, loud logs.
+func compensateDrawdown(facilityID string, amountKobo int64, transferKey string) {
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(cctx, nil)
+	if err != nil {
+		log.Printf("CRITICAL: drawdown compensation begin failed for facility %s key %s: %v", facilityID, transferKey, err)
+		return
+	}
+	if _, err := tx.ExecContext(cctx, `UPDATE tb_overdraft_facilities SET used_kobo=used_kobo-$1, available_kobo=available_kobo+$1 WHERE facility_id=$2`,
+		amountKobo, facilityID); err != nil {
+		tx.Rollback()
+		log.Printf("CRITICAL: drawdown compensation update failed for facility %s key %s: %v", facilityID, transferKey, err)
+		return
+	}
+	if _, err := tx.ExecContext(cctx, `DELETE FROM tb_od_transfers WHERE transfer_id=$1`, transferKey); err != nil {
+		tx.Rollback()
+		log.Printf("CRITICAL: drawdown compensation delete failed for facility %s key %s: %v", facilityID, transferKey, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("CRITICAL: drawdown compensation commit failed for facility %s key %s: %v", facilityID, transferKey, err)
+	}
 }
 
 func repayHandler(w http.ResponseWriter, r *http.Request) {
@@ -450,12 +521,15 @@ func repayHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+
+	// GCM-045: FOR UPDATE row lock held only for the validation read + atomic
+	// balance/seq claim; the TigerBeetle RPC runs AFTER commit. TB failure →
+	// compensating reversal, clean error, no lock held across I/O.
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		jsonErr(w, "db error", 500)
 		return
 	}
-	defer tx.Rollback()
 
 	var f OverdraftFacility
 	var repaySeq int64
@@ -465,10 +539,12 @@ func repayHandler(w http.ResponseWriter, r *http.Request) {
 		Scan(&f.FacilityID, &f.AccountID, &f.ODAccountID, &f.LimitKobo, &f.UsedKobo, &f.AvailableKobo,
 			&f.InterestRate, &f.Status, &f.CreatedAt, &f.ExpiresAt, &repaySeq)
 	if err == sql.ErrNoRows {
+		tx.Rollback()
 		jsonErr(w, "no overdraft facility for this account", 404)
 		return
 	}
 	if err != nil {
+		tx.Rollback()
 		jsonErr(w, "db error", 500)
 		return
 	}
@@ -478,23 +554,14 @@ func repayHandler(w http.ResponseWriter, r *http.Request) {
 		repayAmount = f.UsedKobo
 	}
 	if repayAmount <= 0 {
+		tx.Rollback()
 		jsonErr(w, "nothing to repay", 400)
 		return
 	}
 
-	facTB, err := ensureFacilityTBAccount(ctx, f.FacilityID)
-	if err != nil {
-		jsonErr(w, "facility TB account unavailable: "+err.Error(), 502)
-		return
-	}
-
+	// Claim the sequence + balances atomically while the row lock is held.
 	seq := repaySeq + 1
 	transferKey := fmt.Sprintf("od:%s:repay:%d", f.FacilityID, seq)
-	if err := odTransfer(ctx, transferKey, custTB, facTB, repayAmount, transferRepayment); err != nil {
-		jsonErr(w, "ledger transfer failed — repayment NOT executed: "+err.Error(), 502)
-		return
-	}
-
 	balanceBefore := f.UsedKobo
 	f.UsedKobo -= repayAmount
 	f.AvailableKobo = f.LimitKobo - f.UsedKobo
@@ -509,12 +576,14 @@ func repayHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE tb_overdraft_facilities SET used_kobo=$1, available_kobo=$2, repay_seq=$3 WHERE facility_id=$4`,
 		f.UsedKobo, f.AvailableKobo, seq, f.FacilityID); err != nil {
+		tx.Rollback()
 		jsonErr(w, "db error", 500)
 		return
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO tb_od_transfers (transfer_id, facility_id, amount_kobo, type, balance_before_kobo, balance_after_kobo, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (transfer_id) DO NOTHING`,
 		transfer.TransferID, transfer.FacilityID, transfer.AmountKobo, transfer.Type, transfer.BalanceBefore, transfer.BalanceAfter, transfer.CreatedAt); err != nil {
+		tx.Rollback()
 		jsonErr(w, "db error", 500)
 		return
 	}
@@ -522,9 +591,66 @@ func repayHandler(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, "commit failed", 500)
 		return
 	}
+	// Row lock RELEASED — only network I/O follows.
+
+	// GCM-046: use the persisted od_account_id; legacy rows fall back to
+	// ensureFacilityTBAccount (persisted for next time).
+	var facTB tbclient.Uint128
+	if f.ODAccountID != "" {
+		facTB, err = parseTBAccountID(f.ODAccountID)
+		if err != nil {
+			compensateRepayment(f.FacilityID, repayAmount, transferKey)
+			jsonErr(w, "stored od_account_id invalid: "+err.Error(), 500)
+			return
+		}
+	} else {
+		facTB, err = ensureFacilityTBAccount(ctx, f.FacilityID)
+		if err != nil {
+			compensateRepayment(f.FacilityID, repayAmount, transferKey)
+			jsonErr(w, "facility TB account unavailable: "+err.Error(), 502)
+			return
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE tb_overdraft_facilities SET od_account_id=$1 WHERE facility_id=$2 AND (od_account_id IS NULL OR od_account_id='')`,
+			u128Hex(facTB), f.FacilityID); err != nil {
+			log.Printf("warning: persist od_account_id failed for facility %s: %v", f.FacilityID, err)
+		}
+	}
+
+	if err := odTransfer(ctx, transferKey, custTB, facTB, repayAmount, transferRepayment); err != nil {
+		compensateRepayment(f.FacilityID, repayAmount, transferKey)
+		jsonErr(w, "ledger transfer failed — repayment NOT executed: "+err.Error(), 502)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"transfer": transfer, "facility": f, "tb_result": "success"})
+}
+
+// compensateRepayment reverts the balance claim and transfer record when the
+// TigerBeetle transfer fails after the claim committed. Best-effort with loud
+// logs; repay_seq is left bumped (harmless gap).
+func compensateRepayment(facilityID string, amountKobo int64, transferKey string) {
+	cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(cctx, nil)
+	if err != nil {
+		log.Printf("CRITICAL: repayment compensation begin failed for facility %s key %s: %v", facilityID, transferKey, err)
+		return
+	}
+	if _, err := tx.ExecContext(cctx, `UPDATE tb_overdraft_facilities SET used_kobo=used_kobo+$1, available_kobo=available_kobo-$1 WHERE facility_id=$2`,
+		amountKobo, facilityID); err != nil {
+		tx.Rollback()
+		log.Printf("CRITICAL: repayment compensation update failed for facility %s key %s: %v", facilityID, transferKey, err)
+		return
+	}
+	if _, err := tx.ExecContext(cctx, `DELETE FROM tb_od_transfers WHERE transfer_id=$1`, transferKey); err != nil {
+		tx.Rollback()
+		log.Printf("CRITICAL: repayment compensation delete failed for facility %s key %s: %v", facilityID, transferKey, err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("CRITICAL: repayment compensation commit failed for facility %s key %s: %v", facilityID, transferKey, err)
+	}
 }
 
 // checkHandler is the debit-path authorization contract (MN-08) consumed by
@@ -637,8 +763,7 @@ func accrueHandler(w http.ResponseWriter, r *http.Request) {
 		if tok := os.Getenv("INTEREST_ACCRUAL_TOKEN"); tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		client := &http.Client{Timeout: 10 * time.Second}
-		if resp, err := client.Do(req); err != nil {
+		if resp, err := sharedHTTPClient.Do(req); err != nil {
 			engineStatus = "trigger_failed: " + err.Error()
 		} else {
 			engineStatus = fmt.Sprintf("triggered: http_%d", resp.StatusCode)
@@ -713,8 +838,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -896,7 +1020,13 @@ func main() {
 		port = "8304"
 	}
 
-	server := &http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux))}
+	server := &http.Server{
+		Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		log.Printf("[tb-overdraft-protection-go] Starting on :%s", port)

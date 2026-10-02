@@ -28,6 +28,25 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
 var db *sql.DB
 
 // --- 54Bank Real-Time WebSocket Gateway ---
@@ -378,6 +397,8 @@ type AuditEntry struct {
 	Details   string `json:"details"`
 }
 
+const maxAuditEntries = 2000
+
 var auditLog []AuditEntry
 
 func appendAudit(action, recordID, actor, details string) {
@@ -386,7 +407,11 @@ func appendAudit(action, recordID, actor, details string) {
 		Action: action, RecordID: recordID, Actor: actor,
 		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
 	})
-
+	// Bound the in-memory audit log: evict oldest entries (GPT-06).
+	if len(auditLog) > maxAuditEntries {
+		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
+		auditLog = auditLog[:maxAuditEntries]
+	}
 }
 
 // sanitizeLogValue strips CR/LF and other control characters from
@@ -899,16 +924,8 @@ func warnIfAuthUnconfigured() {
 }
 
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
-		}
-	}()
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -1138,7 +1155,13 @@ func main() {
 	mux.Handle("/v1/realtime-gateway/events/types", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleEventTypes)))
 	mux.Handle("/v1/realtime-gateway/connections", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleConnections)))
 	log.Printf("54Bank Real-Time Gateway listening on :%s (SSE + REST)", PORT)
-	server := &http.Server{Addr: ":" + PORT, Handler: panicRecoveryMiddleware(rateLimitMiddleware(mux))}
+	server := &http.Server{
+		Addr: ":" + PORT, Handler: panicRecoveryMiddleware(rateLimitMiddleware(mux)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		log.Printf("[realtime-gateway-go] Starting on :%s", PORT)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

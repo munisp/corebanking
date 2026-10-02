@@ -1,6 +1,7 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 
 from database import Base, engine
 from api.v1 import account_router, health_router, system_router, bank_router, statements_router, opening_router, closure_router, safe_deposit_router, billing_router, lifecycle_router
@@ -24,6 +25,7 @@ app = FastAPI(
     description="54link account management service.",
     version="0.0.1"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     RequiredHeadersMiddleware,

@@ -284,7 +284,7 @@ async fn main() -> std::io::Result<()> {
     let db = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             match PgPoolOptions::new()
-                .max_connections(5)
+                .max_connections(20) /* Wave-11 RS-37: was 5, undersized */
                 .acquire_timeout(std::time::Duration::from_secs(5))
                 .connect(&url)
                 .await

@@ -5,6 +5,7 @@ Unified service for customer registration with automatic KYC/KYB verification
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, Literal
 from datetime import datetime
@@ -18,6 +19,7 @@ app = FastAPI(
     description="Unified customer registration with KYC/KYB verification",
     version="1.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -1088,4 +1090,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8003)
+    uvicorn.run("main:app", host="0.0.0.0", port=8003, workers=int(os.environ.get("UVICORN_WORKERS", "4")))

@@ -271,12 +271,14 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 		return nil, err
 	}
 
+	// GCM-102: hold s.mu ONLY for in-memory map updates — all RPC/HTTP
+	// (TigerBeetle, NIBSS, lakehouse) run after the lock is released.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Generate unique VAN
 	van, err := s.generateVAN(req.BankID)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, fmt.Errorf("failed to generate VAN: %w", err)
 	}
 
@@ -313,6 +315,7 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 	// Store account
 	s.accounts[van] = account
 	s.accountsByID[account.ID] = account
+	s.mu.Unlock()
 
 	// Escrow VANs need a dedicated holding account in TigerBeetle.
 	// All other purposes credit the parent account directly on payment, so no sub-account is needed.
@@ -322,7 +325,7 @@ func (s *VirtualAccountService) CreateVAN(ctx context.Context, req *CreateVANReq
 		}
 	}
 
-	// Register with NIBSS for inbound routing
+	// Register with NIBSS for inbound routing (outside s.mu — slow HTTP call)
 	if err := s.registerWithNIBSS(ctx, account); err != nil {
 		log.Printf("Warning: Failed to register with NIBSS: %v", err)
 		// Continue anyway - can be registered later
@@ -406,9 +409,11 @@ func (s *VirtualAccountService) registerWithNIBSS(ctx context.Context, account *
 }
 
 // ProcessInboundPayment processes an inbound payment to a VAN
+// GCM-101: s.mu is held ONLY for in-memory map/field mutations. The Postgres
+// dedup claim, TigerBeetle RPCs and lakehouse publishes all run outside the
+// lock. Idempotency semantics unchanged: the dedup INSERT ... ON CONFLICT
+// remains the atomic gate and runs before any side effect.
 func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payment *VANPayment) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// MN-14 (S14): durable dedup in Postgres — in-memory dedup was lost on
 	// restart and duplicates returned 400, amplifying upstream retry storms.
@@ -436,39 +441,52 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 		}
 	} else {
 		log.Printf("[virtual-account-service] WARNING: in-memory dedup fallback (DATABASE_URL unset)")
+		s.mu.RLock()
 		for _, existing := range s.payments {
 			if payment.SessionID != "" && existing.SessionID == payment.SessionID {
+				s.mu.RUnlock()
 				return ErrDuplicateInboundPayment
 			}
 			if payment.TransactionRef != "" && existing.TransactionRef == payment.TransactionRef {
+				s.mu.RUnlock()
 				return ErrDuplicateInboundPayment
 			}
 		}
+		s.mu.RUnlock()
 	}
 
-	// Find the VAN
+	// Find and validate the VAN under a read lock. The account fields used
+	// below and by the TigerBeetle client (ID, VAN, BankID, ParentAccountID,
+	// Purpose, ReferenceID, Currency) are immutable after creation.
+	s.mu.RLock()
 	account, ok := s.accounts[payment.VAN]
 	if !ok {
+		s.mu.RUnlock()
 		return fmt.Errorf("VAN not found: %s", payment.VAN)
 	}
 
 	// Validate account status
 	if account.Status != "active" {
+		s.mu.RUnlock()
 		return fmt.Errorf("VAN is not active: %s", account.Status)
 	}
 
 	// Check expiry
 	if account.ExpiresAt != nil && time.Now().After(*account.ExpiresAt) {
+		s.mu.RUnlock()
 		return fmt.Errorf("VAN has expired")
 	}
 
 	// Validate amount constraints
 	if account.MinAmount != nil && payment.Amount < *account.MinAmount {
+		s.mu.RUnlock()
 		return fmt.Errorf("payment amount %.2f below minimum %.2f", payment.Amount, *account.MinAmount)
 	}
 	if account.MaxAmount != nil && payment.Amount > *account.MaxAmount {
+		s.mu.RUnlock()
 		return fmt.Errorf("payment amount %.2f exceeds maximum %.2f", payment.Amount, *account.MaxAmount)
 	}
+	s.mu.RUnlock()
 
 	// Generate payment ID
 	payment.ID = uuid.New().String()
@@ -478,16 +496,21 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	payment.Status = "pending"
 	payment.CreatedAt = time.Now()
 
-	// Create ledger entry in TigerBeetle
+	// Create ledger entry in TigerBeetle (RPC — outside s.mu). The transfer
+	// ID is payment.ID, so a retried call with the same payment ID is
+	// idempotent at the ledger.
 	ledgerEntryID, err := s.createLedgerEntry(ctx, account, payment)
 	if err != nil {
 		payment.Status = "failed"
+		s.mu.Lock()
 		s.payments[payment.ID] = payment
+		s.mu.Unlock()
 		return fmt.Errorf("failed to create ledger entry: %w", err)
 	}
 	payment.LedgerEntryID = ledgerEntryID
 
-	// Update account stats
+	// Update account stats + record the payment (in-memory mutations only).
+	s.mu.Lock()
 	account.TotalReceived += payment.Amount
 	account.PaymentCount++
 	now := time.Now()
@@ -503,6 +526,7 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	payment.Status = "processed"
 	payment.ProcessedAt = &now
 	s.payments[payment.ID] = payment
+	s.mu.Unlock()
 
 	// Send webhook notification
 	go s.sendWebhookNotification(account, payment)
@@ -512,18 +536,29 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	vanPaymentAmount.WithLabelValues(account.BankID).Observe(payment.Amount)
 
 	if s.lakehouse != nil {
-		if err := s.lakehouse.PublishVANCollection(ctx, account.ID, payment.TransactionRef, payment.Amount, payment.Currency, payment.SenderName, payment.SenderBank, account.BankID); err != nil {
-			log.Printf("Warning: failed to publish VAN collection to lakehouse: %v", err)
-		}
-		if s.shouldRouteSettlementViaMojaloop(account, payment) {
-			settlementRef := payment.TransactionRef
-			if settlementRef == "" {
-				settlementRef = payment.ID
+		// Publish asynchronously with its own deadline — the request ctx may
+		// be cancelled as soon as the handler returns, and these publishes
+		// must neither hold s.mu nor block the webhook response.
+		accountID, bankID, parentID := account.ID, account.BankID, account.ParentAccountID
+		txRef, senderName, senderBank := payment.TransactionRef, payment.SenderName, payment.SenderBank
+		amount, currency, paymentID := payment.Amount, payment.Currency, payment.ID
+		viaMojaloop := s.shouldRouteSettlementViaMojaloop(account, payment)
+		go func() {
+			pubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := s.lakehouse.PublishVANCollection(pubCtx, accountID, txRef, amount, currency, senderName, senderBank, bankID); err != nil {
+				log.Printf("Warning: failed to publish VAN collection to lakehouse: %v", err)
 			}
-			if err := s.lakehouse.PublishVANSettlement(ctx, account.ID, settlementRef, payment.Amount, account.ParentAccountID, account.BankID); err != nil {
-				log.Printf("Warning: failed to publish VAN settlement to lakehouse: %v", err)
+			if viaMojaloop {
+				settlementRef := txRef
+				if settlementRef == "" {
+					settlementRef = paymentID
+				}
+				if err := s.lakehouse.PublishVANSettlement(pubCtx, accountID, settlementRef, amount, parentID, bankID); err != nil {
+					log.Printf("Warning: failed to publish VAN settlement to lakehouse: %v", err)
+				}
 			}
-		}
+		}()
 	}
 
 	log.Printf("Processed payment %s of %.2f to VAN %s", payment.ID, payment.Amount, payment.VAN)
@@ -895,8 +930,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -1311,5 +1345,17 @@ func main() {
 
 	port := getEnv("PORT", "8080")
 	log.Printf("Virtual Account Service starting on port %s", port)
-	router.Run(":" + port)
+	// GCM-105: router.Run() = bare http.ListenAndServe (no timeouts, Slowloris
+	// exposure). Use a configured http.Server instead.
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("server error: %v", err)
+	}
 }

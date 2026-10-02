@@ -1,6 +1,7 @@
 import axios, { AxiosInstance } from "axios";
 import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
+import logger from "../config/logger.config";
 import { IAdminProfilePayload } from "../types/admin";
 import { serviceAuthClient } from "../lib/serviceAuthClient";
 
@@ -30,7 +31,9 @@ class AdminService {
         tenantRole: payload.tenant_role,
         branchId: payload.branch_id,
       };
-      console.log("[adminService.createAdminProfile] sending to admin-service:", JSON.stringify(body));
+      // TS-33: full body only at debug level (LOG_LEVEL=debug), not on the
+      // default info path.
+      logger.debug("[adminService.createAdminProfile] sending to admin-service", { body });
       await this._axiosInstance.post("/admin", body, {
         headers: {
           "x-tenant-id": payload.tenant_id,

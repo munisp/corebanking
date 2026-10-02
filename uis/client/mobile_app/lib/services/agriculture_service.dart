@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'api_service.dart';
 import '../config/app_config.dart';
 
@@ -8,14 +9,18 @@ class AgricultureService {
   final ApiService _api = ApiService();
 
   void _log(String endpoint, dynamic data) {
-    print("AGRICULTURE RESPONSE [$endpoint]: $data");
+    // MOB-04: full-payload logging gated to debug builds (was print() in
+    // release — log-throttle jank + data leak on large lists).
+    if (kDebugMode) {
+      print("AGRICULTURE RESPONSE [$endpoint]: $data");
+    }
   }
 
   String get base => AppConfig.agricultureEndpoint;
 
   // ================= CROPS =================
-  Future<dynamic> listCrops() async {
-    final res = await _api.get("$base/crops");
+  Future<dynamic> listCrops({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/crops", queryParameters: {'page': page, 'limit': limit});
     _log("/crops", res.data);
     return res.data;
   }
@@ -27,8 +32,8 @@ class AgricultureService {
   }
 
   // ================= LIVESTOCK =================
-  Future<dynamic> listLivestock() async {
-    final res = await _api.get("$base/livestock");
+  Future<dynamic> listLivestock({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/livestock", queryParameters: {'page': page, 'limit': limit});
     _log("/livestock", res.data);
     return res.data;
   }
@@ -40,8 +45,8 @@ class AgricultureService {
   }
 
   // ================= FARMERS =================
-  Future<dynamic> listFarmers() async {
-    final res = await _api.get("$base/farmers");
+  Future<dynamic> listFarmers({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/farmers", queryParameters: {'page': page, 'limit': limit});
     _log("/farmers", res.data);
     return res.data;
   }
@@ -58,15 +63,15 @@ class AgricultureService {
     return res.data;
   }
 
-  Future<dynamic> getFarmerFarms(String id) async {
-    final res = await _api.get("$base/farmers/$id/farms");
+  Future<dynamic> getFarmerFarms(String id, {int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/farmers/$id/farms", queryParameters: {'page': page, 'limit': limit});
     _log("/farmers/$id/farms", res.data);
     return res.data;
   }
 
   // ================= FARMS =================
-  Future<dynamic> listFarms() async {
-    final res = await _api.get("$base/farms");
+  Future<dynamic> listFarms({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/farms", queryParameters: {'page': page, 'limit': limit});
     _log("/farms", res.data);
     return res.data;
   }
@@ -84,8 +89,8 @@ class AgricultureService {
   }
 
   // ================= LOANS =================
-  Future<dynamic> listLoans() async {
-    final res = await _api.get("$base/loans");
+  Future<dynamic> listLoans({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/loans", queryParameters: {'page': page, 'limit': limit});
     _log("/loans", res.data);
     return res.data;
   }
@@ -115,8 +120,8 @@ class AgricultureService {
   }
 
   // ================= COOPERATIVES =================
-  Future<dynamic> listCooperatives() async {
-    final res = await _api.get("$base/cooperatives");
+  Future<dynamic> listCooperatives({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/cooperatives", queryParameters: {'page': page, 'limit': limit});
     _log("/cooperatives", res.data);
     return res.data;
   }
@@ -147,8 +152,8 @@ class AgricultureService {
     return res.data;
   }
 
-  Future<dynamic> getPriceHistory(String commodity) async {
-    final res = await _api.get("$base/prices/$commodity/history");
+  Future<dynamic> getPriceHistory(String commodity, {int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/prices/$commodity/history", queryParameters: {'page': page, 'limit': limit});
     _log("/prices/$commodity/history", res.data);
     return res.data;
   }
@@ -180,8 +185,8 @@ class AgricultureService {
   }
 
   // ================= PROGRAMS =================
-  Future<dynamic> listPrograms() async {
-    final res = await _api.get("$base/programs");
+  Future<dynamic> listPrograms({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/programs", queryParameters: {'page': page, 'limit': limit});
     _log("/programs", res.data);
     return res.data;
   }
@@ -199,8 +204,8 @@ class AgricultureService {
   }
 
   // ================= PARTNERS =================
-  Future<dynamic> listPartners() async {
-    final res = await _api.get("$base/partners");
+  Future<dynamic> listPartners({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$base/partners", queryParameters: {'page': page, 'limit': limit});
     _log("/partners", res.data);
     return res.data;
   }
@@ -268,8 +273,8 @@ class AgricultureService {
   String get mergedBase => '/agricultural/api/v1';
 
   // Animal ID Traceability
-  Future<dynamic> listAnimalTraceability() async {
-    final res = await _api.get("$mergedBase/animal-id-traceability/list");
+  Future<dynamic> listAnimalTraceability({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/animal-id-traceability/list", queryParameters: {'page': page, 'limit': limit});
     _log("/animal-id-traceability/list", res.data);
     return res.data;
   }
@@ -287,8 +292,8 @@ class AgricultureService {
   }
 
   // Area Yield Index Insurance
-  Future<dynamic> listAreaYieldIndexInsurance() async {
-    final res = await _api.get("$mergedBase/area-yield-index-insurance/list");
+  Future<dynamic> listAreaYieldIndexInsurance({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/area-yield-index-insurance/list", queryParameters: {'page': page, 'limit': limit});
     _log("/area-yield-index-insurance/list", res.data);
     return res.data;
   }
@@ -306,8 +311,8 @@ class AgricultureService {
   }
 
   // Crop Yield Prediction
-  Future<dynamic> listCropYieldPredictions() async {
-    final res = await _api.get("$mergedBase/crop-yield-prediction/list");
+  Future<dynamic> listCropYieldPredictions({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/crop-yield-prediction/list", queryParameters: {'page': page, 'limit': limit});
     _log("/crop-yield-prediction/list", res.data);
     return res.data;
   }
@@ -325,8 +330,8 @@ class AgricultureService {
   }
 
   // Farm Boundary Mapping
-  Future<dynamic> listFarmBoundaryMappings() async {
-    final res = await _api.get("$mergedBase/farm-boundary-mapping/list");
+  Future<dynamic> listFarmBoundaryMappings({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/farm-boundary-mapping/list", queryParameters: {'page': page, 'limit': limit});
     _log("/farm-boundary-mapping/list", res.data);
     return res.data;
   }
@@ -344,8 +349,8 @@ class AgricultureService {
   }
 
   // Livestock Finance
-  Future<dynamic> listLivestockFinance() async {
-    final res = await _api.get("$mergedBase/livestock-finance/list");
+  Future<dynamic> listLivestockFinance({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/livestock-finance/list", queryParameters: {'page': page, 'limit': limit});
     _log("/livestock-finance/list", res.data);
     return res.data;
   }
@@ -363,8 +368,8 @@ class AgricultureService {
   }
 
   // Fisheries & Aquaculture
-  Future<dynamic> listFisheriesAquaculture() async {
-    final res = await _api.get("$mergedBase/fisheries-aquaculture/list");
+  Future<dynamic> listFisheriesAquaculture({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/fisheries-aquaculture/list", queryParameters: {'page': page, 'limit': limit});
     _log("/fisheries-aquaculture/list", res.data);
     return res.data;
   }
@@ -382,8 +387,8 @@ class AgricultureService {
   }
 
   // Livestock Insurance
-  Future<dynamic> listLivestockInsurance() async {
-    final res = await _api.get("$mergedBase/livestock-insurance/list");
+  Future<dynamic> listLivestockInsurance({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/livestock-insurance/list", queryParameters: {'page': page, 'limit': limit});
     _log("/livestock-insurance/list", res.data);
     return res.data;
   }
@@ -401,8 +406,8 @@ class AgricultureService {
   }
 
   // Livestock Management
-  Future<dynamic> listLivestockHerds() async {
-    final res = await _api.get("$mergedBase/livestock-management/list");
+  Future<dynamic> listLivestockHerds({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/livestock-management/list", queryParameters: {'page': page, 'limit': limit});
     _log("/livestock-management/list", res.data);
     return res.data;
   }
@@ -420,8 +425,8 @@ class AgricultureService {
   }
 
   // Satellite Crop Monitor
-  Future<dynamic> listSatelliteCropMonitor() async {
-    final res = await _api.get("$mergedBase/satellite-crop-monitor/list");
+  Future<dynamic> listSatelliteCropMonitor({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/satellite-crop-monitor/list", queryParameters: {'page': page, 'limit': limit});
     _log("/satellite-crop-monitor/list", res.data);
     return res.data;
   }
@@ -439,8 +444,8 @@ class AgricultureService {
   }
 
   // Soil Analysis
-  Future<dynamic> listSoilAnalysis() async {
-    final res = await _api.get("$mergedBase/soil-analysis/list");
+  Future<dynamic> listSoilAnalysis({int page = 1, int limit = 50}) async {
+    final res = await _api.get("$mergedBase/soil-analysis/list", queryParameters: {'page': page, 'limit': limit});
     _log("/soil-analysis/list", res.data);
     return res.data;
   }

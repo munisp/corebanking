@@ -782,6 +782,9 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
     match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
         Ok(mut stream) => {
+            // Wave-11: bound blocking I/O (was unbounded read_to_string).
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
             let host = host_port.split(':').next().unwrap_or("localhost");
             let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
             stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
@@ -828,9 +831,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }
@@ -1020,12 +1033,19 @@ async fn main() -> std::io::Result<()> {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("none")
                     .to_string();
-                eprintln!("[gl-engine-rs] {} {} trace={}", req.method(), req.path(), trace_id);
+                // Wave-11: log only errors, plus 1% sampled requests (was: every request).
+                let w11_method = req.method().clone();
+                let w11_path = req.path().to_string();
+                let w11_sample = _REQ_COUNT.load(AtomicOrdering::Relaxed) % 100 == 0;
                 let fut = srv.call(req);
                 async move {
                     let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
+                    let w11_err = res.status().is_server_error() || res.status().is_client_error();
+                    if w11_err {
                         _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if w11_err || w11_sample {
+                        eprintln!("[gl-engine-rs] {} {} trace={} status={}", w11_method, w11_path, trace_id, res.status().as_u16());
                     }
                     Ok(res)
                 }

@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { tenantService, type Tenant, type TenantBranding } from '../services/tenant';
 
 interface TenantBrandingContextType {
@@ -82,19 +82,34 @@ export function TenantBrandingProvider({ children }: { children: ReactNode }) {
   const secondaryColor = branding?.secondary_color || '#8b5cf6';
   const domain = branding?.domain || null;
 
+  const value = useMemo(
+    () => ({
+      tenant,
+      branding,
+      name,
+      logoUrl,
+      faviconUrl,
+      primaryColor,
+      secondaryColor,
+      domain,
+      isLoading,
+    }),
+    [
+      tenant,
+      branding,
+      name,
+      logoUrl,
+      faviconUrl,
+      primaryColor,
+      secondaryColor,
+      domain,
+      isLoading,
+    ]
+  );
+
   return (
     <TenantBrandingContext.Provider
-      value={{
-        tenant,
-        branding,
-        name,
-        logoUrl,
-        faviconUrl,
-        primaryColor,
-        secondaryColor,
-        domain,
-        isLoading,
-      }}
+      value={value}
     >
       {children}
     </TenantBrandingContext.Provider>

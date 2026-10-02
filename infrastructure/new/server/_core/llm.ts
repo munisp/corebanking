@@ -218,6 +218,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   if (normalizedResponseFormat) payload.response_format = normalizedResponseFormat;
 
   const response = await fetch(resolveApiUrl(), {
+    signal: AbortSignal.timeout(30_000),
     method: "POST",
     headers: buildHeaders(),
     body: JSON.stringify(payload),
@@ -243,11 +244,12 @@ export async function listLLMModels(): Promise<{ id: string; object: string; cre
   const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
   // Ollama exposes /v1/models (OpenAI-compatible) and /api/tags (native)
   const response = await fetch(`${base}/v1/models`, {
+    signal: AbortSignal.timeout(10_000),
     headers: buildHeaders(),
   });
   if (!response.ok) {
     // Fallback to Ollama native /api/tags endpoint
-    const tagsResponse = await fetch(`${base}/api/tags`, { headers: buildHeaders() });
+    const tagsResponse = await fetch(`${base}/api/tags`, { headers: buildHeaders(), signal: AbortSignal.timeout(10_000) });
     if (!tagsResponse.ok) {
       throw new Error(`Failed to list Ollama models: ${response.status} ${response.statusText}`);
     }

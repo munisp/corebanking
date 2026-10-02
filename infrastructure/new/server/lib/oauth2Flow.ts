@@ -95,6 +95,7 @@ export function registerOAuth2Endpoints(app: Express) {
       // Exchange authorization code for tokens
       const tokenResp = await fetch(`${oidcBase}/token`, {
         method: "POST",
+        signal: AbortSignal.timeout(5000),
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           grant_type: "authorization_code",
@@ -123,6 +124,7 @@ export function registerOAuth2Endpoints(app: Express) {
       // Fetch userinfo
       const userinfoResp = await fetch(`${oidcBase}/userinfo`, {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
+        signal: AbortSignal.timeout(5000),
       });
       const userinfo = userinfoResp.ok ? await userinfoResp.json() : {};
 
@@ -161,6 +163,7 @@ export function registerOAuth2Endpoints(app: Express) {
     try {
       const resp = await fetch(`${oidcBase}/token`, {
         method: "POST",
+        signal: AbortSignal.timeout(5000),
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           grant_type: "refresh_token",
@@ -191,6 +194,7 @@ export function registerOAuth2Endpoints(app: Express) {
     try {
       const resp = await fetch(`${oidcBase}/userinfo`, {
         headers: { Authorization: auth },
+        signal: AbortSignal.timeout(5000),
       });
       if (resp.ok) {
         res.json(await resp.json());
@@ -224,6 +228,7 @@ export function registerOAuth2Endpoints(app: Express) {
       if (rt) {
         await fetch(`${oidcBase}/logout`, {
           method: "POST",
+          signal: AbortSignal.timeout(5000),
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({
             client_id: CLIENT_ID,

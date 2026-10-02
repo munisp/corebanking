@@ -4,6 +4,7 @@ import logging as _logging
 _logging.warning("DEPRECATED: payment-processing-service — migrate to payments-hub-go")
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 
 from database import Base, engine
 from api import (
@@ -43,6 +44,7 @@ app = FastAPI(
     description="54Link payment processing service.",
     version="0.0.1",
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- OpenTelemetry init (SPEC w9 §2.5): OTLP gRPC traces+metrics, W3C ---
 # propagation, FastAPI server spans, TenantMiddleware (tenant.id span attr).

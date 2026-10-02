@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends
+from fastapi.middleware.gzip import GZipMiddleware
 
 from database import Base, engine
 from database.migrations import run_migrations
@@ -14,6 +15,7 @@ app = FastAPI(
     description="54Link Audit Service.",
     version="0.0.0"
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
 # OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
 # tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware

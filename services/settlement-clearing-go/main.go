@@ -23,6 +23,17 @@ import (
 	"shared/otel/go/otelkit"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var serviceName = "settlement-clearing-go"
 
 type NostroPosition struct {
@@ -177,11 +188,16 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GCM-015: 5s deadline on all money-path DB calls — a hung DB must not
+	// hang the request (and its pool conn) forever.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
 	// MN-15: idempotent replay — return the original transfer, do NOT move
 	// funds a second time.
 	if req.IdempotencyKey != "" {
 		var existingID, existingStatus string
-		err := app.db.QueryRow(`SELECT transfer_id, status FROM nip_transfers WHERE idempotency_key = $1`, req.IdempotencyKey).Scan(&existingID, &existingStatus)
+		err := app.db.QueryRowContext(ctx, `SELECT transfer_id, status FROM nip_transfers WHERE idempotency_key = $1`, req.IdempotencyKey).Scan(&existingID, &existingStatus)
 		if err == nil {
 			respondJSON(w, 200, map[string]interface{}{
 				"transfer_id": existingID, "status": existingStatus,
@@ -202,7 +218,7 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 
 	transferID := fmt.Sprintf("NIP-%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))[0:22]
 
-	tx, err := app.db.Begin()
+	tx, err := app.db.BeginTx(ctx, nil)
 	if err != nil {
 		respondJSON(w, 500, map[string]string{"error": "transaction start failed"})
 		return
@@ -211,7 +227,7 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 	// MN-15: atomic conditional debit INSIDE the tx — eliminates the
 	// check-then-debit TOCTOU race that could overdraw the nostro position
 	// under concurrent transfers.
-	result, err := tx.Exec(`UPDATE nostro_positions SET balance_kobo = balance_kobo - $1, last_updated = NOW() WHERE bank_code = $2 AND balance_kobo >= $1`, req.AmountKobo, req.SourceBank)
+	result, err := tx.ExecContext(ctx, `UPDATE nostro_positions SET balance_kobo = balance_kobo - $1, last_updated = NOW() WHERE bank_code = $2 AND balance_kobo >= $1`, req.AmountKobo, req.SourceBank)
 	if err != nil {
 		tx.Rollback()
 		respondJSON(w, 500, map[string]string{"error": "debit failed"})
@@ -221,7 +237,7 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 	if rows == 0 {
 		tx.Rollback()
 		var sourceBalance int64
-		if berr := app.db.QueryRow(`SELECT balance_kobo FROM nostro_positions WHERE bank_code = $1`, req.SourceBank).Scan(&sourceBalance); berr == sql.ErrNoRows {
+		if berr := app.db.QueryRowContext(ctx, `SELECT balance_kobo FROM nostro_positions WHERE bank_code = $1`, req.SourceBank).Scan(&sourceBalance); berr == sql.ErrNoRows {
 			respondJSON(w, 404, map[string]string{"error": "source bank not found"})
 			return
 		}
@@ -231,13 +247,13 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	_, err = tx.Exec(`UPDATE nostro_positions SET balance_kobo = balance_kobo + $1, last_updated = NOW() WHERE bank_code = $2`, req.AmountKobo, req.DestBank)
+	_, err = tx.ExecContext(ctx, `UPDATE nostro_positions SET balance_kobo = balance_kobo + $1, last_updated = NOW() WHERE bank_code = $2`, req.AmountKobo, req.DestBank)
 	if err != nil {
 		tx.Rollback()
 		respondJSON(w, 500, map[string]string{"error": "credit failed"})
 		return
 	}
-	_, err = tx.Exec(`INSERT INTO nip_transfers (transfer_id, source_bank, dest_bank, amount_kobo, session_id, payment_ref, narration_code, status, settlement_type, idempotency_key)
+	_, err = tx.ExecContext(ctx, `INSERT INTO nip_transfers (transfer_id, source_bank, dest_bank, amount_kobo, session_id, payment_ref, narration_code, status, settlement_type, idempotency_key)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'settled', $8, $9)
 		ON CONFLICT (transfer_id) DO NOTHING`,
 		transferID, req.SourceBank, req.DestBank, req.AmountKobo, req.SessionID, req.PaymentRef, req.NarrationCode, settlementType, req.IdempotencyKey)
@@ -337,8 +353,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -512,7 +527,14 @@ func main() {
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/api/v1/settlement/transfer", processTransfer)
 	mux.HandleFunc("/api/v1/settlement/positions", getPositions)
-	srv := &http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux))}
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           otelkit.HTTPMiddleware(jwtAuthMiddleware(mux)),
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		log.Printf("[%s] Starting on :%s", serviceName, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

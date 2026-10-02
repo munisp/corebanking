@@ -16,6 +16,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // Database initialization
 func initDatabase() *sql.DB {
 	connStr := os.Getenv("DATABASE_URL")
@@ -1068,13 +1079,12 @@ func verifyGuarantorDetails(guarantor *Guarantor) *VerificationResult {
 			return false, "no " + idKey + " supplied"
 		}
 		payload, _ := json.Marshal(map[string]string{idKey: idValue, "customerId": guarantor.ID})
-		client := &http.Client{Timeout: 8 * time.Second}
 		req, err := http.NewRequest("POST", base+path, bytes.NewReader(payload))
 		if err != nil {
 			return false, err.Error()
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			return false, "verification provider unreachable: " + err.Error()
 		}

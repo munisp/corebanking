@@ -1792,10 +1792,49 @@ function currentRuntimeState(): PersistedRuntimeState {
   };
 }
 
+// TS-02: ring-buffer cap for the in-memory audit trail. Bounding the trail
+// also bounds the persisted payload (TS-01).
+const AUDIT_TRAIL_CAP = 1000;
+const RUNTIME_STATE_FLUSH_MS = 500;
+let runtimeStateDirty = false;
+let runtimeStateFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function trimAuditTrail() {
+  if (auditTrail.length > AUDIT_TRAIL_CAP) {
+    auditTrail.length = AUDIT_TRAIL_CAP;
+  }
+}
+
 function persistRuntimeState() {
+  // TS-01: never write synchronously on the request path. Mark the state dirty
+  // and schedule a coalesced async flush; mutations within the flush window
+  // collapse into a single file write + DB sync.
+  trimAuditTrail();
+  runtimeStateDirty = true;
+  if (runtimeStateFlushTimer) {
+    return;
+  }
+  runtimeStateFlushTimer = setTimeout(() => {
+    runtimeStateFlushTimer = null;
+    void flushRuntimeState();
+  }, RUNTIME_STATE_FLUSH_MS);
+  runtimeStateFlushTimer.unref();
+}
+
+async function flushRuntimeState() {
+  if (!runtimeStateDirty) {
+    return;
+  }
+  runtimeStateDirty = false;
+  trimAuditTrail();
   const payload = currentRuntimeState();
-  fs.mkdirSync(persistenceDirectory, { recursive: true });
-  fs.writeFileSync(persistenceFile, JSON.stringify(payload, null, 2));
+  try {
+    await fs.promises.mkdir(persistenceDirectory, { recursive: true });
+    // Compact JSON (no pretty-print) — smaller payload, cheaper write.
+    await fs.promises.writeFile(persistenceFile, JSON.stringify(payload));
+  } catch (error) {
+    logger.error("Unable to write platform runtime state file", { error: String(error) });
+  }
   persistenceChain = persistenceChain
     .then(async () => {
       await syncRuntimeStateToDb(
@@ -1809,6 +1848,16 @@ function persistRuntimeState() {
     .catch((error) => {
       logger.error("Unable to persist platform runtime state", { error: String(error) });
     });
+}
+
+// Flush any pending runtime-state write during graceful shutdown (SIGTERM/SIGINT).
+async function flushRuntimeStateForShutdown() {
+  if (runtimeStateFlushTimer) {
+    clearTimeout(runtimeStateFlushTimer);
+    runtimeStateFlushTimer = null;
+  }
+  await flushRuntimeState();
+  await persistenceChain;
 }
 
 async function refreshPartnerOnboardingRuntimeFromDb() {
@@ -2097,6 +2146,7 @@ function recordAudit(entry: Omit<AuditEntry, "id" | "timestamp">) {
     ...entry,
   };
   auditTrail.unshift(record);
+  trimAuditTrail();
   persistRuntimeState();
   return record;
 }
@@ -2929,8 +2979,9 @@ async function startServer() {
   app.use(jwtAuthMiddleware);
   app.use(multiTenancyMiddleware);
 
-  // Production auth middleware (validates JWT on all /api/* routes)
-  app.use(authMiddleware());
+  // TS-03: removed duplicate authMiddleware() registration here — the single
+  // registration above (before registerAuthRoutes) already covers every route
+  // registered after it, so a second app.use() double-verified JWTs per request.
 
   // MFA & API key routes (must be AFTER authMiddleware so req.user is populated)
   registerMfaRoutes(app);
@@ -3622,6 +3673,7 @@ async function startServer() {
       middleware: ["Postgres", "Notification rail"],
       detail: notification.message,
     });
+    trimAuditTrail();
     res.status(201).json(notification);
   });
 
@@ -5201,11 +5253,15 @@ async function startServer() {
     if (!domain || domain === "customers") searchDomains.push({ name: "customers", url: "" });
 
     const results: Array<{ domain: string; id: string; match: string; score: number }> = [];
-    for (const d of searchDomains) {
+    // TS-04: hoist a single escaped RegExp out of the per-item loop (escaping
+    // also prevents ReDoS from a user-supplied pattern).
+    const queryRegex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+    // TS-06: fan out to search domains concurrently — iterations are independent.
+    await Promise.allSettled(searchDomains.map(async (d) => {
       try {
-        if (!d.url) continue;
+        if (!d.url) return;
         const resp = await fetch(d.url, { signal: AbortSignal.timeout(5000) });
-        if (!resp.ok) continue;
+        if (!resp.ok) return;
         const data = await resp.json() as Record<string, unknown>[];
         const items = Array.isArray(data) ? data : [];
         for (const item of items) {
@@ -5215,12 +5271,12 @@ async function startServer() {
               domain: d.name,
               id: String((item as Record<string, unknown>).id ?? ""),
               match: text.slice(0, 200),
-              score: (text.match(new RegExp(query, "g")) ?? []).length,
+              score: (text.match(queryRegex) ?? []).length,
             });
           }
         }
       } catch { /* service not available */ }
-    }
+    }));
 
     results.sort((a, b) => b.score - a.score);
     res.json({ query, results: results.slice(0, limit), total: results.length });
@@ -8436,6 +8492,8 @@ async function startServer() {
       server.close(() => resolve());
     });
 
+    // TS-01: flush any debounced runtime-state write before tearing down the DB pool.
+    await flushRuntimeStateForShutdown();
     await closeDbPool();
     process.exit(0);
   };

@@ -112,8 +112,8 @@ export default function RegulatoryReporting() {
 
         {/* Compliance Stats */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-          {stats.map((stat, index) => (
-            <Card key={index} className="p-6">
+          {stats.map((stat) => (
+            <Card key={stat.label} className="p-6">
               <div className="flex items-center justify-between mb-2">
                 <stat.icon className="h-8 w-8" style={{ color: primaryColor }} />
                 {getStatusBadge(stat.status)}

@@ -111,6 +111,8 @@ class AuthProvider with ChangeNotifier {
         if (refreshToken != null) {
           await _secureStorage.write(key: 'refresh_token', value: refreshToken);
         }
+        // New session — drop ApiService's cached auth headers (MOB-02)
+        ApiService.invalidateAuthCache();
 
         // Extract and store keycloak_id
         String? keycloakId = data['keycloak_id']?.toString() ??
@@ -261,6 +263,8 @@ class AuthProvider with ChangeNotifier {
             await _secureStorage.write(
                 key: 'refresh_token', value: data['refresh_token']);
           }
+          // New session — drop ApiService's cached auth headers (MOB-02)
+          ApiService.invalidateAuthCache();
 
           // Extract and store keycloak_id from response data (matching web app)
           String? keycloakId;
@@ -599,6 +603,7 @@ class AuthProvider with ChangeNotifier {
       debugPrint('Logout API call failed: $e');
     } finally {
       // Clear all storage (matching web app)
+      ApiService.invalidateAuthCache();
       await _secureStorage.delete(key: 'access_token');
       await _secureStorage.delete(key: 'refresh_token');
       await _secureStorage.delete(key: _pinStorageKey);
@@ -660,6 +665,8 @@ class AuthProvider with ChangeNotifier {
             await _secureStorage.write(
                 key: 'refresh_token', value: newRefreshToken);
           }
+          // Refreshed session — drop ApiService's cached auth headers (MOB-02)
+          ApiService.invalidateAuthCache();
           return true;
         }
       }

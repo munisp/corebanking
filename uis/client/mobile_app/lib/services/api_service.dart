@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:math' show min;
 import 'package:dio/dio.dart';
 import 'package:jwt_decoder/jwt_decoder.dart';
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/foundation.dart' show kIsWeb, kDebugMode, debugPrint;
 import 'package:universal_html/html.dart' as html;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../config/app_config.dart';
@@ -46,12 +46,42 @@ class ApiService {
     ),
   );
 
-  ApiService() {
+  /// Shared singleton: every `ApiService()` call (including the Provider
+  /// registration in main.dart) returns this instance, so a single Dio and
+  /// its connection pool (keep-alive) are reused app-wide (MOB-01).
+  static final ApiService _shared = ApiService._internal();
+  factory ApiService() => _shared;
+
+  /// In-memory cache of auth/prefs-derived request headers, loaded once and
+  /// reused across requests instead of hitting secure storage /
+  /// SharedPreferences on every call (MOB-02). `null` means "not loaded yet"
+  /// (missing keys are re-read each request until found, so values written
+  /// later during login/tenant bootstrap are still picked up).
+  String? _cachedToken;
+  String? _cachedKeycloakId;
+  String? _cachedAccountId;
+  Map<String, String>? _cachedTenantHeaders;
+  String? _lastDecodedToken;
+
+  /// Drop all cached auth/header state. Called automatically on token
+  /// refresh and [clearStorage]; auth flows (login/logout) should call this
+  /// after writing/removing tokens.
+  static void invalidateAuthCache() => _shared._invalidateAuthCache();
+
+  void _invalidateAuthCache() {
+    _cachedToken = null;
+    _cachedKeycloakId = null;
+    _cachedAccountId = null;
+    _cachedTenantHeaders = null;
+    _lastDecodedToken = null;
+  }
+
+  ApiService._internal() {
     _dio = Dio(
       BaseOptions(
         baseUrl: AppConfig.baseUrl,
-        connectTimeout: Duration(seconds: AppConfig.apiTimeout),
-        receiveTimeout: Duration(seconds: AppConfig.apiTimeout),
+        connectTimeout: Duration(seconds: AppConfig.apiConnectTimeout),
+        receiveTimeout: Duration(seconds: AppConfig.apiReceiveTimeout),
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
@@ -59,247 +89,53 @@ class ApiService {
       ),
     );
 
+    // MOB-09: decode large JSON responses in a background isolate instead of
+    // on the UI thread (not supported on web).
+    if (!kIsWeb) {
+      _dio.transformer = BackgroundTransformer();
+    }
+
     _dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (options, handler) async {
-          // ---------- Storage Helpers ----------
-          Future<String?> getStorageValue(String key) async {
-            return await LocalStorageService.getString(key);
-          }
+          // Resolve token/prefs-derived headers from the in-memory cache
+          // (storage is only hit for keys not yet cached) — MOB-02.
+          await _primeAuthCache();
 
-          Future<void> setStorageValue(String key, String value) async {
-            await LocalStorageService.setString(key, value);
-          }
-
-          // ---------- Normalizer (FIX) ----------
-          String normalizeKeycloakId(String value) {
-            final trimmed = value.trim();
-
-            if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-              try {
-                return jsonDecode(trimmed);
-              } catch (_) {
-                return trimmed.replaceAll('"', '');
-              }
-            }
-
-            return trimmed;
-          }
-
-          // ---------- Token ----------
-          String? token;
-          if (kIsWeb) {
-            token = html.window.localStorage[AppConfig.accessTokenKey];
-          } else {
-            try {
-              token = await _secureStorage.read(key: AppConfig.accessTokenKey);
-            } catch (e) {
-              debugPrint('[API] ⚠️  Secure storage read error: $e');
-              debugPrint('[API] 🔄 Clearing corrupted secure storage...');
-              try {
-                await _secureStorage.deleteAll();
-              } catch (_) {}
-              token = null;
-            }
-          }
-
+          final token = _cachedToken;
           if (token != null) {
             options.headers['Authorization'] = 'Bearer $token';
-            debugPrint('[API] ✓ Added Authorization header');
-          } else {
-            debugPrint('[API] ✗ No token found');
           }
-          final switchName = "mojaloop";
           options.headers['x-tenant-name'] = AppConfig.CURRENT_TENANT_ID;
-          options.headers['x-switch-name'] = switchName;
-          options.headers['x-ams-name'] = "core_banking";
-          // ---------- keycloak_id (CRITICAL) ----------
-          String? keycloakId;
+          options.headers['x-switch-name'] = 'mojaloop';
+          options.headers['x-ams-name'] = 'core_banking';
 
-          debugPrint('[API] ========== KEYCLOAK_ID EXTRACTION START ==========');
-
-          // Step 1: Try to extract from token
-          if (token != null) {
-            try {
-              final decoded = JwtDecoder.decode(token);
-              debugPrint('[API] ✓ Token decoded successfully');
-              debugPrint('[API] Token fields available: ${decoded.keys.toList()}');
-
-              final extracted = decoded['sub'] ??
-                  decoded['keycloak_id'] ??
-                  decoded['user_id'] ??
-                  decoded['preferred_username'] ??
-                  decoded['id'];
-
-              if (extracted != null) {
-                debugPrint('[API] ✓ Found in token (raw): $extracted');
-                keycloakId = normalizeKeycloakId(extracted.toString());
-                
-                // Save to storage for future requests
-                await setStorageValue('keycloak_id', keycloakId);
-                debugPrint('[API] ✓ Normalized and saved: $keycloakId');
-              } else {
-                debugPrint('[API] ✗ No keycloak_id field in token');
-                debugPrint('[API] Available token fields: ${decoded.keys.join(", ")}');
-              }
-            } catch (e) {
-              debugPrint('[API] ✗ Token decode error: $e');
-            }
-          } else {
-            debugPrint('[API] ✗ No token available to decode');
-          }
-
-          // Step 2: Try to get from storage
-          if (keycloakId == null || keycloakId.isEmpty) {
-            debugPrint('[API] Attempting to retrieve from storage...');
-            
-            // Try LocalStorageService
-            keycloakId = await getStorageValue('keycloak_id');
-            
-            if (keycloakId != null && keycloakId.isNotEmpty) {
-              debugPrint('[API] ✓ Retrieved from storage (raw): $keycloakId');
-              keycloakId = normalizeKeycloakId(keycloakId);
-              debugPrint('[API] ✓ After normalization: $keycloakId');
-            } else {
-              debugPrint('[API] ✗ Not found in LocalStorageService');
-              
-              // For web, try direct access
-              if (kIsWeb) {
-                final directValue = html.window.localStorage['keycloak_id'];
-                debugPrint('[API] Direct web localStorage value: $directValue');
-                
-                if (directValue != null && directValue.isNotEmpty) {
-                  keycloakId = normalizeKeycloakId(directValue);
-                  debugPrint('[API] ✓ Got from direct web access: $keycloakId');
-                }
-              }
-            }
-          }
-
-          // Final status
-          debugPrint('[API] Final keycloak_id value: $keycloakId');
-          
-          // Check if this is an auth endpoint that doesn't require x-keycloak-id
-          final isAuthEndpoint = options.path.contains('/auth/login') || 
-                                 options.path.contains('/auth/register') ||
-                                 options.path.contains('/auth/refresh') ||
-                                 options.path.contains('/auth/forgot-password') ||
-                                 options.path.contains('/auth/reset-password') ||
-                                 options.path.contains('/auth/verify-otp') ||
-                                 options.path.contains('/auth/verify-email');
-          
+          final keycloakId = _cachedKeycloakId;
           if (keycloakId != null && keycloakId.isNotEmpty) {
             options.headers['x-keycloak-id'] = keycloakId;
-            debugPrint('[API] ✓✓✓ SUCCESS: x-keycloak-id header SET: $keycloakId');
-          } else if (!isAuthEndpoint) {
-            debugPrint('[API] ✗✗✗ CRITICAL FAILURE: No keycloak_id available!');
-            debugPrint('[API] Request path: ${options.path}');
-            debugPrint('[API] This request WILL FAIL with missing header error!');
-            
-            // Emergency diagnostic
-            if (kIsWeb) {
-              debugPrint('[API] === EMERGENCY DIAGNOSTIC ===');
-              debugPrint('[API] All localStorage keys: ${html.window.localStorage.keys.toList()}');
-              debugPrint('[API] keycloak_id: ${html.window.localStorage['keycloak_id']}');
-              debugPrint('[API] user: ${html.window.localStorage['user']}');
-            } else {
-              // For mobile, try to read from secure storage as well
-              try {
-                final secureKeycloakId = await _secureStorage.read(key: 'keycloak_id');
-                debugPrint('[API] SecureStorage keycloak_id: $secureKeycloakId');
-              } catch (e) {
-                debugPrint('[API] Error reading from SecureStorage: $e');
-              }
+          } else if (kDebugMode) {
+            final isAuthEndpoint = options.path.contains('/auth/login') ||
+                options.path.contains('/auth/register') ||
+                options.path.contains('/auth/refresh') ||
+                options.path.contains('/auth/forgot-password') ||
+                options.path.contains('/auth/reset-password') ||
+                options.path.contains('/auth/verify-otp') ||
+                options.path.contains('/auth/verify-email');
+            if (!isAuthEndpoint) {
+              debugPrint('[API] No keycloak_id available for ${options.path}');
             }
-          } else {
-            debugPrint('[API] Auth endpoint detected, skipping x-keycloak-id header requirement');
-          }
-          
-          debugPrint('[API] ========== KEYCLOAK_ID EXTRACTION END ==========');
-
-          // ---------- Default Account ----------
-          try {
-            String? accountId;
-            final userStr = await getStorageValue('user');
-            if (userStr != null && userStr.isNotEmpty) {
-              final user = jsonDecode(userStr);
-              accountId = (user['account_id'] ?? user['accountId'])?.toString();
-            }
-            accountId ??= await getStorageValue('account_id');
-            if (accountId != null) {
-              options.headers['x-default-account-id'] = accountId;
-            }
-          } catch (_) {}
-
-          // ---------- Tenant + Feature Flags ----------
-          try {
-            final tenantStr = await getStorageValue('tenant_config');
-            if (tenantStr != null) {
-              final tenant = jsonDecode(tenantStr) as Map<String, dynamic>;
-
-              final tenantId = tenant['tenant_id'] ?? tenant['id'];
-              final switchName = "mojaloop";
-              options.headers['x-switch-name'] = switchName;
-              options.headers['x-ams-name'] = "core_banking";
-              if (tenantId != null) {
-                options.headers['x-tenant-id'] = tenantId.toString();
-                
-              }
-
-              final featureFlags = tenant['feature_flags'];
-
-              if (featureFlags is List) {
-                Map<String, dynamic>? auth;
-                Map<String, dynamic>? accounts;
-
-                for (final flag in featureFlags) {
-                  if (flag['name'] == 'auth' &&
-                      flag['is_enabled'] == true) {
-                    auth = flag;
-                  }
-                  if (flag['name'] == 'accounts' &&
-                      flag['is_enabled'] == true) {
-                    accounts = flag;
-                  }
-                }
-
-                if (auth?['config'] != null) {
-                  options.headers['x-keycloak-realm'] =
-                      auth!['config']['realm']?.toString();
-                  options.headers['x-keycloak-pub-key'] =
-                      auth['config']['public_rsa_key']?.toString();
-                }
-
-                if (accounts?['config']?['account'] != null) {
-                  final acc = accounts!['config']['account'];
-                  options.headers['x-mint-account-id'] =
-                      acc['id']?.toString();
-                  options.headers['x-mint-id'] =
-                      acc['id']?.toString();
-                  options.headers['x-ledger-id'] =
-                      acc['ledger_id']?.toString();
-                }
-              }
-            }
-          } catch (_) {}
-
-          // Ensure x-tenant-id is always set — fall back to compile-time constant when
-          // tenant_config is not yet in storage (e.g. first launch before login).
-          if (!options.headers.containsKey('x-tenant-id')) {
-            options.headers['x-tenant-id'] = AppConfig.CURRENT_TENANT_ID;
-            debugPrint('[API] x-tenant-id fallback: ${AppConfig.CURRENT_TENANT_ID}');
           }
 
-          if (!options.headers.containsKey('x-ledger-id')) {
-            debugPrint('[API] ✗ x-ledger-id not set — accounts feature flag missing from tenant config');
+          if (_cachedAccountId != null) {
+            options.headers['x-default-account-id'] = _cachedAccountId;
           }
 
-          // Final header debug
-          debugPrint('[API] === REQUEST HEADERS ===');
-          debugPrint('[API] x-keycloak-id: ${options.headers['x-keycloak-id']}');
-          debugPrint('[API] x-tenant-id: ${options.headers['x-tenant-id']}');
-          debugPrint('[API] x-default-account-id: ${options.headers['x-default-account-id']}');
-          debugPrint('[API] =========================');
+          _cachedTenantHeaders?.forEach((k, v) => options.headers[k] = v);
+
+          // Ensure x-tenant-id is always set — fall back to compile-time
+          // constant when tenant_config is not yet in storage (e.g. first
+          // launch before login).
+          options.headers['x-tenant-id'] ??= AppConfig.CURRENT_TENANT_ID;
 
           return handler.next(options);
         },
@@ -315,13 +151,18 @@ class ApiService {
             
             if (isAuthEndpoint) {
               // For auth endpoints, just pass the error through without clearing storage
-              debugPrint('[API] 401 on auth endpoint, not clearing storage');
+              if (kDebugMode) {
+                debugPrint('[API] 401 on auth endpoint, not clearing storage');
+              }
               return handler.next(error);
             }
-            
+
             try {
-              debugPrint('[API] 401 error, attempting token refresh...');
+              if (kDebugMode) {
+                debugPrint('[API] 401 error, attempting token refresh...');
+              }
               await _refreshToken();
+              _invalidateAuthCache(); // pick up the fresh token on retry
               final response = await _dio.request(
                 error.requestOptions.path,
                 options: Options(
@@ -334,7 +175,7 @@ class ApiService {
               );
               return handler.resolve(response);
             } catch (e) {
-              debugPrint('[API] Token refresh failed: $e');
+              if (kDebugMode) debugPrint('[API] Token refresh failed: $e');
               // Only wipe storage when the refresh token itself is rejected (401),
               // meaning the session is truly over. Any other failure (404, 500,
               // network error, no refresh token) is transient or a config problem —
@@ -351,6 +192,140 @@ class ApiService {
         },
       ),
     );
+  }
+
+  // ---------- Auth/header cache priming (MOB-02) ----------
+  /// Loads token, keycloak_id, account id and tenant headers into memory.
+  /// Each key is read from storage only until it is found; found values are
+  /// reused until [invalidateAuthCache] is called (login/logout/refresh/401).
+  /// The JWT is decoded only when the token actually changes.
+  Future<void> _primeAuthCache() async {
+    // ----- Token -----
+    if (_cachedToken == null) {
+      if (kIsWeb) {
+        _cachedToken = html.window.localStorage[AppConfig.accessTokenKey];
+      } else {
+        try {
+          _cachedToken =
+              await _secureStorage.read(key: AppConfig.accessTokenKey);
+        } catch (e) {
+          if (kDebugMode) {
+            debugPrint('[API] Secure storage read error: $e — clearing');
+          }
+          try {
+            await _secureStorage.deleteAll();
+          } catch (_) {}
+          _cachedToken = null;
+        }
+      }
+    }
+
+    // ----- keycloak_id (decode JWT only when token changes) -----
+    final token = _cachedToken;
+    if (token != null && token != _lastDecodedToken) {
+      _lastDecodedToken = token;
+      try {
+        final decoded = JwtDecoder.decode(token);
+        final extracted = decoded['sub'] ??
+            decoded['keycloak_id'] ??
+            decoded['user_id'] ??
+            decoded['preferred_username'] ??
+            decoded['id'];
+        if (extracted != null) {
+          _cachedKeycloakId = _normalizeKeycloakId(extracted.toString());
+          await LocalStorageService.setString(
+              'keycloak_id', _cachedKeycloakId!);
+        }
+      } catch (e) {
+        if (kDebugMode) debugPrint('[API] Token decode error: $e');
+      }
+    }
+    if (_cachedKeycloakId == null) {
+      final stored = await LocalStorageService.getString('keycloak_id');
+      if (stored != null && stored.isNotEmpty) {
+        _cachedKeycloakId = _normalizeKeycloakId(stored);
+      } else if (kIsWeb) {
+        final direct = html.window.localStorage['keycloak_id'];
+        if (direct != null && direct.isNotEmpty) {
+          _cachedKeycloakId = _normalizeKeycloakId(direct);
+        }
+      }
+    }
+
+    // ----- Default account -----
+    if (_cachedAccountId == null) {
+      try {
+        final userStr = await LocalStorageService.getString('user');
+        if (userStr != null && userStr.isNotEmpty) {
+          final user = jsonDecode(userStr);
+          _cachedAccountId =
+              (user['account_id'] ?? user['accountId'])?.toString();
+        }
+        _cachedAccountId ??= await LocalStorageService.getString('account_id');
+      } catch (_) {}
+    }
+
+    // ----- Tenant + feature-flag headers -----
+    if (_cachedTenantHeaders == null) {
+      try {
+        final tenantStr = await LocalStorageService.getString('tenant_config');
+        if (tenantStr != null) {
+          final tenant = jsonDecode(tenantStr) as Map<String, dynamic>;
+          final headers = <String, String>{};
+
+          final tenantId = tenant['tenant_id'] ?? tenant['id'];
+          if (tenantId != null) {
+            headers['x-tenant-id'] = tenantId.toString();
+          }
+
+          final featureFlags = tenant['feature_flags'];
+          if (featureFlags is List) {
+            Map<String, dynamic>? auth;
+            Map<String, dynamic>? accounts;
+
+            for (final flag in featureFlags) {
+              if (flag['name'] == 'auth' && flag['is_enabled'] == true) {
+                auth = flag;
+              }
+              if (flag['name'] == 'accounts' && flag['is_enabled'] == true) {
+                accounts = flag;
+              }
+            }
+
+            if (auth?['config'] != null) {
+              final realm = auth!['config']['realm']?.toString();
+              final pubKey = auth['config']['public_rsa_key']?.toString();
+              if (realm != null) headers['x-keycloak-realm'] = realm;
+              if (pubKey != null) headers['x-keycloak-pub-key'] = pubKey;
+            }
+
+            if (accounts?['config']?['account'] != null) {
+              final acc = accounts!['config']['account'];
+              final accId = acc['id']?.toString();
+              final ledgerId = acc['ledger_id']?.toString();
+              if (accId != null) {
+                headers['x-mint-account-id'] = accId;
+                headers['x-mint-id'] = accId;
+              }
+              if (ledgerId != null) headers['x-ledger-id'] = ledgerId;
+            }
+          }
+          _cachedTenantHeaders = headers;
+        }
+      } catch (_) {}
+    }
+  }
+
+  String _normalizeKeycloakId(String value) {
+    final trimmed = value.trim();
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+      try {
+        return jsonDecode(trimmed);
+      } catch (_) {
+        return trimmed.replaceAll('"', '');
+      }
+    }
+    return trimmed;
   }
 
   // ---------- Refresh Token ----------
@@ -388,6 +363,7 @@ class ApiService {
           key: AppConfig.refreshTokenKey,
           value: data['refresh_token']);
     }
+    _invalidateAuthCache();
   }
 
   // ---------- HTTP METHODS ----------
@@ -428,6 +404,7 @@ class ApiService {
   Future<void> clearStorage() async {
     await _secureStorage.deleteAll();
     await LocalStorageService.clear();
+    _invalidateAuthCache();
   }
   
   // ---------- Debug Helper (call this manually to diagnose) ----------

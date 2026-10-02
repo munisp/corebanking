@@ -167,9 +167,9 @@ class RewardService {
   }
 
   // Get earned rewards history
-  Future<List<Reward>> getEarnedRewards() async {
+  Future<List<Reward>> getEarnedRewards({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('${AppConfig.rewardEndpoint}/earned');
+      final response = await _apiService.get('${AppConfig.rewardEndpoint}/earned', queryParameters: {'page': page, 'limit': limit});
 
       if (response.data['success'] == true || response.statusCode == 200) {
         final rewardsData = response.data['data'] as List<dynamic>;
@@ -184,9 +184,9 @@ class RewardService {
   }
 
   // Get available redemption options
-  Future<List<RedeemOption>> getRedeemOptions() async {
+  Future<List<RedeemOption>> getRedeemOptions({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('${AppConfig.rewardEndpoint}/redeem-options');
+      final response = await _apiService.get('${AppConfig.rewardEndpoint}/redeem-options', queryParameters: {'page': page, 'limit': limit});
 
       if (response.data['success'] == true || response.statusCode == 200) {
         final optionsData = response.data['data'] as List<dynamic>;
@@ -234,9 +234,9 @@ class RewardService {
   }
 
   // Get redemption history
-  Future<List<RedemptionHistory>> getRedemptionHistory() async {
+  Future<List<RedemptionHistory>> getRedemptionHistory({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('${AppConfig.rewardEndpoint}/redemption-history');
+      final response = await _apiService.get('${AppConfig.rewardEndpoint}/redemption-history', queryParameters: {'page': page, 'limit': limit});
 
       if (response.data['success'] == true || response.statusCode == 200) {
         final historyData = response.data['data'] as List<dynamic>;

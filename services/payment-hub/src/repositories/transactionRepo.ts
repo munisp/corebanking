@@ -89,7 +89,10 @@ export class TransactionRepository extends MainRepository<Transaction> {
       },
     });
 
-    transactions.forEach(async (transaction) => {
+    // TS-48: for..of + await — the async forEach was fire-and-forget: DB writes
+    // raced the response and errors were silently lost. Iterations are kept
+    // sequential because fund release/re-reserve operations mutate balances.
+    for (const transaction of transactions) {
       // If transaction is a reversal, update balance_after_transaction to the pre-transaction state
       if (payload.reason.toLowerCase() == "reversal" && transaction.balance_after_transaction) {
         const currentBalance = Number(transaction.balance_after_transaction ?? "0.0");
@@ -182,7 +185,7 @@ export class TransactionRepository extends MainRepository<Transaction> {
         PhEventTypeEnum.TransactionFailed,
         transaction.transaction_id
       ).catch(console.error);
-    });
+    }
   }
 
   async reserve_transaction(transaction_id: string) {

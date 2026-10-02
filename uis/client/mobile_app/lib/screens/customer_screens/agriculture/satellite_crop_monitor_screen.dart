@@ -17,6 +17,15 @@ class _SatelliteCropMonitorScreenState extends State<SatelliteCropMonitorScreen>
   Map<String, dynamic> _stats = {};
   bool _loading = true;
 
+  // MOB-03: pagination state — records are fetched page-by-page (page size
+  // 50) and rendered lazily via ListView.builder instead of an eager
+  // ListView(children: [..._records.map(...)]) that built every row at once.
+  static const int _pageSize = 50;
+  int _page = 1;
+  bool _hasMore = false;
+  bool _loadingMore = false;
+  final ScrollController _scrollCtrl = ScrollController();
+
   final _farmIdCtrl = TextEditingController();
   final _cropCtrl = TextEditingController();
   final _coordsCtrl = TextEditingController();
@@ -31,13 +40,16 @@ class _SatelliteCropMonitorScreenState extends State<SatelliteCropMonitorScreen>
   @override
   void initState() {
     super.initState();
+    _scrollCtrl.addListener(_onScroll);
     _load();
   }
 
   Future<void> _load() async {
     setState(() => _loading = true);
     try {
-      final res = await service.listSatelliteCropMonitor();
+      final res = await service.listSatelliteCropMonitor(page: 1, limit: _pageSize);
+      _page = 1;
+      _hasMore = res is List && res.length >= _pageSize;
       final statsRes = await service.getSatelliteCropMonitorStats();
       setState(() {
         _records = (res is List && res.isNotEmpty) ? res : _fallbackRecords;
@@ -50,6 +62,35 @@ class _SatelliteCropMonitorScreenState extends State<SatelliteCropMonitorScreen>
       });
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  void _onScroll() {
+    if (_loading || _loadingMore || !_hasMore) return;
+    if (!_scrollCtrl.hasClients) return;
+    if (_scrollCtrl.position.pixels >=
+        _scrollCtrl.position.maxScrollExtent - 200) {
+      _loadMore();
+    }
+  }
+
+  Future<void> _loadMore() async {
+    setState(() => _loadingMore = true);
+    try {
+      final res = await service.listSatelliteCropMonitor(page: _page + 1, limit: _pageSize);
+      if (res is List && res.isNotEmpty) {
+        setState(() {
+          _page += 1;
+          _records = [..._records, ...res];
+          _hasMore = res.length >= _pageSize;
+        });
+      } else {
+        setState(() => _hasMore = false);
+      }
+    } catch (_) {
+      setState(() => _hasMore = false);
+    } finally {
+      setState(() => _loadingMore = false);
     }
   }
 
@@ -165,6 +206,7 @@ class _SatelliteCropMonitorScreenState extends State<SatelliteCropMonitorScreen>
     _farmIdCtrl.dispose();
     _cropCtrl.dispose();
     _coordsCtrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
@@ -190,59 +232,74 @@ class _SatelliteCropMonitorScreenState extends State<SatelliteCropMonitorScreen>
           ? Center(child: CircularProgressIndicator(color: primary))
           : RefreshIndicator(
               onRefresh: _load,
-              child: ListView(
+              child: ListView.builder(
+                controller: _scrollCtrl,
                 padding: const EdgeInsets.all(16),
-                children: [
-                  const Text('Satellite Crop Monitor', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 4),
-                  Text('Sentinel-2 NDVI health monitoring for registered farms', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
-                  const SizedBox(height: 16),
-                  Row(children: [
-                    _statCard('Scans / Month', _stats['scans_this_month']?.toString() ?? '1,248', Icons.satellite, primary),
-                    _statCard('Healthy', _stats['healthy_pct']?.toString() ?? '62%', Icons.eco, Colors.green),
-                    _statCard('Alerts', _stats['alerts']?.toString() ?? '48', Icons.warning_amber, Colors.red),
-                  ]),
-                  const SizedBox(height: 20),
-                  ..._records.map((item) {
-                    final m = item is Map ? item : {};
-                    final health = m['health']?.toString() ?? '-';
-                    final alert = m['alert']?.toString() ?? 'None';
-                    final ndvi = m['ndvi_score']?.toString() ?? '0';
-                    return Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text('${m['crop'] ?? 'Crop'} — ${m['farm'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                decoration: BoxDecoration(color: _healthColor(health).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
-                                child: Text(health, style: TextStyle(color: _healthColor(health), fontSize: 11, fontWeight: FontWeight.w600)),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          _ndviBar(ndvi),
-                          Row(
-                            children: [
-                              Icon(alert == 'None' ? Icons.check_circle_outline : Icons.warning_amber, size: 14, color: alert == 'None' ? Colors.green : Colors.orange),
-                              const SizedBox(width: 4),
-                              Text(alert == 'None' ? 'No alerts' : alert, style: TextStyle(color: alert == 'None' ? Colors.green : Colors.orange, fontSize: 12, fontWeight: FontWeight.w500)),
-                              const Spacer(),
-                              Text('Last scan: ${m['last_scan'] ?? '-'}', style: TextStyle(color: Colors.grey.shade500, fontSize: 11)),
-                            ],
-                          ),
-                        ],
-                      ),
+                itemCount: 1 + _records.length + ((_hasMore || _loadingMore) ? 1 : 0),
+                itemBuilder: (context, index) {
+                  if (index == 0) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                          const Text('Satellite Crop Monitor', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 4),
+                          Text('Sentinel-2 NDVI health monitoring for registered farms', style: TextStyle(color: Colors.grey.shade600, fontSize: 13)),
+                          const SizedBox(height: 16),
+                          Row(children: [
+                            _statCard('Scans / Month', _stats['scans_this_month']?.toString() ?? '1,248', Icons.satellite, primary),
+                            _statCard('Healthy', _stats['healthy_pct']?.toString() ?? '62%', Icons.eco, Colors.green),
+                            _statCard('Alerts', _stats['alerts']?.toString() ?? '48', Icons.warning_amber, Colors.red),
+                          ]),
+                          const SizedBox(height: 20),
+                      ],
                     );
-                  }),
-                ],
-              ),
+                  }
+                  final recIndex = index - 1;
+                  if (recIndex >= _records.length) {
+                    return const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 16),
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  }
+                  final item = _records[recIndex];
+                      final m = item is Map ? item : {};
+                      final health = m['health']?.toString() ?? '-';
+                      final alert = m['alert']?.toString() ?? 'None';
+                      final ndvi = m['ndvi_score']?.toString() ?? '0';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), boxShadow: [BoxShadow(blurRadius: 8, color: Colors.black.withOpacity(0.05), offset: const Offset(0, 3))]),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text('${m['crop'] ?? 'Crop'} — ${m['farm'] ?? ''}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                  decoration: BoxDecoration(color: _healthColor(health).withOpacity(0.15), borderRadius: BorderRadius.circular(20)),
+                                  child: Text(health, style: TextStyle(color: _healthColor(health), fontSize: 11, fontWeight: FontWeight.w600)),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            _ndviBar(ndvi),
+                            Row(
+                              children: [
+                                Icon(alert == 'None' ? Icons.check_circle_outline : Icons.warning_amber, size: 14, color: alert == 'None' ? Colors.green : Colors.orange),
+                                const SizedBox(width: 4),
+                                Text(alert == 'None' ? 'No alerts' : alert, style: TextStyle(color: alert == 'None' ? Colors.green : Colors.orange, fontSize: 12, fontWeight: FontWeight.w500)),
+                                const Spacer(),
+                                Text('Last scan: ${m['last_scan'] ?? '-'}', style: TextStyle(color: Colors.grey.shade500, fontSize: 11)),
+                              ],
+                            ),
+                          ],
+                        ),
+                      );
+                },
+                ),
             ),
     );
   }

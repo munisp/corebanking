@@ -22,6 +22,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var serviceName = "programmable-money-go"
 
 type Condition struct {
@@ -268,8 +279,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -432,7 +442,13 @@ func main() {
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/api/v1/smart-transfer/create", createSmartTransfer)
 	mux.HandleFunc("/api/v1/smart-transfer/satisfy", satisfyCondition)
-	srv := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux)}
+	srv := &http.Server{
+		Addr: ":" + port, Handler: jwtAuthMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		log.Printf("[%s] Starting on :%s", serviceName, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

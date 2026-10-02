@@ -32,9 +32,21 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"golang.org/x/sync/errgroup"
 
 	"shared/otel/go/otelkit"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var db *sql.DB
 
@@ -220,8 +232,7 @@ func publishFailureEvent(payload map[string]interface{}) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("[scheduler] WARN publish standing_orders.failed: %v", err)
 		return
@@ -266,6 +277,13 @@ func startScheduler(ctx context.Context) {
 // in 'running' by a crashed scheduler are reclaimed after a grace period.
 // The schedule (next_execution_at) advances ONLY after a confirmed rail
 // execution; failures are recorded and retried on the next poll.
+type dueOrder struct {
+	id, accountID, beneficiaryID, narration, frequency string
+	amount                                             float64
+	execCount, maxExec                                 int
+	endDate                                            sql.NullString
+}
+
 func executeDueStandingOrders() {
 	if db == nil {
 		return
@@ -288,12 +306,6 @@ func executeDueStandingOrders() {
 		log.Printf("[scheduler] due orders claim failed: %v", err)
 		return
 	}
-	type dueOrder struct {
-		id, accountID, beneficiaryID, narration, frequency string
-		amount                                             float64
-		execCount, maxExec                                 int
-		endDate                                            sql.NullString
-	}
 	var due []dueOrder
 	for rows.Next() {
 		var o dueOrder
@@ -303,7 +315,26 @@ func executeDueStandingOrders() {
 	}
 	rows.Close()
 
+	// GCM-074 (AP-09): execute due orders concurrently (bounded at 8) — 50
+	// sequential executions x 20s rail timeout could take ~16min vs the 30s
+	// tick. Per-order idempotency refs are unchanged (unique per execution).
+	g := new(errgroup.Group)
+	g.SetLimit(8)
 	for _, o := range due {
+		o := o
+		g.Go(func() error {
+			processDueStandingOrder(o)
+			return nil
+		})
+	}
+	_ = g.Wait()
+}
+
+// processDueStandingOrder executes one claimed standing order and records the
+// outcome. Errors are handled internally (recorded + notified); the schedule
+// is advanced only on confirmed execution.
+func processDueStandingOrder(o dueOrder) {
+	{
 		ref := "SO-EXEC-" + o.id + "-" + fmt.Sprint(time.Now().UnixNano())
 		execErr := executeTransfer(o.accountID, o.beneficiaryID, o.amount, o.narration, ref)
 
@@ -356,7 +387,7 @@ func executeDueStandingOrders() {
 			})
 			log.Printf("[scheduler] order %s execution FAILED (recorded, schedule NOT advanced, consec=%d, autoPaused=%v): %v",
 				o.id, consec, autoPaused, execErr)
-			continue
+			return
 		}
 
 		// Confirmed execution: advance the schedule exactly once.
@@ -387,6 +418,11 @@ func executeDueStandingOrders() {
 // before executing it, so concurrent schedulers never double-debit. The final
 // status is written only after the rail confirms (executed) or rejects
 // (failed) the transfer.
+type due struct {
+	id, accountID, paymentType, reference string
+	amount                                float64
+}
+
 func executeDueScheduledPayments() {
 	if db == nil {
 		return
@@ -406,10 +442,6 @@ func executeDueScheduledPayments() {
 		log.Printf("[scheduler] scheduled payment claim failed: %v", err)
 		return
 	}
-	type due struct {
-		id, accountID, paymentType, reference string
-		amount                                float64
-	}
 	var payments []due
 	for rows.Next() {
 		var p due
@@ -419,7 +451,22 @@ func executeDueScheduledPayments() {
 	}
 	rows.Close()
 
+	// GCM-074 (AP-09): bounded concurrency (8) for due scheduled payments.
+	g := new(errgroup.Group)
+	g.SetLimit(8)
 	for _, p := range payments {
+		p := p
+		g.Go(func() error {
+			processDueScheduledPayment(p)
+			return nil
+		})
+	}
+	_ = g.Wait()
+}
+
+// processDueScheduledPayment executes one claimed scheduled payment.
+func processDueScheduledPayment(p due) {
+	{
 		err := executeTransfer(p.accountID, "", p.amount, "scheduled payment "+p.id, p.reference)
 		status := "executed"
 		if err != nil {
@@ -823,8 +870,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -1118,5 +1164,5 @@ func main() {
 
 	handler := corsMiddleware(jwtAuthMiddleware(rateLimitMiddleware(mux))) // CORS is handled by APISIX gateway
 	log.Printf("Standing Orders Service starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, otelkit.HTTPMiddleware(handler)))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(handler), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }

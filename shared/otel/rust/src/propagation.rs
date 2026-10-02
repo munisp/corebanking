@@ -12,9 +12,17 @@ use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 
 /// Composite W3C propagator: `traceparent`/`tracestate` + `baggage`.
 pub(crate) struct CompositePropagator {
+    // `global::set_text_map_propagator` requires `Debug`; the wrapped
+    // propagators do not all expose it, so implement it manually below.
     trace_context: TraceContextPropagator,
     baggage: BaggagePropagator,
     fields: Vec<String>,
+}
+
+impl std::fmt::Debug for CompositePropagator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompositePropagator").field("fields", &self.fields).finish()
+    }
 }
 
 impl CompositePropagator {

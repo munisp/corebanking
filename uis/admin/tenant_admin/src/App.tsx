@@ -1,22 +1,14 @@
 import { lazy, useEffect, useState, Suspense } from "react";
 import { Route, Switch, useLocation } from "wouter";
 import { authService } from "./services/auth/authService";
-const ErrorBoundary = lazy(() => import("./components/ErrorBoundary"));
-const Toaster = lazy(() =>
-  import("./components/ui/sonner").then((m) => ({ default: m.Toaster }))
-);
-const TooltipProvider = lazy(() =>
-  import("./components/ui/tooltip").then((m) => ({ default: m.TooltipProvider }))
-);
-const ProgressProvider = lazy(() =>
-  import("./contexts/ProgressContext").then((m) => ({ default: m.ProgressProvider }))
-);
-const TenantBrandingProvider = lazy(() =>
-  import("./contexts/TenantBrandingContext").then((m) => ({ default: m.TenantBrandingProvider }))
-);
-const ThemeProvider = lazy(() =>
-  import("./contexts/ThemeContext").then((m) => ({ default: m.ThemeProvider }))
-);
+// Shell providers are imported statically so the whole app isn't gated behind
+// one Suspense boundary waiting on 6 micro-chunks; only routes stay lazy.
+import ErrorBoundary from "./components/ErrorBoundary";
+import { Toaster } from "./components/ui/sonner";
+import { TooltipProvider } from "./components/ui/tooltip";
+import { ProgressProvider } from "./contexts/ProgressContext";
+import { TenantBrandingProvider } from "./contexts/TenantBrandingContext";
+import { ThemeProvider } from "./contexts/ThemeContext";
 
 // UI components that are used inline — kept as static imports
 const KYCVerificationDialog = lazy(() =>

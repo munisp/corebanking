@@ -40,6 +40,14 @@ export default defineConfig({
         entryFileNames: "assets/[name]-[hash].js",
         chunkFileNames: "assets/[name]-[hash].js",
         assetFileNames: "assets/[name]-[hash].[ext]",
+        manualChunks(id: string) {
+          if (!id.includes("node_modules")) return undefined;
+          if (/node_modules[\\/](react|react-dom|react-router-dom|react-router)[\\/]/.test(id)) return "vendor-react";
+          if (id.includes("node_modules/@mui") || id.includes("node_modules/@emotion")) return "vendor-mui";
+          if (id.includes("node_modules/antd") || id.includes("node_modules/@ant-design") || /node_modules[\\/]rc-[^\\/]+[\\/]/.test(id)) return "vendor-antd";
+          if (id.includes("node_modules/framer-motion")) return "vendor-motion";
+          return "vendor";
+        },
       },
     },
   },

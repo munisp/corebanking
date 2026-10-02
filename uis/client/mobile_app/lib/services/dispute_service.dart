@@ -6,9 +6,9 @@ class DisputeService {
   final ApiService _apiService = ApiService();
 
   // Get all disputes for the current user
-  Future<List<Dispute>> getAllDisputes() async {
+  Future<List<Dispute>> getAllDisputes({int page = 1, int limit = 50}) async {
     try {
-      final response = await _apiService.get('/dispute/api/v1/disputes');
+      final response = await _apiService.get('/dispute/api/v1/disputes', queryParameters: {'page': page, 'limit': limit});
       
       if (response.statusCode == 200) {
         final data = response.data;

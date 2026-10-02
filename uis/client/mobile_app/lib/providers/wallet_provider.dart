@@ -28,15 +28,16 @@ class WalletProvider with ChangeNotifier {
     _errorMessage = null;
     notifyListeners();
 
+    // MOB-18: batch the terminal state update into a single notification
+    // (was notifyListeners in both try and catch = 2-3 rebuilds per call).
     try {
       _wallet = await _walletService.getMyWallet();
       _isLoading = false;
-      notifyListeners();
     } catch (e) {
       _errorMessage = e.toString().replaceAll('Exception: ', '');
       _isLoading = false;
-      notifyListeners();
     }
+    notifyListeners();
   }
 
   // Refresh wallet balance

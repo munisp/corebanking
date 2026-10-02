@@ -19,6 +19,7 @@ export class KeycloakAdminApiClient {
   private constructor() {
     this.axios_client = axios.create({
       baseURL: readEnv("KEYCLOAK_BASE_URL"),
+      timeout: 10000,
       httpsAgent,
     });
     this.logger = logger;

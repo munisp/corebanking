@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 )
 
 func main() {
@@ -23,7 +24,7 @@ func main() {
 	http.HandleFunc("/", rootHandler)
 
 	log.Printf("[%s] listening on :%s", svc, port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := (&http.Server{Addr: ":" + port, Handler: nil, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

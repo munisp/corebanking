@@ -1,5 +1,9 @@
 #![allow(unused)]
 use tokio_postgres;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use serde_json::json;
+use actix_web::HttpMessage;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
@@ -28,6 +32,8 @@ struct CreateRequest {
 
 struct AppState {
     db: PgPool,
+    records: Mutex<Vec<serde_json::Value>>,
+    db_url: Option<String>,
 }
 
 fn sliding_window_count(timestamps: &[u64], window_ms: u64, now: u64) -> u32 { timestamps.iter().filter(|&&t| now - t <= window_ms).count() as u32 }
@@ -72,10 +78,21 @@ async fn check_rate(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
     db_persist(&state, "check_rate", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}")).await {
-        Ok(Ok(_resp)) => eprintln!("express-rate-limiter-rs: upstream call ok"),
-        Ok(Err(e)) => eprintln!("express-rate-limiter-rs: upstream call failed: {}", e),
-        Err(e) => eprintln!("express-rate-limiter-rs: upstream call join failed: {}", e),
+    {
+        // Wave-11: upstream AML/notify result is discarded on this path; run
+        // fire-and-forget with a 3s timeout instead of blocking the request.
+        let (w11_url, w11_body) = ((format!("{}/v1/screen", _upstream_url)).to_string(), ("{}").to_string());
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::task::spawn_blocking(move || call_service_sync(&w11_url, &w11_body)),
+            ).await {
+                Ok(Ok(Ok(_resp))) => {}
+                Ok(Ok(Err(e))) => eprintln!("express-rate-limiter-rs: upstream call failed: {}", e),
+                Ok(Err(e)) => eprintln!("express-rate-limiter-rs: upstream call join failed: {}", e),
+                Err(_) => eprintln!("express-rate-limiter-rs: upstream call timed out after 3s"),
+            }
+        });
     }
 
     HttpResponse::Ok().json(json!({
@@ -93,6 +110,41 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
     let total = records.len();
     let items: Vec<&serde_json::Value> = records.iter().skip((page-1)*limit).take(limit).collect();
     HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "in-memory" }}))
+}
+
+// --- Missing route handlers (W11 R-09 gate cleanup): in-memory record store,
+// mirroring the existing list_records precedent on the same resource; metrics
+// renders the existing Prometheus counters from prom_metrics. ---
+async fn metrics() -> HttpResponse {
+    prom_metrics().await
+}
+
+static _REC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let seq = _REC_SEQ.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let id = format!("rec-{}-{}", ts, seq);
+    let mut record = body.into_inner();
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("id".to_string(), json!(id));
+        obj.insert("created_at_ms".to_string(), json!(ts));
+    } else {
+        record = json!({"id": id, "created_at_ms": ts, "value": record});
+    }
+    state.records.lock().unwrap().push(record.clone());
+    HttpResponse::Created().json(record)
+}
+
+async fn get_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let records = state.records.lock().unwrap();
+    match records.iter().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
+        Some(r) => HttpResponse::Ok().json(r),
+        None => HttpResponse::NotFound().json(json!({"error": "not found", "id": id})),
+    }
 }
 
 async fn stats(state: web::Data<AppState>) -> HttpResponse {
@@ -141,24 +193,16 @@ async fn prom_metrics() -> HttpResponse {
 }
 
 
-// --- Database Connection ---
-use tokio_postgres::NoTls;
-
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS service_records (
-                    id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-                    status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
-    }
+// --- Database Connection (Wave-11: sqlx pool, max 25 connections) ---
+async fn init_db_pool(pool: &sqlx::PgPool) {
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS service_records (
+            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+        )",
+    ).execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)").execute(pool).await;
 }
 
 
@@ -328,7 +372,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -348,7 +392,7 @@ async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
@@ -391,16 +435,51 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
+// Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
+// or every 100 rows by a spawned task on the shared sqlx pool
+// (was: one blocking INSERT per request on a single tokio_postgres::Client).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "express_rate_limiter_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let svc_name = String::from("express-rate-limiter-rs");
-        let status = String::from("active");
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+    let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let id = format!("{}_{}_{}", "express_rate_limiter_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let svc_name = String::from("express-rate-limiter-rs");
+    let status = String::from("active");
+    let data_str = serde_json::to_string(data).unwrap_or_default();
+    if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let pool = state.db.clone();
+        let buf = buf.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                let rows: Vec<(String, String, String, String, String)> = {
+                    let mut b = buf.lock().unwrap();
+                    if b.is_empty() { continue; }
+                    std::mem::take(&mut *b)
+                };
+                for (id, svc, ep, st, d) in rows {
+                    let _ = sqlx::query(
+                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                    ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+                }
+            }
+        });
+    }
+    let mut b = buf.lock().unwrap();
+    b.push((id, svc_name, endpoint.to_string(), status, data_str));
+    if b.len() >= 100 {
+        let rows = std::mem::take(&mut *b);
+        drop(b);
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            for (id, svc, ep, st, d) in rows {
+                let _ = sqlx::query(
+                    "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+            }
+        });
     }
 }
 
@@ -473,6 +552,9 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
     match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
         Ok(mut stream) => {
+            // Wave-11: bound blocking I/O (was unbounded read_to_string).
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
             let host = host_port.split(':').next().unwrap_or("localhost");
             let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
             stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
@@ -515,9 +597,19 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
             Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
         };
         eprintln!("[{}] gRPC server on :{}", service_name, port);
+        // Wave-11: bound concurrent connection handlers (was: unbounded thread-per-conn).
+        let conn_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
+                let conn_permit = match conn_sem.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        eprintln!("[{}] gRPC connection limit (256) reached; dropping connection", service_name);
+                        continue;
+                    }
+                };
                 std::thread::spawn(move || {
+                    let _conn_permit = conn_permit; // released when handler exits
                     use std::io::{Read, Write};
                     let mut len_buf = [0u8; 4];
                     if stream.read_exact(&mut len_buf).is_err() { return; }
@@ -580,16 +672,34 @@ fn mtls_config() -> (bool, String, String, String) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8213);
-    let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
-        match init_db(&url).await {
-            Some(c) => { println!("express-rate-limiter-rs: connected to Postgres"); Some(std::sync::Arc::new(c)) }
-            None => None,
+    // Wave-11: shared sqlx pool (max 25) replaces the single tokio_postgres::Client.
+    let db: sqlx::PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("express-rate-limiter-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[express-rate-limiter-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[express-rate-limiter-rs] DATABASE_URL not set — DB endpoints will fail");
+            sqlx::postgres::PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
         }
-    } else { None };
+    };
+    {
+        let schema_pool = db.clone();
+        tokio::spawn(async move { init_db_pool(&schema_pool).await; });
+    }
     let state = web::Data::new(AppState {
+        db: db.clone(),
         records: Mutex::new(Vec::new()),
         db_url: std::env::var("DATABASE_URL").ok(),
-        db_client,
     });
     println!("express-rate-limiter-rs on port {}", port);
     start_grpc_server("express-rate-limiter-rs", 10498);
@@ -610,12 +720,19 @@ async fn main() -> std::io::Result<()> {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("none")
                     .to_string();
-                eprintln!("[express-rate-limiter-rs] {} {} trace={}", req.method(), req.path(), trace_id);
+                // Wave-11: log only errors, plus 1% sampled requests (was: every request).
+                let w11_method = req.method().clone();
+                let w11_path = req.path().to_string();
+                let w11_sample = _REQ_COUNT.load(AtomicOrdering::Relaxed) % 100 == 0;
                 let fut = srv.call(req);
                 async move {
                     let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
+                    let w11_err = res.status().is_server_error() || res.status().is_client_error();
+                    if w11_err {
                         _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    if w11_err || w11_sample {
+                        eprintln!("[express-rate-limiter-rs] {} {} trace={} status={}", w11_method, w11_path, trace_id, res.status().as_u16());
                     }
                     Ok(res)
                 }

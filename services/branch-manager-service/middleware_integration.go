@@ -6,8 +6,20 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // MiddlewareIntegration handles integration with platform middleware
 type MiddlewareIntegration struct {
@@ -16,7 +28,23 @@ type MiddlewareIntegration struct {
 	tigerBeetleClient *TigerBeetleClient
 	redisClient       *RedisClient
 	permifyClient     *PermifyClient
+
+	// decisionCache: short-TTL Permify decision cache (GPT-23). Errors are
+	// never cached; callers keep fail-closed behavior.
+	decisionCache   map[string]permifyDecisionEntry
+	decisionCacheMu sync.RWMutex
 }
+
+// permifyDecisionEntry is one cached allow/deny decision.
+type permifyDecisionEntry struct {
+	allowed   bool
+	expiresAt time.Time
+}
+
+const (
+	permifyDecisionCacheTTL        = 30 * time.Second
+	permifyDecisionCacheMaxEntries = 10000
+)
 
 // KafkaClient handles Kafka operations
 type KafkaClient struct {
@@ -46,6 +74,7 @@ func NewMiddlewareIntegration(tenantID string) *MiddlewareIntegration {
 		tigerBeetleClient: &TigerBeetleClient{serviceURL: getEnv("TIGERBEETLE_URL", "http://localhost:3000")},
 		redisClient:       &RedisClient{serviceURL: getEnv("REDIS_URL", "http://localhost:6379")},
 		permifyClient:     &PermifyClient{serviceURL: getEnv("PERMIFY_URL", "http://localhost:3476")},
+		decisionCache:     make(map[string]permifyDecisionEntry),
 	}
 }
 
@@ -131,8 +160,7 @@ func (m *MiddlewareIntegration) publishToKafka(topic string, message interface{}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Kafka publish error (non-fatal): %v\n", err)
 		return nil
@@ -210,8 +238,7 @@ func (m *MiddlewareIntegration) postToTigerBeetle(entries []map[string]interface
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("TigerBeetle post error (non-fatal): %v\n", err)
 		return nil
@@ -239,8 +266,7 @@ func (m *MiddlewareIntegration) CacheBranchData(key string, data interface{}, tt
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Redis cache error (non-fatal): %v\n", err)
 		return nil
@@ -252,6 +278,17 @@ func (m *MiddlewareIntegration) CacheBranchData(key string, data interface{}, tt
 
 // CheckPermission checks if a user has permission via Permify
 func (m *MiddlewareIntegration) CheckPermission(userID, permission, resource, resourceID string) (bool, error) {
+	// Consult the short-TTL decision cache first (GPT-23); only successful
+	// decisions are cached, errors remain fail-closed.
+	cacheKey := userID + "|" + permission + "|" + resource + "|" + resourceID
+	now := time.Now()
+	m.decisionCacheMu.RLock()
+	e, ok := m.decisionCache[cacheKey]
+	m.decisionCacheMu.RUnlock()
+	if ok && now.Before(e.expiresAt) {
+		return e.allowed, nil
+	}
+
 	payload, err := json.Marshal(map[string]interface{}{
 		"tenant_id": m.tenantID,
 		"entity": map[string]string{
@@ -274,8 +311,7 @@ func (m *MiddlewareIntegration) CheckPermission(userID, permission, resource, re
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("permify unreachable: %w", err)
 	}
@@ -287,7 +323,24 @@ func (m *MiddlewareIntegration) CheckPermission(userID, permission, resource, re
 	}
 
 	if can, ok := result["can"].(string); ok {
-		return can == "CHECK_RESULT_ALLOWED", nil
+		allowed := can == "CHECK_RESULT_ALLOWED"
+		m.decisionCacheMu.Lock()
+		if len(m.decisionCache) >= permifyDecisionCacheMaxEntries {
+			for k, v := range m.decisionCache { // evict expired first
+				if now.After(v.expiresAt) {
+					delete(m.decisionCache, k)
+				}
+			}
+			if len(m.decisionCache) >= permifyDecisionCacheMaxEntries {
+				for k := range m.decisionCache { // still full: drop one
+					delete(m.decisionCache, k)
+					break
+				}
+			}
+		}
+		m.decisionCache[cacheKey] = permifyDecisionEntry{allowed: allowed, expiresAt: now.Add(permifyDecisionCacheTTL)}
+		m.decisionCacheMu.Unlock()
+		return allowed, nil
 	}
 
 	return false, fmt.Errorf("permify: unexpected response format")
@@ -315,8 +368,7 @@ func (m *MiddlewareIntegration) SendNotification(notificationType, recipientID, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Dapr notification error (non-fatal): %v\n", err)
 		return nil
@@ -376,8 +428,7 @@ func (m *MiddlewareIntegration) PublishToLakehouse(dataType string, data interfa
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", m.tenantID)
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		fmt.Printf("Lakehouse publish error (non-fatal): %v\n", err)
 		return nil

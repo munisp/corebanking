@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 from fastapi import Depends
+from fastapi.middleware.gzip import GZipMiddleware
 
 from utils import config, BusinessServiceException, BusinessNotFoundError
 from database import init_db, get_session
@@ -48,6 +49,7 @@ app = FastAPI(
     version=settings.APP_VERSION,
     lifespan=lifespan,
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL

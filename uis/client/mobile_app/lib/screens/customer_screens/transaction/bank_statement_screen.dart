@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint, compute;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:universal_html/html.dart' as html;
 import 'package:intl/intl.dart';
@@ -7,6 +7,12 @@ import 'dart:convert';
 import '../../../services/api_service.dart';
 import '../../../services/wallet_service.dart';
 import '../../../models/transaction.dart';
+
+/// MOB-09: top-level so it can run in a background isolate via compute().
+List<Transaction> _sortTransactionsDesc(List<Transaction> txs) {
+  txs.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  return txs;
+}
 
 class BankStatementScreen extends StatefulWidget {
   const BankStatementScreen({super.key});
@@ -337,17 +343,25 @@ class _BankStatementScreenState extends State<BankStatementScreen> {
 
     try {
       debugPrint('[BankStatement] Fetching transactions from ${_startDate.toIso8601String()} to ${_endDate.toIso8601String()}');
-      
-      // Fetch transactions using WalletService which calls the transaction endpoint
-      final transactions = await _walletService.getTransactions(
-        page: 1,
-        limit: 100, // Get all transactions for the statement
-        startDate: _startDate,
-        endDate: _endDate,
-      );
 
-      // Sort by date (newest first)
-      transactions.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      // MOB-16: page through the transaction endpoint instead of a single
+      // hard-capped limit:100 fetch that silently truncated longer histories.
+      final allTransactions = <Transaction>[];
+      const int pageSize = 100;
+      const int maxPages = 10; // safety bound: 1,000 rows per statement
+      for (var page = 1; page <= maxPages; page++) {
+        final batch = await _walletService.getTransactions(
+          page: page,
+          limit: pageSize,
+          startDate: _startDate,
+          endDate: _endDate,
+        );
+        allTransactions.addAll(batch);
+        if (batch.length < pageSize) break; // last page
+      }
+
+      // MOB-09: sort large result sets off the UI thread.
+      final transactions = await compute(_sortTransactionsDesc, allTransactions);
 
       setState(() {
         _transactions = transactions;

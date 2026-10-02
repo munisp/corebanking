@@ -21,8 +21,9 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	_ "github.com/lib/pq"
+	pq "github.com/lib/pq"
 	"github.com/munisp/corebanking/pkg/tbclient"
+	"golang.org/x/sync/singleflight"
 	"shared/otel/go/otelkit"
 )
 
@@ -283,8 +284,34 @@ type jwksCache struct {
 
 var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
 
+// GCM (JWKS AP-02): shared client — bare http.Get had NO timeout.
+var jwksHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+// Singleflight + 30s cooldown for unknown-kid refreshes: a burst of tokens
+// with an unknown kid coalesces into ONE fetch, and attempts are rate-limited.
+var (
+	jwksSFGroup     singleflight.Group
+	jwksCoolMu      sync.Mutex
+	jwksLastAttempt time.Time
+)
+
+func refreshJWKSUnknownKid(realmURL string) {
+	jwksCoolMu.Lock()
+	if time.Since(jwksLastAttempt) < 30*time.Second {
+		jwksCoolMu.Unlock()
+		return
+	}
+	jwksLastAttempt = time.Now()
+	jwksCoolMu.Unlock()
+	// Duplicate callers block until the in-flight refresh completes.
+	_, _, _ = jwksSFGroup.Do("jwks", func() (interface{}, error) {
+		fetchJWKS(realmURL)
+		return nil, nil
+	})
+}
+
 func fetchJWKS(realmURL string) {
-	resp, err := http.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := jwksHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -363,8 +390,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		pub, ok := jwtCache.keys[header.Kid]
 		jwtCache.mu.RUnlock()
 		if !ok {
-			// Try refresh
-			fetchJWKS(realmURL)
+			// Unknown kid — singleflight refresh with 30s cooldown (GCM
+			// JWKS AP-02): unknown-kid tokens cannot force a fetch storm.
+			refreshJWKSUnknownKid(realmURL)
 			jwtCache.mu.RLock()
 			pub, ok = jwtCache.keys[header.Kid]
 			jwtCache.mu.RUnlock()
@@ -464,10 +492,9 @@ func relayOutbox(brokers string, topic string) {
 	// fails the event stays unpublished and will be re-published on the next
 	// relay tick (duplicate-safe), so the error is logged loudly, never
 	// silently dropped — and never crashes the relay.
-	for _, id := range ids {
-		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
-			log.Printf("[outbox-relay] failed to mark event %s published: %v — event remains unpublished and will be retried", id, err)
-		}
+	// GCM (AP-01): single batch UPDATE instead of one RTT per event.
+	if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = ANY($1::uuid[])`, pq.Array(ids)); err != nil {
+		log.Printf("[outbox-relay] failed to batch-mark %d events published: %v — events remain unpublished and will be retried", len(ids), err)
 	}
 	log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
 }
@@ -775,11 +802,12 @@ func main() {
 	handler := otelkit.HTTPMiddleware(panicRecoveryMiddleware(securityMiddleware(mux)))
 
 	srv := &http.Server{
-		Addr:         ":" + port,
-		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

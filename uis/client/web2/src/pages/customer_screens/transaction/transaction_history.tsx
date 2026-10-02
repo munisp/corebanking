@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { FiArrowDownLeft, FiArrowLeft, FiArrowUpRight } from "react-icons/fi";
 import { useNavigate } from "react-router-dom";
 import { AppConfig } from "../../../config/app_config";
@@ -85,11 +85,18 @@ export default function TransactionHistory() {
     }
   };
 
+  // Parse the cached user once per raw-value change instead of per row per render
+  const userRaw = localStorage.getItem('user');
+  const myAccountId = useMemo(() => {
+    try {
+      return JSON.parse(userRaw || '{}')?.account_id?.toString() || '11';
+    } catch {
+      return '11';
+    }
+  }, [userRaw]);
+
   // Helper function to determine if transaction is credit or debit
   const getTransactionType = (tx: Transaction): 'credit' | 'debit' => {
-    const user = JSON.parse(localStorage.getItem('user') || '{}');
-    const myAccountId = user?.account_id?.toString() || '11';
-    
     // If I'm the payee, it's a credit (money coming in)
     // If I'm the payer, it's a debit (money going out)
     return tx.payee === myAccountId ? 'credit' : 'debit';

@@ -257,11 +257,12 @@ class VoiceBankingService extends ChangeNotifier {
             }
             // Notify that final result is ready for processing
             if (onFinalResult != null) {
-              debugPrint('🔔 Triggering onFinalResult callback');
+              if (kDebugMode) debugPrint('🔔 Triggering onFinalResult callback');
               onFinalResult!();
             }
           } else {
-            debugPrint('Partial result: $_lastWords');
+            // MOB-12: fires many times/sec while listening — debug only.
+            if (kDebugMode) debugPrint('Partial result: $_lastWords');
           }
 
           notifyListeners();

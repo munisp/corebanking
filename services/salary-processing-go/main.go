@@ -25,6 +25,27 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// longTimeoutHTTPClient is a pooled HTTP client for long-running outbound calls.
+var longTimeoutHTTPClient = &http.Client{
+	Timeout: 120 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 type SalaryBatch struct {
 	ID            string  `json:"id"`
 	CompanyName   string  `json:"companyName"`
@@ -358,8 +379,7 @@ func bulkRequest(r *http.Request, method, url string, body interface{}) (int, []
 			req.Header.Set(h, v)
 		}
 	}
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := longTimeoutHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -430,14 +450,22 @@ func (s *SalaryService) executeBatch(w http.ResponseWriter, r *http.Request, bat
 	}
 
 	// Assign durable leg indexes (execute runs only on pending instructions,
-	// so this is the first and only assignment).
-	for i, ins := range instructions {
-		if _, err := s.db.Exec(ctx,
-			`UPDATE salary_instructions SET leg_index=$3 WHERE id=$1 AND bank_id=$2`,
-			ins.id, tid, i); err != nil {
-			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "leg index assignment failed: " + err.Error()})
-			return
-		}
+	// so this is the first and only assignment). GCM-059: single statement
+	// instead of one UPDATE per instruction (1000 RTTs per 1000-employee
+	// batch). row_number() OVER (ORDER BY id) reproduces the exact 0-based
+	// positions of the SELECT ... ORDER BY id above — leg indexes are
+	// byte-identical to the per-row loop.
+	if _, err := s.db.Exec(ctx, `
+		UPDATE salary_instructions SET leg_index = t.rn - 1
+		FROM (
+			SELECT id, row_number() OVER (ORDER BY id) AS rn
+			FROM salary_instructions
+			WHERE batch_id=$1 AND bank_id=$2 AND status='pending'
+		) t
+		WHERE salary_instructions.id = t.id AND salary_instructions.bank_id=$2`,
+		batchID, tid); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "leg index assignment failed: " + err.Error()})
+		return
 	}
 
 	// bulk-payments-rs batch id is namespaced by tenant+batch because salary
@@ -714,8 +742,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -903,7 +930,18 @@ func main() {
 		addr = ":8150"
 	}
 	fmt.Printf("salary-processing listening on %s\n", addr)
-	if err := http.ListenAndServe(addr, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))); err != nil {
+	// GCM-058: bare ListenAndServe pins a goroutine+pgx conn forever when the
+	// 120s bulk rail call stalls, and exposes Slowloris. WriteTimeout exceeds
+	// the 120s bulk-rail client timeout (:361).
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))),
+		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      130 * time.Second, // bulk rail client timeout is 120s
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}

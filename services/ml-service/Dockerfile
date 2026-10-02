@@ -5,4 +5,4 @@ COPY . .
 RUN useradd --create-home --shell /usr/sbin/nologin appuser && chown -R appuser:appuser /app
 USER appuser
 EXPOSE 8080
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "exec uvicorn api.main:app --host 0.0.0.0 --port 8080 --workers ${UVICORN_WORKERS:-4}"]

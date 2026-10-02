@@ -1,4 +1,6 @@
 import axios, { AxiosInstance } from "axios";
+import http from "http";
+import https from "https";
 import { readEnv } from "../config/readEnv.config";
 import * as z from "zod";
 import { ProcessCardPaymentSchema } from "../validations/v1/card_payment";
@@ -14,6 +16,9 @@ export class LuxConnectorApiClient {
   private constructor() {
     this.clientAxios = axios.create({
       baseURL: url,
+      timeout: 10000,
+      httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+      httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
     });
   }
 

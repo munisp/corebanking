@@ -20,6 +20,29 @@ const MAX_LOGIN_ATTEMPTS = 5;
 const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes
 const ATTEMPT_WINDOW = 5 * 60 * 1000; // 5 minutes
 
+// TS-19: periodically sweep stale per-IP entries so the map stays bounded even
+// when attackers never revisit from the same IP.
+const loginAttemptsSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of loginAttempts) {
+    const locked = record.lockedUntil !== undefined && record.lockedUntil > now;
+    if (!locked && now - record.lastAttempt > ATTEMPT_WINDOW) {
+      loginAttempts.delete(ip);
+    }
+  }
+}, ATTEMPT_WINDOW);
+loginAttemptsSweep.unref();
+
+// TS-09: derive the PII encryption key once — scryptSync is a ~50-100ms
+// event-loop block and the inputs are static per process.
+let cachedPiiKey: Buffer | null = null;
+function getPiiKey(): Buffer {
+  if (!cachedPiiKey) {
+    cachedPiiKey = crypto.scryptSync(process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || "54bank-default-key", "ndpr-salt", 32);
+  }
+  return cachedPiiKey;
+}
+
 // OWASP recommended security headers
 function securityHeaders(_req: Request, res: Response, next: NextFunction) {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -108,7 +131,7 @@ function recordLoginAttempt(ip: string, success: boolean) {
 
 // Data encryption utilities
 function encryptPII(data: string): string {
-  const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || "54bank-default-key", "ndpr-salt", 32);
+  const key = getPiiKey();
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const encrypted = Buffer.concat([cipher.update(data, "utf8"), cipher.final()]);
@@ -118,7 +141,7 @@ function encryptPII(data: string): string {
 
 function decryptPII(ciphertext: string): string {
   const [ivHex, authTagHex, encryptedHex] = ciphertext.split(":");
-  const key = crypto.scryptSync(process.env.ENCRYPTION_KEY || process.env.JWT_SECRET || "54bank-default-key", "ndpr-salt", 32);
+  const key = getPiiKey();
   const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"));
   decipher.setAuthTag(Buffer.from(authTagHex, "hex"));
   return decipher.update(Buffer.from(encryptedHex, "hex")) + decipher.final("utf8");

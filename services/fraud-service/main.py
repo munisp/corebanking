@@ -13,6 +13,7 @@ from enum import Enum
 from decimal import Decimal
 import uvicorn
 import asyncpg
+import asyncio
 import os
 import sys
 import json
@@ -25,7 +26,7 @@ try:
 except ImportError:
     LakehousePublisher = None
 
-from rust_risk_evaluator import build_risk_input, evaluate_risk
+from rust_risk_evaluator import build_risk_input, evaluate_risk, initialize_cli
 
 app = FastAPI(
     title="54link-dev Fraud Detection Service",
@@ -330,6 +331,10 @@ def publish_lakehouse_event(event_type: str, tenant_id: str, entity_id: str, pay
 @app.on_event("startup")
 async def startup():
     global db_pool, fraud_lakehouse
+    # W11 PY-003: locate/build the Rust CLI evaluator binary ONCE at startup
+    # (in a thread, off the event loop) instead of `cargo run` per request.
+    # If unavailable it is marked as such honestly — no mock scores.
+    await asyncio.to_thread(initialize_cli)
     db_host = os.getenv("DB_HOST", "postgres")
     db_port = int(os.getenv("DB_PORT", "5432"))
     db_user = os.getenv("DB_USER", "postgres")
@@ -607,7 +612,9 @@ async def check_transaction(
                     WHERE rule_id = $1
                 """, rule['rule_id'])
         
-        rust_risk = evaluate_risk(build_risk_input(
+        # W11 PY-002: evaluate_risk blocks (requests.post + CLI fallback) —
+        # run it off the event loop.
+        rust_risk = await asyncio.to_thread(evaluate_risk, build_risk_input(
             transaction_id=check.transaction_id,
             tenant_id=check.tenant_id,
             customer_id=check.customer_id,

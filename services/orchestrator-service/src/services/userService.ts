@@ -10,6 +10,7 @@ class UserService {
   constructor() {
     this._axiosInstance = axios.create({
       baseURL: readEnv("USER_SVC_URL"),
+      timeout: 10000,
       headers: {
         "content-type": "application/json",
       },

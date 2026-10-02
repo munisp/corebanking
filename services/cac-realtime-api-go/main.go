@@ -18,6 +18,17 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var middlewareConfig = map[string]interface{}{
 	"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"kyb.cac-verified", "kyb.cac-status-changed", "kyb.director-changed", "kyb.annual-return-overdue"}},
 	"dapr":        map[string]interface{}{"app_id": "cac-realtime-api-go", "url": envOr("DAPR_URL", "http://localhost:3500")},
@@ -121,8 +132,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -317,7 +327,7 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]interface{}{"overdue_companies": overdue, "total_overdue": len(overdue)})
 	})
 	fmt.Printf("cac-realtime-api-go listening on :%s\n", port)
-	http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))))
+	(&http.Server{Addr: ":" + port, Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(http.DefaultServeMux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe()
 }
 
 // healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).

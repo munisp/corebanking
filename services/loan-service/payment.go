@@ -11,6 +11,17 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // LN-03 (L3): PAYMENT_URL is REQUIRED. It is resolved once at boot via
 // InitPaymentConfig (fail-fast); an empty value previously meant every
 // disbursement died against an empty URL (w8:F1-14).
@@ -54,10 +65,6 @@ func Payment(payload *PaymentStruct) (*PaymentResult, error) {
 		return nil, fmt.Errorf("failed to marshal payment payload: %w", err)
 	}
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
 	req, err := http.NewRequest("POST", paymentServiceURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to build payment request: %w", err)
@@ -70,7 +77,7 @@ func Payment(payload *PaymentStruct) (*PaymentResult, error) {
 	req.Header.Set("x-ledger-id", payload.LedgerID)
 	req.Header.Set("x-mint-account-id", payload.MintAccountID)
 
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

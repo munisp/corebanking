@@ -54,6 +54,17 @@ import (
 	"shared/otel/go/otelkit"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 func getEnv(key, fallback string) string {
@@ -266,8 +277,7 @@ func pbacCheck(tid, userID, permission, entityType string) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("AUTHZ PDP unreachable (fail-closed): %v", err)
 		return false
@@ -297,8 +307,7 @@ func fireCallback(callbackURL, status string, requestID int, payload string) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("WARN callback id=%d url=%s failed: %v", requestID, callbackURL, err)
 		return
@@ -315,8 +324,7 @@ func publishEvent(topic string, payload interface{}) {
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("WARN publish %s: %v", topic, err)
 		return
@@ -641,17 +649,26 @@ func handleApprove(w http.ResponseWriter, r *http.Request, reqID int) {
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	tx, err := db.Begin()
+	// GCM (AP-14): per-request 5s deadline + 2s lock_timeout so a wedged DB
+	// or lock queue cannot hang the approve/reject handler forever.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		errorJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer tx.Rollback()
+	// Bound the FOR UPDATE lock wait below.
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+		errorJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	var makerID, status, payloadStr, callbackURL string
 	var currentLevel, maxLevel int
 	var slaDeadline time.Time
-	err = tx.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 		SELECT maker_id, status, current_level, max_level, sla_deadline, payload, COALESCE(callback_url,'')
 		FROM approval_requests WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,
 		reqID, tid,
@@ -680,7 +697,7 @@ func handleApprove(w http.ResponseWriter, r *http.Request, reqID int) {
 	}
 
 	// Record action
-	tx.Exec(`INSERT INTO approval_actions
+	tx.ExecContext(ctx, `INSERT INTO approval_actions
 		(request_id, tenant_id, action, actor_id, actor_name, actor_role, level, remarks)
 		VALUES ($1,$2,'approve',$3,$4,$5,$6,$7)`,
 		reqID, tid, checkerID, checkerName, checkerRole, currentLevel, body.Remarks)
@@ -689,12 +706,12 @@ func handleApprove(w http.ResponseWriter, r *http.Request, reqID int) {
 	if currentLevel >= maxLevel {
 		// Final approval
 		newStatus = "approved"
-		tx.Exec(`UPDATE approval_requests SET status='approved', resolved_at=now(),
+		tx.ExecContext(ctx, `UPDATE approval_requests SET status='approved', resolved_at=now(),
 			remarks=$1 WHERE id=$2`, body.Remarks, reqID)
 	} else {
 		// Advance to next level
 		newStatus = "pending"
-		tx.Exec(`UPDATE approval_requests SET current_level=current_level+1 WHERE id=$1`, reqID)
+		tx.ExecContext(ctx, `UPDATE approval_requests SET current_level=current_level+1 WHERE id=$1`, reqID)
 	}
 
 	tx.Commit()
@@ -747,16 +764,25 @@ func handleReject(w http.ResponseWriter, r *http.Request, reqID int) {
 		return
 	}
 
-	tx, err := db.Begin()
+	// GCM (AP-14): per-request 5s deadline + 2s lock_timeout so a wedged DB
+	// or lock queue cannot hang the approve/reject handler forever.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		errorJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer tx.Rollback()
+	// Bound the FOR UPDATE lock wait below.
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+		errorJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	var makerID, status, callbackURL string
 	var currentLevel int
-	err = tx.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 		SELECT maker_id, status, current_level, COALESCE(callback_url,'')
 		FROM approval_requests WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,
 		reqID, tid,
@@ -778,12 +804,12 @@ func handleReject(w http.ResponseWriter, r *http.Request, reqID int) {
 		return
 	}
 
-	tx.Exec(`INSERT INTO approval_actions
+	tx.ExecContext(ctx, `INSERT INTO approval_actions
 		(request_id, tenant_id, action, actor_id, actor_name, actor_role, level, remarks)
 		VALUES ($1,$2,'reject',$3,$4,$5,$6,$7)`,
 		reqID, tid, checkerID, checkerName, checkerRole, currentLevel, body.Remarks)
 
-	tx.Exec(`UPDATE approval_requests SET status='rejected', resolved_at=now(), remarks=$1 WHERE id=$2`,
+	tx.ExecContext(ctx, `UPDATE approval_requests SET status='rejected', resolved_at=now(), remarks=$1 WHERE id=$2`,
 		body.Remarks, reqID)
 
 	tx.Commit()
@@ -1003,8 +1029,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -1230,7 +1255,7 @@ func main() {
 
 	port := getEnv("PORT", "8210")
 	log.Printf("maker-checker-go listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux)))))))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux))))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 // --- Request metrics (restored fleet-canonical block) ---

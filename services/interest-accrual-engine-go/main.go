@@ -39,6 +39,27 @@ import (
 	"github.com/munisp/corebanking/pkg/tbclient"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// longTimeoutHTTPClient is a pooled HTTP client for long-running outbound calls.
+var longTimeoutHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var db *sql.DB
 
 var serviceName = "interest-accrual-engine-go"
@@ -535,7 +556,6 @@ func syncEligibleAccountsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	synced := 0
 	skipped := 0
 	for page := 1; ; page++ {
@@ -551,7 +571,7 @@ func syncEligibleAccountsHandler(w http.ResponseWriter, r *http.Request) {
 		if tok := strings.TrimSpace(os.Getenv("ACCOUNT_SVC_TOKEN")); tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		resp, err := client.Do(req)
+		resp, err := longTimeoutHTTPClient.Do(req)
 		if err != nil {
 			writeJSON(w, 502, map[string]interface{}{"error": "account_service_unreachable", "detail": err.Error(), "syncedSoFar": synced})
 			return
@@ -754,8 +774,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -973,11 +992,12 @@ func main() {
 	mux.HandleFunc("/v1/interest/sync-eligible-accounts", syncEligibleAccountsHandler) // MN-09
 
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(jwtAuthMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           rateLimitMiddleware(jwtAuthMiddleware(mux)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	log.Printf("[%s] listening on :%s", serviceName, port)
 	log.Fatal(server.ListenAndServe())

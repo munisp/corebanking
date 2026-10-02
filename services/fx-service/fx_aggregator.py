@@ -5,6 +5,7 @@ Production-ready implementation with failover, caching, and rate aggregation
 
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="54link-dev FX Aggregator Service", version="2.0.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
 # is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
@@ -921,4 +923,4 @@ async def list_fx_transactions(
         }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8007")))
+    uvicorn.run("fx_aggregator:app", host="0.0.0.0", port=int(os.getenv("PORT", "8007")), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

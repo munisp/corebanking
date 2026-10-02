@@ -5,6 +5,10 @@ use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use serde_json::json;
+use actix_web::HttpMessage;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
 
@@ -28,6 +32,8 @@ struct CreateRequest {
 
 struct AppState {
     db: PgPool,
+    policies: Mutex<Vec<serde_json::Value>>,
+    db_url: Option<String>,
 }
 
 fn validate_token_claims(exp: u64, iss: &str) -> Result<(), String> {
@@ -157,21 +163,16 @@ async fn prom_metrics() -> HttpResponse {
 // --- Database Connection ---
 use tokio_postgres::NoTls;
 
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS service_records (
-                    id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-                    status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
-    }
+// --- Database Connection (Wave-11: sqlx pool, max 25 connections) ---
+async fn init_db_pool(pool: &sqlx::PgPool) {
+    let _ = sqlx::query(
+        "CREATE TABLE IF NOT EXISTS service_records (
+            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+        )",
+    ).execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)").execute(pool).await;
 }
 
 
@@ -341,7 +342,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -361,7 +362,7 @@ async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
     if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
@@ -404,16 +405,51 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
+// Wave-11: audit INSERTs are buffered behind a Mutex and flushed every 100ms
+// or every 100 rows by a spawned task on the shared sqlx pool
+// (was: one blocking INSERT per request on a single tokio_postgres::Client).
+static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
+static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "auth_enforcer_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let svc_name = String::from("auth-enforcer-rs");
-        let status = String::from("active");
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+    let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let id = format!("{}_{}_{}", "auth_enforcer_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let svc_name = String::from("auth-enforcer-rs");
+    let status = String::from("active");
+    let data_str = serde_json::to_string(data).unwrap_or_default();
+    if !W11_FLUSH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let pool = state.db.clone();
+        let buf = buf.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                tick.tick().await;
+                let rows: Vec<(String, String, String, String, String)> = {
+                    let mut b = buf.lock().unwrap();
+                    if b.is_empty() { continue; }
+                    std::mem::take(&mut *b)
+                };
+                for (id, svc, ep, st, d) in rows {
+                    let _ = sqlx::query(
+                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                    ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+                }
+            }
+        });
+    }
+    let mut b = buf.lock().unwrap();
+    b.push((id, svc_name, endpoint.to_string(), status, data_str));
+    if b.len() >= 100 {
+        let rows = std::mem::take(&mut *b);
+        drop(b);
+        let pool = state.db.clone();
+        tokio::spawn(async move {
+            for (id, svc, ep, st, d) in rows {
+                let _ = sqlx::query(
+                    "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+                ).bind(id).bind(svc).bind(ep).bind(st).bind(d).execute(&pool).await;
+            }
+        });
     }
 }
 
@@ -593,18 +629,35 @@ fn mtls_config() -> (bool, String, String, String) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8201);
+    // Wave-11: shared sqlx pool (max 25) replaces the discarded single tokio_postgres::Client.
+    let db: PgPool = match std::env::var("DATABASE_URL") {
+        Ok(url) => match PgPoolOptions::new()
+            .max_connections(25)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect_lazy(&url)
+        {
+            Ok(p) => { println!("auth-enforcer-rs: Postgres pool configured (max 25)"); p }
+            Err(e) => {
+                eprintln!("[auth-enforcer-rs] invalid DATABASE_URL: {} — DB endpoints will fail", e);
+                PgPoolOptions::new().max_connections(1)
+                    .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+            }
+        },
+        Err(_) => {
+            eprintln!("[auth-enforcer-rs] DATABASE_URL not set — DB endpoints will fail");
+            PgPoolOptions::new().max_connections(1)
+                .connect_lazy("postgres://127.0.0.1:5432/postgres").expect("static fallback URL parses")
+        }
+    };
+    {
+        let schema_pool = db.clone();
+        tokio::spawn(async move { init_db_pool(&schema_pool).await; });
+    }
     let state = web::Data::new(AppState {
+        db: db.clone(),
         policies: Mutex::new(Vec::new()),
         db_url: std::env::var("DATABASE_URL").ok(),
-        db_client: None,
     });
-    // Wire DB client
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        if let Some(client) = init_db(&url).await {
-            println!("auth_enforcer_rs: connected to Postgres");
-            // Note: Cannot mutate web::Data after creation, DB used via init_db
-        }
-    }
     println!("auth-enforcer-rs on port {}", port);
     start_grpc_server("auth-enforcer-rs", 10345);
     HttpServer::new(move || {
@@ -703,6 +756,72 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+// --- Missing route handlers (W11 R-09 gate cleanup): real sqlx-backed CRUD against
+// the shared PgPool, mirroring update_record/delete_record; metrics renders the
+// existing Prometheus counters from prom_metrics. ---
+async fn metrics() -> HttpResponse {
+    prom_metrics().await
+}
+
+fn row_to_config_json(r: &sqlx::postgres::PgRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.get::<String, _>("id"),
+        "config_key": r.get::<String, _>("config_key"),
+        "config_value": r.get::<serde_json::Value, _>("config_value"),
+        "environment": r.get::<String, _>("environment"),
+        "version": r.get::<i32, _>("version"),
+        "is_active": r.get::<bool, _>("is_active"),
+        "created_at": r.get::<String, _>("created_at"),
+        "updated_at": r.get::<String, _>("updated_at"),
+    })
+}
+
+const CONFIG_COLS: &str = "id::text AS id, config_key, config_value, environment, version, is_active, created_at::text AS created_at, updated_at::text AS updated_at";
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let q = format!("SELECT {} FROM service_configs WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 500", CONFIG_COLS);
+    match sqlx::query(&q).fetch_all(&data.db).await {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows.iter().map(row_to_config_json).collect();
+            HttpResponse::Ok().json(serde_json::json!({"records": items, "count": items.len()}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let key = body.extra.get("config_key").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+    let value = body.extra.get("config_value").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let env = body.extra.get("environment").and_then(|v| v.as_str()).unwrap_or("production").to_string();
+    let result = sqlx::query("INSERT INTO service_configs (config_key, config_value, environment) VALUES ($1, $2, $3) RETURNING id::text AS id")
+        .bind(&key).bind(&value).bind(&env)
+        .fetch_one(&data.db).await;
+    match result {
+        Ok(row) => {
+            let id: String = row.get("id");
+            let payload = serde_json::json!({"id": &id, "config_key": &key, "environment": &env});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created").bind(&id).bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id, "config_key": key, "environment": env}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let q = format!("SELECT {} FROM service_configs WHERE id = $1::uuid", CONFIG_COLS);
+    match sqlx::query(&q).bind(&id).fetch_optional(&data.db).await {
+        Ok(Some(r)) => HttpResponse::Ok().json(row_to_config_json(&r)),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found", "id": id})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()})),
+    }
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {

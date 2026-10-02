@@ -16,6 +16,8 @@ class BillingService {
 
       const res = await fetch(`${this.BASE_URL}/billing`, {
         method: "PUT",
+        // TS-64: bound the wait on a stalled billing-service.
+        signal: AbortSignal.timeout(5000),
         headers: {
           "Content-Type": "application/json",
           "x-tenant-id": tenantId,
@@ -61,6 +63,8 @@ class BillingService {
 
       const res = await fetch(`${this.BASE_URL}/billing/info`, {
         method: "GET",
+        // TS-64: bound the wait on a stalled billing-service.
+        signal: AbortSignal.timeout(5000),
         headers: {
           "x-tenant-id": tenantId,
         },

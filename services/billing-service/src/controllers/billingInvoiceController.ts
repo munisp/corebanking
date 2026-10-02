@@ -8,6 +8,20 @@ import { billingErpPostingRepository } from "../repositories/billingErpPostingRe
 import { billingInvoiceService } from "../services/billingInvoiceService";
 import { generateId, generateErpReference } from "../utils/id";
 
+// TS-61: map over items with bounded concurrency, preserving result order.
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const current = index++;
+      results[current] = await fn(items[current]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export const billingInvoiceController = {
   async list(req: Request, res: Response) {
     const [items, lines, approvals] = await Promise.all([
@@ -24,8 +38,10 @@ export const billingInvoiceController = {
       ? [await billingAccountRepository.findById(billingAccountId)].filter(Boolean)
       : await billingAccountRepository.findActive();
 
-    const results = await Promise.all(
-      accounts.map((acc) => billingInvoiceService.generateForAccount(acc!.id, periodType ?? "monthly", false)),
+    // TS-61: chunk concurrency (10) — a Promise.all over every active account
+    // exhausts the DB pool at large tenant counts.
+    const results = await mapWithConcurrency(accounts, 10, (acc) =>
+      billingInvoiceService.generateForAccount(acc!.id, periodType ?? "monthly", false),
     );
 
     return res.status(httpStatus.OK).json({
@@ -43,8 +59,9 @@ export const billingInvoiceController = {
       ? [await billingAccountRepository.findById(billingAccountId)].filter(Boolean)
       : await billingAccountRepository.findActive();
 
-    const results = await Promise.all(
-      accounts.map((acc) => billingInvoiceService.generateForAccount(acc!.id, periodType ?? "monthly", true)),
+    // TS-61: chunked concurrency (see generate).
+    const results = await mapWithConcurrency(accounts, 10, (acc) =>
+      billingInvoiceService.generateForAccount(acc!.id, periodType ?? "monthly", true),
     );
 
     return res.status(httpStatus.OK).json({

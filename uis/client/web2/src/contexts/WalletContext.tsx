@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { walletService } from '../services/wallet_service';
 
 interface Wallet {
@@ -88,17 +88,23 @@ export const WalletProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     }
   }, []);
 
+  const value = useMemo(
+    () => ({
+      wallet,
+      transactions,
+      isLoading,
+      fetchWallet,
+      fetchTransactions,
+      refreshAll,
+    }),
+    // fetchWallet/fetchTransactions/refreshAll are re-created per render; the
+    // memo still collapses the common case where only unrelated parent state
+    // changed (wallet/transactions/isLoading unchanged).
+    [wallet, transactions, isLoading]
+  );
+
   return (
-    <WalletContext.Provider
-      value={{
-        wallet,
-        transactions,
-        isLoading,
-        fetchWallet,
-        fetchTransactions,
-        refreshAll,
-      }}
-    >
+    <WalletContext.Provider value={value}>
       {children}
     </WalletContext.Provider>
   );

@@ -2,4 +2,4 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY main.py .
 EXPOSE 8200
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8200} --workers ${UVICORN_WORKERS:-4}"]

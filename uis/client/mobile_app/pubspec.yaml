@@ -29,6 +29,9 @@ dependencies:
   dio: ^5.9.0
   http: ^1.6.0
 
+  # Image caching (MOB-08: disk+memory cache for network images)
+  cached_network_image: ^3.4.1
+
   # Firebase (Updated versions for compatibility)
   firebase_core: ^3.6.0
   firebase_messaging: ^15.1.3

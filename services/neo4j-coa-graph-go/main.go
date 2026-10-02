@@ -4,7 +4,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto"
@@ -19,13 +18,13 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/signal"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,7 +33,45 @@ import (
 
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
+
+	"github.com/redis/go-redis/v9"
 )
+
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(rand.Int63n(int64(d)/2))
+}
+
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var serviceName = "neo4j-coa-graph-go"
 var db *sql.DB
@@ -719,112 +756,39 @@ func dbInsert(id, svc, tenant, status string, data []byte) error {
 	return err
 }
 
-// redisConn dials Redis and returns the connection plus a buffered reader with
-// a hard deadline (M-23: no partial reads against the raw socket).
-func redisConn() (net.Conn, *bufio.Reader, error) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil {
-		return nil, nil, err
-	}
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	return conn, bufio.NewReader(conn), nil
-}
+// W11 GPT-01: pooled go-redis client shared per service (replaces per-op TCP dial).
+// Lazy init so REDIS_URL env override in init() is honored; DialTimeout kept as dial fallback.
+var (
+	redisClientOnce sync.Once
+	redisClient     *redis.Client
+	redisCtx        = context.Background()
+)
 
-// writeRESPCommand serializes args as a RESP multi-bulk request.
-func writeRESPCommand(w *bufio.Writer, args ...string) {
-	fmt.Fprintf(w, "*%d\r\n", len(args))
-	for _, a := range args {
-		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(a), a)
-	}
-	w.Flush()
-}
-
-// readRESPReply parses one RESP reply: simple string, error, integer, bulk
-// string (length-prefixed read), or multi-bulk (recursive). Redis error
-// replies are returned as Go errors.
-func readRESPReply(r *bufio.Reader) (interface{}, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return nil, err
-	}
-	if len(line) < 3 || !strings.HasSuffix(line, "\r\n") {
-		return nil, fmt.Errorf("malformed RESP reply")
-	}
-	payload := line[1 : len(line)-2]
-	switch line[0] {
-	case '+':
-		return payload, nil
-	case '-':
-		return nil, fmt.Errorf("redis error: %s", payload)
-	case ':':
-		n, err := strconv.ParseInt(payload, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("malformed integer reply: %v", err)
-		}
-		return n, nil
-	case '$':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil // nil bulk string
-		}
-		buf := make([]byte, n+2) // payload + trailing CRLF
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
-		return string(buf[:n]), nil
-	case '*':
-		n, err := strconv.Atoi(payload)
-		if err != nil {
-			return nil, fmt.Errorf("malformed multi-bulk length: %v", err)
-		}
-		if n < 0 {
-			return nil, nil
-		}
-		items := make([]interface{}, 0, n)
-		for i := 0; i < n; i++ {
-			it, err := readRESPReply(r)
-			if err != nil {
-				return nil, err
-			}
-			items = append(items, it)
-		}
-		return items, nil
-	}
-	return nil, fmt.Errorf("unknown RESP type byte %q", line[0])
+func getRedisClient() *redis.Client {
+	redisClientOnce.Do(func() {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  2 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     50,
+		})
+	})
+	return redisClient
 }
 
 func cacheGet(key string) (string, bool) {
-	conn, rd, err := redisConn()
+	s, err := getRedisClient().Get(redisCtx, key).Result()
 	if err != nil {
 		return "", false
 	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "GET", key)
-	rep, err := readRESPReply(rd)
-	if err != nil || rep == nil {
-		return "", false
-	}
-	s, ok := rep.(string)
-	return s, ok
+	return s, true
 }
-
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, rd, err := redisConn()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	wr := bufio.NewWriter(conn)
-	writeRESPCommand(wr, "SET", key, value, "EX", strconv.Itoa(ttlSeconds))
-	if _, err := readRESPReply(rd); err != nil { // detects -ERR replies
+	if err := getRedisClient().Set(redisCtx, key, value, time.Duration(ttlSeconds)*time.Second).Err(); err != nil {
 		log.Printf("[%s] cacheSet(%s) failed: %v", serviceName, key, err)
 	}
 }
-
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
 	var reqBody io.Reader
 	if body != nil {
@@ -835,16 +799,15 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 	for attempt := 0; attempt < 3; attempt++ {
 		req, _ := http.NewRequest(method, url, reqBody)
 		req.Header.Set("Content-Type", "application/json")
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			log.Printf("[neo4j-coa-graph-go] callService attempt %d failed: %v", attempt+1, err)
 			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 			continue
 		}
-		defer resp.Body.Close()
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		return result, nil
 	}
 	return nil, fmt.Errorf("all retries failed for %s", url)
@@ -964,11 +927,10 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 	if !_cb.allow() {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond))
 		}
 		var req *http.Request
 		if body != nil {
@@ -979,21 +941,22 @@ func callServiceWithRetry(method, url string, body interface{}) (map[string]inte
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Source-Service", serviceName)
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -1135,16 +1098,8 @@ func warnIfAuthUnconfigured() {
 }
 
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
-		}
-	}()
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -1379,7 +1334,13 @@ func main() {
 	port := envOr("PORT", "8080")
 	handler := rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(mux)))
 
-	srv := &http.Server{Addr: ":" + port, Handler: handler}
+	srv := &http.Server{
+		Addr: ":" + port, Handler: handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		log.Printf("[neo4j-coa-graph-go] listening on port %s", port)

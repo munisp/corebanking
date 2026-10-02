@@ -1,5 +1,7 @@
 import axios, { AxiosError, AxiosInstance } from "axios";
 import { randomUUID } from "crypto";
+import http from "http";
+import https from "https";
 import logger from "../config/logger.config";
 import { readEnv } from "../config/readEnv.config";
 import { CurrencyEnum, PartyIdTypeEnum } from "../utils/enums";
@@ -49,6 +51,10 @@ const defaultSystemKeycloakId =
   (readEnv("CORE_BANKING_SYSTEM_KEYCLOAK_ID", "payment-hub") as string) ||
   "payment-hub";
 
+// TS-43: keepAlive agents avoid TCP(+TLS) setup per core-banking call.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
+
 export class CoreBankingApiClient {
   private static instance: CoreBankingApiClient | null = null;
   private readonly accountAxios: AxiosInstance;
@@ -58,10 +64,16 @@ export class CoreBankingApiClient {
   private constructor() {
     this.accountAxios = axios.create({
       baseURL: accountServiceUrl,
+      timeout: 10000,
+      httpAgent,
+      httpsAgent,
     });
 
     this.paymentAxios = axios.create({
       baseURL: paymentProcessingServiceUrl,
+      timeout: 10000,
+      httpAgent,
+      httpsAgent,
     });
   }
 

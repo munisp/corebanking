@@ -646,11 +646,12 @@ func main() {
 	mux.HandleFunc("/v1/core/interest-calc", interestCalcHandler)
 
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      otelkit.HTTPMiddleware(rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux)))))),
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           otelkit.HTTPMiddleware(rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux)))))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	ln, err := net.Listen("tcp", server.Addr)

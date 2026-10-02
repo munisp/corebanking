@@ -31,7 +31,10 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
 
   if (transactions.length == 0) return;
 
-  transactions.forEach(async (transaction) => {
+  // TS-49: for..of + await — the async forEach was fire-and-forget and the
+  // bulk update below raced the per-transaction hold refreshes.
+  for (const transaction of transactions) {
+    try {
     // Refresh own hold_id if exists
     if (transaction.hold_id) {
       // Release funds, incase not already released
@@ -82,7 +85,10 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
         await transactionRepository.repo.save(parentTransaction);
       }
     }
-  });
+    } catch (e) {
+      logger.error(`Failed to refresh holds for transaction - ${transaction.id}: ${e}`);
+    }
+  }
 
   // --- Bulk update ---
   await transactionRepository.repo

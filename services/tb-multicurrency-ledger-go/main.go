@@ -25,6 +25,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // TigerBeetle Multicurrency with real ledger-per-currency model (MN-16 rework).
 //
 // A conversion now executes a REAL TigerBeetle linked-transfer pair across the
@@ -243,8 +254,7 @@ func resolveRate(r *http.Request, from, to *CurrencyLedger, tenantID string) (ra
 		if tok := os.Getenv("FX_SERVICE_TOKEN"); tok != "" {
 			req.Header.Set("Authorization", "Bearer "+tok)
 		}
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, ferr := client.Do(req)
+		resp, ferr := sharedHTTPClient.Do(req)
 		if ferr != nil {
 			return 0, nil, 0, "", fmt.Errorf("fx-service unreachable: %v", ferr)
 		}
@@ -670,8 +680,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -839,7 +848,13 @@ func main() {
 		port = "8303"
 	}
 
-	server := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux)}
+	server := &http.Server{
+		Addr: ":" + port, Handler: jwtAuthMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		log.Printf("[tb-multicurrency-ledger-go] Starting on :%s with %d currency ledgers", port, len(currencyLedgers))

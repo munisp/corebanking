@@ -26,6 +26,17 @@ import (
 	"shared/otel/go/otelkit"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ...existing code...
 
 // Esusu/Ajo Service - Nigerian Rotating Savings and Credit Association (ROSCA)
@@ -1611,8 +1622,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -1768,7 +1778,7 @@ func main() {
 	log.Printf(" PostgreSQL database connected and migrated")
 	log.Printf("🤖 AI/ML Features: Default Prediction, Optimal Rotation, Fraud Detection, Group Health Scoring")
 
-	if err := http.ListenAndServe(port, otelkit.HTTPMiddleware(jwtAuthMiddleware(r))); err != nil {
+	if err := (&http.Server{Addr: port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(r)), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

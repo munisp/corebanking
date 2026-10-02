@@ -9,7 +9,9 @@ import (
 	"database/sql"
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
+	mathrand "math/rand"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 
@@ -32,6 +34,42 @@ import (
 
 	"strings"
 )
+
+// _jitterW11 applies full jitter to retry backoff sleeps (GPT-04): returns a
+// duration in [d/2, d), matching the service-framework-go Retry pattern.
+func _jitterW11(d time.Duration) time.Duration {
+	return d/2 + time.Duration(mathrand.Int63n(int64(d)/2))
+}
+
+// jwksRefreshOnce ensures the shared JWKS poller is started exactly once.
+var jwksRefreshOnce sync.Once
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process, no matter how many routes register the middleware
+// (GPT-10: was one poller goroutine pair per route registration).
+func ensureJWKSRefresh(realmURL string) {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(realmURL)
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(realmURL)
+			}
+		}()
+	})
+}
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var db *sql.DB
 
@@ -92,7 +130,7 @@ type DomainStats struct {
 }
 
 var (
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	records = []Record{
 		{ID: "LOA-001", Type: "personal_loan", Status: "active", Data: map[string]interface{}{"domain": "Lending", "priority": "high", "region": "lagos", "amount": 5000000, "customerId": "CUS-1045", "customerName": "Amina Yusuf"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1, KYCVerified: true, KYCLevel: "enhanced"},
 		{ID: "LOA-002", Type: "sme_loan", Status: "pending_kyc", Data: map[string]interface{}{"domain": "Lending", "priority": "medium", "region": "abuja", "amount": 15000000, "customerId": "CUS-3021", "customerName": "John Doe"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2, KYCVerified: false, KYCLevel: ""},
@@ -108,6 +146,72 @@ var (
 		},
 	}
 )
+
+const (
+	maxInMemoryRecords = 5000
+	maxAuditEntries    = 2000
+)
+
+// appendRecord appends to the in-memory store, evicting the oldest entries
+// once the store exceeds maxInMemoryRecords (bounded store, GPT-06).
+func appendRecord(rec Record) {
+	records = append(records, rec)
+	if len(records) > maxInMemoryRecords {
+		copy(records, records[len(records)-maxInMemoryRecords:])
+		records = records[:maxInMemoryRecords]
+	}
+}
+
+// appendAudit appends to the audit log, evicting the oldest entries once the
+// log exceeds maxAuditEntries (bounded store, GPT-06).
+func appendAudit(e AuditEntry) {
+	auditLog = append(auditLog, e)
+	if len(auditLog) > maxAuditEntries {
+		copy(auditLog, auditLog[len(auditLog)-maxAuditEntries:])
+		auditLog = auditLog[:maxAuditEntries]
+	}
+}
+
+// parsePageParams extracts limit/offset query params with a hard cap (GPT-07).
+func parsePageParams(r *http.Request, defLimit, maxLimit int) (limit, offset int) {
+	limit = defLimit
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o > 0 {
+		offset = o
+	}
+	return
+}
+
+// paginateRecords bounds list responses (default 100, max 500 per page).
+func paginateRecords(all []Record, r *http.Request) []Record {
+	limit, offset := parsePageParams(r, 100, 500)
+	if offset >= len(all) {
+		return []Record{}
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end]
+}
+
+// paginateAudit bounds audit responses (default 100, max 500 per page).
+func paginateAudit(all []AuditEntry, r *http.Request) []AuditEntry {
+	limit, offset := parsePageParams(r, 100, 500)
+	if offset >= len(all) {
+		return []AuditEntry{}
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[offset:end]
+}
 
 // ─── KYC Enforcement ────────────────────────────────────────────────────────
 
@@ -184,8 +288,8 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(cached))
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 	status := r.URL.Query().Get("status")
 	filtered := []Record{}
 	for _, rec := range records {
@@ -193,7 +297,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 			filtered = append(filtered, rec)
 		}
 	}
-	respondJSON(w, 200, map[string]interface{}{"records": filtered, "total": len(filtered), "domain": "Lending"})
+	respondJSON(w, 200, map[string]interface{}{"records": paginateRecords(filtered, r), "total": len(filtered), "domain": "Lending"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -275,10 +379,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		KYCVerified: true,
 		KYCLevel:    requiredKYCLevel(loanType, amount),
 	}
-	records = append(records, rec)
+	appendRecord(rec)
 	domainStats.TotalRecords = len(records)
 
-	auditLog = append(auditLog, AuditEntry{
+	appendAudit(AuditEntry{
 		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: fmt.Sprintf("Loan application created — KYC verified at %s level", rec.KYCLevel),
@@ -316,7 +420,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
-			auditLog = append(auditLog, AuditEntry{
+			appendAudit(AuditEntry{
 				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
@@ -372,9 +476,9 @@ func handleKYCCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog)})
+	mu.RLock()
+	defer mu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{"auditLog": paginateAudit(auditLog, r), "total": len(auditLog)})
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -480,12 +584,11 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+			time.Sleep(_jitterW11(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond))
 		}
 
 		var req *http.Request
@@ -497,16 +600,16 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, err := client.Do(req)
+		resp, err := sharedHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			_cb.recordFailure()
 			log.Printf("[inter-service] %s %s attempt %d failed: %v", method, url, attempt+1, err)
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode >= 500 {
+			resp.Body.Close()
 			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
 			_cb.recordFailure()
 			continue
@@ -514,6 +617,7 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
 		_cb.recordSuccess()
 		return result, nil
 	}
@@ -1055,16 +1159,8 @@ func fetchJWKS(realmURL string) {
 }
 
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			fetchJWKS(realmURL)
-		}
-	}()
+	// Single shared JWKS poller per process (started once, not per route)
+	ensureJWKSRefresh(realmURL)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
@@ -1276,11 +1372,12 @@ func main() {
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      jwtAuthMiddleware(rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(countingMiddleware(mux))))),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + port,
+		Handler:           jwtAuthMiddleware(rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

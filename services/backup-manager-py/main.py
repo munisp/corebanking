@@ -14,8 +14,10 @@ from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import time
@@ -50,7 +52,6 @@ OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 PORT = int(os.getenv("PORT", "8639"))
 
-db_conn = None
 
 # Rate limiter state (module-level, guarded by _rl_lock)
 _rl_tokens = 100
@@ -174,22 +175,76 @@ def inc_errors():
 
 # --- Database ---
 _db_pool = None
+_db_pool_lock = threading.Lock()
 
-def get_db():
-    global db_conn
-    if db_conn is None or db_conn.closed:
-        db_conn = psycopg2.connect(DATABASE_URL)
-        db_conn.autocommit = True
-    return db_conn
-
-def release_db(conn):
-    """Return a connection to the pool."""
+def _get_db_pool():
+    """Lazily create the process-wide connection pool (thread-safe)."""
     global _db_pool
-    if _db_pool and conn:
+    if _db_pool is None or _db_pool.closed:
+        with _db_pool_lock:
+            if _db_pool is None or _db_pool.closed:
+                _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+    return _db_pool
+
+class _PooledConn:
+    """Borrowed pooled connection.
+
+    Returned to the pool on close() or when the last reference is dropped
+    (CPython refcounting), so existing `conn = get_db()` call sites remain
+    safe without an explicit release_db() call."""
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        raw, self._raw = self._raw, None
+        if raw is not None:
+            try:
+                _get_db_pool().putconn(raw)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+
+    def __del__(self):
         try:
-            _db_pool.putconn(conn)
+            self.close()
         except Exception:
             pass
+
+def get_db():
+    """Borrow a connection from the pool (thread-safe)."""
+    raw = _get_db_pool().getconn()
+    raw.autocommit = True
+    return _PooledConn(raw)
+
+def release_db(conn):
+    """Return a borrowed connection to the pool."""
+    if conn:
+        conn.close()
+
+_schema_ready = threading.Event()
+
+def _init_schema_bg():
+    """Run blocking schema init off the event loop in a daemon thread;
+    sets _schema_ready when done (surfaced via /healthz)."""
+    try:
+        init_schema()
+    finally:
+        _schema_ready.set()
+
 
 def init_schema():
     """Create the tables this service actually uses. Never crash startup:
@@ -228,17 +283,19 @@ def init_schema():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_schema()
+    _schema_ready.clear()
+    threading.Thread(target=_init_schema_bg, daemon=True, name="init-schema").start()
     logger.info(f"[backup-manager-py] ready on :%d", PORT)
     logger.info(f"[backup-manager-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
     yield
-    if db_conn:
-        db_conn.close()
+    if _db_pool:
+        _db_pool.closeall()
 
 
 app = FastAPI(title="backup-manager-py", version="1.0.0", lifespan=lifespan)
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
 import inspect as _jwt_inspect
 from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
@@ -318,7 +375,7 @@ class UpdateRequest(BaseModel):
 
 @app.get("/healthz")
 def health():
-    return {"status": "healthy", "service": "backup-manager-py", "version": "1.0.0"}
+    return {"status": "healthy", "service": "backup-manager-py", "version": "1.0.0", "schema_ready": _schema_ready.is_set()}
 
 
 @app.get("/readyz")
@@ -501,13 +558,13 @@ def grpc_call(target, method, payload, retries=3):
     if not _grpc_cb.allow():
         logger.warning(f"Circuit breaker open for {target}/{method}")
         return None
+    data = json.dumps({"method": method, "payload": payload}).encode()
     for attempt in range(retries):
         try:
             host, port = target.rsplit(":", 1)
             sock = _grpc_socket.socket(_grpc_socket.AF_INET, _grpc_socket.SOCK_STREAM)
             sock.settimeout(5.0)
             sock.connect((host, int(port)))
-            data = json.dumps({"method": method, "payload": payload}).encode()
             sock.sendall(_grpc_struct.pack(">I", len(data)) + data)
             length_bytes = sock.recv(4)
             if len(length_bytes) == 4:
@@ -531,9 +588,9 @@ def call_service(method, url, body=None, retries=3, timeout=15):
     if not _grpc_cb.allow():
         return None
     import urllib.request, urllib.error
+    data = json.dumps(body).encode() if body else None
     for attempt in range(retries):
         try:
-            data = json.dumps(body).encode() if body else None
             req = urllib.request.Request(url, data=data, method=method,
                                          headers={"Content-Type": "application/json"})
             resp = urllib.request.urlopen(req, timeout=timeout)
@@ -839,13 +896,11 @@ def init_tracing(service_name):
 signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == "__main__":
-    get_db()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": "backup-manager-py", "port": PORT, "message": "starting"}))
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        logger.info("Server stopped gracefully")
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=PORT,
+        workers=int(os.environ.get("UVICORN_WORKERS", "4")),
+    )

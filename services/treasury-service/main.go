@@ -233,8 +233,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -421,7 +420,7 @@ func main() {
 	}
 
 	log.Printf("Treasury Service starting on port %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, jwtAuthMiddleware(router)))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(router), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 // Middleware functions

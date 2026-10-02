@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 interface Transaction {
@@ -23,6 +24,17 @@ const ReceiptScreen = () => {
   const navigate = useNavigate();
   const transaction = (location.state as { transaction?: Transaction })?.transaction;
 
+  // Parse the cached user once, not every render (hook must run before any
+  // early return below)
+  const myAccountId = useMemo(() => {
+    try {
+      const user = JSON.parse(localStorage.getItem('user') || '{}');
+      return user?.account_id?.toString() || localStorage.getItem('account_id') || '';
+    } catch {
+      return localStorage.getItem('account_id') || '';
+    }
+  }, []);
+
   // If no transaction data, redirect back
   if (!transaction) {
     navigate('/transaction-history');
@@ -30,8 +42,6 @@ const ReceiptScreen = () => {
   }
 
   // Determine transaction type
-  const user = JSON.parse(localStorage.getItem('user') || '{}');
-  const myAccountId = user?.account_id?.toString() || localStorage.getItem('account_id') || '';
   const isCredit = transaction.payee === myAccountId || transaction.payee === myAccountId.toString();
   // ...existing code...
 

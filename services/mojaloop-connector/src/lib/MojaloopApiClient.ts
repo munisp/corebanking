@@ -1,4 +1,6 @@
 import axios, { AxiosInstance, isAxiosError } from "axios";
+import http from "http";
+import https from "https";
 import util from "util";
 import { readEnv } from "../config/readEnv.config";
 import { CurrencyEnum, PartyIdTypeEnum } from "../utils/enums";
@@ -7,6 +9,10 @@ import { extract_name_form_path } from "../utils/helpers";
 import { IPostTransfer } from "../types";
 
 const logger = createLogger(extract_name_form_path(__filename));
+
+// TS-36: keepAlive agents avoid TCP(+TLS) setup per switch call.
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
 export class MojaloopApiClient {
   private static instance: MojaloopApiClient | null = null;
@@ -38,6 +44,9 @@ export class MojaloopApiClient {
 
     this.account_lookup_axios = axios.create({
       baseURL: accountLookupUrl,
+      timeout: 5000,
+      httpAgent,
+      httpsAgent,
       headers: {
         "accept-encoding": "gzip, deflate",
         "cache-control": "no-cache",
@@ -46,6 +55,9 @@ export class MojaloopApiClient {
 
     this.quotes_axios = axios.create({
       baseURL: quotesUrl,
+      timeout: 5000,
+      httpAgent,
+      httpsAgent,
       headers: {
         "accept-encoding": "gzip, deflate",
         "cache-control": "no-cache",
@@ -54,6 +66,9 @@ export class MojaloopApiClient {
 
     this.tranfers_axios = axios.create({
       baseURL: transfersUrl,
+      timeout: 10000,
+      httpAgent,
+      httpsAgent,
       headers: {
         "accept-encoding": "gzip, deflate",
         "cache-control": "no-cache",

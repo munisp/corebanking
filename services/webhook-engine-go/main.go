@@ -18,6 +18,17 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // Webhook engine: tenant-configurable webhooks with retry, signing,
 // delivery tracking, and payload filtering.
 
@@ -69,8 +80,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -287,7 +297,7 @@ func main() {
 	})
 
 	log.Printf("webhook-engine-go listening on :%s", port)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))))
+	log.Fatal((&http.Server{Addr: fmt.Sprintf(":%s", port), Handler: rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 // healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).

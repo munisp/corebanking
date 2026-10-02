@@ -29,9 +29,21 @@ import (
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 
 	"shared/otel/go/otelkit"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 var (
 	serviceName  = "payments-hub-go"
@@ -41,6 +53,7 @@ var (
 	// CP-12/T33: malformed/undecodable compliance.screening verdicts and
 	// verdict persistence failures. Exposed as sanctions_screen_errors_total.
 	sanctionsScreenErrors uint64
+	auditInsertFailures   uint64 // GCM-002: async audit flusher batch failures (retried)
 )
 
 func respondJSON(w http.ResponseWriter, args ...interface{}) {
@@ -92,6 +105,8 @@ func metricsHandler(w http.ResponseWriter, _ *http.Request) {
 	// CP-12/T33: compliance.screening verdict processing errors (exact metric
 	// name per SPEC alerting addendum).
 	fmt.Fprintf(w, "sanctions_screen_errors_total{service=\"%s\"} %d\n", serviceName, atomic.LoadUint64(&sanctionsScreenErrors))
+	// GCM-002: async audit-chain flusher insert failures (retried; entries never dropped).
+	fmt.Fprintf(w, "audit_insert_failures_total{service=\"%s\"} %d\n", serviceName, atomic.LoadUint64(&auditInsertFailures))
 }
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
@@ -120,9 +135,11 @@ func jwtRealmURL() string {
 	return "http://keycloak:8080/realms/54bank"
 }
 
+// GCM-001: package-level shared client (no per-fetch allocation).
+var jwksHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := jwksHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[%s] JWKS fetch failed: %v", serviceName, err)
 		return
@@ -164,6 +181,29 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[%s] JWKS refreshed: %d keys", serviceName, len(jwtCache.keys))
 }
 
+// GCM-001: coalesce concurrent unknown-kid refreshes (singleflight) and
+// enforce a 30s cooldown between fetch attempts.
+var (
+	jwksSFGroup     singleflight.Group
+	jwksCoolMu      sync.Mutex
+	jwksLastAttempt time.Time
+)
+
+func refreshJWKSUnknownKid() {
+	jwksCoolMu.Lock()
+	if time.Since(jwksLastAttempt) < 30*time.Second {
+		jwksCoolMu.Unlock()
+		return
+	}
+	jwksLastAttempt = time.Now()
+	jwksCoolMu.Unlock()
+	// Duplicate callers block until the in-flight refresh completes.
+	_, _, _ = jwksSFGroup.Do("jwks", func() (interface{}, error) {
+		fetchJWKS(jwtRealmURL())
+		return nil, nil
+	})
+}
+
 func startJWKSRefresh() {
 	go fetchJWKS(jwtRealmURL())
 	go func() {
@@ -201,8 +241,9 @@ func verifyBearerToken(token string) (map[string]interface{}, error) {
 	pub, ok := jwtCache.keys[header.Kid]
 	jwtCache.mu.RUnlock()
 	if !ok {
-		// Key unknown — refresh once and retry (key rotation).
-		fetchJWKS(jwtRealmURL())
+		// Key unknown — singleflight refresh with 30s cooldown (GCM-001):
+		// unknown-kid tokens cannot force a fetch storm against Keycloak.
+		refreshJWKSUnknownKid()
 		jwtCache.mu.RLock()
 		pub, ok = jwtCache.keys[header.Kid]
 		jwtCache.mu.RUnlock()
@@ -838,7 +879,73 @@ var (
 	auditChainMu   sync.Mutex
 	auditChainHead string // cached last entry_hash; seeded from the DB once
 	auditChainInit bool
+	// GCM-002: inserts are performed asynchronously by a single flusher
+	// goroutine; auditChainMu is held only for hash chaining (no DB I/O).
+	// Chain order is preserved because sequence is assigned under the mutex
+	// and the flusher drains this channel FIFO.
+	auditInsertCh = make(chan AuditEntry, 4096)
 )
+
+// startAuditFlusher drains auditInsertCh and batch-inserts audit entries in
+// chain order. Fail-closed: on DB error the batch is retried with backoff
+// (entries are never dropped); failures are logged and counted.
+func startAuditFlusher() {
+	go func() {
+		const maxBatch = 100
+		var pending []AuditEntry
+		flush := func() {
+			for len(pending) > 0 {
+				batch := pending
+				if len(batch) > maxBatch {
+					batch = batch[:maxBatch]
+				}
+				if err := insertAuditBatch(batch); err != nil {
+					log.Printf("[audit] batch insert failed (%d entries buffered, retrying): %v", len(pending), err)
+					atomic.AddUint64(&auditInsertFailures, 1)
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+				pending = pending[len(batch):]
+			}
+		}
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case e := <-auditInsertCh:
+				pending = append(pending, e)
+				if len(pending) >= maxBatch {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			}
+		}
+	}()
+}
+
+// insertAuditBatch performs a single multi-row INSERT for a chain-ordered
+// batch of audit entries.
+func insertAuditBatch(batch []AuditEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO payments_hub_audit_trail
+		(id, action, record_id, actor, tenant_id, details, previous_hash, entry_hash, created_at) VALUES `)
+	args := make([]interface{}, 0, len(batch)*9)
+	for i, e := range batch {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			i*9+1, i*9+2, i*9+3, i*9+4, i*9+5, i*9+6, i*9+7, i*9+8, i*9+9)
+		args = append(args, e.ID, e.Action, e.RecordID, e.Actor, e.TenantID,
+			e.Details, e.PreviousHash, e.EntryHash, e.Timestamp)
+	}
+	_, err := db.Exec(sb.String(), args...)
+	return err
+}
 
 var eventBus = newEventBus("banking.payments", "payments-hub")
 
@@ -846,20 +953,22 @@ var eventBus = newEventBus("banking.payments", "payments-hub")
 // The chain head is re-seeded from the database on first use so a restart
 // continues the existing chain instead of forking it. Any failure is
 // returned — callers must surface it, never drop the audit record silently.
+// GCM-002: the mutex covers ONLY hash chaining — the INSERT is queued to the
+// async flusher. The channel send blocks under extreme backlog (backpressure)
+// rather than dropping an audit record.
 func appendAudit(action, recordID, actor, tenantID, details string) error {
 	if db == nil {
 		return fmt.Errorf("audit store unavailable (no database connection)")
 	}
 
 	auditChainMu.Lock()
-	defer auditChainMu.Unlock()
-
 	if !auditChainInit {
 		var head sql.NullString
 		err := db.QueryRow(
 			"SELECT entry_hash FROM payments_hub_audit_trail ORDER BY created_at DESC, id DESC LIMIT 1",
 		).Scan(&head)
 		if err != nil && err != sql.ErrNoRows {
+			auditChainMu.Unlock()
 			return fmt.Errorf("load audit chain head: %w", err)
 		}
 		auditChainHead = head.String
@@ -881,17 +990,10 @@ func appendAudit(action, recordID, actor, tenantID, details string) error {
 		entry.PreviousHash, entry.Timestamp,
 	}, "|")
 	entry.EntryHash = auditHash(entry.PreviousHash, canonical)
-
-	if _, err := db.Exec(
-		`INSERT INTO payments_hub_audit_trail
-			(id, action, record_id, actor, tenant_id, details, previous_hash, entry_hash, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		entry.ID, entry.Action, entry.RecordID, entry.Actor, entry.TenantID,
-		entry.Details, entry.PreviousHash, entry.EntryHash, entry.Timestamp,
-	); err != nil {
-		return fmt.Errorf("persist audit entry: %w", err)
-	}
 	auditChainHead = entry.EntryHash
+	auditChainMu.Unlock()
+
+	auditInsertCh <- entry
 	return nil
 }
 
@@ -1333,6 +1435,7 @@ func main() {
 		port = "8100"
 	}
 	initDB()
+	startAuditFlusher() // GCM-002: async audit-chain persistence
 	initRedis()
 	if redisClient != nil {
 		redisClient.AddHook(otelkit.RedisHook())

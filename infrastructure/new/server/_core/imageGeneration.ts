@@ -30,6 +30,7 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
 
   const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
   const response = await fetch(`${base}/images/generations`, {
+    signal: AbortSignal.timeout(60_000),
     method: "POST",
     headers: {
       "content-type": "application/json",

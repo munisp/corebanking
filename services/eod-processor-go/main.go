@@ -61,6 +61,27 @@ import (
 	"shared/otel/go/otelkit"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
+// longTimeoutHTTPClient is a pooled HTTP client for long-running outbound calls.
+var longTimeoutHTTPClient = &http.Client{
+	Timeout: 300 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 func getEnv(key, fallback string) string {
@@ -206,9 +227,8 @@ func callService(method, url string, tenantID string, body interface{}) (int, []
 	if tok := strings.TrimSpace(os.Getenv("EOD_SERVICE_TOKEN")); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-
-	client := &http.Client{Timeout: 300 * time.Second} // 5min per step
-	resp, err := client.Do(req)
+	// 5min per step
+	resp, err := longTimeoutHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -231,8 +251,7 @@ func pbacCheck(tid, userID, permission, entityType string) bool {
 		return false // fail-closed
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("AUTHZ PDP unreachable (fail-closed): %v", err)
 		return false
@@ -252,8 +271,7 @@ func publishEvent(topic string, payload interface{}) {
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("WARN publish %s: %v", topic, err)
 		return
@@ -866,8 +884,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -1052,7 +1069,7 @@ func main() {
 
 	port := getEnv("PORT", "8207")
 	log.Printf("eod-processor-go listening on :%s — %d pipeline steps", port, len(pipeline))
-	log.Fatal(http.ListenAndServe(":"+port, otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux)))))))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux))))), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }
 
 // --- Request metrics (restored fleet-canonical block) ---

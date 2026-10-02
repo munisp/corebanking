@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:provider/provider.dart';
 import '../../models/registration_data.dart';
 import '../../providers/theme_provider.dart';
@@ -151,14 +152,16 @@ class _RegisterStep1ScreenState extends State<RegisterStep1Screen> {
                             width: 90,
                             height: 90,
                             fit: BoxFit.cover,
-                            errorBuilder: (context, error, stackTrace) {
+                            errorWidget: (context, url, error) {
                               if (tenantProvider.tenantConfig.logo.isNotEmpty) {
-                                return Image.network(
-                                  tenantProvider.tenantConfig.logo,
+                                return CachedNetworkImage(
+                                    imageUrl: tenantProvider.tenantConfig.logo,
                                   width: 90,
+                                  memCacheWidth: 180, // MOB-08
                                   height: 90,
+                                  memCacheHeight: 180, // MOB-08: decode at ~2x display size, not full-res
                                   fit: BoxFit.cover,
-                                  errorBuilder: (context, error, stackTrace) {
+                                  errorWidget: (context, url, error) {
                                     return Center(
                                       child: Text(
                                         toUpperCase(tenantProvider.tenantConfig.name.substring(0, 2)),
@@ -424,7 +427,7 @@ class _RegisterStep1ScreenState extends State<RegisterStep1Screen> {
         width: 56,
         height: 56,
         fit: BoxFit.contain,
-        errorBuilder: (context, error, stackTrace) {
+        errorWidget: (context, url, error) {
           return const SizedBox(width: 56, height: 56);
         },
       ),

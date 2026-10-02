@@ -166,18 +166,27 @@ async fn post_gl_provision(gl_url: &str, posting: &GLProvisioning) -> String {
     })
     .to_string();
     let url = format!("{}/v1/gl/journal-entries", gl_url);
-    match tokio::task::spawn_blocking(move || call_service_sync(&url, &body)).await {
-        Ok(Ok(resp)) if !resp.contains("\"error\"") => "posted".to_string(),
-        Ok(Ok(resp)) => {
+    // Wave-11: result drives the posting decision — keep blocking semantics but
+    // bound the wait with a 3s timeout (was: unbounded spawn_blocking await).
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || call_service_sync(&url, &body)),
+    ).await {
+        Ok(Ok(Ok(resp))) if !resp.contains("\"error\"") => "posted".to_string(),
+        Ok(Ok(Ok(resp))) => {
             eprintln!("[ifrs9-ecl-engine-rs] GL post rejected: {}", resp);
             "not_posted".to_string()
         }
-        Ok(Err(e)) => {
+        Ok(Ok(Err(e))) => {
             eprintln!("[ifrs9-ecl-engine-rs] GL post failed: {}", e);
             "not_posted".to_string()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("[ifrs9-ecl-engine-rs] GL post join failed: {}", e);
+            "not_posted".to_string()
+        }
+        Err(_) => {
+            eprintln!("[ifrs9-ecl-engine-rs] GL post timed out after 3s");
             "not_posted".to_string()
         }
     }
@@ -551,6 +560,9 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
     let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
     match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
         Ok(mut stream) => {
+            // Wave-11: bound blocking I/O (was unbounded read_to_string).
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|e| format!("{}", e))?;
             let host = host_port.split(':').next().unwrap_or("localhost");
             let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
             stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;

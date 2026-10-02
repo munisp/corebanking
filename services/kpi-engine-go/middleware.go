@@ -13,6 +13,17 @@ import (
 	"time"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ─── MIDDLEWARE STATUS TRACKING ─────────────────────────────────────────────
 
 type MiddlewareStatus struct {
@@ -93,12 +104,11 @@ func probeTCP(endpoint string) string {
 }
 
 func probeHTTP(endpoint string) string {
-	client := &http.Client{Timeout: 3 * time.Second}
 	url := endpoint
 	if !strings.HasPrefix(url, "http") {
 		url = "http://" + url
 	}
-	resp, err := client.Get(url)
+	resp, err := sharedHTTPClient.Get(url)
 	if err != nil {
 		return "disconnected"
 	}
@@ -146,10 +156,9 @@ func saveToDaprState(role string, kpiData interface{}) error {
 		Value: kpiData,
 	}
 	data, _ := json.Marshal([]DaprStateEntry{entry})
-	client := &http.Client{Timeout: 5 * time.Second}
 	req, _ := http.NewRequest("POST", daprURL+"/v1.0/state/kpi-store", strings.NewReader(string(data)))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -160,10 +169,9 @@ func saveToDaprState(role string, kpiData interface{}) error {
 func publishViaDapr(topic string, event interface{}) error {
 	daprURL := getEnv("DAPR_HTTP_ENDPOINT", "http://localhost:3500")
 	data, _ := json.Marshal(event)
-	client := &http.Client{Timeout: 5 * time.Second}
 	req, _ := http.NewRequest("POST", daprURL+"/v1.0/publish/kpi-pubsub/"+topic, strings.NewReader(string(data)))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -198,11 +206,10 @@ func indexKPIToOpenSearch(role string, metrics interface{}) error {
 		"index_date": time.Now().Format("2006-01-02"),
 	}
 	data, _ := json.Marshal(doc)
-	client := &http.Client{Timeout: 5 * time.Second}
 	indexName := fmt.Sprintf("kpi-metrics-%s", time.Now().Format("2006.01"))
 	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/%s/_doc", osURL, indexName), strings.NewReader(string(data)))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}

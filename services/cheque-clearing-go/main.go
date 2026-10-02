@@ -14,14 +14,27 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"tbclient"
 	"time"
 
 	_ "github.com/lib/pq"
 )
+
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // Cheque clearing (MN-21 rework): persisted lifecycle with REAL money movement.
 //  - Postgres is the source of truth (in-memory map deleted).
@@ -340,8 +353,7 @@ func callGLJournal(ctx context.Context, payload map[string]any) error {
 	if tok := os.Getenv("GL_ENGINE_TOKEN"); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -448,9 +460,12 @@ func listCheques(tenantID, status string, page, limit int) ([]*Cheque, int) {
 	if len(where) > 0 {
 		countQ += " WHERE " + strings.Join(where, " AND ")
 	}
-	db.QueryRow(countQ, args...).Scan(&total)
+	// GCM (AP-14): 5s deadline on DB calls — hung DB must not hang requests.
+	listCtx, listCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer listCancel()
+	db.QueryRowContext(listCtx, countQ, args...).Scan(&total)
 	q += fmt.Sprintf(" ORDER BY created_at DESC LIMIT %d OFFSET %d", limit, (page-1)*limit)
-	rows, err := db.Query(q, args...)
+	rows, err := db.QueryContext(listCtx, q, args...)
 	if err != nil {
 		return []*Cheque{}, 0
 	}
@@ -513,7 +528,9 @@ func clearCheque(id string) (*Cheque, int, string) {
 		// settlement-clearing-go to sweep (documented handoff).
 		settleNote = "suspense_interbank"
 	}
-	res, err := db.Exec(`UPDATE cheques SET status='cleared', cleared_at=NOW(), updated_at=NOW() WHERE id=$1 AND status IN ('pending','clearing')`, id)
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dbCancel()
+	res, err := db.ExecContext(dbCtx, `UPDATE cheques SET status='cleared', cleared_at=NOW(), updated_at=NOW() WHERE id=$1 AND status IN ('pending','clearing')`, id)
 	if err != nil {
 		return nil, 500, "db error"
 	}
@@ -545,7 +562,9 @@ func dishonorCheque(id, reason string) (*Cheque, int, string) {
 			return nil, 502, "failed to void hold: " + err.Error()
 		}
 	}
-	res, err := db.Exec(`UPDATE cheques SET status='dishonored', dishonor_reason=$2, updated_at=NOW() WHERE id=$1 AND status IN ('pending','clearing')`, id, reason)
+	dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dbCancel()
+	res, err := db.ExecContext(dbCtx, `UPDATE cheques SET status='dishonored', dishonor_reason=$2, updated_at=NOW() WHERE id=$1 AND status IN ('pending','clearing')`, id, reason)
 	if err != nil {
 		return nil, 500, "db error"
 	}
@@ -656,7 +675,9 @@ func handleSubmit(w http.ResponseWriter, r *http.Request) {
 	c.HoldTransferID = holdHex
 	c.Status = "clearing"
 
-	if _, err := db.Exec(`INSERT INTO cheques (id, tenant_id, cheque_number, amount_kobo, currency, drawer_account, payee_account, bank_code, branch_code, status, hold_transfer_id, presented_at)
+	dbCtx, dbCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer dbCancel()
+	if _, err := db.ExecContext(dbCtx, `INSERT INTO cheques (id, tenant_id, cheque_number, amount_kobo, currency, drawer_account, payee_account, bank_code, branch_code, status, hold_transfer_id, presented_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		c.ID, c.TenantID, c.ChequeNumber, c.AmountKobo, c.Currency, c.DrawerAccount, c.PayeeAccount,
 		c.BankCode, c.BranchCode, c.Status, c.HoldTransferID, c.PresentedAt); err != nil {
@@ -820,8 +841,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -985,7 +1005,25 @@ func main() {
 	}
 	http.HandleFunc("/", route)
 	log.Printf("cheque-clearing-go listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, jwtAuthMiddleware(http.DefaultServeMux)); err != nil {
-		log.Fatal(err)
+	// GCM-067: TB calls can legitimately take 15s; configure timeouts and
+	// graceful shutdown instead of bare ListenAndServe (Slowloris exposure).
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           jwtAuthMiddleware(http.DefaultServeMux),
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	shCtx, shCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shCancel()
+	srv.Shutdown(shCtx)
 }

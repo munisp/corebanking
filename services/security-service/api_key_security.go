@@ -155,7 +155,38 @@ type APIKeySecurityManager struct {
 	tenantConfig map[string]APIKeyConfig
 	rateLimiter  map[string]*RateLimiter
 	mu           sync.RWMutex
+
+	// keyCache: short-TTL validation cache keyed by keyHash, including
+	// negative entries (GPT-25). Revocation/rotation propagate within
+	// apiKeyCacheTTL.
+	keyCache   map[string]apiKeyCacheEntry
+	keyCacheMu sync.RWMutex
+
+	// usageCh buffers per-request usage updates for async batched writes
+	// (GPT-26); stopCh terminates background goroutines (GPT-39).
+	usageCh chan usageUpdate
+	stopCh  chan struct{}
 }
+
+// apiKeyCacheEntry caches one validated key record (nil key = negative entry).
+type apiKeyCacheEntry struct {
+	key       *APIKey
+	expiresAt time.Time
+}
+
+// usageUpdate is one buffered last-used/usage-count update.
+type usageUpdate struct {
+	keyID string
+	ip    string
+}
+
+const (
+	apiKeyCacheTTL        = 30 * time.Second
+	apiKeyCacheMaxEntries = 10000
+	usageBatchSize        = 200
+	usageFlushInterval    = 5 * time.Second
+	maxRateLimiters       = 50000
+)
 
 // RateLimiter implements a token bucket rate limiter
 type RateLimiter struct {
@@ -173,6 +204,9 @@ func NewAPIKeySecurityManager(db *sql.DB) *APIKeySecurityManager {
 		config:       DefaultAPIKeyConfig,
 		tenantConfig: make(map[string]APIKeyConfig),
 		rateLimiter:  make(map[string]*RateLimiter),
+		keyCache:     make(map[string]apiKeyCacheEntry),
+		usageCh:      make(chan usageUpdate, 4096),
+		stopCh:       make(chan struct{}),
 	}
 
 	// Load environment overrides
@@ -187,7 +221,55 @@ func NewAPIKeySecurityManager(db *sql.DB) *APIKeySecurityManager {
 	// Start background cleanup
 	go aksm.backgroundCleanup()
 
+	// Start async batched usage-counter flusher (GPT-26)
+	go aksm.usageFlusher()
+
 	return aksm
+}
+
+// Stop terminates background goroutines (GPT-39).
+func (aksm *APIKeySecurityManager) Stop() {
+	close(aksm.stopCh)
+}
+
+// usageFlusher batches usage-counter updates (GPT-26): at most one UPDATE per
+// key per flush window instead of one UPDATE per validated request.
+func (aksm *APIKeySecurityManager) usageFlusher() {
+	ticker := time.NewTicker(usageFlushInterval)
+	defer ticker.Stop()
+	lastIP := make(map[string]string)
+	counts := make(map[string]int)
+	flush := func() {
+		if len(counts) == 0 {
+			return
+		}
+		for keyID, n := range counts {
+			if _, err := aksm.db.Exec(`
+				UPDATE api_keys
+				SET last_used_at = NOW(), last_used_ip = $1, usage_count = usage_count + $2, updated_at = NOW()
+				WHERE id = $3
+			`, lastIP[keyID], n, keyID); err != nil {
+				log.Printf("batched usage update failed for key %s: %v", keyID, err)
+			}
+		}
+		lastIP = make(map[string]string)
+		counts = make(map[string]int)
+	}
+	for {
+		select {
+		case u := <-aksm.usageCh:
+			lastIP[u.keyID] = u.ip
+			counts[u.keyID]++
+			if len(counts) >= usageBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-aksm.stopCh:
+			flush()
+			return
+		}
+	}
 }
 
 func (aksm *APIKeySecurityManager) loadEnvOverrides() {
@@ -474,50 +556,17 @@ func (aksm *APIKeySecurityManager) ValidateAPIKey(key, ipAddress string, require
 	// Hash the key for lookup
 	keyHash := hashAPIKey(key)
 
-	// Look up the key
-	var apiKey APIKey
-	var scopesJSON, allowedIPsJSON, metadataJSON []byte
-	var expiresAt, lastUsedAt sql.NullTime
-	var lastUsedIP sql.NullString
-
-	err := aksm.db.QueryRow(`
-		SELECT id, key_prefix, name, description, user_id, tenant_id, key_type, status,
-		       scopes, allowed_ips, rate_limit, burst_limit, expires_at, last_used_at,
-		       last_used_ip, usage_count, created_at, updated_at, created_by, metadata
-		FROM api_keys
-		WHERE key_hash = $1
-	`, keyHash).Scan(
-		&apiKey.ID, &apiKey.KeyPrefix, &apiKey.Name, &apiKey.Description,
-		&apiKey.UserID, &apiKey.TenantID, &apiKey.Type, &apiKey.Status,
-		&scopesJSON, &allowedIPsJSON, &apiKey.RateLimit, &apiKey.BurstLimit,
-		&expiresAt, &lastUsedAt, &lastUsedIP, &apiKey.UsageCount,
-		&apiKey.CreatedAt, &apiKey.UpdatedAt, &apiKey.CreatedBy, &metadataJSON,
-	)
-
-	if err == sql.ErrNoRows {
-		result.Reasons = append(result.Reasons, "Invalid API key")
-		return result, nil
-	}
+	// Look up the key (TTL cache incl. negative entries, GPT-25)
+	apiKey, found, err := aksm.lookupKey(keyHash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate API key: %v", err)
 	}
-
-	// Parse JSON fields
-	json.Unmarshal(scopesJSON, &apiKey.Scopes)
-	json.Unmarshal(allowedIPsJSON, &apiKey.AllowedIPs)
-	json.Unmarshal(metadataJSON, &apiKey.Metadata)
-
-	if expiresAt.Valid {
-		apiKey.ExpiresAt = &expiresAt.Time
-	}
-	if lastUsedAt.Valid {
-		apiKey.LastUsedAt = &lastUsedAt.Time
-	}
-	if lastUsedIP.Valid {
-		apiKey.LastUsedIP = lastUsedIP.String
+	if !found {
+		result.Reasons = append(result.Reasons, "Invalid API key")
+		return result, nil
 	}
 
-	result.Key = &apiKey
+	result.Key = apiKey
 
 	// Check status
 	if apiKey.Status != KeyStatusActive {
@@ -580,21 +629,111 @@ func (aksm *APIKeySecurityManager) ValidateAPIKey(key, ipAddress string, require
 		return result, nil
 	}
 
-	// Update last used
-	aksm.db.Exec(`
-		UPDATE api_keys
-		SET last_used_at = NOW(), last_used_ip = $1, usage_count = usage_count + 1, updated_at = NOW()
-		WHERE id = $2
-	`, ipAddress, apiKey.ID)
+	// Update last used (async batched write, GPT-26; dropped with a log line
+	// if the buffer is full rather than blocking the request path)
+	select {
+	case aksm.usageCh <- usageUpdate{keyID: apiKey.ID, ip: ipAddress}:
+	default:
+		log.Printf("api-key usage update queue full; dropping update for key %s", apiKey.ID)
+	}
 
 	result.Valid = true
 	return result, nil
+}
+
+// lookupKey resolves a keyHash to an APIKey record, backed by a short-TTL
+// cache including negative entries (GPT-25). Errors are never cached.
+func (aksm *APIKeySecurityManager) lookupKey(keyHash string) (*APIKey, bool, error) {
+	now := time.Now()
+	aksm.keyCacheMu.RLock()
+	e, ok := aksm.keyCache[keyHash]
+	aksm.keyCacheMu.RUnlock()
+	if ok && now.Before(e.expiresAt) {
+		return e.key, e.key != nil, nil
+	}
+
+	var apiKey APIKey
+	var scopesJSON, allowedIPsJSON, metadataJSON []byte
+	var expiresAt, lastUsedAt sql.NullTime
+	var lastUsedIP sql.NullString
+
+	err := aksm.db.QueryRow(`
+		SELECT id, key_prefix, name, description, user_id, tenant_id, key_type, status,
+		       scopes, allowed_ips, rate_limit, burst_limit, expires_at, last_used_at,
+		       last_used_ip, usage_count, created_at, updated_at, created_by, metadata
+		FROM api_keys
+		WHERE key_hash = $1
+	`, keyHash).Scan(
+		&apiKey.ID, &apiKey.KeyPrefix, &apiKey.Name, &apiKey.Description,
+		&apiKey.UserID, &apiKey.TenantID, &apiKey.Type, &apiKey.Status,
+		&scopesJSON, &allowedIPsJSON, &apiKey.RateLimit, &apiKey.BurstLimit,
+		&expiresAt, &lastUsedAt, &lastUsedIP, &apiKey.UsageCount,
+		&apiKey.CreatedAt, &apiKey.UpdatedAt, &apiKey.CreatedBy, &metadataJSON,
+	)
+
+	if err != nil && err != sql.ErrNoRows {
+		return nil, false, err
+	}
+
+	var keyPtr *APIKey
+	if err == nil {
+		// Parse JSON fields
+		json.Unmarshal(scopesJSON, &apiKey.Scopes)
+		json.Unmarshal(allowedIPsJSON, &apiKey.AllowedIPs)
+		json.Unmarshal(metadataJSON, &apiKey.Metadata)
+
+		if expiresAt.Valid {
+			apiKey.ExpiresAt = &expiresAt.Time
+		}
+		if lastUsedAt.Valid {
+			apiKey.LastUsedAt = &lastUsedAt.Time
+		}
+		if lastUsedIP.Valid {
+			apiKey.LastUsedIP = lastUsedIP.String
+		}
+		keyPtr = &apiKey
+	}
+
+	aksm.keyCacheMu.Lock()
+	if len(aksm.keyCache) >= apiKeyCacheMaxEntries {
+		for k, v := range aksm.keyCache { // evict expired first
+			if now.After(v.expiresAt) {
+				delete(aksm.keyCache, k)
+			}
+		}
+		if len(aksm.keyCache) >= apiKeyCacheMaxEntries { // still full: drop one
+			for k := range aksm.keyCache {
+				delete(aksm.keyCache, k)
+				break
+			}
+		}
+	}
+	aksm.keyCache[keyHash] = apiKeyCacheEntry{key: keyPtr, expiresAt: now.Add(apiKeyCacheTTL)}
+	aksm.keyCacheMu.Unlock()
+
+	return keyPtr, keyPtr != nil, nil
 }
 
 func (aksm *APIKeySecurityManager) checkRateLimit(keyID string, rateLimit, burstLimit int) (bool, int) {
 	aksm.mu.Lock()
 	limiter, exists := aksm.rateLimiter[keyID]
 	if !exists {
+		if len(aksm.rateLimiter) >= maxRateLimiters {
+			// Hard cap: evict the least-recently-active limiter (GPT-27).
+			var oldestKey string
+			var oldestTime time.Time
+			first := true
+			for id, l := range aksm.rateLimiter {
+				l.mu.Lock()
+				lr := l.lastRefill
+				l.mu.Unlock()
+				if first || lr.Before(oldestTime) {
+					first = false
+					oldestKey, oldestTime = id, lr
+				}
+			}
+			delete(aksm.rateLimiter, oldestKey)
+		}
 		limiter = &RateLimiter{
 			tokens:     float64(burstLimit),
 			maxTokens:  float64(burstLimit),
@@ -929,7 +1068,13 @@ func (aksm *APIKeySecurityManager) GetExpiringKeys(tenantID string, daysUntilExp
 
 func (aksm *APIKeySecurityManager) backgroundCleanup() {
 	ticker := time.NewTicker(1 * time.Hour)
-	for range ticker.C {
+	defer ticker.Stop()
+	for {
+		select {
+		case <-aksm.stopCh:
+			return
+		case <-ticker.C:
+		}
 		// Expire old keys
 		aksm.db.Exec(`
 			UPDATE api_keys

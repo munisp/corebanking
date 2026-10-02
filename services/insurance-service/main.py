@@ -4,6 +4,7 @@ Insurance Service - Policy management, premium calculation, claims processing, u
 
 from fastapi import FastAPI, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ load_dotenv()
 coa_client = CoAClient()
 
 app = FastAPI(title="54Link Insurance Service", version="1.0.0")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
 # OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
 # tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
@@ -1172,4 +1174,4 @@ async def renew_policy(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8016)))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8016)), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

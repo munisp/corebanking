@@ -35,7 +35,7 @@ export function registerMultiTenantPlatformRoutes(app: Express): void {
     // Health check proxy
     app.get(`${svc.prefix}/healthz`, async (_req: Request, res: Response) => {
       try {
-        const resp = await fetch(`${target}/healthz`);
+        const resp = await fetch(`${target}/healthz`, { signal: AbortSignal.timeout(3000) });
         const data = await resp.json();
         res.json(data);
       } catch {
@@ -50,7 +50,7 @@ export function registerMultiTenantPlatformRoutes(app: Express): void {
         try {
           const qs = new URLSearchParams(req.query as Record<string, string>).toString();
           const url = `${target}${sub}${qs ? `?${qs}` : ""}`;
-          const resp = await fetch(url);
+          const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
           const data = await resp.json();
           res.json(data);
         } catch {
@@ -65,6 +65,7 @@ export function registerMultiTenantPlatformRoutes(app: Express): void {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(req.body),
+            signal: AbortSignal.timeout(3000),
           });
           const data = await resp.json();
           res.status(resp.status).json(data);

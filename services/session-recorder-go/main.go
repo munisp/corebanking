@@ -27,6 +27,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 func secureRandHex(n int) string { b := make([]byte, n); rand.Read(b); return hex.EncodeToString(b) }
 
 var semaphore = make(chan struct{}, 100)
@@ -421,8 +432,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -610,7 +620,11 @@ func main() {
 	mux.HandleFunc("/api/v1/session/list", handleListSessions)
 	mux.HandleFunc("/api/v1/session/stats", handleStats)
 	handler := panicMW(rateLimitMW(loggingMW(mux)))
-	srv := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(handler), ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
+	srv := &http.Server{
+		Addr: ":" + port, Handler: jwtAuthMiddleware(handler), ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		log.Printf("[session-recorder] Starting on :%s", port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

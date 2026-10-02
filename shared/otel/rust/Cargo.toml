@@ -16,13 +16,15 @@ actix-web = ["dep:actix-web", "dep:futures-util"]
 
 [dependencies]
 # Version pinning rationale: see README.md.
-# opentelemetry* 0.27.x and tracing-opentelemetry 0.28.x are the mutually
+# opentelemetry* 0.28.x and tracing-opentelemetry 0.29.x are the mutually
 # compatible release line; bumping one without the other breaks compilation.
-opentelemetry = { version = "0.27", features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+# Wave-11: the source (SdkTracerProvider, Resource::builder, ExporterBuildError)
+# targets the 0.28 API; the previous 0.27 pins did not compile.
+opentelemetry = { version = "0.28", features = ["trace"] }
+opentelemetry_sdk = { version = "0.28", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
 tracing = "0.1"
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.29"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
 
 axum = { version = "0.7", optional = true }

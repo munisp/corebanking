@@ -13,6 +13,8 @@ import { ForbiddenError } from "@shared/_core/errors";
 import axios from "axios";
 import { parse as parseCookieHeader } from "cookie";
 import type { Request } from "express";
+import http from "http";
+import https from "https";
 import { SignJWT, jwtVerify } from "jose";
 import type { User } from "../../drizzle/schema";
 import * as db from "../db";
@@ -51,7 +53,12 @@ const keycloakBase = (): string => {
   return `${url.replace(/\/$/, "")}/realms/${realm}/protocol/openid-connect`;
 };
 
-const keycloakClient = axios.create({ timeout: 10_000 });
+// TS-22: reuse TLS connections to Keycloak instead of a handshake per call.
+const keycloakClient = axios.create({
+  timeout: 10_000,
+  httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+  httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
+});
 
 class KeycloakService {
   async exchangeCode(code: string, redirectUri: string): Promise<KeycloakTokenResponse> {

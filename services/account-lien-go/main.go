@@ -24,6 +24,17 @@ import (
 	"shared/otel/go/otelkit"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 var serviceName = "account-lien-go"
 
 type Lien struct {
@@ -116,6 +127,10 @@ func placeLien(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 400, map[string]string{"error": "amount must be positive"})
 		return
 	}
+
+	// GCM-040: 5s deadline on all DB calls on the money path.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 	validTypes := map[string]bool{"judicial_hold": true, "collateral_lock": true, "garnishment": true, "regulatory_freeze": true, "card_hold": true, "loan_security": true}
 	if !validTypes[req.Type] {
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid lien type", "valid_types": []string{"judicial_hold", "collateral_lock", "garnishment", "regulatory_freeze", "card_hold", "loan_security"}})
@@ -124,7 +139,7 @@ func placeLien(w http.ResponseWriter, r *http.Request) {
 
 	var totalLienKobo int64
 	if app.db != nil {
-		app.db.QueryRow(`SELECT COALESCE(SUM(amount_kobo), 0) FROM liens WHERE account_id = $1 AND status = 'active'`, req.AccountID).Scan(&totalLienKobo)
+		app.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(amount_kobo), 0) FROM liens WHERE account_id = $1 AND status = 'active'`, req.AccountID).Scan(&totalLienKobo)
 	}
 
 	lienID := fmt.Sprintf("LIEN-%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", req.AccountID, time.Now().UnixNano()))))[0:20]
@@ -139,7 +154,7 @@ func placeLien(w http.ResponseWriter, r *http.Request) {
 		// MN-11: idempotent placement — a retry with the same
 		// (account_id, reference) returns the existing lien instead of
 		// stacking a duplicate hold.
-		result, err := app.db.Exec(`INSERT INTO liens (lien_id, account_id, amount_kobo, type, reason, reference, status, placed_by, placed_at, expires_at)
+		result, err := app.db.ExecContext(ctx, `INSERT INTO liens (lien_id, account_id, amount_kobo, type, reason, reference, status, placed_by, placed_at, expires_at)
 			VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9)
 			ON CONFLICT (account_id, reference) WHERE reference <> '' DO NOTHING`,
 			lienID, req.AccountID, req.AmountKobo, req.Type, req.Reason, req.Reference, req.PlacedBy, now, expiresAt)
@@ -151,7 +166,7 @@ func placeLien(w http.ResponseWriter, r *http.Request) {
 		if rows, _ := result.RowsAffected(); rows == 0 && req.Reference != "" {
 			var existingID, existingStatus string
 			var existingAmount int64
-			app.db.QueryRow(`SELECT lien_id, status, amount_kobo FROM liens WHERE account_id = $1 AND reference = $2`,
+			app.db.QueryRowContext(ctx, `SELECT lien_id, status, amount_kobo FROM liens WHERE account_id = $1 AND reference = $2`,
 				req.AccountID, req.Reference).Scan(&existingID, &existingStatus, &existingAmount)
 			respondJSON(w, 200, map[string]interface{}{
 				"lien_id": existingID, "status": existingStatus,
@@ -180,8 +195,11 @@ func releaseLien(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if app.db != nil {
+		// GCM-040: 5s deadline on the release UPDATE.
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
 		now := time.Now()
-		result, err := app.db.Exec(`UPDATE liens SET status = 'released', released_at = $1, released_by = $2 WHERE lien_id = $3 AND status = 'active'`,
+		result, err := app.db.ExecContext(ctx, `UPDATE liens SET status = 'released', released_at = $1, released_by = $2 WHERE lien_id = $3 AND status = 'active'`,
 			now, req.ReleasedBy, req.LienID)
 		if err != nil {
 			respondJSON(w, 500, map[string]string{"error": "database error"})
@@ -205,7 +223,11 @@ func getAccountLiens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := app.db.Query(`SELECT lien_id, account_id, amount_kobo, type, reason, reference, status, placed_by, placed_at, expires_at, released_at, released_by FROM liens WHERE account_id = $1 ORDER BY placed_at DESC`, accountID)
+	// GCM-040: 5s deadline on the list query.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := app.db.QueryContext(ctx, `SELECT lien_id, account_id, amount_kobo, type, reason, reference, status, placed_by, placed_at, expires_at, released_at, released_by FROM liens WHERE account_id = $1 ORDER BY placed_at DESC`, accountID)
 	if err != nil {
 		respondJSON(w, 500, map[string]string{"error": "query failed"})
 		return
@@ -268,8 +290,7 @@ func jwtRealmURL() string {
 }
 
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -472,7 +493,13 @@ func main() {
 	mux.HandleFunc("/api/v1/lien/place", placeLien)
 	mux.HandleFunc("/api/v1/lien/release", releaseLien)
 	mux.HandleFunc("/api/v1/lien/account", getAccountLiens)
-	srv := &http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux))}
+	srv := &http.Server{
+		Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux)),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
 		log.Printf("[%s] Starting on :%s", serviceName, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -45,7 +45,7 @@ export const receive_transfer = asyncHandler(async (req, res) => {
     }
 
     const parsed_cached_data = JSON.parse(cached_data) as ICachedQuoteData;
-    logger.info(`parsed_cached_data: ${JSON.stringify(parsed_cached_data)}`);
+    logger.debug(`parsed_cached_data: ${JSON.stringify(parsed_cached_data)}`);
 
     // validate ilpPacket
     const { ilpPacket, condition } = payload;
@@ -63,7 +63,7 @@ export const receive_transfer = asyncHandler(async (req, res) => {
     let { data } = deserializeIlpPacket(packetBuffer);
     data = data as IlpPrepare;
 
-    logger.info(`Deserialized packet: ${JSON.stringify(data)}`);
+    logger.debug(`Deserialized packet: ${JSON.stringify(data)}`);
 
     // Validate ilp-packet data
     if (data.amount != parsed_cached_data.amount) throw new Error("Amount mismatch");
@@ -73,7 +73,7 @@ export const receive_transfer = asyncHandler(async (req, res) => {
 
     const transaction_data = JSON.parse(data.data.toString("utf8")) as IIlpPrepTxnData;
 
-    logger.info(`transaction data: ${JSON.stringify(transaction_data)}`);
+    logger.debug(`transaction data: ${JSON.stringify(transaction_data)}`);
 
     const destination_details = data.destination.split(".");
     const id_type = destination_details.at(destination_details.length - 2) as PartyIdTypeEnum;

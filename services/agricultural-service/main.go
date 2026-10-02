@@ -23,6 +23,17 @@ import (
 	_ "github.com/lib/pq"
 )
 
+// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
+// (replaces per-call &http.Client{} construction).
+var sharedHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ==================== EXPANDED CROP DATABASE (15+ Nigerian Crops) ====================
 
 type CropData struct {
@@ -2476,8 +2487,7 @@ func jwtRealmURL() string {
 
 // fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
 func fetchJWKS(realmURL string) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	resp, err := sharedHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -2654,5 +2664,5 @@ func main() {
 
 	log.Printf("Agricultural Service starting on port %s", port)
 	log.Printf("Total endpoints registered: 350+ across 15 service modules")
-	log.Fatal(http.ListenAndServe(":"+port, jwtAuthMiddleware(r)))
+	log.Fatal((&http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(r), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe())
 }

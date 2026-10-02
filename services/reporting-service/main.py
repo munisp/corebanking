@@ -1,5 +1,6 @@
 """Reporting and Analytics Service"""
 from fastapi import FastAPI, Header, Depends
+from fastapi.middleware.gzip import GZipMiddleware
 from audit_middleware import AuditMiddleware
 import uvicorn, asyncpg, os
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ coa_client = CoAClient()
 
 app = FastAPI(title="54Link Reporting Service", version="1.0.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
 # is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
@@ -242,4 +244,4 @@ async def get_dashboard(
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8022")))
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8022")), workers=int(os.environ.get("UVICORN_WORKERS", "4")))

@@ -892,16 +892,19 @@ export function registerDrizzleRoutes(app: any) {
   });
 
   app.get("/api/db/stats", async (_req: any, res: any) => {
-    const stats: { table: string; count: number; domain: string }[] = [];
-    for (const config of routeConfigs.slice(0, 20)) {
-      try {
-        const repo = repos[config.repo] as any;
-        const total = await repo.count();
-        stats.push({ table: config.repo, count: total, domain: config.domain });
-      } catch {
-        stats.push({ table: config.repo, count: 0, domain: config.domain });
-      }
-    }
+    // TS-13: run the per-table COUNT(*) queries concurrently — iterations are
+    // independent; Promise.all preserves routeConfigs ordering.
+    const stats: { table: string; count: number; domain: string }[] = await Promise.all(
+      routeConfigs.slice(0, 20).map(async (config) => {
+        try {
+          const repo = repos[config.repo] as any;
+          const total = await repo.count();
+          return { table: config.repo, count: total, domain: config.domain };
+        } catch {
+          return { table: config.repo, count: 0, domain: config.domain };
+        }
+      }),
+    );
     const totalRecords = stats.reduce((s, r) => s + r.count, 0);
     res.json({ tables: stats, totalRecords, tablesQueried: stats.length, totalTables: routeConfigs.length });
   });
