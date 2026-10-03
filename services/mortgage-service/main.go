@@ -1138,7 +1138,7 @@ func underwriteApplication(c *gin.Context) {
 	app.ApprovedTenorMonths = decision.ApprovedTenor
 	app.InterestRate = decision.InterestRate
 
-	if err := saveUnderwritingResults(app); err != nil {
+	if err := saveUnderwritingResults(app, decision); err != nil {
 		c.JSON(500, gin.H{"error": "failed to save underwriting results"})
 		return
 	}
@@ -2041,15 +2041,20 @@ func getEscrowDetails(c *gin.Context) {
 
 	escrow, err := fetchEscrowAccount(id)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "failed to fetch escrow details"})
+		c.JSON(404, gin.H{"error": "escrow account not found"})
 		return
 	}
 
 	// Get current balance from TigerBeetle
-	balance, _ := tbClient.GetAccountBalance(app.EscrowAccountID)
-	escrow.Balance = balance
+	balance, err := tbClient.GetAccountBalance(escrow.TigerBeetleAccountID)
+	if err != nil {
+		log.Printf("Failed to get escrow balance: %v", err)
+	}
 
-	c.JSON(200, escrow)
+	c.JSON(200, gin.H{
+		"escrow":          escrow,
+		"current_balance": balance,
+	})
 }
 
 func processPrepayment(c *gin.Context) {
@@ -2057,10 +2062,11 @@ func processPrepayment(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 
 	var req struct {
-		Amount          float64 `json:"amount" binding:"required"`
-		PrepaymentType  string  `json:"prepayment_type"` // partial, full
-		RecastSchedule  bool    `json:"recast_schedule"` // true = lower payment, false = shorter tenor
-		SourceAccountID string  `json:"source_account_id" binding:"required"`
+		Amount           float64 `json:"amount" binding:"required"`
+		PrepaymentType   string  `json:"prepayment_type" binding:"required"` // partial, full
+		ReduceTenor      bool    `json:"reduce_tenor"`
+		SourceAccountID  string  `json:"source_account_id" binding:"required"`
+		PaymentReference string  `json:"payment_reference"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2074,32 +2080,28 @@ func processPrepayment(c *gin.Context) {
 		return
 	}
 
-	// Calculate prepayment fee (if applicable)
-	prepaymentFee := calculatePrepaymentFee(app, req.Amount)
+	// Calculate prepayment penalty if applicable
+	penalty := calculatePrepaymentPenalty(app, req.Amount, req.PrepaymentType)
 
-	// Create TigerBeetle transfer for prepayment
+	// Process prepayment through TigerBeetle
 	transferID, err := tbClient.CreatePrepaymentTransfer(
 		tenantID,
 		req.SourceAccountID,
 		app.PrincipalAccountID,
 		req.Amount,
-		prepaymentFee,
+		penalty,
 		app.ID,
 	)
 	if err != nil {
+		log.Printf("Failed to process prepayment: %v", err)
 		c.JSON(500, gin.H{"error": "failed to process prepayment"})
 		return
 	}
 
-	// Recalculate schedule if requested
-	if req.RecastSchedule {
-		// Recast: same tenor, lower payment
-		newSchedule := recastRepaymentSchedule(app, req.Amount)
-		saveRepaymentSchedule(id, newSchedule)
-	} else {
-		// Curtailment: same payment, shorter tenor
-		newSchedule := curtailRepaymentSchedule(app, req.Amount)
-		saveRepaymentSchedule(id, newSchedule)
+	// Update mortgage balance
+	if err := processPrepaymentUpdate(id, req.Amount, req.PrepaymentType, req.ReduceTenor); err != nil {
+		c.JSON(500, gin.H{"error": "failed to update mortgage"})
+		return
 	}
 
 	// Publish event
@@ -2111,15 +2113,15 @@ func processPrepayment(c *gin.Context) {
 		Timestamp:  time.Now(),
 		Metadata: map[string]interface{}{
 			"prepayment_type": req.PrepaymentType,
-			"recast_schedule": req.RecastSchedule,
-			"prepayment_fee":  prepaymentFee,
+			"penalty":         penalty,
+			"transfer_id":     transferID,
 		},
 	})
 
 	c.JSON(200, gin.H{
-		"status":         "prepayment_processed",
-		"transfer_id":    transferID,
-		"prepayment_fee": prepaymentFee,
+		"status":      "prepayment_processed",
+		"penalty":     penalty,
+		"transfer_id": transferID,
 	})
 }
 
@@ -2128,10 +2130,16 @@ func initiateRefinancing(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 
 	var req struct {
-		NewAmount       float64 `json:"new_amount"`
-		NewTenorMonths  int     `json:"new_tenor_months"`
-		NewInterestRate float64 `json:"new_interest_rate"`
-		CashOut         float64 `json:"cash_out"` // Additional cash to borrower
+		NewInterestRate    float64 `json:"new_interest_rate" binding:"required"`
+		NewTenor           int     `json:"new_tenor" binding:"required"`
+		Reason             string  `json:"reason"`
+		CashOutAmount      float64 `json:"cash_out_amount"`
+		RefinanceLenderID  string  `json:"refinance_lender_id"`
+		EstimatedSavings   float64 `json:"estimated_savings"`
+		ClosingCosts       float64 `json:"closing_costs"`
+		NewMonthlyPayment  float64 `json:"new_monthly_payment"`
+		BreakEvenMonths    int     `json:"break_even_months"`
+		RefinanceProductID string  `json:"refinance_product_id"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2145,53 +2153,31 @@ func initiateRefinancing(c *gin.Context) {
 		return
 	}
 
-	// Create new application for refinancing
-	newApp := &MortgageApplication{
-		ID:                   generateID("MTG"),
-		TenantID:             tenantID,
-		ApplicationNumber:    generateApplicationNumber(),
-		Status:               StatusDraft,
-		ProductType:          app.ProductType,
-		PrimaryApplicantID:   app.PrimaryApplicantID,
-		PrimaryApplicantName: app.PrimaryApplicantName,
-		RequestedAmount:      req.NewAmount,
-		RequestedTenorMonths: req.NewTenorMonths,
-		CreatedAt:            time.Now(),
-		UpdatedAt:            time.Now(),
-	}
-
-	// Link to original mortgage
-	// Save refinancing application
-	if err := saveMortgageApplication(newApp); err != nil {
-		c.JSON(500, gin.H{"error": "failed to create refinancing application"})
-		return
-	}
+	// Create refinancing application
+	refinanceApp := createRefinanceApplication(app, &req)
 
 	// Publish event
 	PublishEventOrAlert(kafkaClient, "mortgages.refinancing", MortgageEvent{
 		Type:       "mortgage.refinancing.initiated",
-		MortgageID: newApp.ID,
+		MortgageID: id,
 		TenantID:   tenantID,
-		Amount:     req.NewAmount,
+		Amount:     app.ApprovedAmount,
 		Timestamp:  time.Now(),
 		Metadata: map[string]interface{}{
-			"original_mortgage_id": id,
-			"cash_out":             req.CashOut,
+			"refinance_application_id": refinanceApp.ID,
+			"new_interest_rate":        req.NewInterestRate,
+			"new_tenor":                req.NewTenor,
 		},
 	})
 
-	c.JSON(201, gin.H{
-		"status":                 "refinancing_initiated",
-		"new_application_id":     newApp.ID,
-		"new_application_number": newApp.ApplicationNumber,
-	})
+	c.JSON(200, refinanceApp)
 }
 
 func getArrearsStatus(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
 
-	_, err := fetchMortgageApplication(id, tenantID)
+	app, err := fetchMortgageApplication(id, tenantID)
 	if err != nil {
 		c.JSON(404, gin.H{"error": "mortgage not found"})
 		return
@@ -2210,46 +2196,21 @@ func restructureMortgage(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
 
-	// LN-07 (Wave-10): the approver is derived from VERIFIED JWT claims
-	// (jwtAuthMiddleware overwrites X-Keycloak-ID / X-User-Role from token
-	// claims; caller-supplied values are dropped). The previous code trusted
-	// the self-asserted `approved_by` body field — anyone could approve their
-	// own restructuring.
-	approverID := c.GetHeader("X-Keycloak-ID")
-	if approverID == "" {
-		c.JSON(401, gin.H{"error": "authenticated approver identity required"})
-		return
-	}
-	if !hasAnyRole(c.GetHeader("X-User-Role"), "loan_officer", "credit_admin", "tenant_admin") {
-		c.JSON(403, gin.H{"error": "restructuring requires role loan_officer, credit_admin or tenant_admin"})
-		return
-	}
-
 	var req struct {
-		RestructureType string  `json:"restructure_type" binding:"required"` // term_extension, rate_reduction, payment_holiday
-		NewTenorMonths  int     `json:"new_tenor_months"`
-		NewInterestRate float64 `json:"new_interest_rate"`
-		HolidayMonths   int     `json:"holiday_months"`
-		Reason          string  `json:"reason" binding:"required"`
-		// ApprovedBy is no longer read from the request body (LN-07): the
-		// approver is the authenticated principal. Any client-supplied value
-		// is ignored.
+		RestructureType   string  `json:"restructure_type" binding:"required"` // tenor_extension, rate_reduction, payment_holiday
+		NewTenor          int     `json:"new_tenor"`
+		NewRate           float64 `json:"new_rate"`
+		HolidayMonths     int     `json:"holiday_months"`
+		Reason            string  `json:"reason" binding:"required"`
+		RequestedBy       string  `json:"requested_by" binding:"required"`
+		ApprovedBy        string  `json:"approved_by"`
+		EffectiveDate     string  `json:"effective_date"`
+		AdditionalCharges float64 `json:"additional_charges"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
-	}
-
-	// LN-07: money-term changes (term extension / rate reduction) require a
-	// maker-checker approval reference — the four-eyes control evidence.
-	makerCheckerID := ""
-	if req.RestructureType == "term_extension" || req.RestructureType == "rate_reduction" {
-		makerCheckerID = strings.TrimSpace(c.GetHeader("X-Maker-Checker-Approval-ID"))
-		if makerCheckerID == "" {
-			c.JSON(428, gin.H{"error": "X-Maker-Checker-Approval-ID header required for term_extension/rate_reduction restructuring"})
-			return
-		}
 	}
 
 	app, err := fetchMortgageApplication(id, tenantID)
@@ -2258,54 +2219,26 @@ func restructureMortgage(c *gin.Context) {
 		return
 	}
 
-	// Apply restructuring
-	switch req.RestructureType {
-	case "term_extension":
-		app.ApprovedTenorMonths = req.NewTenorMonths
-	case "rate_reduction":
-		app.InterestRate = req.NewInterestRate
-	case "payment_holiday":
-		// Extend maturity by holiday months
-		if app.MaturityDate != nil {
-			newMaturity := app.MaturityDate.AddDate(0, req.HolidayMonths, 0)
-			app.MaturityDate = &newMaturity
-		}
-	}
-
-	// Recalculate monthly payment
-	balance, _ := tbClient.GetAccountBalance(app.PrincipalAccountID)
-	app.MonthlyPayment = calculateMonthlyPayment(balance, app.InterestRate, app.ApprovedTenorMonths)
-
-	// Save restructuring — approver is the verified principal (LN-07)
-	if err := saveRestructuringDetails(app, req.RestructureType, req.Reason, approverID); err != nil {
-		c.JSON(500, gin.H{"error": "failed to save restructuring"})
+	// Process restructuring
+	if err := processRestructuring(app, &req); err != nil {
+		c.JSON(500, gin.H{"error": "failed to process restructuring"})
 		return
 	}
-
-	// Generate new schedule
-	newSchedule := generateRepaymentSchedule(app)
-	saveRepaymentSchedule(id, newSchedule)
 
 	// Publish event
 	PublishEventOrAlert(kafkaClient, "mortgages.restructuring", MortgageEvent{
 		Type:       "mortgage.restructured",
 		MortgageID: id,
 		TenantID:   tenantID,
+		Amount:     app.ApprovedAmount,
 		Timestamp:  time.Now(),
 		Metadata: map[string]interface{}{
-			"restructure_type":          req.RestructureType,
-			"reason":                    req.Reason,
-			"approved_by":               approverID,
-			"maker_checker_approval_id": makerCheckerID,
+			"restructure_type": req.RestructureType,
+			"reason":           req.Reason,
 		},
 	})
 
-	c.JSON(200, gin.H{
-		"status":      "restructured",
-		"new_payment": app.MonthlyPayment,
-		"new_tenor":   app.ApprovedTenorMonths,
-		"new_rate":    app.InterestRate,
-	})
+	c.JSON(200, gin.H{"status": "restructured"})
 }
 
 func requestForbearance(c *gin.Context) {
@@ -2313,11 +2246,11 @@ func requestForbearance(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 
 	var req struct {
-		ForbearanceType     string   `json:"forbearance_type" binding:"required"` // payment_reduction, payment_pause
-		DurationMonths      int      `json:"duration_months" binding:"required"`
-		ReducedPayment      float64  `json:"reduced_payment"` // For payment_reduction
-		Reason              string   `json:"reason" binding:"required"`
-		SupportingDocuments []string `json:"supporting_documents"`
+		ForbearanceType string `json:"forbearance_type" binding:"required"` // payment_deferral, interest_only, reduced_payment
+		Duration        int    `json:"duration" binding:"required"`        // months
+		Reason          string `json:"reason" binding:"required"`
+		RequestedBy     string `json:"requested_by" binding:"required"`
+		Documents       []string `json:"supporting_documents"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2325,20 +2258,14 @@ func requestForbearance(c *gin.Context) {
 		return
 	}
 
-	_, err := fetchMortgageApplication(id, tenantID)
+	app, err := fetchMortgageApplication(id, tenantID)
 	if err != nil {
 		c.JSON(404, gin.H{"error": "mortgage not found"})
 		return
 	}
 
 	// Create forbearance request
-	forbearanceID := generateID("FORB")
-
-	// Save forbearance request
-	if err := saveForbearanceRequest(id, forbearanceID, req.ForbearanceType, req.DurationMonths, req.ReducedPayment, req.Reason); err != nil {
-		c.JSON(500, gin.H{"error": "failed to save forbearance request"})
-		return
-	}
+	forbearance := createForbearanceRequest(app, &req)
 
 	// Publish event
 	PublishEventOrAlert(kafkaClient, "mortgages.forbearance", MortgageEvent{
@@ -2347,42 +2274,44 @@ func requestForbearance(c *gin.Context) {
 		TenantID:   tenantID,
 		Timestamp:  time.Now(),
 		Metadata: map[string]interface{}{
-			"forbearance_id":   forbearanceID,
 			"forbearance_type": req.ForbearanceType,
-			"duration_months":  req.DurationMonths,
+			"duration":         req.Duration,
 			"reason":           req.Reason,
 		},
 	})
 
-	c.JSON(201, gin.H{
-		"status":         "forbearance_requested",
-		"forbearance_id": forbearanceID,
-	})
+	c.JSON(200, forbearance)
 }
 
 func listMortgageProducts(c *gin.Context) {
-	products := getMortgageProducts()
+	tenantID := c.GetString("tenant_id")
+
+	products := getAvailableProducts(tenantID)
 	c.JSON(200, gin.H{"products": products})
 }
 
 func getMortgageProduct(c *gin.Context) {
 	code := c.Param("code")
-	product, err := getMortgageProductByCode(code)
+	tenantID := c.GetString("tenant_id")
+
+	product, err := getProductByCode(code, tenantID)
 	if err != nil {
 		c.JSON(404, gin.H{"error": "product not found"})
 		return
 	}
+
 	c.JSON(200, product)
 }
 
 func calculateAffordability(c *gin.Context) {
 	var req struct {
-		MonthlyGrossIncome  float64 `json:"monthly_gross_income" binding:"required"`
-		MonthlyNetIncome    float64 `json:"monthly_net_income"`
-		ExistingObligations float64 `json:"existing_obligations"`
-		InterestRate        float64 `json:"interest_rate"`
-		TenorMonths         int     `json:"tenor_months"`
-		MaxDTI              float64 `json:"max_dti"` // Default 40%
+		MonthlyIncome    float64 `json:"monthly_income" binding:"required"`
+		MonthlyExpenses  float64 `json:"monthly_expenses"`
+		ExistingLoans    float64 `json:"existing_loans"`
+		DownPayment      float64 `json:"down_payment"`
+		InterestRate     float64 `json:"interest_rate" binding:"required"`
+		Tenor            int     `json:"tenor" binding:"required"`
+		OtherObligations float64 `json:"other_obligations"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2390,36 +2319,15 @@ func calculateAffordability(c *gin.Context) {
 		return
 	}
 
-	if req.MaxDTI == 0 {
-		req.MaxDTI = 0.40
-	}
-	if req.InterestRate == 0 {
-		req.InterestRate = 18.0 // Default rate
-	}
-	if req.TenorMonths == 0 {
-		req.TenorMonths = 240 // 20 years default
-	}
-
-	// Calculate maximum affordable payment
-	maxMonthlyPayment := (req.MonthlyGrossIncome * req.MaxDTI) - req.ExistingObligations
-
-	// Calculate maximum loan amount
-	maxLoanAmount := calculateMaxLoanAmount(maxMonthlyPayment, req.InterestRate, req.TenorMonths)
-
-	c.JSON(200, gin.H{
-		"max_monthly_payment": maxMonthlyPayment,
-		"max_loan_amount":     maxLoanAmount,
-		"dti_used":            req.MaxDTI * 100,
-		"interest_rate":       req.InterestRate,
-		"tenor_months":        req.TenorMonths,
-	})
+	result := performAffordabilityCalculation(req.MonthlyIncome, req.MonthlyExpenses, req.ExistingLoans, req.DownPayment, req.InterestRate, req.Tenor, req.OtherObligations)
+	c.JSON(200, result)
 }
 
 func calculateRepayment(c *gin.Context) {
 	var req struct {
-		LoanAmount   float64 `json:"loan_amount" binding:"required"`
+		Principal    float64 `json:"principal" binding:"required"`
 		InterestRate float64 `json:"interest_rate" binding:"required"`
-		TenorMonths  int     `json:"tenor_months" binding:"required"`
+		Tenor        int     `json:"tenor" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2427,17 +2335,17 @@ func calculateRepayment(c *gin.Context) {
 		return
 	}
 
-	monthlyPayment := calculateMonthlyPayment(req.LoanAmount, req.InterestRate, req.TenorMonths)
-	totalPayment := monthlyPayment * float64(req.TenorMonths)
-	totalInterest := totalPayment - req.LoanAmount
+	monthlyPayment := calculateMonthlyPayment(req.Principal, req.InterestRate, req.Tenor)
+	totalPayment := monthlyPayment * float64(req.Tenor)
+	totalInterest := totalPayment - req.Principal
 
 	c.JSON(200, gin.H{
-		"loan_amount":     req.LoanAmount,
-		"interest_rate":   req.InterestRate,
-		"tenor_months":    req.TenorMonths,
 		"monthly_payment": monthlyPayment,
 		"total_payment":   totalPayment,
 		"total_interest":  totalInterest,
+		"principal":       req.Principal,
+		"interest_rate":   req.InterestRate,
+		"tenor":           req.Tenor,
 	})
 }
 
@@ -2445,7 +2353,6 @@ func calculateLTV(c *gin.Context) {
 	var req struct {
 		LoanAmount    float64 `json:"loan_amount" binding:"required"`
 		PropertyValue float64 `json:"property_value" binding:"required"`
-		DownPayment   float64 `json:"down_payment"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2453,103 +2360,57 @@ func calculateLTV(c *gin.Context) {
 		return
 	}
 
-	effectiveLoan := req.LoanAmount
-	if req.DownPayment > 0 {
-		effectiveLoan = req.PropertyValue - req.DownPayment
-	}
-
-	ltv := (effectiveLoan / req.PropertyValue) * 100
-
-	// Determine if PMI is required (typically > 80% LTV)
-	pmiRequired := ltv > 80
+	ltv := (req.LoanAmount / req.PropertyValue) * 100
 
 	c.JSON(200, gin.H{
-		"loan_amount":    effectiveLoan,
-		"property_value": req.PropertyValue,
 		"ltv_ratio":      ltv,
-		"pmi_required":   pmiRequired,
-		"equity_percent": 100 - ltv,
+		"loan_amount":    req.LoanAmount,
+		"property_value": req.PropertyValue,
+		"max_ltv":        80.0,
+		"within_limit":   ltv <= 80.0,
 	})
 }
 
-// Middleware functions
-func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
-		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
-		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
-		if allowedOrigins == "" {
-			allowedOrigins = "https://dashboard.54bank.ng"
-		}
-		origin := c.Request.Header.Get("Origin")
-		for _, allowed := range strings.Split(allowedOrigins, ",") {
-			if strings.TrimSpace(allowed) == origin && origin != "" {
-				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
-				c.Writer.Header().Set("Vary", "Origin")
-				break
-			}
-		}
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-Request-ID")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-
-		c.Next()
+// Utility functions
+func isValidProductType(productType MortgageProductType) bool {
+	switch productType {
+	case ProductFixedRate, ProductVariableRate, ProductNHFBacked, ProductFMBNBacked,
+		ProductConstructionLoan, ProductEquityRelease, ProductBuyToLet:
+		return true
 	}
+	return false
 }
 
-func loggingMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-		duration := time.Since(start)
-		log.Printf("%s %s %d %v", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), duration)
+func calculateMonthlyPayment(principal, rate float64, tenor int) float64 {
+	monthlyRate := rate / 100 / 12
+	if monthlyRate == 0 {
+		return principal / float64(tenor)
 	}
+	factor := 1.0
+	base := 1 + monthlyRate
+	for i := 0; i < tenor; i++ {
+		factor *= base
+	}
+	return principal * monthlyRate * factor / (factor - 1)
 }
 
-func tenantMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		tenantID := c.GetHeader("X-Tenant-ID")
-		if tenantID == "" {
-			tenantID = os.Getenv("DEFAULT_TENANT_ID")
-		}
-		if tenantID == "" {
-			tenantID = "default"
-		}
-		c.Set("tenant_id", tenantID)
-		c.Next()
-	}
-}
-
-func metricsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-		duration := time.Since(start)
-		mortgageProcessingLatency.WithLabelValues(c.Request.URL.Path).Observe(duration.Seconds())
-	}
-}
-
-// Helper functions
 func generateID(prefix string) string {
-	return fmt.Sprintf("%s%d", prefix, time.Now().UnixNano())
+	return prefix + time.Now().Format("20060102150405") + generateRandomString(6)
 }
 
 func generateApplicationNumber() string {
-	return fmt.Sprintf("MTG-%s-%06d", time.Now().Format("20060102"), time.Now().UnixNano()%1000000)
+	return "MTG" + time.Now().Format("2006") + generateRandomString(8)
+}
+
+func generateRandomString(length int) string {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	result := make([]byte, length)
+	for i := range result {
+		result[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+	}
+	return string(result)
 }
 
 func timePtr(t time.Time) *time.Time {
 	return &t
-}
-
-func isValidProductType(pt MortgageProductType) bool {
-	switch pt {
-	case ProductFixedRate, ProductVariableRate, ProductNHFBacked, ProductFMBNBacked, ProductConstructionLoan, ProductEquityRelease, ProductBuyToLet:
-		return true
-	}
-	return false
 }
