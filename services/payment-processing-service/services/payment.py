@@ -831,7 +831,7 @@ class PaymentService:
                     amount=str(payload.amount),
                     completed_at=datetime.now(timezone.utc),
                     currency=CurrencyEnum.NGN,
-                    note=payload.note,
+                    note=payload.note or "credit",
                     payee=str(account_id),
                     payer="MINT_ACCOUNT",
                     status=TransactionStatus.INITIATED,
