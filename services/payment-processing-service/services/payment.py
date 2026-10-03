@@ -831,7 +831,7 @@ class PaymentService:
                     amount=str(payload.amount),
                     completed_at=datetime.now(timezone.utc),
                     currency=CurrencyEnum.NGN,
-                    note=payload.note or "credit",
+                    note=payload.note,
                     payee=str(account_id),
                     payer="MINT_ACCOUNT",
                     status=TransactionStatus.INITIATED,
@@ -2397,41 +2397,53 @@ class PaymentService:
     ):
         """Notify agents external systems about the transaction."""
 
-        is_outbound = bool(payload.payee_bank_code)
-
-        if not is_outbound:
+        outbound_payload = build_outbound_transfer_payload(reference, payload, context)
+        if outbound_payload is None:
             return
 
-        amount_currency = "NGN"
-        if payload.note:
-            note = payload.note
-        else:
-            note = "Transfer"
-
-        outbound_payload = {
-            "transactionId": reference,
-            "payer": {
-                "idType": "MSISDN",
-                "idValue": str(payload.payer),
-            },
-            "payee": {
-                "idType": "MSISDN",
-                "idValue": str(payload.payee),
-            },
-            "destination": str(payload.payee_bank_code or payload.payee_tenant_id),
-            "amount": {
-                "currency": amount_currency,
-                "amount": payload.amount,
-            },
-            "note": note,
-            "pin": payload.pin,
-            "debit_in_payment_processing": False,
-            "metadata": {
-                "source_tenant_id": context.tenant_id,
-                "payee_tenant_id": payload.payee_tenant_id,
-                "payee_bank_code": payload.payee_bank_code,
-                "flow": "outbound",
-            },
-        }
-
         payment_rails_connector_adapter.initiate_outbound_transfer(outbound_payload)
+
+
+def build_outbound_transfer_payload(
+    reference: str, payload: InitiatePaymentSchema, context: Context
+):
+    """Build the outbound (mojaloop/payment-rails) notification payload for a
+    transfer. Returns None when the transfer is not outbound (no payee bank
+    code). Shared by notify_external_systems and the W13-RISK-16 durable
+    outbox enqueue path so a retried notification is byte-identical."""
+    is_outbound = bool(payload.payee_bank_code)
+
+    if not is_outbound:
+        return None
+
+    amount_currency = "NGN"
+    if payload.note:
+        note = payload.note
+    else:
+        note = "Transfer"
+
+    return {
+        "transactionId": reference,
+        "payer": {
+            "idType": "MSISDN",
+            "idValue": str(payload.payer),
+        },
+        "payee": {
+            "idType": "MSISDN",
+            "idValue": str(payload.payee),
+        },
+        "destination": str(payload.payee_bank_code or payload.payee_tenant_id),
+        "amount": {
+            "currency": amount_currency,
+            "amount": payload.amount,
+        },
+        "note": note,
+        "pin": payload.pin,
+        "debit_in_payment_processing": False,
+        "metadata": {
+            "source_tenant_id": context.tenant_id,
+            "payee_tenant_id": payload.payee_tenant_id,
+            "payee_bank_code": payload.payee_bank_code,
+            "flow": "outbound",
+        },
+    }
