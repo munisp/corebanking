@@ -91,6 +91,11 @@ secrets:
   # OB-07: compliance-kyc-aml has no /api/screen route; the real implementation
   # is sanctions-screening-service (Rust, src/main.rs:1248), chart port 8283.
   SANCTIONS_SCREENING_URL: "http://sanctions-screening-service.54link-dev.svc.cluster.local:8283"
+  # W14-B2: orchestrator-service's Temporal worker+client require
+  # TEMPORAL_ADDRESS/TEMPORAL_NAMESPACE (EnvSchema src/validations/schemas.ts:39-41
+  # fails boot without them). Server: infrastructure/new/k8s/infra/temporal.yaml.
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "54link-dev"
   TEMPORAL_TASK_QUEUE: "orchestrator-service"
   DAPR_PUBSUB_TOPIC_PREFIX: ""
   TENANT_SERVICE_APP_ID: "platform-tenant"

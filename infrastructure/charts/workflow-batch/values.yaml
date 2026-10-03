@@ -59,4 +59,11 @@ secrets:
   APP_PORT: "9658"
   PORT_BASE: "9658"
   SERVICE_GROUP: workflow-batch
+  # W14-B2: orchestrator-service runs inside this consolidated container
+  # (SERVICES list) and its Temporal worker+client fail boot without these
+  # (EnvSchema src/validations/schemas.ts:39-41). Server:
+  # infrastructure/new/k8s/infra/temporal.yaml.
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "54link-dev"
+  TEMPORAL_TASK_QUEUE: "orchestrator-service"
   SERVICES: "batch-aggregator-go,batch-processing-py,e2e-orchestrator-go,orchestrator-service,saga-coordinator-py,temporal-access-service,temporal-memoizer-go,temporal-orchestrator-py,temporal-sagas-go,temporal-worker-go,workflow-engine-py"

@@ -24,7 +24,6 @@ import (
 type Config struct {
 	Port                    string
 	MojaloopURL             string
-	MySQLDSN                string
 	MaxConcurrency          int
 	BatchSize               int
 	CircuitBreakerThreshold int
@@ -35,7 +34,6 @@ func loadConfig() Config {
 	return Config{
 		Port:                    envOr("PORT", "8090"),
 		MojaloopURL:             envOr("MOJALOOP_URL", "http://mojaloop-switch:4003"),
-		MySQLDSN:                envOr("MYSQL_DSN", "central_ledger:password@tcp(proxysql:6033)/central_ledger"),
 		MaxConcurrency:          1000,
 		BatchSize:               500,
 		CircuitBreakerThreshold: 50,
@@ -108,6 +106,38 @@ type Transfer struct {
 	AmountKobo     int64  `json:"amountKobo"`
 	Currency       string `json:"currency"`
 	IdempotencyKey string `json:"idempotencyKey"`
+	// IlpPacket, Condition and Expiration come from the real quoting phase
+	// (PUT /quotes response from the payee FSP). They MUST be supplied by the
+	// caller — this adapter never fabricates them.
+	IlpPacket  string `json:"ilpPacket"`
+	Condition  string `json:"condition"`
+	Expiration string `json:"expiration"`
+}
+
+// validate enforces fail-closed semantics on the mutating transfer path:
+// a transfer without a real ILP packet/condition (obtained from a completed
+// quote) is rejected instead of being sent to the switch with fabricated
+// values.
+func (t Transfer) validate() error {
+	if t.TransferID == "" {
+		return fmt.Errorf("transferId is required")
+	}
+	if t.PayerFSP == "" || t.PayeeFSP == "" {
+		return fmt.Errorf("payerFsp and payeeFsp are required")
+	}
+	if t.AmountKobo <= 0 {
+		return fmt.Errorf("amountKobo must be positive")
+	}
+	if t.Currency == "" {
+		return fmt.Errorf("currency is required")
+	}
+	if t.IlpPacket == "" || t.Condition == "" {
+		return fmt.Errorf("ilpPacket and condition are required (from the quoting phase); refusing to fabricate them")
+	}
+	if t.Expiration == "" {
+		return fmt.Errorf("expiration is required (from the quoting phase)")
+	}
+	return nil
 }
 
 type BatchProcessor struct {
@@ -173,7 +203,17 @@ func (bp *BatchProcessor) flush(batch []Transfer) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			body, _ := json.Marshal(map[string]interface{}{
+			// Defense in depth: validate() is enforced at the HTTP boundary,
+			// but never forward a transfer with missing cryptographic material
+			// even if the batch was populated through another path.
+			if tr.IlpPacket == "" || tr.Condition == "" || tr.Expiration == "" {
+				bp.cb.RecordFailure()
+				atomic.AddInt64(&bp.failed, 1)
+				log.Printf("[mojaloop-adapter] refusing to forward transfer %s: missing ilpPacket/condition/expiration", tr.TransferID)
+				return
+			}
+
+			body, err := json.Marshal(map[string]interface{}{
 				"transferId": tr.TransferID,
 				"payerFsp":   tr.PayerFSP,
 				"payeeFsp":   tr.PayeeFSP,
@@ -181,12 +221,24 @@ func (bp *BatchProcessor) flush(batch []Transfer) {
 					"amount":   fmt.Sprintf("%.2f", float64(tr.AmountKobo)/100.0),
 					"currency": tr.Currency,
 				},
-				"ilpPacket":  "placeholder",
-				"condition":  "placeholder",
-				"expiration": time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339),
+				"ilpPacket":  tr.IlpPacket,
+				"condition":  tr.Condition,
+				"expiration": tr.Expiration,
 			})
+			if err != nil {
+				bp.cb.RecordFailure()
+				atomic.AddInt64(&bp.failed, 1)
+				log.Printf("[mojaloop-adapter] marshal error for transfer %s: %v", tr.TransferID, err)
+				return
+			}
 
-			req, _ := http.NewRequest("POST", bp.url+"/transfers", bytes.NewReader(body))
+			req, err := http.NewRequest("POST", bp.url+"/transfers", bytes.NewReader(body))
+			if err != nil {
+				bp.cb.RecordFailure()
+				atomic.AddInt64(&bp.failed, 1)
+				log.Printf("[mojaloop-adapter] request build error for transfer %s: %v", tr.TransferID, err)
+				return
+			}
 			req.Header.Set("Content-Type", "application/vnd.interoperability.transfers+json;version=1.1")
 			req.Header.Set("FSPIOP-Source", tr.PayerFSP)
 			req.Header.Set("FSPIOP-Destination", tr.PayeeFSP)
@@ -252,6 +304,10 @@ func handleTransfer(bp *BatchProcessor) http.HandlerFunc {
 			http.Error(w, "invalid body", http.StatusBadRequest)
 			return
 		}
+		if err := t.validate(); err != nil {
+			http.Error(w, "invalid transfer: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 
 		atomic.AddInt64(&metrics.transfersReceived, 1)
 		start := time.Now()
@@ -281,6 +337,14 @@ func handleBulkTransfer(bp *BatchProcessor) http.HandlerFunc {
 		if err := json.NewDecoder(r.Body).Decode(&transfers); err != nil {
 			http.Error(w, "invalid body", http.StatusBadRequest)
 			return
+		}
+		// Fail closed: reject the whole batch if any element is invalid —
+		// a partial accept would silently drop funds-bearing transfers.
+		for i, t := range transfers {
+			if err := t.validate(); err != nil {
+				http.Error(w, fmt.Sprintf("invalid transfer at index %d: %s", i, err.Error()), http.StatusBadRequest)
+				return
+			}
 		}
 
 		atomic.AddInt64(&metrics.transfersReceived, int64(len(transfers)))

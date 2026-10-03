@@ -18,10 +18,12 @@
 
 ## Verified-static findings
 
-- The repo contains **no Temporal server manifest** — only worker/client
-  deployments (`infrastructure/new/**/temporal-*.yaml`,
-  `infrastructure/manifests/temporal-access-service.yaml`). How the server is
-  deployed (Helm release name, namespace) must be confirmed before applying.
+- W14-B2: the Temporal server manifest now exists at
+  `infrastructure/new/k8s/infra/temporal.yaml` (server + UI + namespace
+  registration Job, namespace `temporal`, Service
+  `temporal-frontend.temporal.svc.cluster.local:7233`, metrics on :8000).
+  The Helm-values fragment below remains valid for Helm-chart-based deploys;
+  pick one deploy method, not both.
 - dynamicconfig cannot enable the metrics listener; it is static config. The
   dynamicconfig stub in `helm-values.yaml` is intentionally minimal.
 

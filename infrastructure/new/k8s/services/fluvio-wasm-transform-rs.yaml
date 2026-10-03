@@ -110,6 +110,10 @@ spec:
                   name: 54bank-config
                   key: kafka-brokers
                   optional: true
+            # Fluvio SC endpoint (infrastructure/new/k8s/infra/fluvio.yaml).
+            # Node BFF default: infrastructure/new/server/lib/fluvioStreaming.ts:24.
+            - name: FLUVIO_ENDPOINT
+              value: "fluvio:9003"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               valueFrom:
                 configMapKeyRef:

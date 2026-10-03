@@ -1,0 +1,137 @@
+# Fluvio streaming platform — all-in-one SC/SPU deployment (ns 54bank).
+#
+# Consumers of this service (verified-static):
+# - infrastructure/new/server/lib/fluvioStreaming.ts:24
+#     FLUVIO_ENDPOINT default "fluvio:9003"  → Service `fluvio` port 9003 below
+# - infrastructure/new/server/lib/fluvioStreaming.ts:23
+#     FLUVIO_STREAMS_URL default "http://fluvio-streams-rs:8119" (wrapper svc)
+# - infrastructure/new/k8s/observability/10-otel-collector.yaml:84-86
+#     scrape job `fluvio` → ${FLUVIO_HOST:-fluvio}:${FLUVIO_METRICS_PORT:-9110}
+# - infrastructure/observability/middleware/fluvio/fluvio-scrape.yaml
+#     StatefulSet patch adding the :9110 metrics port (now included inline here)
+#
+# Image pinned to infinyon/fluvio:0.11.9 per the observability patch fragment.
+# NOTE (requires-deployment): whether this image serves /metrics on :9110 must
+# be verified against the running pod (see fluvio-scrape.yaml header).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fluvio
+  namespace: 54bank
+  labels:
+    app: fluvio
+    app.kubernetes.io/component: streaming
+spec:
+  serviceName: fluvio-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluvio
+  template:
+    metadata:
+      labels:
+        app: fluvio
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9110"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: fluvio
+          image: infinyon/fluvio:0.11.9
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: sc-public
+              containerPort: 9003
+              protocol: TCP
+            - name: metrics
+              containerPort: 9110
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 9003
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 9003
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/fluvio
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+# Headless service for StatefulSet identity.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluvio-headless
+  namespace: 54bank
+  labels:
+    app: fluvio
+spec:
+  clusterIP: None
+  ports:
+    - name: sc-public
+      port: 9003
+      targetPort: 9003
+      protocol: TCP
+  selector:
+    app: fluvio
+---
+# SC public endpoint — producers/consumers connect here (fluvio:9003).
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluvio
+  namespace: 54bank
+  labels:
+    app: fluvio
+spec:
+  type: ClusterIP
+  ports:
+    - name: sc-public
+      port: 9003
+      targetPort: 9003
+      protocol: TCP
+  selector:
+    app: fluvio
+---
+# Metrics endpoint consumed by the otel-collector scrape job (SPEC §3).
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluvio-metrics
+  namespace: 54bank
+  labels:
+    app: fluvio
+    observability.corebanking/scrape: "true"
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 9110
+      targetPort: 9110
+      protocol: TCP
+  selector:
+    app: fluvio

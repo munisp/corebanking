@@ -3,10 +3,10 @@
 #
 # Collector scrape job contract (SPEC §3): `temporal` -> :8000.
 #
-# verified-static: the repo has NO Temporal *server* deployment manifest —
-# only SDK workers/clients (infrastructure/new/**/temporal-*.yaml). The server
-# is therefore assumed to be deployed via the `temporalio/temporal` Helm chart
-# (or externally); these values apply to that chart. Requires deployment.
+# W14-B2: an in-tree server manifest now exists at
+# infrastructure/new/k8s/infra/temporal.yaml (namespace `temporal`, Service
+# temporal-frontend:7233, metrics :8000). Use EITHER that manifest OR the
+# `temporalio/temporal` Helm chart with these values — not both.
 #
 # Two files in one document:
 #   1) Helm values fragment for temporalio/temporal chart

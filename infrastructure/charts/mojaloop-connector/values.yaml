@@ -46,6 +46,11 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
+  # W14-B2: worker/client read TEMPORAL_ADDRESS/TEMPORAL_NAMESPACE
+  # (src/utils/constants, setupTemporalWorker.ts:3). Server:
+  # infrastructure/new/k8s/infra/temporal.yaml.
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "54link-dev"
   TEMPORAL_TASK_QUEUE: "mojaloop-connector"
   CORE_BANKING_CONNECT_DAPR_ID: "core-payments"
   TENANT_NAME: "bpmgd"

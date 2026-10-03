@@ -12,6 +12,16 @@ import {
 
 const url = readEnv("MOJALOOP_CONNECTOR_URL") as string;
 
+// Fail closed: payment-hub must never silently send transfers/lookups to an
+// undefined baseURL (axios would fall back to relative URLs and produce
+// confusing connection errors deep in the transfer path). Mirror the
+// validation that services/mojaloop-connector performs for its switch URLs.
+if (!url) {
+  throw new Error(
+    "MOJALOOP_CONNECTOR_URL environment variable is not configured. Please set it to the Mojaloop connector base URL (e.g., http://mojaloop-connector:9489)",
+  );
+}
+
 // TS-42: keepAlive agents avoid TCP(+TLS) setup per transfer/lookup call.
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });

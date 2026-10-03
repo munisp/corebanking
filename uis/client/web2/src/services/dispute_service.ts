@@ -54,7 +54,7 @@ export class DisputeService {
   // Get a specific dispute by ID
   async getDisputeById(id: string): Promise<Dispute> {
     try {
-      const response = await apiService.get(`/dispute/${id}`);
+      const response = await apiService.get(`/dispute/api/v1/disputes/${id}`);
 
       if (response.status === 200) {
         const data = response.data as Record<string, unknown>;

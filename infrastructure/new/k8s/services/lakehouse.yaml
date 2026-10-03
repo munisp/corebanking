@@ -1,0 +1,186 @@
+# K8s manifest for the lakehouse REST server (infrastructure/new/lakehouse/server.py).
+# Follows the auto-generated idiom of lakehouse-etl-py.yaml (ns 54bank).
+# Storage is wired to the in-cluster MinIO (infrastructure/new/k8s/infra/minio.yaml)
+# via the LAKEHOUSE_S3_* variables consumed by
+# infrastructure/new/lakehouse/configs/storage.py.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lakehouse
+  namespace: 54bank
+  labels:
+    app: lakehouse
+    language: python
+    tier: microservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lakehouse
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: lakehouse
+        language: python
+        tier: microservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8020"
+        prometheus.io/path: "/v1/stats"
+    spec:
+      serviceAccountName: lakehouse
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-minio
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z minio.54bank.svc.cluster.local 9000; do echo "Waiting for MinIO..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgresql.54bank.svc.cluster.local 5432; do echo "Waiting for PostgreSQL..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: lakehouse
+          image: ghcr.io/54bank/lakehouse:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8020
+              name: http
+              protocol: TCP
+          env:
+            - name: LAKEHOUSE_PORT
+              value: "8020"
+            - name: SERVICE_NAME
+              value: "lakehouse"
+            - name: ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: environment
+                  optional: true
+            - name: LAKEHOUSE_STORAGE
+              value: "s3"
+            - name: LAKEHOUSE_S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: lakehouse-s3
+                  key: endpoint
+            - name: LAKEHOUSE_S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: lakehouse-s3
+                  key: bucket
+            - name: LAKEHOUSE_S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lakehouse-s3
+                  key: access-key
+            - name: LAKEHOUSE_S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lakehouse-s3
+                  key: secret-key
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: lakehouse-secrets
+                  key: database-url
+                  optional: true
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: kafka-brokers
+                  optional: true
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: otel-endpoint
+                  optional: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8020
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8020
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 5
+          startupProbe:
+            httpGet:
+              path: /v1/health
+              port: 8020
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 12
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lakehouse
+  namespace: 54bank
+  labels:
+    app: lakehouse
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8020
+      targetPort: 8020
+      protocol: TCP
+      name: http
+  selector:
+    app: lakehouse
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lakehouse
+  namespace: 54bank
+  labels:
+    app: lakehouse

@@ -3,7 +3,6 @@ use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, FromRow};
-use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use pbkdf2::pbkdf2_hmac;
@@ -63,11 +62,41 @@ struct VerifyRequest {
 // system of record. SECURITY: only the PBKDF2 hash + salt are stored — the
 // PIN itself is never persisted. Fail-closed: DB down => 503 on all
 // hash/verify paths (no in-memory fallback).
+// pin_blocks follows the same PG pattern (W14-A4 residual): the in-memory
+// in-memory pin-block Vec state is gone — pin_blocks (tenant-scoped, typed cols,
+// FromRow) is the system of record, fail-closed 503 on DB error.
 #[derive(Clone)]
 struct AppState {
     start_time: Instant,
-    pin_blocks: Arc<RwLock<Vec<PinBlock>>>,
     db: Option<PgPool>,
+}
+
+// DB row shape for pin_blocks (typed cols + FromRow).
+#[derive(Debug, FromRow)]
+#[allow(dead_code)] // tenant_id selected for scoping/audit; not re-serialized
+struct PinBlockRow {
+    id: String,
+    tenant_id: String,
+    format: String,
+    pan_truncated: String,
+    block_hex: String,
+    algorithm: String,
+    key_id: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<PinBlockRow> for PinBlock {
+    fn from(r: PinBlockRow) -> Self {
+        PinBlock {
+            id: r.id,
+            format: r.format,
+            pan_truncated: r.pan_truncated,
+            block_hex: r.block_hex,
+            algorithm: r.algorithm,
+            key_id: r.key_id,
+            created_at: r.created_at.to_rfc3339(),
+        }
+    }
 }
 
 // DB row shape (typed cols + FromRow, canonical wave-12 rust store idiom).
@@ -153,6 +182,17 @@ async fn init_store() -> Option<PgPool> {
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_pin_hashes_tenant ON pin_hashes (tenant_id)"#,
+        r#"CREATE TABLE IF NOT EXISTS pin_blocks (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            format TEXT NOT NULL,
+            pan_truncated TEXT NOT NULL,
+            block_hex TEXT NOT NULL,
+            algorithm TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_pin_blocks_tenant ON pin_blocks (tenant_id)"#,
     ];
     for stmt in schema {
         if let Err(e) = sqlx::query(stmt).execute(&pool).await {
@@ -160,7 +200,7 @@ async fn init_store() -> Option<PgPool> {
             return None;
         }
     }
-    eprintln!("[pin-block-engine-rs] postgres store ready (table pin_hashes)");
+    eprintln!("[pin-block-engine-rs] postgres store ready (tables pin_hashes, pin_blocks)");
     Some(pool)
 }
 
@@ -169,7 +209,6 @@ impl AppState {
         // No seeded/fake records: only real operations populate the store.
         AppState {
             start_time: Instant::now(),
-            pin_blocks: Arc::new(RwLock::new(Vec::new())),
             db,
         }
     }
@@ -225,8 +264,22 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
 
 async fn list_blocks(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let blocks = state.pin_blocks.read().unwrap();
-    HttpResponse::Ok().json(json!({"items": *blocks, "total": blocks.len()}))
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    // Real tenant-scoped query; fail-closed 503 on DB error (no in-memory fallback).
+    let rows = match sqlx::query_as::<_, PinBlockRow>(
+        "SELECT id, tenant_id, format, pan_truncated, block_hex, algorithm, key_id, created_at FROM pin_blocks WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1000")
+        .bind(&tenant).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("pin_blocks query failed: {}", e)),
+    };
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM pin_blocks WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("pin_blocks count failed: {}", e)),
+    };
+    let items: Vec<PinBlock> = rows.into_iter().map(PinBlock::from).collect();
+    HttpResponse::Ok().json(json!({"items": items, "total": total}))
 }
 
 async fn encode_pin_block(req: actix_web::HttpRequest, _state: web::Data<AppState>, body: web::Json<EncodeRequest>) -> HttpResponse {
@@ -361,7 +414,11 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let tenant = request_tenant(&req);
-    let blocks = state.pin_blocks.read().unwrap();
+    let blocks: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM pin_blocks WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("pin_blocks count failed: {}", e)),
+    };
     let stored: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM pin_hashes WHERE tenant_id = $1")
         .bind(&tenant).fetch_one(db).await {
         Ok(n) => n,
@@ -374,7 +431,7 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
     };
     let algo_counts: std::collections::HashMap<String, i64> = algo_rows.into_iter().collect();
     HttpResponse::Ok().json(json!({
-        "pinBlocksEncoded": blocks.len(),
+        "pinBlocksEncoded": blocks,
         "pinHashesStored": stored,
         "algorithmBreakdown": algo_counts,
     }))

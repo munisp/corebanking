@@ -116,6 +116,10 @@ spec:
                   name: 54bank-config
                   key: otel-endpoint
                   optional: true
+            # Real lakehouse REST endpoint (services/lakehouse-rs/src/main.rs:45
+            # reads LAKEHOUSE_API_URL; previous default was http://localhost:8020).
+            - name: LAKEHOUSE_API_URL
+              value: "http://lakehouse:8020"
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:

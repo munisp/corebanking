@@ -758,17 +758,26 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
     match tokio_postgres::connect(db_url, NoTls).await {
         Ok((client, connection)) => {
             tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
+            // W14-A4: DDL setup is fail-closed — a schema error aborts startup
+            // (process exit) instead of being swallowed into a half-initialized
+            // store that would silently drop writes later.
+            for ddl in [
                 "CREATE TABLE IF NOT EXISTS service_records (
                     id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
                     status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
                     created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
+                )",
+                "CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)",
+            ] {
+                if let Err(e) = client.execute(ddl, &[]).await {
+                    eprintln!("[bulk-payments-rs] FATAL: schema init failed (fail-closed boot): {}", e);
+                    std::process::exit(1);
+                }
+            }
             // MN-18: durable batch + per-leg stores. batch_legs.idempotency_key
             // is sha256(batch_id|index) — a batch retry re-derives the same
             // keys, so succeeded legs are never re-executed.
-            let _ = client.execute(
+            for ddl in [
                 "CREATE TABLE IF NOT EXISTS batches (
                     batch_id TEXT PRIMARY KEY,
                     tenant_id TEXT,
@@ -780,8 +789,7 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
                     approval_id TEXT,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute(
+                )",
                 "CREATE TABLE IF NOT EXISTS batch_legs (
                     idempotency_key TEXT PRIMARY KEY,
                     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
@@ -793,8 +801,14 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (batch_id, leg_index)
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_batch_legs_batch ON batch_legs(batch_id, status)", &[]).await;
+                )",
+                "CREATE INDEX IF NOT EXISTS idx_batch_legs_batch ON batch_legs(batch_id, status)",
+            ] {
+                if let Err(e) = client.execute(ddl, &[]).await {
+                    eprintln!("[bulk-payments-rs] FATAL: schema init failed (fail-closed boot): {}", e);
+                    std::process::exit(1);
+                }
+            }
             Some(client)
         }
         Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
@@ -1005,6 +1019,32 @@ async fn jwt_route_guard(
 static W11_AUDIT_BUF: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String, String)>>>> = std::sync::OnceLock::new();
 static W11_FLUSH_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+type AuditRow = (String, String, String, String, String);
+
+// W14-A4: flush failures must not silently drop audit rows. A failed INSERT is
+// logged and the row is returned so the caller requeues it into the buffer for
+// retry on the next tick (no outbox table exists in this service). Rows are
+// never discarded.
+async fn flush_audit_rows(client: &tokio_postgres::Client, rows: Vec<AuditRow>) -> Vec<AuditRow> {
+    let mut failed: Vec<AuditRow> = Vec::new();
+    for (id, svc, ep, st, d) in rows {
+        if let Err(e) = client.execute(
+            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
+            &[&id, &svc, &ep, &st, &d],
+        ).await {
+            eprintln!("[bulk-payments-rs] audit flush failed for {} ({}): {} — row requeued for retry", id, ep, e);
+            failed.push((id, svc, ep, st, d));
+        }
+    }
+    failed
+}
+
+fn requeue_audit_rows(buf: &std::sync::Arc<std::sync::Mutex<Vec<AuditRow>>>, failed: Vec<AuditRow>) {
+    if !failed.is_empty() {
+        buf.lock().unwrap().extend(failed);
+    }
+}
+
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
         let buf = W11_AUDIT_BUF.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
@@ -1024,12 +1064,8 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
                         if b.is_empty() { continue; }
                         std::mem::take(&mut *b)
                     };
-                    for (id, svc, ep, st, d) in rows {
-                        let _ = client.execute(
-                            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-                            &[&id, &svc, &ep, &st, &d],
-                        ).await;
-                    }
+                    let failed = flush_audit_rows(&client, rows).await;
+                    requeue_audit_rows(&buf, failed);
                 }
             });
         }
@@ -1039,13 +1075,10 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
             let rows = std::mem::take(&mut *b);
             drop(b);
             let client = client.clone();
+            let buf = buf.clone();
             tokio::spawn(async move {
-                for (id, svc, ep, st, d) in rows {
-                    let _ = client.execute(
-                        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-                        &[&id, &svc, &ep, &st, &d],
-                    ).await;
-                }
+                let failed = flush_audit_rows(&client, rows).await;
+                requeue_audit_rows(&buf, failed);
             });
         }
     }

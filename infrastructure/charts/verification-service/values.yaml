@@ -44,6 +44,11 @@ secrets:
   DB_DATABASE: link_core_banking
   DB_DATABASE_TYPE: postgres
   DB_SSL_ENABLED: "true"
+  # W14-B2: EnvSchema (src/validations/schemas.ts:21-23) requires all three;
+  # boot fails without TEMPORAL_ADDRESS/TEMPORAL_NAMESPACE. Server:
+  # infrastructure/new/k8s/infra/temporal.yaml.
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "54link-dev"
   TEMPORAL_TASK_QUEUE: "verification-task-queue"
   KYC_FLOW_BASE_URL: "https://kyc.54link-dev.upi.dev"
   KYB_COLLECTION_FLOW_BASE_URL: "http://verification-service.54link-dev.svc.cluster.local:8383"

@@ -1,0 +1,376 @@
+# =============================================================================
+# Temporal server + UI — durable workflow orchestration for the platform.
+#
+# Closes the wave-12 B2 finding (b2-summary.md): "Temporal server: NO server
+# manifest in-tree (only observability helm-values.yaml + platform
+# temporalClient.ts)". The SDK workers (orchestrator-service,
+# verification-service, mojaloop-connector) connect to
+# `temporal-frontend.temporal.svc.cluster.local:7233` (already referenced by
+# docker-compose.consolidated.yml:75 and the chart values) — this manifest is
+# what provides that Service.
+#
+# Idiom: follows infrastructure/new/k8s/infra/redis-ha.yaml (self-contained
+# server manifest, pinned image tags) and the ExternalSecret convention from
+# infrastructure/new/k8s/external-secrets/external-secrets-operator.yaml:73-95.
+#
+# Image pins match docker-compose.yml:171-192 (CVE-fixed versions):
+#   temporalio/auto-setup:1.30.3, temporalio/ui:2.44.0,
+#   temporalio/admin-tools:1.30.3 (same server release line).
+#
+# Metrics: the stock temporal config_template.yaml inside auto-setup already
+# enables the Prometheus listener on 0.0.0.0:8000 — port is exposed here and
+# annotated for scrape, satisfying the SPEC §3 contract documented in
+# infrastructure/observability/middleware/temporal/helm-values.yaml.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: temporal
+  labels:
+    name: temporal
+---
+# Database credentials for the Temporal persistence store, mirrored into this
+# namespace from the same Vault path used by the fleet-wide ExternalSecret
+# (external-secrets-operator.yaml:87-95).
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: temporal-database-credentials
+  namespace: temporal
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: temporal-database-credentials
+    creationPolicy: Owner
+  data:
+    - secretKey: username
+      remoteRef:
+        key: secret/data/shared/database
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: secret/data/shared/database
+        property: password
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: temporal
+  namespace: temporal
+  labels:
+    app: temporal
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-server
+  namespace: temporal
+  labels:
+    app: temporal
+    tier: infrastructure
+spec:
+  replicas: 1
+  strategy:
+    # auto-setup runs schema setup + single frontend/matching/history/worker
+    # in one process; rolling would race the schema bootstrap.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: temporal
+  template:
+    metadata:
+      labels:
+        app: temporal
+        tier: infrastructure
+      annotations:
+        reloader.stakater.com/auto: "true"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: temporal
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgresql.54bank.svc.cluster.local 5432; do echo "Waiting for PostgreSQL..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: temporal-server
+          image: temporalio/auto-setup:1.30.3  # CVE-2026-33186 fix; matches docker-compose.yml:171
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 7233
+              name: grpc
+              protocol: TCP
+            - containerPort: 8000
+              name: metrics
+              protocol: TCP
+          env:
+            - name: DB
+              value: "postgresql"
+            - name: DB_PORT
+              value: "5432"
+            - name: POSTGRES_SEEDS
+              value: "postgresql.54bank.svc.cluster.local"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: temporal-database-credentials
+                  key: username
+                  optional: false
+            - name: POSTGRES_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: temporal-database-credentials
+                  key: password
+                  optional: false
+            - name: TEMPORAL_ADDRESS
+              value: "0.0.0.0:7233"
+            - name: TEMPORAL_BROADCAST_ADDRESS
+              value: "temporal-frontend.temporal.svc.cluster.local"
+            - name: SKIP_DEFAULT_NAMESPACE_CREATION
+              value: "false"
+          # auto-setup entrypoint renders /etc/temporal/config/config.yaml via
+          # envsubst, so the root filesystem must stay writable.
+          securityContext:
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          readinessProbe:
+            tcpSocket:
+              port: 7233
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: 7233
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-frontend
+  namespace: temporal
+  labels:
+    app: temporal
+spec:
+  type: ClusterIP
+  ports:
+    - port: 7233
+      targetPort: 7233
+      protocol: TCP
+      name: grpc
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: metrics
+  selector:
+    app: temporal
+---
+# Register the platform namespace used by all SDK workers
+# (TEMPORAL_NAMESPACE=54link-dev — docker-compose.consolidated.yml:76 and the
+# chart values). Idempotent: skips creation when the namespace already exists.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: temporal-register-namespace
+  namespace: temporal
+  labels:
+    app: temporal
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app: temporal
+    spec:
+      serviceAccountName: temporal
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: register-namespace
+          image: temporalio/admin-tools:1.30.3  # same release line as the server
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              tctl --address temporal-frontend.temporal.svc.cluster.local:7233 namespace describe 54link-dev \
+                || tctl --address temporal-frontend.temporal.svc.cluster.local:7233 namespace register --retention 7 54link-dev
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-ui
+  namespace: temporal
+  labels:
+    app: temporal-ui
+    tier: infrastructure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: temporal-ui
+  template:
+    metadata:
+      labels:
+        app: temporal-ui
+        tier: infrastructure
+    spec:
+      serviceAccountName: temporal
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: temporal-ui
+          image: temporalio/ui:2.44.0  # CVE-2026-34986, CVE-2026-33186 fixes; matches docker-compose.yml:192
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: TEMPORAL_ADDRESS
+              value: "temporal-frontend.temporal.svc.cluster.local:7233"
+            - name: TEMPORAL_CORS_ORIGINS
+              value: "https://ops.54link-dev.upi.dev"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-ui
+  namespace: temporal
+  labels:
+    app: temporal-ui
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: temporal-ui
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: temporal
+  namespace: temporal
+spec:
+  podSelector:
+    matchLabels:
+      tier: infrastructure
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # SDK workers live in the 54bank / 54link-dev service namespaces.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: 54bank
+        - namespaceSelector:
+            matchLabels:
+              name: 54link-dev
+      ports:
+        - protocol: TCP
+          port: 7233
+    # Prometheus/Collector scrape of the metrics listener.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: observability
+      ports:
+        - protocol: TCP
+          port: 8000
+    # In-namespace (UI -> frontend, admin-tools Job).
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 7233
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53
