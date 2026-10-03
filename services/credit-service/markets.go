@@ -226,6 +226,52 @@ func (s *CreditServer) initETDTable(r *http.Request) {
 	)`)
 }
 
+// etdCreateHandler books an exchange-traded derivative trade
+// (W13-RISK-9: etd_trades was read by trades/stats but had NO writer).
+// Fail-closed: DB errors return 500.
+func (s *CreditServer) etdCreateHandler(w http.ResponseWriter, r *http.Request) {
+	tid := tenantID(r)
+	s.initETDTable(r)
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	id := uuid.New().String()
+	str := func(k string) string { v, _ := body[k].(string); return v }
+	num := func(k string) float64 { v, _ := body[k].(float64); return v }
+
+	tradeType := str("trade_type")
+	if tradeType == "" {
+		tradeType = "buy"
+	}
+	currency := str("currency")
+	if currency == "" {
+		currency = "NGN"
+	}
+	quantity := num("quantity")
+	price := num("price")
+	totalValue := num("total_value")
+	if totalValue == 0 {
+		totalValue = quantity * price
+	}
+
+	_, err := s.db.ExecContext(r.Context(), `
+		INSERT INTO etd_trades (id, tenant_id, instrument, exchange, trade_type,
+			quantity, price, total_value, currency, settlement_date, status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open')`,
+		id, tid, str("instrument"), str("exchange"), tradeType,
+		quantity, price, totalValue, currency, nilIfEmpty(str("settlement_date")))
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
+		return
+	}
+	body["id"] = id
+	body["status"] = "open"
+	body["total_value"] = totalValue
+	respondJSON(w, http.StatusCreated, body)
+}
+
 func (s *CreditServer) etdTradesHandler(w http.ResponseWriter, r *http.Request) {
 	tid := tenantID(r)
 	s.initETDTable(r)

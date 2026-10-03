@@ -9,10 +9,10 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -61,18 +61,14 @@ type Message struct {
 	SentAt    string `json:"sentAt"`
 }
 
+// TGServer holds the Postgres store handle. The former in-memory slice (and
+// its fabricated TG-001/TG-002 seed rows) was removed: telegram_messages is
+// the system of record (see store_pg.go). db == nil => handlers 503.
 type TGServer struct {
-	mu      sync.RWMutex
-	counter int
-	msgs    []Message
+	db *sql.DB
 }
 
-var srv = &TGServer{
-	msgs: []Message{
-		{ID: "TG-001", ChatID: 1234567890, Direction: "inbound", Text: "/balance", Status: "processed", SentAt: "2026-05-09T10:00:00Z"},
-		{ID: "TG-002", ChatID: 1234567890, Direction: "outbound", Text: "Your balance is ₦1,250,000.00", Status: "delivered", SentAt: "2026-05-09T10:00:01Z"},
-	},
-}
+var srv = &TGServer{db: openTelegramStore()}
 
 // jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
 // (RS256 signature + required exp claim). Fail-closed: any verification
@@ -383,17 +379,29 @@ func webhook(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 200, map[string]bool{"ok": true})
 		return
 	}
-	srv.mu.Lock()
-	srv.counter++
-	srv.msgs = append(srv.msgs, Message{
-		ID: fmt.Sprintf("TG-%03d", srv.counter), ChatID: update.Message.Chat.ID,
+	if srv.db == nil {
+		// Fail-closed: never acknowledge a webhook whose messages we cannot persist.
+		storeUnavailableTG(w)
+		return
+	}
+	inbound := Message{
+		ChatID:    update.Message.Chat.ID,
 		Direction: "inbound", Text: update.Message.Text, Status: "received",
-		SentAt: time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if err := persistMessage(srv.db, "", &inbound); err != nil {
+		log.Printf("[telegram-service] inbound persist failed: %v", err)
+		storeUnavailableTG(w)
+		return
+	}
 	reply := buildReply(update.Message.Chat.ID, update.Message.Text)
-	srv.counter++
-	srv.msgs = append(srv.msgs, reply)
-	srv.mu.Unlock()
+	if err := persistMessage(srv.db, "", &reply); err != nil {
+		log.Printf("[telegram-service] reply persist failed: %v", err)
+		storeUnavailableTG(w)
+		return
+	}
+	if deliverViaBotAPI(reply.ChatID, reply.Text) {
+		updateMessageStatus(srv.db, reply.ID, "sent")
+	}
 	respondJSON(w, 200, map[string]interface{}{"ok": true, "reply": reply.Text})
 }
 
@@ -401,10 +409,10 @@ func buildReply(chatID int64, text string) Message {
 	cmd := strings.ToLower(strings.SplitN(strings.TrimSpace(text), " ", 2)[0])
 	var body string
 	switch cmd {
-	case "/balance":
-		body = "💰 Balance: ₦1,250,000.00 | Available: ₦1,150,000.00\nAs at: " + time.Now().Format("02 Jan 2006 15:04")
-	case "/statement":
-		body = "📋 Last 5 Transactions:\n1. -₦5,000 Transfer\n2. +₦10,000 Deposit\n3. -₦500 Airtime\n4. -₦2,000 Bills\n5. +₦50,000 Salary"
+	case "/balance", "/statement":
+		// Never fabricate balances/transactions: this service has no
+		// core-banking read path, so answer honestly.
+		body = "⚠️ Account balances and statements are not available over Telegram. Please use the 54Bank app or internet banking."
 	case "/transfer":
 		body = "💸 Format: /transfer <10-digit account> <amount>"
 	case "/airtime":
@@ -413,9 +421,8 @@ func buildReply(chatID int64, text string) Message {
 		body = "🏦 54Bank Telegram Banking\n/balance /transfer /statement /airtime /bills /help"
 	}
 	return Message{
-		ID: fmt.Sprintf("TG-%03d", srv.counter), ChatID: chatID,
+		ChatID:    chatID,
 		Direction: "outbound", Text: body, Status: "queued",
-		SentAt: time.Now().UTC().Format(time.RFC3339),
 	}
 }
 
@@ -424,23 +431,68 @@ func send(w http.ResponseWriter, r *http.Request) {
 		ChatID int64  `json:"chatId"`
 		Text   string `json:"text"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
-	srv.mu.Lock()
-	srv.counter++
-	msg := Message{
-		ID: fmt.Sprintf("TG-%03d", srv.counter), ChatID: req.ChatID,
-		Direction: "outbound", Text: req.Text, Status: "queued",
-		SentAt: time.Now().UTC().Format(time.RFC3339),
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
 	}
-	srv.msgs = append(srv.msgs, msg)
-	srv.mu.Unlock()
+	if req.ChatID == 0 || strings.TrimSpace(req.Text) == "" {
+		http.Error(w, `{"error":"chatId and text are required"}`, http.StatusUnprocessableEntity)
+		return
+	}
+	if srv.db == nil {
+		// Fail-closed: never 201 a message we could not durably queue.
+		storeUnavailableTG(w)
+		return
+	}
+	msg := Message{
+		ChatID:    req.ChatID,
+		Direction: "outbound", Text: req.Text, Status: "queued",
+	}
+	if err := persistMessage(srv.db, r.Header.Get("X-Tenant-ID"), &msg); err != nil {
+		log.Printf("[telegram-service] outbound persist failed: %v", err)
+		storeUnavailableTG(w)
+		return
+	}
+	// Durable row exists ('queued'); attempt real delivery when a bot token
+	// is configured and reflect the outcome on the row.
+	if deliverViaBotAPI(msg.ChatID, msg.Text) {
+		msg.Status = "sent"
+		updateMessageStatus(srv.db, msg.ID, "sent")
+	}
 	respondJSON(w, 201, map[string]interface{}{"ok": true, "message": msg})
 }
 
 func messages(w http.ResponseWriter, _ *http.Request) {
-	srv.mu.RLock()
-	defer srv.mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"messages": srv.msgs, "total": len(srv.msgs)})
+	if srv.db == nil {
+		storeUnavailableTG(w)
+		return
+	}
+	rows, err := srv.db.Query(`SELECT id, chat_id, direction, text, status, sent_at FROM telegram_messages ORDER BY sent_at DESC, id LIMIT 100`)
+	if err != nil {
+		log.Printf("[telegram-service] messages query failed: %v", err)
+		storeUnavailableTG(w)
+		return
+	}
+	defer rows.Close()
+	msgs := []Message{}
+	for rows.Next() {
+		var m Message
+		var sentAt time.Time
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.Direction, &m.Text, &m.Status, &sentAt); err != nil {
+			log.Printf("[telegram-service] messages scan failed: %v", err)
+			storeUnavailableTG(w)
+			return
+		}
+		m.SentAt = sentAt.UTC().Format(time.RFC3339)
+		msgs = append(msgs, m)
+	}
+	var total int
+	if err := srv.db.QueryRow(`SELECT COUNT(*) FROM telegram_messages`).Scan(&total); err != nil {
+		log.Printf("[telegram-service] messages count failed: %v", err)
+		storeUnavailableTG(w)
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"messages": msgs, "total": total})
 }
 
 func commands(w http.ResponseWriter, _ *http.Request) {
@@ -455,10 +507,21 @@ func commands(w http.ResponseWriter, _ *http.Request) {
 }
 
 func stats(w http.ResponseWriter, _ *http.Request) {
-	srv.mu.RLock()
-	defer srv.mu.RUnlock()
+	if srv.db == nil {
+		storeUnavailableTG(w)
+		return
+	}
+	var total, queued, sent int
+	if err := srv.db.QueryRow(`SELECT COUNT(*),
+		COUNT(*) FILTER (WHERE status = 'queued'),
+		COUNT(*) FILTER (WHERE status = 'sent') FROM telegram_messages`).Scan(&total, &queued, &sent); err != nil {
+		log.Printf("[telegram-service] stats query failed: %v", err)
+		storeUnavailableTG(w)
+		return
+	}
 	respondJSON(w, 200, map[string]interface{}{
-		"channel": "telegram", "totalMessages": len(srv.msgs),
+		"channel": "telegram", "totalMessages": total,
+		"queued": queued, "sent": sent,
 		"botApiVersion": "7.0", "uptime_secs": int(time.Since(startTime).Seconds()),
 	})
 }

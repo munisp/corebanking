@@ -474,36 +474,63 @@ async fn retry_failed(
         .await
         {
             Ok(resp_body) => {
-                succeeded += 1;
-                let _ = db.execute(
+                // W13-RISK-2: fail-closed — the durable leg record MUST be updated
+                // once money moved upstream; never swallow bookkeeping errors.
+                if let Err(e) = db.execute(
                     "UPDATE batch_legs SET status='success', error=NULL, response=$2::jsonb, updated_at=NOW() WHERE idempotency_key=$1",
                     &[&idem_key, &resp_body.to_string()],
-                ).await;
+                ).await {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "leg_status_persist_failed",
+                        "detail": format!("leg {} executed upstream but durable status update failed: {}", idem_key, e),
+                        "idempotencyKey": idem_key,
+                    }));
+                }
+                succeeded += 1;
                 results.push(json!({"index": idx, "status": "success", "idempotencyKey": idem_key, "response": resp_body}));
             }
             Err(err_msg) => {
-                failed += 1;
-                let _ = db.execute(
+                if let Err(e) = db.execute(
                     "UPDATE batch_legs SET status='failed', error=$2, updated_at=NOW() WHERE idempotency_key=$1",
                     &[&idem_key, &err_msg],
-                ).await;
+                ).await {
+                    return HttpResponse::ServiceUnavailable().json(json!({
+                        "error": "leg_status_persist_failed",
+                        "detail": format!("leg {} durable status update failed: {}", idem_key, e),
+                        "idempotencyKey": idem_key,
+                    }));
+                }
+                failed += 1;
                 results.push(json!({"index": idx, "status": "failed", "idempotencyKey": idem_key, "error": err_msg}));
             }
         }
     }
 
-    // Refresh the persisted batch summary from leg reality.
-    if let Ok(row) = db.query_one(
+    // Refresh the persisted batch summary from leg reality (fail-closed).
+    match db.query_one(
         "SELECT COUNT(*) FILTER (WHERE status = 'success'), COUNT(*) FILTER (WHERE status = 'failed') FROM batch_legs WHERE batch_id = $1",
         &[&batch_id],
     ).await {
-        let s: i64 = row.get(0);
-        let f: i64 = row.get(1);
-        let st = if f == 0 { "completed" } else if s == 0 { "failed" } else { "completed_with_failures" };
-        let _ = db.execute(
-            "UPDATE batches SET succeeded=$2, failed=$3, status=$4, updated_at=NOW() WHERE batch_id=$1",
-            &[&batch_id, &(s as i32), &(f as i32), &st],
-        ).await;
+        Ok(row) => {
+            let s: i64 = row.get(0);
+            let f: i64 = row.get(1);
+            let st = if f == 0 { "completed" } else if s == 0 { "failed" } else { "completed_with_failures" };
+            if let Err(e) = db.execute(
+                "UPDATE batches SET succeeded=$2, failed=$3, status=$4, updated_at=NOW() WHERE batch_id=$1",
+                &[&batch_id, &(s as i32), &(f as i32), &st],
+            ).await {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "batch_summary_persist_failed", "detail": e.to_string(),
+                    "batch_id": batch_id, "succeeded": succeeded, "failed": failed,
+                }));
+            }
+        }
+        Err(e) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_summary_read_failed", "detail": e.to_string(),
+                "batch_id": batch_id, "succeeded": succeeded, "failed": failed,
+            }));
+        }
     }
 
     HttpResponse::Ok().json(json!({

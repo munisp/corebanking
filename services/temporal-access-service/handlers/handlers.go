@@ -20,12 +20,12 @@ import (
 
 // Handler handles HTTP requests
 type Handler struct {
-	store   *storage.RedisStore
+	store   *storage.Store
 	permify *permify.Client
 }
 
 // NewHandler creates a new handler
-func NewHandler(store *storage.RedisStore, permifyClient *permify.Client) *Handler {
+func NewHandler(store *storage.Store, permifyClient *permify.Client) *Handler {
 	return &Handler{
 		store:   store,
 		permify: permifyClient,
@@ -1060,7 +1060,11 @@ func (h *Handler) GetPolicy(w http.ResponseWriter, r *http.Request) {
 
 	policy, err := h.store.GetPolicy(ctx, policyID)
 	if err != nil {
-		respondError(w, http.StatusNotFound, "policy not found", err)
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "policy not found", err)
+		} else {
+			respondError(w, http.StatusInternalServerError, "failed to load policy", err)
+		}
 		return
 	}
 
@@ -1081,7 +1085,11 @@ func (h *Handler) UpdatePolicy(w http.ResponseWriter, r *http.Request) {
 
 	policy, err := h.store.GetPolicy(ctx, policyID)
 	if err != nil {
-		respondError(w, http.StatusNotFound, "policy not found", err)
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "policy not found", err)
+		} else {
+			respondError(w, http.StatusInternalServerError, "failed to load policy", err)
+		}
 		return
 	}
 
@@ -1123,7 +1131,11 @@ func (h *Handler) DeletePolicy(w http.ResponseWriter, r *http.Request) {
 	policyID := vars["policy_id"]
 
 	if err := h.store.DeletePolicy(ctx, policyID); err != nil {
-		respondError(w, http.StatusNotFound, "policy not found", err)
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "policy not found", err)
+		} else {
+			respondError(w, http.StatusInternalServerError, "failed to delete policy", err)
+		}
 		return
 	}
 

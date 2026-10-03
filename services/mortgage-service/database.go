@@ -624,13 +624,66 @@ func updateMortgageStatus(id, tenantID string, status MortgageStatus) error {
 		return nil
 	}
 
-	query := `UPDATE mortgage_applications SET status = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`
-	res, err := db.Exec(query, status, id, tenantID)
+	// W13-RISK-12: the status transition and its mortgage_audit_trail row are
+	// written in ONE transaction — the audit trail is fail-closed (an audit
+	// insert failure rolls back the transition).
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var oldStatus string
+	if err := tx.QueryRow(
+		`SELECT status FROM mortgage_applications WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+		id, tenantID,
+	).Scan(&oldStatus); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("mortgage %s not found for tenant — status not updated", id)
+		}
+		return err
+	}
+
+	res, err := tx.Exec(
+		`UPDATE mortgage_applications SET status = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`,
+		status, id, tenantID,
+	)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("mortgage %s not found for tenant — status not updated", id)
+	}
+
+	if err := recordMortgageAuditTx(tx, id, tenantID, "status_change", "system", "system",
+		map[string]interface{}{"status": oldStatus},
+		map[string]interface{}{"status": string(status)},
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// recordMortgageAuditTx inserts a mortgage_audit_trail row inside tx
+// (W13-RISK-12: this table previously had NO writer — the domain audit trail
+// was never recorded anywhere; PublishAuditEvent was dead code with zero call
+// sites).
+func recordMortgageAuditTx(tx *sql.Tx, mortgageID, tenantID, action, actor, actorType string, oldValue, newValue map[string]interface{}) error {
+	oldJSON, err := json.Marshal(oldValue)
+	if err != nil {
+		return fmt.Errorf("marshal audit old_value: %w", err)
+	}
+	newJSON, err := json.Marshal(newValue)
+	if err != nil {
+		return fmt.Errorf("marshal audit new_value: %w", err)
+	}
+	_, err = tx.Exec(`
+		INSERT INTO mortgage_audit_trail (id, mortgage_id, tenant_id, action, actor, actor_type, old_value, new_value)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
+	`, generateID("AUD"), mortgageID, tenantID, action, actor, actorType, string(oldJSON), string(newJSON))
+	if err != nil {
+		return fmt.Errorf("insert mortgage_audit_trail: %w", err)
 	}
 	return nil
 }
@@ -789,10 +842,19 @@ func validateApplicationForSubmission(app *MortgageApplication) error {
 	return nil
 }
 
-func saveUnderwritingResults(app *MortgageApplication) error {
+func saveUnderwritingResults(app *MortgageApplication, decision *UnderwritingDecision) error {
 	if db == nil {
 		return nil
 	}
+
+	// W13-RISK-13: the application update, the mortgage_underwriting_decisions
+	// row (this table previously had NO writer) and the audit-trail row are
+	// written in ONE transaction — fail-closed.
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 
 	query := `
 		UPDATE mortgage_applications SET
@@ -802,18 +864,84 @@ func saveUnderwritingResults(app *MortgageApplication) error {
 		WHERE id = $8 AND tenant_id = $9
 	`
 
-	_, err := db.Exec(query,
+	if _, err := tx.Exec(query,
 		app.CreditScore, app.DTIRatio, app.LTVRatio, app.RiskScore,
 		app.ApprovedAmount, app.ApprovedTenorMonths, app.InterestRate,
 		app.ID, app.TenantID,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+
+	if decision != nil {
+		toJSON := func(v interface{}) (string, error) {
+			b, err := json.Marshal(v)
+			return string(b), err
+		}
+		conditions, err := toJSON(decision.Conditions)
+		if err != nil {
+			return err
+		}
+		declineReasons, err := toJSON(decision.DeclineReasons)
+		if err != nil {
+			return err
+		}
+		referReasons, err := toJSON(decision.ReferReasons)
+		if err != nil {
+			return err
+		}
+		recommendations, err := toJSON(decision.Recommendations)
+		if err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO mortgage_underwriting_decisions (
+				id, application_id, decision, credit_score, dti_ratio, dsti_ratio,
+				ltv_ratio, risk_score, risk_grade, probability_of_default,
+				loss_given_default, expected_loss, approved_amount, approved_tenor,
+				interest_rate, conditions, decline_reasons, refer_reasons,
+				recommendations, underwritten_by
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+			          $16::jsonb,$17::jsonb,$18::jsonb,$19::jsonb,$20)
+		`, generateID("UWD"), app.ID, decision.Decision, decision.CreditScore,
+			decision.DTIRatio, decision.DSTIRatio, decision.LTVRatio,
+			decision.RiskScore, decision.RiskGrade, decision.PD, decision.LGD,
+			decision.EL, decision.ApprovedAmount, decision.ApprovedTenor,
+			decision.InterestRate, conditions, declineReasons, referReasons,
+			recommendations, "underwriting-engine",
+		); err != nil {
+			return fmt.Errorf("insert mortgage_underwriting_decisions: %w", err)
+		}
+
+		if err := recordMortgageAuditTx(tx, app.ID, app.TenantID, "underwritten", "underwriting-engine", "system",
+			nil,
+			map[string]interface{}{
+				"decision":        decision.Decision,
+				"credit_score":    decision.CreditScore,
+				"risk_score":      decision.RiskScore,
+				"risk_grade":      decision.RiskGrade,
+				"approved_amount": decision.ApprovedAmount,
+			},
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
 }
 
 func saveApprovalDetails(app *MortgageApplication, approvedBy string, conditions []string, notes string) error {
 	if db == nil {
 		return nil
 	}
+
+	// W13-RISK-12: approval update + approval record + audit row in ONE
+	// transaction (fail-closed audit trail).
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 
 	// Update application
 	query := `
@@ -822,7 +950,7 @@ func saveApprovalDetails(app *MortgageApplication, approvedBy string, conditions
 			interest_rate = $4, approved_at = NOW(), updated_at = NOW()
 		WHERE id = $5 AND tenant_id = $6
 	`
-	_, err := db.Exec(query, StatusApproved, app.ApprovedAmount, app.ApprovedTenorMonths,
+	_, err = tx.Exec(query, StatusApproved, app.ApprovedAmount, app.ApprovedTenorMonths,
 		app.InterestRate, app.ID, app.TenantID)
 	if err != nil {
 		return err
@@ -834,10 +962,24 @@ func saveApprovalDetails(app *MortgageApplication, approvedBy string, conditions
 		INSERT INTO mortgage_approvals (id, application_id, approved_by, approved_amount, approved_tenor, interest_rate, conditions, notes)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
-	_, err = db.Exec(approvalQuery, generateID("APR"), app.ID, approvedBy,
+	_, err = tx.Exec(approvalQuery, generateID("APR"), app.ID, approvedBy,
 		app.ApprovedAmount, app.ApprovedTenorMonths, app.InterestRate, conditionsJSON, notes)
+	if err != nil {
+		return err
+	}
 
-	return err
+	if err := recordMortgageAuditTx(tx, app.ID, app.TenantID, "approved", approvedBy, "user",
+		nil,
+		map[string]interface{}{
+			"status":          string(StatusApproved),
+			"approved_amount": app.ApprovedAmount,
+			"approved_by":     approvedBy,
+		},
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func saveDisbursementDetails(app *MortgageApplication, transferID string) error {

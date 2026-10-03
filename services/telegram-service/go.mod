@@ -3,7 +3,9 @@ module github.com/54link-dev/platform/services/telegram-service
 go 1.22
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
+	github.com/lib/pq v1.12.3
 	github.com/prometheus/client_golang v1.18.0
 )
 

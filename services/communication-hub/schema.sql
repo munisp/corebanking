@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- W13-RISK-5: unique arbiter for the conversations upsert written by
+-- recordMessage (one active conversation aggregate per tenant/customer/channel).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_conversations_tenant_customer_channel
+    ON conversations(tenant_id, customer_id, channel);
+
 -- Index for conversations
 CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_customer ON conversations(customer_id);

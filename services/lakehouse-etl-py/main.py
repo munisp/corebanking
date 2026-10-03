@@ -715,6 +715,40 @@ def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)
     tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
     status = body.status or "active"
     record_id = str(uuid.uuid4())
+    # W13-FIX-CRIT C5: the body previously ended here — a 201 with no INSERT
+    # and no return value (records silently dropped). INSERT-first into
+    # service_configs (pooled psycopg2, autocommit OFF + explicit commit).
+    # Fail-closed: any DB error rolls back and yields 503, never a 201 with
+    # nothing stored.
+    raw = None
+    try:
+        raw = _get_db_pool().getconn()
+        raw.autocommit = False
+        with raw.cursor() as cur:
+            cur.execute(
+                "INSERT INTO service_configs (id, tenant_id, status) VALUES (%s, %s, %s) RETURNING created_at",
+                (record_id, tenant_id, status),
+            )
+            created_at = cur.fetchone()[0]
+        raw.commit()
+    except Exception as e:
+        if raw is not None:
+            try:
+                raw.rollback()
+            except Exception:
+                pass
+        logger.error(f"create_record insert failed: {e}")
+        raise HTTPException(status_code=503, detail="store_unavailable")
+    finally:
+        if raw is not None:
+            try:
+                _get_db_pool().putconn(raw)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+    return {"id": record_id, "status": status, "tenant_id": tenant_id, "created_at": str(created_at)}
 
 # --- Graceful Shutdown ---
 server = None

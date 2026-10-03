@@ -69,6 +69,7 @@ type ChatAction struct {
 }
 
 type IntentConfig struct {
+	ID          string   `json:"id,omitempty"`
 	Intent      string   `json:"intent"`
 	Patterns    []string `json:"patterns"`
 	Responses   []string `json:"responses"`
@@ -140,7 +141,7 @@ func (s *ChatbotServer) chatHandler(w http.ResponseWriter, r *http.Request) {
 
 	response, err := s.engine.ProcessMessage(req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -153,7 +154,7 @@ func (s *ChatbotServer) getSessionHandler(w http.ResponseWriter, r *http.Request
 
 	session, err := s.engine.GetSession(sessionID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -166,7 +167,7 @@ func (s *ChatbotServer) endSessionHandler(w http.ResponseWriter, r *http.Request
 
 	err := s.engine.EndSession(sessionID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -179,7 +180,7 @@ func (s *ChatbotServer) getHistoryHandler(w http.ResponseWriter, r *http.Request
 
 	history, err := s.engine.GetHistory(sessionID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -191,7 +192,7 @@ func (s *ChatbotServer) getIntentsHandler(w http.ResponseWriter, r *http.Request
 
 	intents, err := s.engine.GetIntents(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -208,7 +209,7 @@ func (s *ChatbotServer) createIntentHandler(w http.ResponseWriter, r *http.Reque
 	tenantID := r.Header.Get("X-Tenant-ID")
 	intent, err := s.engine.CreateIntent(tenantID, req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -229,7 +230,7 @@ func (s *ChatbotServer) updateIntentHandler(w http.ResponseWriter, r *http.Reque
 	tenantID := r.Header.Get("X-Tenant-ID")
 	intent, err := s.engine.UpdateIntent(tenantID, intentID, req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -243,7 +244,7 @@ func (s *ChatbotServer) deleteIntentHandler(w http.ResponseWriter, r *http.Reque
 
 	err := s.engine.DeleteIntent(tenantID, intentID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -255,7 +256,7 @@ func (s *ChatbotServer) trainHandler(w http.ResponseWriter, r *http.Request) {
 
 	jobID, err := s.engine.StartTraining(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -267,7 +268,7 @@ func (s *ChatbotServer) getTrainingStatusHandler(w http.ResponseWriter, r *http.
 
 	status, err := s.engine.GetTrainingStatus(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -279,7 +280,7 @@ func (s *ChatbotServer) getConversationAnalyticsHandler(w http.ResponseWriter, r
 
 	analytics, err := s.engine.GetConversationAnalytics(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -291,7 +292,7 @@ func (s *ChatbotServer) getIntentAnalyticsHandler(w http.ResponseWriter, r *http
 
 	analytics, err := s.engine.GetIntentAnalytics(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -303,7 +304,7 @@ func (s *ChatbotServer) getSatisfactionHandler(w http.ResponseWriter, r *http.Re
 
 	satisfaction, err := s.engine.GetSatisfactionMetrics(tenantID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -322,7 +323,7 @@ func (s *ChatbotServer) requestHandoffHandler(w http.ResponseWriter, r *http.Req
 
 	result, err := s.engine.RequestHandoff(req.SessionID, req.Reason)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -343,7 +344,7 @@ func (s *ChatbotServer) acceptHandoffHandler(w http.ResponseWriter, r *http.Requ
 
 	result, err := s.engine.AcceptHandoff(sessionID, req.AgentID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -359,7 +360,7 @@ func (s *ChatbotServer) whatsappWebhookHandler(w http.ResponseWriter, r *http.Re
 
 	err := s.engine.ProcessWhatsAppMessage(payload)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -375,7 +376,7 @@ func (s *ChatbotServer) telegramWebhookHandler(w http.ResponseWriter, r *http.Re
 
 	err := s.engine.ProcessTelegramMessage(payload)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -391,7 +392,7 @@ func (s *ChatbotServer) facebookWebhookHandler(w http.ResponseWriter, r *http.Re
 
 	err := s.engine.ProcessFacebookMessage(payload)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeEngineError(w, err)
 		return
 	}
 
@@ -707,102 +708,7 @@ func main() {
 	log.Println("Chatbot service stopped")
 }
 
-// ChatbotEngine stub - integrates with chatbot.go
-type ChatbotEngine struct{}
-
-func NewChatbotEngine() *ChatbotEngine {
-	return &ChatbotEngine{}
-}
-
-func (e *ChatbotEngine) ProcessMessage(req ChatRequest) (*ChatResponse, error) {
-	intent := "balance_inquiry"
-	response := "Your current balance is NGN 50,000.00"
-
-	if req.Message == "" {
-		response = "Hello! How can I help you today?"
-		intent = "greeting"
-	}
-
-	return &ChatResponse{
-		SessionID:    req.SessionID,
-		Response:     response,
-		Intent:       intent,
-		Confidence:   0.95,
-		QuickReplies: []string{"Check Balance", "Transfer Money", "Pay Bills", "Talk to Agent"},
-	}, nil
-}
-
-func (e *ChatbotEngine) GetSession(sessionID string) (map[string]interface{}, error) {
-	return map[string]interface{}{
-		"session_id": sessionID,
-		"started_at": time.Now().Add(-10 * time.Minute).Format(time.RFC3339),
-		"status":     "active",
-	}, nil
-}
-
-func (e *ChatbotEngine) EndSession(sessionID string) error {
-	return nil
-}
-
-func (e *ChatbotEngine) GetHistory(sessionID string) ([]map[string]interface{}, error) {
-	return []map[string]interface{}{
-		{"role": "user", "message": "Hello", "timestamp": time.Now().Format(time.RFC3339)},
-		{"role": "bot", "message": "Hello! How can I help you?", "timestamp": time.Now().Format(time.RFC3339)},
-	}, nil
-}
-
-func (e *ChatbotEngine) GetIntents(tenantID string) ([]IntentConfig, error) {
-	return []IntentConfig{
-		{Intent: "balance_inquiry", Patterns: []string{"balance", "how much"}},
-		{Intent: "transfer", Patterns: []string{"send money", "transfer"}},
-	}, nil
-}
-
-func (e *ChatbotEngine) CreateIntent(tenantID string, config IntentConfig) (*IntentConfig, error) {
-	return &config, nil
-}
-
-func (e *ChatbotEngine) UpdateIntent(tenantID, intentID string, config IntentConfig) (*IntentConfig, error) {
-	return &config, nil
-}
-
-func (e *ChatbotEngine) DeleteIntent(tenantID, intentID string) error {
-	return nil
-}
-
-func (e *ChatbotEngine) StartTraining(tenantID string) (string, error) {
-	return "job_" + tenantID, nil
-}
-
-func (e *ChatbotEngine) GetTrainingStatus(tenantID string) (map[string]interface{}, error) {
-	return map[string]interface{}{"status": "completed", "accuracy": 0.92}, nil
-}
-
-func (e *ChatbotEngine) GetConversationAnalytics(tenantID string) (map[string]interface{}, error) {
-	return map[string]interface{}{
-		"total_conversations":  1000,
-		"avg_duration_seconds": 120,
-		"resolution_rate":      0.85,
-	}, nil
-}
-
-func (e *ChatbotEngine) GetIntentAnalytics(tenantID string) (map[string]interface{}, error) {
-	return map[string]interface{}{
-		"top_intents": []string{"balance_inquiry", "transfer", "bill_payment"},
-	}, nil
-}
-
-func (e *ChatbotEngine) GetSatisfactionMetrics(tenantID string) (map[string]interface{}, error) {
-	return map[string]interface{}{"csat_score": 4.2, "nps": 45}, nil
-}
-
-func (e *ChatbotEngine) RequestHandoff(sessionID, reason string) (map[string]interface{}, error) {
-	return map[string]interface{}{"handoff_id": "hoff_" + sessionID, "status": "pending"}, nil
-}
-
-func (e *ChatbotEngine) AcceptHandoff(sessionID, agentID string) (map[string]interface{}, error) {
-	return map[string]interface{}{"status": "accepted", "agent_id": agentID}, nil
-}
+// ChatbotEngine is implemented in store_pg.go (Postgres-backed, fail-closed).
 
 func (e *ChatbotEngine) ProcessWhatsAppMessage(payload map[string]interface{}) error {
 	return nil

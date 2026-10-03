@@ -23,8 +23,9 @@ class AuditServiceAdapter(ExternalAPIClient):
     def create_audit(self, payload: AuditEventSchema, context: Context = None) -> None:
         """
         Emit an audit event synchronously with up to _MAX_RETRIES attempts.
-        On total failure, logs the full event as CRITICAL so it can be reconstructed
-        from log aggregation — audit failures must never propagate to the caller.
+        On total failure, persists the event to the durable audit_outbox table
+        (retried by the outbox relay). Raises only if the durable outbox write
+        itself fails — an audit event must never be silently dropped.
         """
         headers = {
             "x-tenant-id": context.tenant_id if context else "system",
@@ -46,15 +47,27 @@ class AuditServiceAdapter(ExternalAPIClient):
                 if attempt < _MAX_RETRIES - 1:
                     time.sleep(_RETRY_DELAYS[attempt])
 
-        # All retries exhausted — log the full event for ops reconstruction.
+        # All retries exhausted — W13-RISK-15: do NOT drop the event. Persist
+        # it to the durable audit_outbox table so the outbox relay retries
+        # delivery; the audit trail must survive a sustained audit-service
+        # outage. Fail-closed: if the outbox write itself fails, propagate so
+        # the caller knows the audit trail is not durable.
+        from services.outbox_relay import enqueue_audit_event
+
+        outbox_id = enqueue_audit_event(
+            event_data=event_data,
+            headers=headers,
+            tenant_id=context.tenant_id if context else "system",
+            event_type=getattr(payload, "event_type", "UNKNOWN"),
+        )
         logger.critical(
             "audit_emission_failed_all_retries event_type=%s actor_id=%s tenant_id=%s "
-            "event_data=%s error=%s ACTION=reconstruct_from_logs",
+            "error=%s ACTION=enqueued_to_audit_outbox outbox_id=%s",
             getattr(payload, "event_type", "UNKNOWN"),
             getattr(payload, "actor_id", "UNKNOWN"),
             context.tenant_id if context else "UNKNOWN",
-            event_data,
             str(last_exc),
+            outbox_id,
         )
         # Alerting contract (w9 addendum): count exhausted audit ship failures.
         try:

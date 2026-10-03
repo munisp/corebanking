@@ -5,9 +5,9 @@
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::{PgPool, postgres::PgPoolOptions, FromRow};
 use std::collections::HashMap;
 use std::env;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicI64, AtomicI32, AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 use actix_web::HttpMessage;
@@ -56,12 +56,195 @@ struct ListParams {
     limit: Option<usize>,
 }
 
+// ── Postgres persistence (W13-FIX-CRIT C4: in-memory Arc<RwLock<Vec>> → sqlx) ──
+// alerts/thresholds were process-local Vecs: acknowledge/resolve state was lost
+// on restart. kpi_alerts and kpi_thresholds are now the system of record.
+// Fail-closed: when DATABASE_URL is unset/unreachable the data endpoints
+// return 503 — no in-memory fallback, no fabricated alert state.
 struct AppState {
     start_time: Instant,
     db_url: String,
+    db: Option<PgPool>,
     service_name: String,
-    alerts: Arc<RwLock<Vec<KpiAlert>>>,
-    thresholds: Arc<RwLock<Vec<ThresholdRule>>>,
+}
+
+// DB row shapes (typed cols + FromRow, canonical wave-12 rust store idiom).
+// Timestamp columns are TIMESTAMPTZ and map to chrono; the wire structs
+// (ThresholdRule/KpiAlert above) keep their RFC3339-string JSON shape.
+#[derive(Debug, FromRow)]
+struct ThresholdRow {
+    id: String,
+    role: String,
+    metric_id: String,
+    metric_name: String,
+    condition: String,
+    threshold_value: f64,
+    severity: String,
+    action: String,
+    enabled: bool,
+    cooldown_minutes: i32,
+    last_triggered: Option<chrono::DateTime<chrono::Utc>>,
+    description: String,
+}
+
+impl From<ThresholdRow> for ThresholdRule {
+    fn from(r: ThresholdRow) -> Self {
+        ThresholdRule {
+            id: r.id,
+            role: r.role,
+            metric_id: r.metric_id,
+            metric_name: r.metric_name,
+            condition: r.condition,
+            threshold_value: r.threshold_value,
+            severity: r.severity,
+            action: r.action,
+            enabled: r.enabled,
+            cooldown_minutes: r.cooldown_minutes.max(0) as u32,
+            last_triggered: r.last_triggered.map(|t| t.to_rfc3339()),
+            description: r.description,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct AlertRow {
+    id: String,
+    rule_id: String,
+    role: String,
+    metric_id: String,
+    metric_name: String,
+    current_value: Option<f64>,
+    threshold_value: f64,
+    severity: String,
+    status: String,
+    triggered_at: chrono::DateTime<chrono::Utc>,
+    acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    message: String,
+    action_taken: String,
+}
+
+impl From<AlertRow> for KpiAlert {
+    fn from(r: AlertRow) -> Self {
+        KpiAlert {
+            id: r.id,
+            rule_id: r.rule_id,
+            role: r.role,
+            metric_id: r.metric_id,
+            metric_name: r.metric_name,
+            current_value: r.current_value,
+            threshold_value: r.threshold_value,
+            severity: r.severity,
+            status: r.status,
+            triggered_at: r.triggered_at.to_rfc3339(),
+            acknowledged_at: r.acknowledged_at.map(|t| t.to_rfc3339()),
+            resolved_at: r.resolved_at.map(|t| t.to_rfc3339()),
+            message: r.message,
+            action_taken: r.action_taken,
+        }
+    }
+}
+
+fn store_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({
+        "error": "store_unavailable",
+        "service": "kpi-threshold-monitor-rs",
+        "detail": detail,
+    }))
+}
+
+fn require_db(state: &web::Data<AppState>) -> Result<&PgPool, HttpResponse> {
+    state.db.as_ref().ok_or_else(|| {
+        store_unavailable("DATABASE_URL not configured or unreachable; refusing to fabricate KPI alert state")
+    })
+}
+
+async fn init_store(db_url: &str) -> Option<PgPool> {
+    if db_url.is_empty() {
+        eprintln!("[kpi-threshold-monitor-rs] DATABASE_URL not set — persistent store unavailable (data endpoints will 503)");
+        return None;
+    }
+    let pool = match PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(db_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[kpi-threshold-monitor-rs] DB connect failed: {} — endpoints will 503", e);
+            return None;
+        }
+    };
+    let schema = [
+        r#"CREATE TABLE IF NOT EXISTS kpi_thresholds (
+            id TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            metric_id TEXT NOT NULL,
+            metric_name TEXT NOT NULL,
+            condition TEXT NOT NULL,
+            threshold_value DOUBLE PRECISION NOT NULL,
+            severity TEXT NOT NULL,
+            action TEXT NOT NULL,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            cooldown_minutes INTEGER NOT NULL DEFAULT 0,
+            last_triggered TIMESTAMPTZ,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+        r#"CREATE TABLE IF NOT EXISTS kpi_alerts (
+            id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            metric_id TEXT NOT NULL,
+            metric_name TEXT NOT NULL,
+            current_value DOUBLE PRECISION,
+            threshold_value DOUBLE PRECISION NOT NULL,
+            severity TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            triggered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            acknowledged_at TIMESTAMPTZ,
+            resolved_at TIMESTAMPTZ,
+            message TEXT NOT NULL DEFAULT '',
+            action_taken TEXT NOT NULL DEFAULT ''
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_kpi_alerts_status ON kpi_alerts (status)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_kpi_alerts_role ON kpi_alerts (role)"#,
+    ];
+    for stmt in schema {
+        if let Err(e) = sqlx::query(stmt).execute(&pool).await {
+            eprintln!("[kpi-threshold-monitor-rs] schema init failed: {} — endpoints will 503", e);
+            return None;
+        }
+    }
+    // Seed the default threshold rules idempotently (ON CONFLICT DO NOTHING) —
+    // these are the former process-local defaults, preserved as boot config.
+    for rule in default_thresholds() {
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO kpi_thresholds (id, role, metric_id, metric_name, condition, threshold_value, severity, action, enabled, cooldown_minutes, description)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(&rule.id).bind(&rule.role).bind(&rule.metric_id).bind(&rule.metric_name)
+        .bind(&rule.condition).bind(rule.threshold_value).bind(&rule.severity).bind(&rule.action)
+        .bind(rule.enabled).bind(rule.cooldown_minutes as i32).bind(&rule.description)
+        .execute(&pool).await {
+            eprintln!("[kpi-threshold-monitor-rs] threshold seed failed for {}: {}", rule.id, e);
+        }
+    }
+    eprintln!("[kpi-threshold-monitor-rs] postgres store ready (tables kpi_thresholds/kpi_alerts)");
+    Some(pool)
+}
+
+async fn insert_alert(db: &PgPool, a: &KpiAlert) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"INSERT INTO kpi_alerts (id, rule_id, role, metric_id, metric_name, current_value, threshold_value, severity, status, triggered_at, message, action_taken)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW(), $10,$11)"#,
+    )
+    .bind(&a.id).bind(&a.rule_id).bind(&a.role).bind(&a.metric_id).bind(&a.metric_name)
+    .bind(a.current_value).bind(a.threshold_value).bind(&a.severity).bind(&a.status)
+    .bind(&a.message).bind(&a.action_taken)
+    .execute(db).await?;
+    Ok(())
 }
 
 // --- Graceful Degradation ---
@@ -84,77 +267,104 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 
 async fn healthz(state: web::Data<AppState>) -> HttpResponse {
     let uptime = state.start_time.elapsed();
-    let alerts = state.alerts.read().unwrap();
-    let thresholds = state.thresholds.read().unwrap();
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+    let mut body = json!({
         "service": state.service_name,
         "status": "healthy",
         "version": "1.0.0",
         "uptime_secs": uptime.as_secs(),
-        "database": if state.db_url.is_empty() { "not_configured" } else { "configured" },
-        "active_alerts": alerts.iter().filter(|a| a.status == "active").count(),
-        "unavailable_metrics": alerts.iter().filter(|a| a.status == "data_unavailable").count(),
-        "total_rules": thresholds.len(),
-        "enabled_rules": thresholds.iter().filter(|t| t.enabled).count(),
-    }))
+        "database": if state.db.is_some() { "connected" } else if state.db_url.is_empty() { "not_configured" } else { "unreachable" },
+    });
+    if let Some(db) = state.db.as_ref() {
+        // Honest live counts from the store; healthz stays 200 but reports
+        // nulls when a count query fails (never fabricated counters).
+        let active: Option<i64> = sqlx::query_scalar("SELECT COUNT(*) FROM kpi_alerts WHERE status = 'active'").fetch_one(db).await.ok();
+        let unavailable: Option<i64> = sqlx::query_scalar("SELECT COUNT(*) FROM kpi_alerts WHERE status = 'data_unavailable'").fetch_one(db).await.ok();
+        let total_rules: Option<i64> = sqlx::query_scalar("SELECT COUNT(*) FROM kpi_thresholds").fetch_one(db).await.ok();
+        let enabled_rules: Option<i64> = sqlx::query_scalar("SELECT COUNT(*) FROM kpi_thresholds WHERE enabled").fetch_one(db).await.ok();
+        body["active_alerts"] = json!(active);
+        body["unavailable_metrics"] = json!(unavailable);
+        body["total_rules"] = json!(total_rules);
+        body["enabled_rules"] = json!(enabled_rules);
+    }
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(body)
 }
 
 async fn list_thresholds(state: web::Data<AppState>, query: web::Query<ListParams>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
-    let thresholds = state.thresholds.read().unwrap();
-    let mut filtered: Vec<&ThresholdRule> = thresholds.iter().collect();
-
-    if let Some(ref role) = query.role {
-        filtered.retain(|t| &t.role == role);
-    }
-    if let Some(ref severity) = query.severity {
-        filtered.retain(|t| &t.severity == severity);
-    }
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
 
     let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).min(100);
-    let total = filtered.len();
-    let start = (page - 1) * limit;
-    let items: Vec<&ThresholdRule> = filtered.into_iter().skip(start).take(limit).collect();
+    let limit = query.limit.unwrap_or(50).min(100) as i64;
+    let offset = ((page - 1) as i64) * limit;
+
+    let total: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kpi_thresholds WHERE ($1::text IS NULL OR role = $1) AND ($2::text IS NULL OR severity = $2)")
+        .bind(&query.role).bind(&query.severity)
+        .fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("kpi_thresholds count failed: {}", e)),
+    };
+    let rows = match sqlx::query_as::<_, ThresholdRow>(
+        "SELECT id, role, metric_id, metric_name, condition, threshold_value, severity, action, enabled, cooldown_minutes, last_triggered, description
+         FROM kpi_thresholds
+         WHERE ($1::text IS NULL OR role = $1) AND ($2::text IS NULL OR severity = $2)
+         ORDER BY id LIMIT $3 OFFSET $4")
+        .bind(&query.role).bind(&query.severity).bind(limit).bind(offset)
+        .fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("kpi_thresholds query failed: {}", e)),
+    };
+    let items: Vec<ThresholdRule> = rows.into_iter().map(ThresholdRule::from).collect();
 
     HttpResponse::Ok().json(json!({
         "items": items,
         "total": total,
         "page": page,
         "limit": limit,
-        "source": "threshold_rules"
+        "source": "kpi_thresholds"
     }))
 }
 
 async fn list_alerts(state: web::Data<AppState>, query: web::Query<ListParams>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
-    let alerts = state.alerts.read().unwrap();
-    let mut filtered: Vec<&KpiAlert> = alerts.iter().collect();
-
-    if let Some(ref role) = query.role {
-        filtered.retain(|a| &a.role == role);
-    }
-    if let Some(ref severity) = query.severity {
-        filtered.retain(|a| &a.severity == severity);
-    }
-    if let Some(ref status) = query.status {
-        filtered.retain(|a| &a.status == status);
-    }
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
 
     let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).min(100);
-    let total = filtered.len();
-    let start = (page - 1) * limit;
-    let items: Vec<&KpiAlert> = filtered.into_iter().skip(start).take(limit).collect();
+    let limit = query.limit.unwrap_or(50).min(100) as i64;
+    let offset = ((page - 1) as i64) * limit;
+
+    let total: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kpi_alerts WHERE ($1::text IS NULL OR role = $1) AND ($2::text IS NULL OR severity = $2) AND ($3::text IS NULL OR status = $3)")
+        .bind(&query.role).bind(&query.severity).bind(&query.status)
+        .fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("kpi_alerts count failed: {}", e)),
+    };
+    let active_count: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM kpi_alerts WHERE status = 'active'")
+        .fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("kpi_alerts count failed: {}", e)),
+    };
+    let rows = match sqlx::query_as::<_, AlertRow>(
+        "SELECT id, rule_id, role, metric_id, metric_name, current_value, threshold_value, severity, status, triggered_at, acknowledged_at, resolved_at, message, action_taken
+         FROM kpi_alerts
+         WHERE ($1::text IS NULL OR role = $1) AND ($2::text IS NULL OR severity = $2) AND ($3::text IS NULL OR status = $3)
+         ORDER BY triggered_at DESC, id LIMIT $4 OFFSET $5")
+        .bind(&query.role).bind(&query.severity).bind(&query.status).bind(limit).bind(offset)
+        .fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("kpi_alerts query failed: {}", e)),
+    };
+    let items: Vec<KpiAlert> = rows.into_iter().map(KpiAlert::from).collect();
 
     HttpResponse::Ok().json(json!({
         "items": items,
         "total": total,
         "page": page,
         "limit": limit,
-        "active_count": alerts.iter().filter(|a| a.status == "active").count(),
+        "active_count": active_count,
         "source": "kpi_alerts"
     }))
 }
@@ -168,7 +378,14 @@ async fn evaluate_thresholds(req: actix_web::HttpRequest, state: web::Data<AppSt
     // Evaluate all enabled thresholds against current DB values.
     // A metric source failure is LOUD: it produces a data_unavailable alert,
     // never a silently simulated KPI value.
-    let thresholds = state.thresholds.read().unwrap().clone();
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let thresholds: Vec<ThresholdRule> = match sqlx::query_as::<_, ThresholdRow>(
+        "SELECT id, role, metric_id, metric_name, condition, threshold_value, severity, action, enabled, cooldown_minutes, last_triggered, description
+         FROM kpi_thresholds ORDER BY id")
+        .fetch_all(db).await {
+        Ok(rows) => rows.into_iter().map(ThresholdRule::from).collect(),
+        Err(e) => return store_unavailable(&format!("kpi_thresholds query failed: {}", e)),
+    };
     let mut new_alerts: Vec<KpiAlert> = Vec::new();
     let mut evaluated = 0;
     let mut breached = 0;
@@ -232,10 +449,17 @@ async fn evaluate_thresholds(req: actix_web::HttpRequest, state: web::Data<AppSt
         }
     }
 
-    // Store new alerts
-    if !new_alerts.is_empty() {
-        let mut alerts = state.alerts.write().unwrap();
-        alerts.extend(new_alerts.clone());
+    // Persist new alerts (INSERT-first; a persistence failure is loud — 503,
+    // never a silently dropped alert).
+    let mut persisted = 0usize;
+    for alert in &new_alerts {
+        match insert_alert(db, alert).await {
+            Ok(()) => persisted += 1,
+            Err(e) => {
+                eprintln!("[kpi-threshold-monitor-rs] alert insert failed ({}): {}", alert.id, e);
+                return store_unavailable(&format!("kpi_alerts insert failed: {}", e));
+            }
+        }
     }
 
     HttpResponse::Ok().json(json!({
@@ -243,6 +467,7 @@ async fn evaluate_thresholds(req: actix_web::HttpRequest, state: web::Data<AppSt
         "breached": breached,
         "unavailable": unavailable,
         "new_alerts": new_alerts.len(),
+        "persisted_alerts": persisted,
         "timestamp": chrono_now(),
         "alerts": new_alerts
     }))
@@ -251,60 +476,79 @@ async fn evaluate_thresholds(req: actix_web::HttpRequest, state: web::Data<AppSt
 async fn acknowledge_alert(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     if let Err(resp) = permify::require_permify(&req, "kpi", "acknowledge").await { return resp; } // W12-B5P1DF
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let alert_id = path.into_inner();
-    let mut alerts = state.alerts.write().unwrap();
-    if let Some(alert) = alerts.iter_mut().find(|a| a.id == alert_id) {
-        alert.status = "acknowledged".to_string();
-        alert.acknowledged_at = Some(chrono_now());
-        HttpResponse::Ok().json(json!({"status": "acknowledged", "alert_id": alert_id}))
-    } else {
-        HttpResponse::NotFound().json(json!({"error": "alert not found"}))
+    match sqlx::query("UPDATE kpi_alerts SET status = 'acknowledged', acknowledged_at = NOW() WHERE id = $1 AND status IN ('active','data_unavailable')")
+        .bind(&alert_id).execute(db).await {
+        Ok(res) if res.rows_affected() > 0 => {
+            HttpResponse::Ok().json(json!({"status": "acknowledged", "alert_id": alert_id}))
+        }
+        Ok(_) => HttpResponse::NotFound().json(json!({"error": "alert not found or already closed"})),
+        Err(e) => store_unavailable(&format!("kpi_alerts acknowledge failed: {}", e)),
     }
 }
 
 async fn resolve_alert(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     if let Err(resp) = permify::require_permify(&req, "kpi", "resolve").await { return resp; } // W12-B5P1DF
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let alert_id = path.into_inner();
-    let mut alerts = state.alerts.write().unwrap();
-    if let Some(alert) = alerts.iter_mut().find(|a| a.id == alert_id) {
-        alert.status = "resolved".to_string();
-        alert.resolved_at = Some(chrono_now());
-        HttpResponse::Ok().json(json!({"status": "resolved", "alert_id": alert_id}))
-    } else {
-        HttpResponse::NotFound().json(json!({"error": "alert not found"}))
+    match sqlx::query("UPDATE kpi_alerts SET status = 'resolved', resolved_at = NOW() WHERE id = $1 AND status <> 'resolved'")
+        .bind(&alert_id).execute(db).await {
+        Ok(res) if res.rows_affected() > 0 => {
+            HttpResponse::Ok().json(json!({"status": "resolved", "alert_id": alert_id}))
+        }
+        Ok(_) => HttpResponse::NotFound().json(json!({"error": "alert not found or already resolved"})),
+        Err(e) => store_unavailable(&format!("kpi_alerts resolve failed: {}", e)),
     }
 }
 
 async fn dashboard_summary(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     if let Err(resp) = permify::require_permify(&req, "kpi", "view").await { return resp; } // W12-B5P1DF
-    let alerts = state.alerts.read().unwrap();
-    let thresholds = state.thresholds.read().unwrap();
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
 
-    let active_by_severity: HashMap<&str, usize> = alerts.iter()
-        .filter(|a| a.status == "active")
-        .fold(HashMap::new(), |mut acc, a| {
-            *acc.entry(a.severity.as_str()).or_insert(0) += 1;
-            acc
-        });
+    async fn count_status(db: &PgPool, status: &str) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM kpi_alerts WHERE status = $1")
+            .bind(status).fetch_one(db).await
+    }
+    let active = match count_status(db, "active").await { Ok(n) => n, Err(e) => return store_unavailable(&format!("summary query failed: {}", e)) };
+    let acknowledged = match count_status(db, "acknowledged").await { Ok(n) => n, Err(e) => return store_unavailable(&format!("summary query failed: {}", e)) };
+    let resolved = match count_status(db, "resolved").await { Ok(n) => n, Err(e) => return store_unavailable(&format!("summary query failed: {}", e)) };
+    let data_unavailable = match count_status(db, "data_unavailable").await { Ok(n) => n, Err(e) => return store_unavailable(&format!("summary query failed: {}", e)) };
 
-    let active_by_role: HashMap<&str, usize> = alerts.iter()
-        .filter(|a| a.status == "active")
-        .fold(HashMap::new(), |mut acc, a| {
-            *acc.entry(a.role.as_str()).or_insert(0) += 1;
-            acc
-        });
+    let sev_rows = match sqlx::query_as::<_, (String, i64)>("SELECT severity, COUNT(*) FROM kpi_alerts WHERE status = 'active' GROUP BY severity")
+        .fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("summary query failed: {}", e)),
+    };
+    let active_by_severity: HashMap<String, i64> = sev_rows.into_iter().collect();
+
+    let role_rows = match sqlx::query_as::<_, (String, i64)>("SELECT role, COUNT(*) FROM kpi_alerts WHERE status = 'active' GROUP BY role")
+        .fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("summary query failed: {}", e)),
+    };
+    let active_by_role: HashMap<String, i64> = role_rows.into_iter().collect();
+
+    let total_rules: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM kpi_thresholds").fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("summary query failed: {}", e)),
+    };
+    let enabled_rules: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM kpi_thresholds WHERE enabled").fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("summary query failed: {}", e)),
+    };
 
     HttpResponse::Ok().json(json!({
-        "total_active_alerts": alerts.iter().filter(|a| a.status == "active").count(),
-        "total_acknowledged": alerts.iter().filter(|a| a.status == "acknowledged").count(),
-        "total_resolved": alerts.iter().filter(|a| a.status == "resolved").count(),
-        "total_data_unavailable": alerts.iter().filter(|a| a.status == "data_unavailable").count(),
+        "total_active_alerts": active,
+        "total_acknowledged": acknowledged,
+        "total_resolved": resolved,
+        "total_data_unavailable": data_unavailable,
         "active_by_severity": active_by_severity,
         "active_by_role": active_by_role,
-        "total_rules": thresholds.len(),
-        "enabled_rules": thresholds.iter().filter(|t| t.enabled).count(),
+        "total_rules": total_rules,
+        "enabled_rules": enabled_rules,
         "last_evaluation": chrono_now()
     }))
 }
@@ -718,12 +962,14 @@ async fn main() -> std::io::Result<()> {
         eprintln!("[kpi-threshold-monitor-rs] DATABASE_URL not set — all metric evaluations will alert as data_unavailable (loud)");
     }
 
+    // Fail-closed store: None => all data endpoints 503 (never in-memory fallback).
+    let db = init_store(&db_url).await;
+
     let state = AppState {
         start_time: Instant::now(),
         db_url,
+        db,
         service_name: "kpi-threshold-monitor-rs".into(),
-        alerts: Arc::new(RwLock::new(Vec::new())),
-        thresholds: Arc::new(RwLock::new(default_thresholds())),
     };
 
     println!("kpi-threshold-monitor-rs starting on :{} (8 threshold rules, fail-loud on metric source failure)", port);
@@ -763,9 +1009,8 @@ impl Clone for AppState {
         AppState {
             start_time: self.start_time,
             db_url: self.db_url.clone(),
+            db: self.db.clone(),
             service_name: self.service_name.clone(),
-            alerts: self.alerts.clone(),
-            thresholds: self.thresholds.clone(),
         }
     }
 }

@@ -2,6 +2,7 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use actix_web::HttpMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::{PgPool, postgres::PgPoolOptions, FromRow};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -56,20 +57,120 @@ struct VerifyRequest {
     pin: String,
 }
 
+// ── Postgres persistence (W13-FIX-CRIT C6: in-memory PIN-hash HashMap → PG) ──
+// PIN hashes were held in Arc<RwLock<HashMap>>: every customer PIN hash was
+// lost on restart and verify_pin 404'd. pin_hashes (tenant-scoped) is now the
+// system of record. SECURITY: only the PBKDF2 hash + salt are stored — the
+// PIN itself is never persisted. Fail-closed: DB down => 503 on all
+// hash/verify paths (no in-memory fallback).
 #[derive(Clone)]
 struct AppState {
     start_time: Instant,
     pin_blocks: Arc<RwLock<Vec<PinBlock>>>,
-    pin_hashes: Arc<RwLock<std::collections::HashMap<String, PinHashRecord>>>,
+    db: Option<PgPool>,
+}
+
+// DB row shape (typed cols + FromRow, canonical wave-12 rust store idiom).
+#[derive(Debug, FromRow)]
+#[allow(dead_code)] // tenant_id selected for scoping/audit; not re-serialized
+struct PinHashRow {
+    id: String,
+    tenant_id: String,
+    account_number: String,
+    algorithm: String,
+    hash_hex: String,
+    salt: String,
+    iterations: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<PinHashRow> for PinHashRecord {
+    fn from(r: PinHashRow) -> Self {
+        PinHashRecord {
+            id: r.id,
+            account_number: r.account_number,
+            algorithm: r.algorithm,
+            hash_hex: r.hash_hex,
+            salt: r.salt,
+            iterations: r.iterations.max(0) as u32,
+            created_at: r.created_at.to_rfc3339(),
+        }
+    }
+}
+
+fn store_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({
+        "error": "store_unavailable",
+        "service": "pin-block-engine-rs",
+        "detail": detail,
+    }))
+}
+
+fn require_db(state: &web::Data<AppState>) -> Result<&PgPool, HttpResponse> {
+    state.db.as_ref().ok_or_else(|| {
+        store_unavailable("DATABASE_URL not configured or unreachable; refusing to drop PIN hash state")
+    })
+}
+
+// Tenant scoping: verified JWT tenant claim first, then X-Tenant-Id header,
+// then the fleet default — mirrors permify_check's tenant resolution.
+fn request_tenant(req: &actix_web::HttpRequest) -> String {
+    claims_tenant(req)
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string())
+}
+
+async fn init_store() -> Option<PgPool> {
+    let db_url = match std::env::var("DATABASE_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            eprintln!("[pin-block-engine-rs] DATABASE_URL not set — pin hash endpoints will 503");
+            return None;
+        }
+    };
+    let pool = match PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&db_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[pin-block-engine-rs] DB connect failed: {} — pin hash endpoints will 503", e);
+            return None;
+        }
+    };
+    let schema = [
+        r#"CREATE TABLE IF NOT EXISTS pin_hashes (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            account_number TEXT NOT NULL,
+            algorithm TEXT NOT NULL,
+            hash_hex TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            iterations INTEGER NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_pin_hashes_tenant ON pin_hashes (tenant_id)"#,
+    ];
+    for stmt in schema {
+        if let Err(e) = sqlx::query(stmt).execute(&pool).await {
+            eprintln!("[pin-block-engine-rs] schema init failed: {} — pin hash endpoints will 503", e);
+            return None;
+        }
+    }
+    eprintln!("[pin-block-engine-rs] postgres store ready (table pin_hashes)");
+    Some(pool)
 }
 
 impl AppState {
-    fn new() -> Self {
-        // No seeded/fake records: state starts empty and only real operations populate it.
+    fn new(db: Option<PgPool>) -> Self {
+        // No seeded/fake records: only real operations populate the store.
         AppState {
             start_time: Instant::now(),
             pin_blocks: Arc::new(RwLock::new(Vec::new())),
-            pin_hashes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            db,
         }
     }
 }
@@ -153,10 +254,21 @@ async fn encode_pin_block(req: actix_web::HttpRequest, _state: web::Data<AppStat
 
 async fn list_hashes(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    // Wave-11 (RS-31): pin_hashes is now id-keyed (O(1) lookup); listing is capped.
-    let hashes = state.pin_hashes.read().unwrap_or_else(|e| e.into_inner());
-    let items: Vec<&PinHashRecord> = hashes.values().take(1000).collect();
-    let total = hashes.len();
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    // Listing is capped at 1000 rows, tenant-scoped.
+    let rows = match sqlx::query_as::<_, PinHashRow>(
+        "SELECT id, tenant_id, account_number, algorithm, hash_hex, salt, iterations, created_at FROM pin_hashes WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1000")
+        .bind(&tenant).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("pin_hashes query failed: {}", e)),
+    };
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM pin_hashes WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("pin_hashes count failed: {}", e)),
+    };
+    let items: Vec<PinHashRecord> = rows.into_iter().map(PinHashRecord::from).collect();
     HttpResponse::Ok().json(json!({"items": items, "total": total}))
 }
 
@@ -187,13 +299,17 @@ async fn hash_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, body:
         iterations: PBKDF2_ITERATIONS,
         created_at: now_utc(),
     };
-    {
-        // Wave-11 (RS-31): bound table growth (100k records) instead of unbounded push.
-        let mut hashes = state.pin_hashes.write().unwrap_or_else(|e| e.into_inner());
-        if hashes.len() >= 100_000 {
-            return HttpResponse::InsufficientStorage().json(json!({"error": "pin_hash_store_full", "detail": "capacity 100000 reached"}));
-        }
-        hashes.insert(rec.id.clone(), rec.clone());
+    // INSERT-first, tenant-scoped: only the hash + salt are persisted (never
+    // the PIN). A DB failure is loud (503) — never hashStored:true on a drop.
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    if let Err(e) = sqlx::query(
+        "INSERT INTO pin_hashes (id, tenant_id, account_number, algorithm, hash_hex, salt, iterations) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+        .bind(&rec.id).bind(&tenant).bind(&rec.account_number).bind(&rec.algorithm)
+        .bind(&rec.hash_hex).bind(&rec.salt).bind(rec.iterations as i32)
+        .execute(db).await {
+        eprintln!("[pin-block-engine-rs] pin_hashes insert failed: {}", e);
+        return store_unavailable(&format!("pin_hashes insert failed: {}", e));
     }
     HttpResponse::Created().json(json!({"id": rec.id, "algorithm": algo, "hashStored": true}))
 }
@@ -205,13 +321,17 @@ async fn verify_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
         // Fail closed: an invalid candidate PIN is never verified.
         return HttpResponse::Ok().json(json!({"hashId": body.hash_id, "verified": false, "reason": "invalid_pin_format"}));
     }
-    let rec = {
-        // Wave-11 (RS-31): O(1) HashMap lookup (was O(n) scan).
-        let hashes = state.pin_hashes.read().unwrap_or_else(|e| e.into_inner());
-        hashes.get(&body.hash_id).cloned()
+    // Tenant-scoped lookup in Postgres (hash survives restarts).
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    let rec = match sqlx::query_as::<_, PinHashRow>(
+        "SELECT id, tenant_id, account_number, algorithm, hash_hex, salt, iterations, created_at FROM pin_hashes WHERE id = $1 AND tenant_id = $2")
+        .bind(&body.hash_id).bind(&tenant).fetch_optional(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("pin_hashes lookup failed: {}", e)),
     };
     let rec = match rec {
-        Some(r) => r,
+        Some(r) => PinHashRecord::from(r),
         None => return HttpResponse::NotFound().json(json!({"error": "hash record not found"})),
     };
     let salt = match hex_decode(&rec.salt) {
@@ -239,15 +359,23 @@ async fn verify_pin(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
     let blocks = state.pin_blocks.read().unwrap();
-    let hashes = state.pin_hashes.read().unwrap_or_else(|e| e.into_inner());
-    let algo_counts = hashes.values().fold(std::collections::HashMap::<String,u32>::new(), |mut m, h| {
-        *m.entry(h.algorithm.clone()).or_insert(0) += 1;
-        m
-    });
+    let stored: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM pin_hashes WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("pin_hashes count failed: {}", e)),
+    };
+    let algo_rows = match sqlx::query_as::<_, (String, i64)>("SELECT algorithm, COUNT(*) FROM pin_hashes WHERE tenant_id = $1 GROUP BY algorithm")
+        .bind(&tenant).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("pin_hashes stats failed: {}", e)),
+    };
+    let algo_counts: std::collections::HashMap<String, i64> = algo_rows.into_iter().collect();
     HttpResponse::Ok().json(json!({
         "pinBlocksEncoded": blocks.len(),
-        "pinHashesStored": hashes.len(),
+        "pinHashesStored": stored,
         "algorithmBreakdown": algo_counts,
     }))
 }
@@ -549,7 +677,9 @@ async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_i
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "9273".to_string());
-    let state = AppState::new();
+    // Fail-closed store: None => all pin hash endpoints 503 (no in-memory fallback).
+    let db = init_store().await;
+    let state = AppState::new(db);
     println!("PIN Block & Hash Engine (Rust) on :{}", port);
     HttpServer::new(move || {
         App::new()

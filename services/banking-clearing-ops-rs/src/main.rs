@@ -373,11 +373,16 @@ async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: 
     if let Err(resp) = permify::require_permify(&req, "settlement", "delete").await { return resp; } // W12-B5D1
     let db = match require_db(&data) { Ok(d) => d, Err(r) => return r };
     let id = path.into_inner();
-    let _ = sqlx::query("UPDATE settlements SET status = 'deleted' WHERE id = $1::uuid")
+    // W13-RISK-1: fail-closed — never swallow DB errors on settlement soft-delete.
+    match sqlx::query("UPDATE settlements SET status = 'deleted' WHERE id = $1::uuid")
         .bind(&id)
         .execute(db)
-        .await;
-    HttpResponse::NoContent().finish()
+        .await
+    {
+        Ok(res) if res.rows_affected() > 0 => HttpResponse::NoContent().finish(),
+        Ok(_) => HttpResponse::NotFound().json(json!({"error": "not found"})),
+        Err(e) => source_unavailable(&format!("settlement delete failed: {}", e)),
+    }
 }
 
 // ── Shared infrastructure ──────────────────────────────────────────────────

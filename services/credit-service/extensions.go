@@ -348,6 +348,50 @@ func (s *CreditServer) initCollateralTable(r *http.Request) {
 	)`)
 }
 
+// collateralCreateHandler records a collateral valuation
+// (W13-RISK-7: collateral_valuations was read by list/summary/coverage but
+// had NO writer). Fail-closed: DB errors return 500.
+func (s *CreditServer) collateralCreateHandler(w http.ResponseWriter, r *http.Request) {
+	tid := tenantID(r)
+	s.initCollateralTable(r)
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	id := uuid.New().String()
+	str := func(k string) string { v, _ := body[k].(string); return v }
+	num := func(k string) float64 { v, _ := body[k].(float64); return v }
+
+	lienStatus := str("lien_status")
+	if lienStatus == "" {
+		lienStatus = "perfected"
+	}
+	currency := str("currency")
+	if currency == "" {
+		currency = "NGN"
+	}
+
+	_, err := s.db.ExecContext(r.Context(), `
+		INSERT INTO collateral_valuations (id, tenant_id, collateral_id, collateral_type,
+			description, owner, market_value, forced_sale_value, haircut_pct,
+			net_realizable_value, currency, valuer, valuation_date, expiry_date,
+			insurance_value, insurance_expiry, lien_status, status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'current')`,
+		id, tid, str("collateral_id"), str("collateral_type"), str("description"),
+		str("owner"), num("market_value"), num("forced_sale_value"), num("haircut_pct"),
+		num("net_realizable_value"), currency, str("valuer"),
+		nilIfEmpty(str("valuation_date")), nilIfEmpty(str("expiry_date")),
+		num("insurance_value"), nilIfEmpty(str("insurance_expiry")), lienStatus)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
+		return
+	}
+	body["id"] = id
+	body["status"] = "current"
+	respondJSON(w, http.StatusCreated, body)
+}
+
 func (s *CreditServer) collateralListHandler(w http.ResponseWriter, r *http.Request) {
 	tid := tenantID(r)
 	s.initCollateralTable(r)

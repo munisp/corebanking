@@ -1,11 +1,97 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
 use actix_web::HttpMessage;
-// W12-B5-P0-D3: serde derive import dropped with the removed dead CRUD stubs (unused).
 use serde_json::json;
+use sqlx::{PgPool, postgres::PgPoolOptions, FromRow};
 use std::time::Instant;
 
+// ── Postgres persistence (W13-FIX-CRIT C8: created:true-with-nothing → PG) ──
+// create_record returned 201 {"created":true} while storing NOTHING, and
+// stats/list were hardcoded. watchlist_entries is now the system of record.
+// Fail-closed: DB down => 503 on list/create/stats (no fabricated data).
+
 #[derive(Clone)]
-struct AppState { start_time: Instant }
+struct AppState { start_time: Instant, db: Option<PgPool> }
+
+// DB row shape (typed cols + FromRow, canonical wave-12 rust store idiom).
+#[derive(Debug, FromRow)]
+struct WatchlistRow {
+    id: String,
+    tenant_id: String,
+    name: String,
+    status: String,
+    data: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn store_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({
+        "error": "store_unavailable",
+        "service": "watchlist-manager-rs",
+        "detail": detail,
+    }))
+}
+
+fn require_db(state: &web::Data<AppState>) -> Result<&PgPool, HttpResponse> {
+    state.db.as_ref().ok_or_else(|| {
+        store_unavailable("DATABASE_URL not configured or unreachable; refusing to fabricate watchlist data")
+    })
+}
+
+// Tenant from verified JWT claims (fallback X-Tenant-Id header / default).
+fn request_tenant(req: &actix_web::HttpRequest) -> String {
+    let claim_tenant = {
+        let ext = req.extensions();
+        ext.get::<VerifiedClaims>().and_then(|c| {
+            c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+    };
+    claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string())
+}
+
+async fn init_store() -> Option<PgPool> {
+    let db_url = match std::env::var("DATABASE_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            eprintln!("[watchlist-manager-rs] DATABASE_URL not set — endpoints will 503");
+            return None;
+        }
+    };
+    let pool = match PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&db_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[watchlist-manager-rs] DB connect failed: {} — endpoints will 503", e);
+            return None;
+        }
+    };
+    let schema = [
+        r#"CREATE TABLE IF NOT EXISTS watchlist_entries (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            data JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_watchlist_entries_tenant ON watchlist_entries (tenant_id)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_watchlist_entries_status ON watchlist_entries (status)"#,
+    ];
+    for stmt in schema {
+        if let Err(e) = sqlx::query(stmt).execute(&pool).await {
+            eprintln!("[watchlist-manager-rs] schema init failed: {} — endpoints will 503", e);
+            return None;
+        }
+    }
+    eprintln!("[watchlist-manager-rs] postgres store ready (table watchlist_entries)");
+    Some(pool)
+}
 
 async fn healthz(state: web::Data<AppState>) -> HttpResponse {
     HttpResponse::Ok().json(json!({
@@ -15,7 +101,7 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
         "uptime_secs": state.start_time.elapsed().as_secs(),
         "middleware": {
             "kafka": "watchlist-manager.events, watchlist-manager.audit",
-            "postgres": "watchlist_manager_records",
+            "postgres": if state.db.is_some() { "watchlist_entries" } else { "unavailable" },
             "redis": "watchlist-manager_cache",
             "temporal": "WatchlistManagerWorkflow",
             "tigerbeetle": "ledger_integration",
@@ -25,25 +111,82 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
 }
 
 
-async fn list_records(req: actix_web::HttpRequest) -> HttpResponse {
+async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    HttpResponse::Ok().json(json!({"records": [
-        {"id": "REC-001", "status": "active", "domain": "Watchlist Manager", "createdAt": "2026-05-09T10:00:00Z"},
-        {"id": "REC-002", "status": "processing", "domain": "Watchlist Manager", "createdAt": "2026-05-09T11:00:00Z"},
-        {"id": "REC-003", "status": "completed", "domain": "Watchlist Manager", "createdAt": "2026-05-08T14:00:00Z"},
-    ], "total": 3, "domain": "Watchlist Manager"}))
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    let rows = match sqlx::query_as::<_, WatchlistRow>(
+        "SELECT id, tenant_id, name, status, data, created_at FROM watchlist_entries WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1000")
+        .bind(&tenant).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("watchlist_entries query failed: {}", e)),
+    };
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM watchlist_entries WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("watchlist_entries count failed: {}", e)),
+    };
+    let records: Vec<serde_json::Value> = rows.into_iter().map(|r| json!({
+        "id": r.id,
+        "name": r.name,
+        "status": r.status,
+        "data": r.data,
+        "createdAt": r.created_at.to_rfc3339(),
+    })).collect();
+    HttpResponse::Ok().json(json!({"records": records, "total": total, "domain": "Watchlist Manager"}))
 }
-async fn create_record(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
+async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let permify_entity = body.get("id").and_then(|v| v.as_str())
         .or_else(|| body.get("name").and_then(|v| v.as_str()))
         .unwrap_or("watchlist");
     if let Err(resp) = permify_check(&req, "watchlist", permify_entity, "manage").await { return resp; }
-    HttpResponse::Created().json(json!({"created": true, "data": *body}))
+    // INSERT-first: the row is the system of record; a DB failure is loud
+    // (503) — never a 201 {"created":true} with nothing stored.
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    let id = body.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("WLE-{}", uuid::Uuid::new_v4()));
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if name.is_empty() {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "name is required"}));
+    }
+    let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("active").to_string();
+    let data = body.0.clone();
+    match sqlx::query("INSERT INTO watchlist_entries (id, tenant_id, name, status, data) VALUES ($1,$2,$3,$4,$5)")
+        .bind(&id).bind(&tenant).bind(&name).bind(&status).bind(&data)
+        .execute(db).await {
+        Ok(_) => HttpResponse::Created().json(json!({"created": true, "id": id, "data": data})),
+        Err(e) => {
+            eprintln!("[watchlist-manager-rs] watchlist_entries insert failed: {}", e);
+            store_unavailable(&format!("watchlist_entries insert failed: {}", e))
+        }
+    }
 }
-async fn get_stats(req: actix_web::HttpRequest) -> HttpResponse {
+async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    HttpResponse::Ok().json(json!({"total": 1247, "active": 1100, "pending": 120, "archived": 27}))
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    // Real COUNTs from the store (the former 1247/1100/120/27 were fabricated).
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM watchlist_entries WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("watchlist_entries stats failed: {}", e)),
+    };
+    let rows = match sqlx::query_as::<_, (String, i64)>("SELECT status, COUNT(*) FROM watchlist_entries WHERE tenant_id = $1 GROUP BY status")
+        .bind(&tenant).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("watchlist_entries stats failed: {}", e)),
+    };
+    let by_status: std::collections::HashMap<String, i64> = rows.into_iter().collect();
+    HttpResponse::Ok().json(json!({
+        "total": total,
+        "active": by_status.get("active").copied().unwrap_or(0),
+        "pending": by_status.get("pending").copied().unwrap_or(0),
+        "archived": by_status.get("archived").copied().unwrap_or(0),
+        "by_status": by_status,
+    }))
 }
 
 
@@ -312,7 +455,9 @@ async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_i
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "9322".to_string());
-    let state = AppState { start_time: Instant::now() };
+    // Fail-closed store: None => all data endpoints 503 (no fabricated data).
+    let db = init_store().await;
+    let state = AppState { start_time: Instant::now(), db };
     println!("Watchlist Manager (Rust) on :{}", port);
     HttpServer::new(move || {
         App::new()

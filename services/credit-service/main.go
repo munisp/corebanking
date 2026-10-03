@@ -492,6 +492,89 @@ func (s *CreditServer) listCreditReportsHandler(w http.ResponseWriter, r *http.R
 	respondJSON(w, http.StatusOK, map[string]interface{}{"items": items, "total": len(items)})
 }
 
+// nilIfEmpty converts an empty string to SQL NULL (for optional DATE/TEXT columns).
+func nilIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// bureauReportCreateHandler ingests a credit-bureau report into credit_reports
+// (W13-RISK-8: this table was read by score-check/list/stats but had NO
+// writer — every reader got fabricated-empty results). Fail-closed: DB errors
+// return 500, never a fabricated success.
+func (s *CreditServer) bureauReportCreateHandler(w http.ResponseWriter, r *http.Request) {
+	tid := tenantID(r)
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	id := uuid.New().String()
+	str := func(k string) string { v, _ := body[k].(string); return v }
+	num := func(k string) float64 { v, _ := body[k].(float64); return v }
+
+	if str("bvn") == "" && str("customer_id") == "" {
+		respondError(w, http.StatusBadRequest, "bvn or customer_id is required")
+		return
+	}
+
+	_, err := s.db.ExecContext(r.Context(), `
+		INSERT INTO credit_reports (id, tenant_id, customer_id, customer_name, bvn, bureau,
+			credit_score, score_band, total_facilities, active_facilities, total_outstanding,
+			total_overdue, max_days_past_due, performing_percentage, enquiry_count_6m,
+			report_date, next_refresh, status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'current')`,
+		id, tid, str("customer_id"), str("customer_name"), str("bvn"), str("bureau"),
+		int(num("credit_score")), str("score_band"), int(num("total_facilities")),
+		int(num("active_facilities")), num("total_outstanding"), num("total_overdue"),
+		int(num("max_days_past_due")), num("performing_percentage"), int(num("enquiry_count_6m")),
+		nilIfEmpty(str("report_date")), nilIfEmpty(str("next_refresh")))
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
+		return
+	}
+	body["id"] = id
+	body["status"] = "current"
+	respondJSON(w, http.StatusCreated, body)
+}
+
+// bureauFacilityCreateHandler records a facility reported by a credit bureau
+// (W13-RISK-6: bureau_facilities had NO writer).
+func (s *CreditServer) bureauFacilityCreateHandler(w http.ResponseWriter, r *http.Request) {
+	tid := tenantID(r)
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	id := uuid.New().String()
+	str := func(k string) string { v, _ := body[k].(string); return v }
+	num := func(k string) float64 { v, _ := body[k].(float64); return v }
+
+	classification := str("classification")
+	if classification == "" {
+		classification = "performing"
+	}
+
+	_, err := s.db.ExecContext(r.Context(), `
+		INSERT INTO bureau_facilities (id, report_id, tenant_id, institution, facility_type,
+			original_amount, outstanding_balance, overdue_amount, classification,
+			start_date, maturity_date, days_past_due)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		id, str("report_id"), tid, str("institution"), str("facility_type"),
+		num("original_amount"), num("outstanding_balance"), num("overdue_amount"),
+		classification, nilIfEmpty(str("start_date")), nilIfEmpty(str("maturity_date")),
+		int(num("days_past_due")))
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, fmt.Sprintf("create failed: %v", err))
+		return
+	}
+	body["id"] = id
+	respondJSON(w, http.StatusCreated, body)
+}
+
 func (s *CreditServer) listBureauFacilitiesHandler(w http.ResponseWriter, r *http.Request) {
 	tid := tenantID(r)
 	rows, err := s.db.QueryContext(r.Context(), `
@@ -980,7 +1063,9 @@ func main() {
 
 	// Credit bureau — APISIX strips /credit-bureau/ prefix
 	r.HandleFunc("/v1/credit-bureau/reports", permifyAuthzGuard("credit_service", "view", srv.listCreditReportsHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/credit-bureau/reports", permifyAuthzGuard("credit_service", "create", srv.bureauReportCreateHandler)).Methods("POST", "OPTIONS")
 	r.HandleFunc("/v1/credit-bureau/facilities", permifyAuthzGuard("credit_service", "view", srv.listBureauFacilitiesHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/credit-bureau/facilities", permifyAuthzGuard("credit_service", "create", srv.bureauFacilityCreateHandler)).Methods("POST", "OPTIONS")
 	r.HandleFunc("/v1/credit-bureau/stats", permifyAuthzGuard("credit_service", "view", srv.bureauStatsHandler)).Methods("GET", "OPTIONS")
 	r.HandleFunc("/v1/credit-bureau/score-check", permifyAuthzGuard("credit_service", "score_check", srv.scoreCheckHandler)).Methods("POST", "OPTIONS")
 
@@ -1007,6 +1092,7 @@ func main() {
 
 	// Collateral Valuation
 	r.HandleFunc("/v1/valuations", permifyAuthzGuard("credit_service", "view", srv.collateralListHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/valuations", permifyAuthzGuard("credit_service", "create", srv.collateralCreateHandler)).Methods("POST", "OPTIONS")
 	r.HandleFunc("/v1/valuations/summary", permifyAuthzGuard("credit_service", "view", srv.collateralSummaryHandler)).Methods("GET", "OPTIONS")
 	r.HandleFunc("/v1/valuations/compute-fsv", permifyAuthzGuard("credit_service", "compute_fsv", srv.computeFSVHandler)).Methods("POST", "OPTIONS")
 
@@ -1021,6 +1107,7 @@ func main() {
 
 	// ETD Trading
 	r.HandleFunc("/v1/etd/trades", permifyAuthzGuard("credit_service", "view", srv.etdTradesHandler)).Methods("GET", "OPTIONS")
+	r.HandleFunc("/v1/etd/trades", permifyAuthzGuard("credit_service", "create", srv.etdCreateHandler)).Methods("POST", "OPTIONS")
 	r.HandleFunc("/v1/etd/stats", permifyAuthzGuard("credit_service", "view", srv.etdStatsHandler)).Methods("GET", "OPTIONS")
 
 	// Banking Clearing Ops
@@ -1036,7 +1123,7 @@ func main() {
 			if allowedOrigins == "" {
 				allowedOrigins = "https://dashboard.54bank.ng"
 			}
-			origin := r.Header.Get("Origin")
+			origin := req.Header.Get("Origin")
 			for _, allowed := range strings.Split(allowedOrigins, ",") {
 				if strings.TrimSpace(allowed) == origin && origin != "" {
 					w.Header().Set("Access-Control-Allow-Origin", origin)

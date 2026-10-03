@@ -763,14 +763,19 @@ func (aksm *APIKeySecurityManager) checkRateLimit(keyID string, rateLimit, burst
 	// burstLimit), bucket PEXPIRE 60s. This is PURE rate limiting, so it
 	// FAILS OPEN (logged): a redis outage must not take down API-key
 	// authentication itself.
+	// NOTE: go-redis v9 *redis.Cmd has no IntSlice(); use Slice() and coerce
+	// (Lua arrays decode to []interface{} of int64). Pre-existing build break
+	// fixed to unblock the package gate.
 	res, err := apiKeyRateLimitScript.Run(redisCtx, getRedisClient(),
 		[]string{"ratelimit:apikey:" + keyID},
-		float64(rateLimit)/60.0, burstLimit, time.Now().UnixMilli()).IntSlice()
+		float64(rateLimit)/60.0, burstLimit, time.Now().UnixMilli()).Slice()
 	if err != nil || len(res) != 2 {
 		log.Printf("api-key rate limiter unavailable for key %s — FAIL-OPEN (allowing request): %v", keyID, err)
 		return false, -1
 	}
-	return res[0] == 1, int(res[1])
+	allowed, _ := res[0].(int64)
+	remaining, _ := res[1].(int64)
+	return allowed == 1, int(remaining)
 }
 
 // LogAPIKeyUsage logs an API key usage event

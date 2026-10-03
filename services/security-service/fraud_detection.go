@@ -500,6 +500,35 @@ func (fde *FraudDetectionEngine) lookupTenantConfig(tenantID string) (FraudDetec
 	return config, true
 }
 
+// SetTenantConfig sets a custom fraud detection config for a tenant.
+// W13-RISK-18: fraud_config previously had NO writer anywhere — fraud
+// threshold changes could never persist. Postgres remains the store of
+// record; the redis cache is refreshed WRITE-THROUGH after a successful DB
+// write (mirrors the c3-0766 ip_security/api_key idiom). Fail-closed: a DB
+// error is returned and the cache is NOT updated.
+func (fde *FraudDetectionEngine) SetTenantConfig(tenantID string, config FraudDetectionConfig) error {
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	_, err = fde.db.Exec(`
+		INSERT INTO fraud_config (tenant_id, config)
+		VALUES ($1, $2)
+		ON CONFLICT (tenant_id) DO UPDATE SET
+			config = EXCLUDED.config,
+			updated_at = CURRENT_TIMESTAMP
+	`, tenantID, configJSON)
+
+	if err != nil {
+		return err
+	}
+
+	configCacheSet(configFraudKey(tenantID), string(configJSON))
+
+	return nil
+}
+
 // GetConfig returns the applicable fraud detection config (cache-aside via redis, c3-0765)
 func (fde *FraudDetectionEngine) GetConfig(tenantID string) FraudDetectionConfig {
 	if tenantID != "" {

@@ -15,16 +15,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// sharedHTTPClient is a process-wide pooled HTTP client for outbound calls
-// (replaces per-call &http.Client{} construction).
-var sharedHTTPClient = &http.Client{
-	Timeout: 10 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 25,
-		IdleConnTimeout:     90 * time.Second,
-	},
-}
+// sharedHTTPClient is declared in main.go (package-wide); the duplicate
+// declaration that used to live here made the package fail to compile.
 
 var (
 	ginAuditSvcURL      = os.Getenv("AUDIT_SVC_URL")

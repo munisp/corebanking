@@ -368,6 +368,36 @@ func (atm *AuditTrailManager) openLogFile() {
 	atm.logFile = file
 }
 
+// SetTenantConfig sets a custom audit config for a tenant.
+// W13-RISK-17: audit_config previously had NO writer anywhere — per-tenant
+// audit config could never persist and the service always ran on hardcoded
+// env defaults. Postgres remains the store of record; the redis cache is
+// refreshed WRITE-THROUGH after a successful DB write (mirrors the c3-0766
+// ip_security/api_key idiom). Fail-closed: a DB error is returned and the
+// cache is NOT updated.
+func (atm *AuditTrailManager) SetTenantConfig(tenantID string, config AuditTrailConfig) error {
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+
+	_, err = atm.db.Exec(`
+		INSERT INTO audit_config (tenant_id, config)
+		VALUES ($1, $2)
+		ON CONFLICT (tenant_id) DO UPDATE SET
+			config = EXCLUDED.config,
+			updated_at = CURRENT_TIMESTAMP
+	`, tenantID, configJSON)
+
+	if err != nil {
+		return err
+	}
+
+	configCacheSet(configAuditKey(tenantID), string(configJSON))
+
+	return nil
+}
+
 // GetConfig returns the applicable audit config (cache-aside via redis, c3-0764)
 func (atm *AuditTrailManager) GetConfig(tenantID string) AuditTrailConfig {
 	if tenantID != "" {

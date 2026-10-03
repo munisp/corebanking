@@ -262,7 +262,16 @@ app.add_middleware(
     exclude_prefixes=["/health", "/dapr", "/charges", "/transfers"],
 )
 
+# W13-RISK-15/16: register durable outbox tables before create_all.
+from models import outbox as _outbox_models  # noqa: F401,E402
+
 Base.metadata.create_all(bind=engine)
+
+# W13-RISK-15/16: start the durable outbox relay (audit events + external
+# payment notifications persisted on downstream failure are retried forever).
+from services.outbox_relay import start_relay_thread  # noqa: E402
+
+start_relay_thread()
 
 app.include_router(health_router, prefix="", tags=["health"])
 app.include_router(charges_router, prefix="/charges", tags=["charges"])

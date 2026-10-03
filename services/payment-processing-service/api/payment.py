@@ -11,7 +11,8 @@ from schemas import (
     InitiateInsurancePremiumPaymentSchema,
     SupplyChainFinancingPaymentSchema,
 )
-from services import PaymentService
+from services import PaymentService, build_outbound_transfer_payload
+from services.outbox_relay import enqueue_external_notification
 from schemas.payment import (
     ExternalTransferSchema,
     ExternalDebitSchema,
@@ -320,6 +321,28 @@ def transfer(
                 "notify_external_systems_failed reference=%s error=%s",
                 reference, str(notify_error),
             )
+            # W13-RISK-16: the debit is already durable in TigerBeetle — the
+            # outbound notification must become durable too. Persist it to the
+            # external_notification_outbox for the relay to retry. Fail-closed:
+            # if the outbox write fails the caller gets 503 so nothing is lost
+            # silently.
+            outbound_payload = build_outbound_transfer_payload(reference, payload, context)
+            if outbound_payload is not None:
+                try:
+                    enqueue_external_notification(
+                        reference=reference,
+                        payload=outbound_payload,
+                        tenant_id=tenant_id,
+                    )
+                except Exception as outbox_error:
+                    logger.error(
+                        "external_notification_outbox_write_failed reference=%s error=%s",
+                        reference, str(outbox_error),
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Transfer completed but external notification could not be durably queued; retry with the same idempotency key.",
+                    )
 
         resp_body = {"message": "success", "reference": reference}
         _save_idempotency(idem_key, resp_body, "transfer")

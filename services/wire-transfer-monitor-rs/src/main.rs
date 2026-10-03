@@ -1,22 +1,96 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
 use actix_web::HttpMessage;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, FromRow};
 use std::time::Instant;
 
-#[derive(Clone, Serialize, Deserialize)]
-struct WireTransferRecord {
-    id: String,
-    status: String,
-    domain: String,
-    #[serde(rename = "createdAt")]
-    created_at: String,
-}
-
+// ── Postgres persistence (W13-FIX-CRIT C9: Mutex<Vec> → sqlx PG store) ──
+// Monitoring records lived in a process-local Mutex<Vec> and vanished on
+// restart, while healthz advertised a postgres table that did not exist.
+// wire_transfer_monitor_records (the advertised table) is now the system of
+// record. Fail-closed: DB down => 503 on list/create/stats.
 struct AppState {
     start_time: Instant,
-    records: Mutex<Vec<WireTransferRecord>>,
+    db: Option<PgPool>,
+}
+
+// DB row shape (typed cols + FromRow, canonical wave-12 rust store idiom).
+#[derive(Debug, FromRow)]
+struct WireTransferRow {
+    id: String,
+    tenant_id: String,
+    status: String,
+    data: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn store_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({
+        "error": "store_unavailable",
+        "service": "wire-transfer-monitor-rs",
+        "detail": detail,
+    }))
+}
+
+fn require_db(state: &web::Data<AppState>) -> Result<&PgPool, HttpResponse> {
+    state.db.as_ref().ok_or_else(|| {
+        store_unavailable("DATABASE_URL not configured or unreachable; refusing to drop monitoring records")
+    })
+}
+
+// Tenant from verified JWT claims (fallback X-Tenant-Id header / default).
+fn request_tenant(req: &actix_web::HttpRequest) -> String {
+    let claim_tenant = {
+        let ext = req.extensions();
+        ext.get::<VerifiedClaims>().and_then(|c| {
+            c.0.get("tenant_id").or_else(|| c.0.get("tenant")).and_then(|v| v.as_str()).map(|s| s.to_string())
+        })
+    };
+    claim_tenant.filter(|s| !s.is_empty())
+        .or_else(|| req.headers().get("X-Tenant-Id").and_then(|v| v.to_str().ok()).filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .or_else(|| std::env::var("PERMIFY_DEFAULT_TENANT").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "bpmgd".to_string())
+}
+
+async fn init_store() -> Option<PgPool> {
+    let db_url = match std::env::var("DATABASE_URL") {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
+            eprintln!("[wire-transfer-monitor-rs] DATABASE_URL not set — endpoints will 503");
+            return None;
+        }
+    };
+    let pool = match PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&db_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[wire-transfer-monitor-rs] DB connect failed: {} — endpoints will 503", e);
+            return None;
+        }
+    };
+    let schema = [
+        r#"CREATE TABLE IF NOT EXISTS wire_transfer_monitor_records (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            data JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_wtm_records_tenant ON wire_transfer_monitor_records (tenant_id)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_wtm_records_status ON wire_transfer_monitor_records (status)"#,
+    ];
+    for stmt in schema {
+        if let Err(e) = sqlx::query(stmt).execute(&pool).await {
+            eprintln!("[wire-transfer-monitor-rs] schema init failed: {} — endpoints will 503", e);
+            return None;
+        }
+    }
+    eprintln!("[wire-transfer-monitor-rs] postgres store ready (table wire_transfer_monitor_records)");
+    Some(pool)
 }
 
 async fn healthz(state: web::Data<AppState>) -> HttpResponse {
@@ -27,7 +101,7 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
         "uptime_secs": state.start_time.elapsed().as_secs(),
         "middleware": {
             "kafka": "wire-transfer-monitor.events, wire-transfer-monitor.audit",
-            "postgres": "wire_transfer_monitor_records",
+            "postgres": if state.db.is_some() { "wire_transfer_monitor_records" } else { "unavailable" },
             "redis": "wire-transfer-monitor_cache",
             "temporal": "WireTransferMonitorWorkflow",
             "tigerbeetle": "ledger_integration",
@@ -38,8 +112,27 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
 
 async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
-    HttpResponse::Ok().json(json!({"records": *records, "total": records.len(), "domain": "Wire Transfer Monitor"}))
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    let rows = match sqlx::query_as::<_, WireTransferRow>(
+        "SELECT id, tenant_id, status, data, created_at FROM wire_transfer_monitor_records WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1000")
+        .bind(&tenant).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("wire_transfer_monitor_records query failed: {}", e)),
+    };
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM wire_transfer_monitor_records WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("wire_transfer_monitor_records count failed: {}", e)),
+    };
+    let records: Vec<serde_json::Value> = rows.into_iter().map(|r| json!({
+        "id": r.id,
+        "status": r.status,
+        "domain": "Wire Transfer Monitor",
+        "data": r.data,
+        "createdAt": r.created_at.to_rfc3339(),
+    })).collect();
+    HttpResponse::Ok().json(json!({"records": records, "total": total, "domain": "Wire Transfer Monitor"}))
 }
 
 async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -48,26 +141,46 @@ async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, 
         .or_else(|| body.get("transactionRef").and_then(|v| v.as_str()))
         .unwrap_or("wire-transfer-monitor");
     if let Err(resp) = permify_check(&req, "monitoring_rule", permify_entity, "manage").await { return resp; }
-    let mut records = state.records.lock().unwrap_or_else(|e| e.into_inner());
-    let id = format!("REC-{:03}", records.len() + 1);
-    let rec = WireTransferRecord {
-        id: id.clone(),
-        status: body.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string(),
-        domain: "Wire Transfer Monitor".to_string(),
-        created_at: body.get("createdAt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-    };
-    records.push(rec);
-    HttpResponse::Created().json(json!({"created": true, "id": id, "data": *body}))
+    // INSERT-first: the row is the system of record; a DB failure is loud
+    // (503) — never a 201 for a dropped monitoring record.
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    let id = body.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("WTM-{}", uuid::Uuid::new_v4()));
+    let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+    let data = body.0.clone();
+    match sqlx::query("INSERT INTO wire_transfer_monitor_records (id, tenant_id, status, data) VALUES ($1,$2,$3,$4)")
+        .bind(&id).bind(&tenant).bind(&status).bind(&data)
+        .execute(db).await {
+        Ok(_) => HttpResponse::Created().json(json!({"created": true, "id": id, "data": data})),
+        Err(e) => {
+            eprintln!("[wire-transfer-monitor-rs] record insert failed: {}", e);
+            store_unavailable(&format!("wire_transfer_monitor_records insert failed: {}", e))
+        }
+    }
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
-    let total = records.len();
-    let active = records.iter().filter(|r| r.status == "active").count();
-    let pending = records.iter().filter(|r| r.status == "pending" || r.status == "processing").count();
-    let archived = records.iter().filter(|r| r.status == "completed" || r.status == "archived").count();
-    HttpResponse::Ok().json(json!({"total": total, "active": active, "pending": pending, "archived": archived}))
+    let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
+    let tenant = request_tenant(&req);
+    // Real COUNTs from the store.
+    let total: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM wire_transfer_monitor_records WHERE tenant_id = $1")
+        .bind(&tenant).fetch_one(db).await {
+        Ok(n) => n,
+        Err(e) => return store_unavailable(&format!("stats query failed: {}", e)),
+    };
+    let rows = match sqlx::query_as::<_, (String, i64)>("SELECT status, COUNT(*) FROM wire_transfer_monitor_records WHERE tenant_id = $1 GROUP BY status")
+        .bind(&tenant).fetch_all(db).await {
+        Ok(r) => r,
+        Err(e) => return store_unavailable(&format!("stats query failed: {}", e)),
+    };
+    let by_status: std::collections::HashMap<String, i64> = rows.into_iter().collect();
+    let active = by_status.get("active").copied().unwrap_or(0);
+    let pending = by_status.get("pending").copied().unwrap_or(0) + by_status.get("processing").copied().unwrap_or(0);
+    let archived = by_status.get("completed").copied().unwrap_or(0) + by_status.get("archived").copied().unwrap_or(0);
+    HttpResponse::Ok().json(json!({"total": total, "active": active, "pending": pending, "archived": archived, "by_status": by_status}))
 }
 
 // --- JWT Auth Check (fail-closed; N-2 remediation) ---
@@ -335,9 +448,11 @@ async fn permify_check(req: &actix_web::HttpRequest, entity_type: &str, entity_i
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "9325".to_string());
+    // Fail-closed store: None => all data endpoints 503 (no in-memory fallback).
+    let db = init_store().await;
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        records: Mutex::new(vec![]),
+        db,
     });
     println!("Wire Transfer Monitor (Rust) on :{}", port);
     HttpServer::new(move || {

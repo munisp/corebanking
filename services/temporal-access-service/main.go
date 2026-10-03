@@ -269,13 +269,31 @@ func main() {
 	defer redisStore.Close()
 	log.Println("Connected to Redis")
 
+	// Initialize Postgres policy authority (W13-RISK-19). Policies MUST NOT
+	// live only in volatile Redis: PG is the system of record, Redis is a
+	// TTL'd cache. If DATABASE_URL is unset, policy operations fail closed
+	// with 503-style errors instead of silently persisting to Redis only.
+	log.Println("Connecting to Postgres (policy authority)...")
+	var pgPolicyStore *storage.PGPolicyStore
+	if config.DatabaseURL == "" {
+		log.Println("WARNING: DATABASE_URL not set — access-policy endpoints will fail closed (no volatile-only persistence)")
+	} else {
+		pgPolicyStore, err = storage.NewPGPolicyStore(config.DatabaseURL)
+		if err != nil {
+			log.Fatalf("Failed to connect to Postgres policy authority: %v", err)
+		}
+		defer pgPolicyStore.Close()
+		log.Println("Connected to Postgres (policy authority)")
+	}
+	store := storage.NewStore(redisStore, pgPolicyStore)
+
 	// Initialize Permify client
 	log.Println("Initializing Permify client...")
 	permifyClient := permify.NewClient(config.PermifyURL)
 	log.Println("Permify client initialized")
 
 	// Initialize handler
-	handler := handlers.NewHandler(redisStore, permifyClient)
+	handler := handlers.NewHandler(store, permifyClient)
 
 	// Setup router
 	router := setupRouter(handler)
@@ -326,6 +344,7 @@ type Config struct {
 	RedisPassword string
 	PermifyURL    string
 	DaprHTTPPort  string
+	DatabaseURL   string
 }
 
 func loadConfig() Config {
@@ -335,6 +354,7 @@ func loadConfig() Config {
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
 		PermifyURL:    getEnv("PERMIFY_URL", "http://permify.permify.svc.cluster.local:3476"),
 		DaprHTTPPort:  getEnv("DAPR_HTTP_PORT", "3500"),
+		DatabaseURL:   getEnv("DATABASE_URL", ""),
 	}
 }
 
